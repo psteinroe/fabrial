@@ -668,6 +668,7 @@ Conductor behaviors Fabrial relies on, checked against Conductor `main` @ `33228
 8. **Idempotent `emit` with options** (P0). Dedup ID and metadata, for webhook redelivery.
 9. **Node-compatible package** (P0). Today's build is Bun-only, with no exports or types. Fabrial vendors Conductor as a pinned submodule until this ships.
 10. **Terminal-state hooks** (P1). Notify on completion, failure, and cancellation in every state. The adapter polls for settled executions meanwhile.
+11. **Stop hangs on queued claims** (P0). Workers enter handlers with an already-aborted signal after stop, so `stop()` can hang forever. The adapter releases those claims meanwhile.
 
 ## Open questions
 

@@ -1,6 +1,6 @@
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import postgres from "postgres";
-import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import {
 	EXECUTION_SETTLED_EVENT,
 	defineEvent,
@@ -19,7 +19,13 @@ import {
 } from "fabrial";
 import { FakeChat } from "fabrial/testing";
 import { z } from "zod";
-import { conductor, ExecutionError, type ConductorExecution } from "../../src/index.ts";
+import {
+	conductor,
+	ExecutionError,
+	type ConductorExecution,
+	type Conductor,
+	type AnyTask,
+} from "../../src/index.ts";
 
 let container: StartedPostgreSqlContainer;
 let admin: postgres.Sql;
@@ -1609,4 +1615,85 @@ test("core approval accepts an authenticated click during card delivery, before 
 	expect(dm.posts[0]!.content).toMatchObject({ card: { text: "Approved by Alice", actions: [] } });
 	await app.stop();
 	runtimes = runtimes.filter((entry) => entry !== runtime);
+});
+
+test("stop drains a fetch that delivers queued executions after worker abort", async () => {
+	let handlerCalls = 0;
+	const queued = workflow("queued", async (_input, execution) => {
+		handlerCalls++;
+		return execution.step("effect", () => "done");
+	});
+	const runtime = await setup([queued]);
+	// Hold a real fetch after the database has claimed work, but before it reaches
+	// the worker queue. Shutdown must release this claim without entering a handler.
+	const native = runtime as unknown as {
+		client: Conductor;
+		orchestrator: {
+			workers: {
+				queueName: string;
+				tasks: Map<string, AnyTask>;
+				_abortController: AbortController;
+			}[];
+		};
+	};
+	let fetched!: () => void;
+	const claimed = new Promise<void>((resolve) => {
+		fetched = resolve;
+	});
+	let deliver!: () => void;
+	const delivery = new Promise<void>((resolve) => {
+		deliver = resolve;
+	});
+	const original = native.client.db.getExecutions.bind(native.client.db);
+	const fetch = vi.spyOn(native.client.db, "getExecutions").mockImplementation(async (...args) => {
+		const rows = await original(...args);
+		if (rows.some((row) => row.task_key === "queued")) {
+			fetched();
+			await delivery;
+		}
+		return rows;
+	});
+	const worker = native.orchestrator.workers.find((worker) => worker.queueName === "default")!;
+	const task = worker.tasks.get("queued")!;
+	// A bailout lets the broken implementation clean up after the bounded assertion,
+	// rather than leaving afterEach hung on Conductor's intentional hang-up promise.
+	let bailOut!: () => void;
+	const bailout = new Promise<void>((resolve) => {
+		bailOut = resolve;
+	});
+	const execute = task.execute.bind(task);
+	const handler = vi
+		.spyOn(task, "execute")
+		.mockImplementation(
+			(...args) =>
+				Promise.race([
+					execute(...args),
+					bailout.then(() => ({ __pgconductorTaskAborted: true, reason: "parent-aborted" })),
+				]) as ReturnType<typeof task.execute>,
+		);
+	let stopping: Promise<void> | undefined;
+	let id: string | undefined;
+	try {
+		id = await runtime.invoke("queued", null, { metadata });
+		await claimed;
+		stopping = runtime.stop();
+		await expect.poll(() => worker._abortController.signal.aborted, poll).toBe(true);
+		deliver();
+		await expect(
+			Promise.race([
+				stopping.then(() => "stopped"),
+				new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 1000)),
+			]),
+		).resolves.toBe("stopped");
+		expect(handlerCalls).toBe(0);
+	} finally {
+		deliver();
+		bailOut();
+		await stopping;
+		handler.mockRestore();
+		fetch.mockRestore();
+	}
+	await setup([queued]);
+	await expect.poll(() => completed(id!), poll).toBe(true);
+	expect(handlerCalls).toBe(1);
 });

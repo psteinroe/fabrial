@@ -257,7 +257,9 @@ export function createChatPort(
 	bot: Bot,
 	capabilities: Map<string, ChatPluginCapability>,
 	host: FabrialHost,
-): ChatPort {
+): ChatPort & { stop(): Promise<void> } {
+	const pending = new Set<Promise<unknown>>();
+	let closing = false;
 	const threads = new Map<string, ThreadIO>();
 	const capability = (provider: string) => {
 		const value = capabilities.get(provider);
@@ -270,7 +272,13 @@ export function createChatPort(
 			throw new Error("Identity belongs to another installation");
 		return value;
 	};
-	const port: ChatPort = {
+	const port: ChatPort & { stop(): Promise<void> } = {
+		async stop() {
+			closing = true;
+			// Native workers can finish in-flight state operations after their abort
+			// race settles. Keep the adapter connected through releaseLock.
+			await Promise.allSettled(pending);
+		},
 		async thread(ref) {
 			const config = capability(ref.provider);
 			if (!ref.threadId.startsWith(`${ref.provider}:`))
@@ -279,6 +287,13 @@ export function createChatPort(
 			let io = threads.get(ref.threadId);
 			if (!io) {
 				io = new LiveThread(bot.thread(ref.threadId), ref.provider, config, host, bot.getState());
+				const update = io.updateState.bind(io);
+				io.updateState = (change) => {
+					if (closing) return Promise.reject(new Error("Chat integration is stopped"));
+					const operation = update(change).finally(() => pending.delete(operation));
+					pending.add(operation);
+					return operation;
+				};
 				// Presentation caching is bounded; durable state remains in the SDK adapter.
 				if (threads.size >= 1000) threads.delete(threads.keys().next().value!);
 				threads.set(ref.threadId, io);

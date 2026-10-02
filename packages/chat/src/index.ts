@@ -168,7 +168,15 @@ export function chat(options: ChatOptions): ChatIntegration {
 					return response;
 				};
 			}
-			return { port, routes, start: () => bot.initialize(), stop: () => bot.shutdown() };
+			return {
+				port,
+				routes,
+				start: () => bot.initialize(),
+				async stop() {
+					await port.stop();
+					await bot.shutdown();
+				},
+			};
 		},
 	};
 }

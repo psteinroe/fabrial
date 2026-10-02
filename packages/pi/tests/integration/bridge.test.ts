@@ -677,3 +677,64 @@ it("delayed cancellation reconciles lost start receipts and leaves a newer conve
 		await session.close(BACKGROUND_CONTEXT);
 	}
 });
+
+it("stop joins driver routing cleanup after the harness has closed", async () => {
+	const f = fixture();
+	const agent = defineAgent({
+		name: randomUUID(),
+		model: { provider: f.faux.provider.id, modelId: f.faux.getModel().id },
+	});
+	f.faux.setResponses([fauxAssistantMessage("done")]);
+	const io = await f.chat.thread(f.metadata.replyTo as Parameters<typeof f.chat.thread>[0]);
+	let reached!: () => void;
+	const cleaning = new Promise<void>((resolve) => {
+		reached = resolve;
+	});
+	let release!: () => void;
+	const cleanup = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const update = io.updateState.bind(io);
+	vi.spyOn(io, "updateState").mockImplementation(async (change) => {
+		const next = change(await io.getState());
+		if (next?.agentActive === false) {
+			reached();
+			await cleanup;
+		}
+		return update(change);
+	});
+	await io.updateState(() => ({
+		interactionId: f.metadata.interactionId,
+		handlerExecutionId: null,
+		statusMessageId: null,
+		agentActive: true,
+		bufferedReplies: [],
+	}));
+	const workflow: RuntimeWorkflow = {
+		name: randomUUID(),
+		triggers: [],
+		handler: (_input, execution) =>
+			f.integration.agents.run(execution, "agent", agent, { input: "Answer" }),
+	};
+	runtimeRegister(f, workflow);
+	await f.integration.start();
+	await f.runtime.start();
+	await f.runtime.invoke(workflow.name, null, { metadata: f.metadata });
+	const driving = f.runtime.flush();
+	let stopped = false;
+	try {
+		await cleaning;
+		const stopping = f.integration.stop().then(() => {
+			stopped = true;
+		});
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(stopped).toBe(false);
+		release();
+		await stopping;
+		expect(stopped).toBe(true);
+	} finally {
+		release();
+		await driving;
+		await f.integration.stop();
+	}
+});

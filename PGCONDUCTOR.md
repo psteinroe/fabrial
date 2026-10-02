@@ -27,6 +27,7 @@ Current behavior was checked against `main` @ `33228e3` ("fix(workflows): comple
 | 8   | Idempotent `emit` + emit options                    | Gap: `emit(event, payload)` takes no options             | **P0**                                   |
 | 9   | Node-compatible package                             | Gap: Bun-only build, no `exports`/types, `catalog:` deps | **P0**: Fabrial vendors source meanwhile |
 | 10  | Terminal-state hooks                                | Gap: adapter polls for settled executions                | P1                                       |
+| 11  | Stop hangs on queued claims                         | Bug: workers enter handlers with an aborted signal       | **P0**: shutdown can hang forever        |
 
 How `@fabrial/conductor` works around each item today, and what it learned along the way, is in [Findings from the Fabrial adapter](#findings-from-the-fabrial-adapter) at the end.
 
@@ -251,6 +252,18 @@ The source itself runs fine on Node. Fabrial's smoke test (`packages/conductor/t
 **Needed.** A native `onSettled(execution, result)` per task, or a terminal-state event: at-least-once, restart-safe, covering completion, failure (incl. retry exhaustion), and cancellation in every state, with the cancellation reason preserved.
 
 **Acceptance.** Hooks fire for completed, failed-after-retries, cancelled-while-pending, cancelled-while-suspended, and cancelled-while-running executions, including after a restart, and one failing hook doesn't block others.
+
+---
+
+## 11. Stop hangs on queued claims
+
+**Current.** When `orchestrator.stop()` aborts a worker, the worker still drains executions it already claimed. Their task signal is created already aborted, before the worker installs its abort listener, so a handler that reaches a checkpoint or step hangs up forever and the worker's abort race never resolves. `stop()` never returns. Fabrial's CI hit this with a restart during an approval on a slow runner.
+
+**What Fabrial does meanwhile** (`SHIM(conductor#11)`, `packages/conductor/src/shutdown.ts`): wraps each worker's `executeSingleTask`/`executeBatchTask` so that once the worker is aborted, queued claims are returned as `released` instead of entering handlers, preserving them for the next start.
+
+**Needed.** Workers must not start handlers after stop; release unstarted claims instead. Install abort listeners before creating task signals.
+
+**Acceptance.** Stopping an orchestrator with claimed-but-unstarted executions resolves promptly, and those executions run on the next start.
 
 ---
 

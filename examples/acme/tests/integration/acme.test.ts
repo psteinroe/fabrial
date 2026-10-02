@@ -37,6 +37,7 @@ let models: ReturnType<typeof createModels>;
 let logger: ReturnType<typeof createMockLogger>;
 let nextMessage: number;
 let toolResult: string;
+let approvalDelivery: (() => Promise<void>) | undefined;
 
 beforeAll(async () => {
 	container = await new PostgreSqlContainer("postgres:17-alpine").start();
@@ -60,6 +61,7 @@ beforeEach(async () => {
 	states = [];
 	nextMessage = 1;
 	toolResult = "";
+	approvalDelivery = undefined;
 	logger = createMockLogger();
 	// Pin the app's on-call clock to the first week, independent of the wall-clock test date.
 	vi.spyOn(engineeringTriage, "resolve").mockImplementation(() => [weeklyRotationForTest()]);
@@ -98,6 +100,8 @@ beforeEach(async () => {
 			case "conversations.history":
 				return { ok: true, messages: [], has_more: false };
 			case "chat.postMessage":
+				if (args.channel === "D_U_BOB" && button({ method, args, ts }, "Approve"))
+					await approvalDelivery?.();
 				return {
 					ok: true,
 					ts,
@@ -450,6 +454,34 @@ it("restarts Conductor, Pi and Chat during approval and completes exactly once",
 	const children =
 		await sql`SELECT id FROM pgconductor._private_executions WHERE task_key = 'run-sql'`;
 	expect(children).toHaveLength(1);
+});
+it("stops promptly while approval-card delivery is still in flight", async () => {
+	let reached!: () => void;
+	const delivering = new Promise<void>((resolve) => {
+		reached = resolve;
+	});
+	let release!: () => void;
+	const delivered = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	approvalDelivery = () => {
+		reached();
+		return delivered;
+	};
+	scriptRepair();
+	try {
+		await mention();
+		await delivering;
+		await expect(
+			Promise.race([
+				app.stop().then(() => "stopped"),
+				new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 2000)),
+			]),
+		).resolves.toBe("stopped");
+		expect(await balances()).toEqual([{ balance: 0 }, { balance: 100 }]);
+	} finally {
+		release();
+	}
 });
 it("signed GitHub PR opened webhook has one PR-thread owner plus a changelog observer", async () => {
 	vi.spyOn(app.host.clients().github, "request").mockResolvedValue({

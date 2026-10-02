@@ -1,4 +1,5 @@
 import postgres from "postgres";
+import { releaseQueuedExecutionsOnStop } from "./shutdown.ts";
 import {
 	EXECUTION_SETTLED_EVENT,
 	type DurableExecution,
@@ -394,6 +395,7 @@ class ConductorRuntime implements DurableRuntime {
 			defaultWorker: this.config.worker,
 		});
 		retainDispatchReceipts(this.orchestrator);
+		releaseQueuedExecutionsOnStop(this.orchestrator);
 		this.registered = true;
 	}
 

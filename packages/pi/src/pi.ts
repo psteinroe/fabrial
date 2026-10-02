@@ -94,7 +94,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	const evaluator = createEvaluator(options.models);
 	const agents = new Map<string, DefinedAgent>();
 	const configs = new Map<string, AgentChange>();
-	const active = new Set<BridgeFrame>();
+	const active = new Map<BridgeFrame, Promise<void>>();
 	let started = false;
 	const internal = defineExtension({
 		name: "fabrial.internal",
@@ -243,6 +243,13 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			let events: Awaited<ReturnType<typeof watchEvents>> | undefined;
 			let outcome: Json | undefined;
 			let children: { executionId: string; detached: boolean }[] = [];
+			let finish!: () => void;
+			active.set(
+				frame,
+				new Promise<void>((resolve) => {
+					finish = resolve;
+				}),
+			);
 			try {
 				frame.harness = await Harness.open(
 					storage,
@@ -254,7 +261,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					},
 					context,
 				);
-				active.add(frame);
 				const ids = await frame.harness.snapshot(Conversations, context);
 				conversationId = ids?.ids[request.agent] as ConversationId | undefined;
 				let conversation = conversationId
@@ -471,28 +477,34 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				}
 			} finally {
 				try {
-					if (execution.signal.aborted && frame.harness)
-						await cancelRun(
-							frame.harness,
-							execution.executionId,
-							execution.signal.reason?.message ?? "Agent cancelled",
-						);
-				} finally {
-					// A failed cleanup is retried by onSettled; it must not retain the Session lease.
 					try {
-						await events?.stop();
+						if (execution.signal.aborted && frame.harness)
+							await cancelRun(
+								frame.harness,
+								execution.executionId,
+								execution.signal.reason?.message ?? "Agent cancelled",
+							);
 					} finally {
+						// A failed cleanup is retried by onSettled; it must not retain the Session lease.
 						try {
-							await frame.harness?.close(BACKGROUND_CONTEXT);
+							await events?.stop();
 						} finally {
-							await storage.close(BACKGROUND_CONTEXT);
-							active.delete(frame);
-							if (execution.metadata.ownsThread && io) {
-								await setActive(io, execution.metadata.interactionId, false);
-								await io.setStatus(null).catch(() => {});
+							try {
+								await frame.harness?.close(BACKGROUND_CONTEXT);
+							} finally {
+								await storage.close(BACKGROUND_CONTEXT);
+								if (execution.metadata.ownsThread && io) {
+									await setActive(io, execution.metadata.interactionId, false);
+									await io.setStatus(null).catch(() => {});
+								}
 							}
 						}
 					}
+				} finally {
+					// Include routing-state/status cleanup in the shutdown join: Chat must
+					// stay connected until these operations release their durable locks.
+					active.delete(frame);
+					finish();
 				}
 			}
 			if (outcome !== undefined) return outcome;
@@ -699,7 +711,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		},
 		async stop() {
 			started = false;
-			await Promise.all([...active].map((frame) => frame.harness.close(BACKGROUND_CONTEXT)));
+			// Runtime stop aborts the drivers, but native workers race abort against
+			// handlers rather than joining their finally blocks. Join the entire
+			// cleanup, not just Harness.close, before core shuts down Chat.
+			await Promise.all(active.values());
 		},
 	};
 }
