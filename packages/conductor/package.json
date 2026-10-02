@@ -1,0 +1,40 @@
+{
+	"name": "@fabrial/conductor",
+	"version": "0.0.0",
+	"description": "PG Conductor runtime adapter for Fabrial.",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/psteinroe/fabrial.git",
+		"directory": "packages/conductor"
+	},
+	"files": [
+		"dist"
+	],
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"publishConfig": {
+		"exports": {
+			".": {
+				"types": "./dist/index.d.ts",
+				"default": "./dist/index.js"
+			}
+		},
+		"access": "public"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"fabrial": "workspace:*",
+		"pgconductor-js": "workspace:*",
+		"postgres": "catalog:"
+	},
+	"devDependencies": {
+		"@testcontainers/postgresql": "catalog:",
+		"zod": "catalog:"
+	}
+}

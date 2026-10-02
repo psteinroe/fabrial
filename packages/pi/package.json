@@ -1,0 +1,37 @@
+{
+	"name": "@fabrial/pi",
+	"version": "0.0.0",
+	"description": "Pi Durable agents for Fabrial.",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/psteinroe/fabrial.git",
+		"directory": "packages/pi"
+	},
+	"files": [
+		"dist"
+	],
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"publishConfig": {
+		"exports": {
+			".": {
+				"types": "./dist/index.d.ts",
+				"default": "./dist/index.js"
+			}
+		},
+		"access": "public"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@earendil-works/chord": "catalog:",
+		"@earendil-works/pi-ai": "catalog:",
+		"@earendil-works/pi-durable": "catalog:",
+		"fabrial": "workspace:*"
+	}
+}

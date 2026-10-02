@@ -1,0 +1,3 @@
+[submodule "vendor/postgres-conductor"]
+	path = vendor/postgres-conductor
+	url = https://github.com/psteinroe/postgres-conductor.git
