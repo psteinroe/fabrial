@@ -666,6 +666,7 @@ Conductor behaviors Fabrial relies on, checked against Conductor `main` @ `33228
 7. **Start without waiting** (P1). Durable, deduped `ctx.start` for handoffs and `asTool()`.
 8. **Idempotent `emit` with options** (P0). Dedup ID and metadata, for webhook redelivery.
 9. **Node-compatible package** (P0). Today's build is Bun-only, with no exports or types. Fabrial vendors Conductor as a pinned submodule until this ships.
+10. **Terminal-state hooks** (P1). Notify on completion, failure, and cancellation in every state. The adapter polls for settled executions meanwhile.
 
 ## Open questions
 

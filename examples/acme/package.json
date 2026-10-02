@@ -1,0 +1,31 @@
+{
+	"name": "@fabrial/example-acme",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@earendil-works/pi-ai": "catalog:",
+		"@fabrial/chat": "workspace:*",
+		"@fabrial/conductor": "workspace:*",
+		"@fabrial/github": "workspace:*",
+		"@fabrial/linear": "workspace:*",
+		"@fabrial/pi": "workspace:*",
+		"@fabrial/slack": "workspace:*",
+		"chat": "catalog:",
+		"fabrial": "workspace:*",
+		"postgres": "catalog:",
+		"typebox": "catalog:",
+		"zod": "catalog:"
+	},
+	"devDependencies": {
+		"@chat-adapter/state-pg": "catalog:",
+		"@chat-adapter/tests": "catalog:",
+		"@slack/web-api": "catalog:",
+		"@testcontainers/postgresql": "catalog:",
+		"@types/node": "catalog:",
+		"typescript": "catalog:",
+		"vitest": "catalog:"
+	}
+}

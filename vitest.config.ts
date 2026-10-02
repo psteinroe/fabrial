@@ -20,7 +20,10 @@ export default defineConfig({
 				extends: true,
 				test: {
 					name: "integration",
-					include: ["packages/*/tests/integration/**/*.test.ts", "examples/*/tests/integration/**/*.test.ts"],
+					include: [
+						"packages/*/tests/integration/**/*.test.ts",
+						"examples/*/tests/integration/**/*.test.ts",
+					],
 					testTimeout: 60_000,
 					hookTimeout: 120_000,
 				},

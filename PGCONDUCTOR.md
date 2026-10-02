@@ -26,6 +26,9 @@ Current behavior was checked against `main` @ `33228e3` ("fix(workflows): comple
 | 7   | Start a child without waiting (durable, deduped)    | Gap from inside `ctx`                                    | P1                                       |
 | 8   | Idempotent `emit` + emit options                    | Gap: `emit(event, payload)` takes no options             | **P0**                                   |
 | 9   | Node-compatible package                             | Gap: Bun-only build, no `exports`/types, `catalog:` deps | **P0**: Fabrial vendors source meanwhile |
+| 10  | Terminal-state hooks                                | Gap: adapter polls for settled executions                | P1                                       |
+
+How `@fabrial/conductor` works around each item today, and what it learned along the way, is in [Findings from the Fabrial adapter](#findings-from-the-fabrial-adapter) at the end.
 
 Fabrial can be prototyped against 1–3 and 8 alone. Items 4–7 are needed before the v1 reference flow (Slack → agent → `run-sql` tool workflow → approval in a DM → resume) is reliable.
 
@@ -239,7 +242,32 @@ The source itself runs fine on Node. Fabrial's smoke test (`packages/conductor/t
 
 ---
 
+## 10. Terminal-state hooks
+
+**Current.** Nothing notifies application code when an execution reaches a terminal state outside its own handler, e.g. retries exhausted or cancelled while suspended. Fabrial needs this to clear thread routing state and to emit `fabrial.execution.settled`, which waiting parents and agent bridges wake on.
+
+**What Fabrial does meanwhile.** `@fabrial/conductor` runs a restart-safe monitor that polls for terminal executions and calls `RuntimeWorkflow.onSettled` at least once, isolating hooks that fail repeatedly.
+
+**Needed.** A native `onSettled(execution, result)` per task, or a terminal-state event: at-least-once, restart-safe, covering completion, failure (incl. retry exhaustion), and cancellation in every state, with the cancellation reason preserved.
+
+**Acceptance.** Hooks fire for completed, failed-after-retries, cancelled-while-pending, cancelled-while-suspended, and cancelled-while-running executions, including after a restart, and one failing hook doesn't block others.
+
+---
+
 ## Not needed from Conductor
 
 - **Repeated step IDs.** Conductor requires unique step names per execution. Fabrial suffixes repeated IDs itself (`processed`, `processed:1`, …), which is deterministic because handlers re-run from the top on every resume.
 - **Event filters.** The current filter operators (top-level scalar fields, ≤ 8 fields) are enough for correlating by `interactionId` / `approvalId`.
+
+## Findings from the Fabrial adapter
+
+`@fabrial/conductor` implements every item above on the pinned Conductor revision. `packages/conductor/README.md` has the full shim table. What it learned, per item:
+
+- **#1:** Native `waitForEvent` is used as is. The pre-registration race is the one gap with no workaround (`test.todo` in the adapter suite), so approvals are not production-safe until Conductor fixes it.
+- **#2:** Metadata travels in a payload envelope, with reserved top-level fields (`__fabrial`, `__fabrialOwner`) on events. Filters on payload fields keep working.
+- **#4:** `groupConcurrency: 1` per key, which is soft. Fabrial's Pi storage keeps its own owner id and a Session epoch that increases monotonically across executions, so correctness doesn't depend on Conductor. A random per-claim UUID can't serve as that epoch. Strict claims are still wanted, to avoid wasted model calls and duplicate posts.
+- **#5:** Native running cancellation overwrites the requested reason with the claim's stale error, so the adapter stores the reason in the envelope. Cancellation of running executions arrives on the orchestrator heartbeat (up to 30 s). It is unclear whether a step that is mid-flight when cancellation settles the attempt gets its result recorded; Conductor should define this.
+- **#6:** Races use native subscriptions plus polling over retained dispatch receipts. This works but scans receipts, so an indexed, claim-guarded native race API is still needed.
+- **#7:** Native deduped invoke updates or re-invokes an execution that already completed. `ctx.start` needs insert-on-conflict that keeps the original execution, plus result retrieval by execution id.
+- **#8:** Dedupe by `(event, id)` requires disabling immediate deletion of dispatch receipts on the internal queue. There is no TTL yet.
+- **Cross-category dispatch:** one inbound chat message can match several events (e.g. `slack.message` + `slack.mentioned`). The adapter merges triggered invocations per `(dispatchId, workflow)`; the first submission wins. Core emits the owner's event first, so precedence only breaks if several ingress replicas race on the same message.
