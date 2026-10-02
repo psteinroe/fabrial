@@ -13,14 +13,14 @@ export default defineConfig({
 				extends: true,
 				test: {
 					name: "unit",
-					include: ["packages/*/tests/unit/**/*.test.ts"],
+					include: ["packages/*/tests/unit/**/*.test.ts", "examples/*/tests/unit/**/*.test.ts"],
 				},
 			},
 			{
 				extends: true,
 				test: {
 					name: "integration",
-					include: ["packages/*/tests/integration/**/*.test.ts"],
+					include: ["packages/*/tests/integration/**/*.test.ts", "examples/*/tests/integration/**/*.test.ts"],
 					testTimeout: 60_000,
 					hookTimeout: 120_000,
 				},

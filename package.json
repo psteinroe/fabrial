@@ -4,7 +4,7 @@
 	"type": "module",
 	"scripts": {
 		"build": "pnpm -r --filter './packages/*' build",
-		"typecheck": "pnpm -r --filter './packages/*' typecheck",
+		"typecheck": "pnpm -r --filter './packages/*' --filter './examples/*' typecheck",
 		"test": "vitest run",
 		"test:unit": "vitest run --project unit",
 		"test:integration": "vitest run --project integration",
