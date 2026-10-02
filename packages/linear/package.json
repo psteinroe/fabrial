@@ -31,11 +31,11 @@
 	"dependencies": {
 		"@chat-adapter/linear": "catalog:",
 		"@fabrial/chat": "workspace:*",
-		"fabrial": "workspace:*"
+		"fabrial": "workspace:*",
+		"zod": "catalog:"
 	},
 	"devDependencies": {
 		"@chat-adapter/state-memory": "catalog:",
-		"@chat-adapter/tests": "catalog:",
-		"zod": "catalog:"
+		"@chat-adapter/tests": "catalog:"
 	}
 }

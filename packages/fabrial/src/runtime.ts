@@ -99,6 +99,13 @@ export interface RuntimeWorkflow {
 	/** Strict per-key mutual exclusion (Conductor item 4); key computed from input + metadata. */
 	mutex?: (input: Json, metadata: InvocationMetadata) => string | undefined;
 	handler: (input: Json, execution: DurableExecution) => Promise<Json | void>;
+	/** Runtime calls this after terminal settlement (success, failure, cancellation), never suspension.
+	 * Must be retried after restart on delivery failure; implementations must be idempotent. */
+	onSettled?: (
+		executionId: string,
+		metadata: InvocationMetadata,
+		result: ExecutionResult,
+	) => Promise<void>;
 }
 
 export interface RuntimeEvent {
@@ -111,6 +118,8 @@ export interface RuntimeEvent {
 export const EXECUTION_SETTLED_EVENT = "fabrial.execution.settled";
 
 export interface DurableRuntime {
+	/** Optional clock, primarily for deterministic tests. Defaults to Date.now in core. */
+	now?(): number;
 	register(definition: { workflows: RuntimeWorkflow[]; events: RuntimeEvent[] }): void;
 	/**
 	 * Emit an event. `owner` names the single workflow (if any) whose owner trigger receives it;
@@ -119,7 +128,13 @@ export interface DurableRuntime {
 	emit(
 		event: string,
 		payload: JsonObject,
-		options: { id?: string; metadata: InvocationMetadata; owner?: string },
+		options: {
+			id?: string;
+			metadata: InvocationMetadata;
+			owner?: string;
+			/** One ingress spanning event categories: dedupe triggered runs by (dispatchId, workflow). */
+			dispatchId?: string;
+		},
 	): Promise<void>;
 	invoke(
 		workflow: string,
@@ -146,7 +161,7 @@ export interface ThreadIO {
 	setState(state: ThreadRoutingState | null): Promise<void>;
 }
 
-export interface ThreadRoutingState extends JsonObject {
+export type ThreadRoutingState = JsonObject & {
 	interactionId: string;
 	handlerExecutionId: string | null;
 	/** True while an agent run drives the thread; replies go to the Pi conversation as steering. */
@@ -154,7 +169,13 @@ export interface ThreadRoutingState extends JsonObject {
 	statusMessageId: string | null;
 	/** Replies received while nobody waited; consumed by the next `waitForReply` / `ctx.agent`. */
 	bufferedReplies: ChatMessage[];
-}
+	/** Message ids already delivered to a workflow reply wait (buffer/event deduplication). */
+	consumedReplyIds?: string[];
+	/** Cancellation authority is scoped to the current interaction. */
+	requesterId?: string;
+	participantIds?: string[];
+	cancellationIds?: string[];
+};
 
 /** Port implemented by `@fabrial/chat`. */
 export interface ChatPort {
@@ -168,6 +189,8 @@ export interface ChatPort {
 
 export interface AgentRunOptions {
 	input: Json;
+	/** Let the agent execution survive cancellation of its caller. */
+	detached?: boolean;
 	/** Standard Schema for a typed structured result. */
 	output?: unknown;
 	/** Native escape hatch, applied to the Pi conversation before submitting. */

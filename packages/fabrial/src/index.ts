@@ -1,3 +1,4 @@
+export { fabrial } from "./core.ts";
 export type * from "./app.ts";
 export type * from "./approval.ts";
 export * from "./evaluate.ts";

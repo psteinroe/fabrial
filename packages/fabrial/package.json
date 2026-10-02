@@ -13,13 +13,18 @@
 	],
 	"type": "module",
 	"exports": {
-		".": "./src/index.ts"
+		".": "./src/index.ts",
+		"./testing": "./src/testing.ts"
 	},
 	"publishConfig": {
 		"exports": {
 			".": {
 				"types": "./dist/index.d.ts",
 				"default": "./dist/index.js"
+			},
+			"./testing": {
+				"types": "./dist/testing.d.ts",
+				"default": "./dist/testing.js"
 			}
 		},
 		"access": "public"

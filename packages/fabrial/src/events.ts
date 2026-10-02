@@ -1,3 +1,5 @@
+import type { ExternalIdentity } from "./identity.ts";
+import type { Surface } from "./thread.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { Schema } from "./schema.ts";
 
@@ -47,6 +49,9 @@ export interface EmitOptions {
 	id?: string;
 	/** Where the event came from (e.g. a Sentry issue, a Slack message). Serializable references only. */
 	origin?: Origin;
+	/** Optional response destination and authenticated requester, supplied by ingress. */
+	replyTo?: Surface;
+	requestedBy?: ExternalIdentity;
 }
 
 /** Serializable reference to the source of an event. `provider` is the plugin id. */

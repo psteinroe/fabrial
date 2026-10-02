@@ -105,10 +105,11 @@ export interface WorkflowDefinition<
 	access?: WorkflowAccess;
 	concurrency?: number;
 	retries?: { maxAttempts?: number };
-	run: (
+	run(
+		this: void,
 		input: TInput | TriggerPayload<TTriggers[number]>,
 		ctx: WorkflowContext,
-	) => Promise<TOutput>;
+	): Promise<TOutput>;
 }
 
 export interface Workflow<

@@ -54,7 +54,11 @@ export interface FabrialHost {
 	 */
 	receiveMessage(
 		message: ChatMessage,
-		options: { event: string; dedupeId: string },
+		options: {
+			events?: readonly string[];
+			/** @deprecated Use events. */ event?: string;
+			dedupeId: string;
+		},
 	): Promise<"reply" | "new" | "ignored">;
 
 	/** Inbound card action (approval buttons, [Cancel request]). */
@@ -64,6 +68,13 @@ export interface FabrialHost {
 		actor: ExternalIdentity;
 		thread: ThreadRef;
 		messageId: string;
+		dedupeId: string;
+	}): Promise<void>;
+
+	/** Requesters and participants in the current interaction may stop its handler. */
+	receiveCancellation(action: {
+		actor: ExternalIdentity;
+		thread: ThreadRef;
 		dedupeId: string;
 	}): Promise<void>;
 
@@ -79,6 +90,8 @@ export interface HostIntegration<T> {
 export interface ChatIntegration extends HostIntegration<{
 	port: ChatPort;
 	routes: Record<string, (request: Request) => Promise<Response>>;
+	start?(): Promise<void>;
+	stop?(): Promise<void>;
 }> {
 	readonly kind: "fabrial.chat";
 }
