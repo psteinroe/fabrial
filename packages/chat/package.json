@@ -32,5 +32,11 @@
 		"@chat-adapter/state-pg": "catalog:",
 		"chat": "catalog:",
 		"fabrial": "workspace:*"
+	},
+	"devDependencies": {
+		"@chat-adapter/slack": "catalog:",
+		"@chat-adapter/state-memory": "catalog:",
+		"@chat-adapter/tests": "catalog:",
+		"zod": "catalog:"
 	}
 }

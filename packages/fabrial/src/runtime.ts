@@ -1,0 +1,208 @@
+/**
+ * Ports between Fabrial core and its runtimes. Core implements the workflow context, approvals, replies,
+ * routing, and identity on top of these; adapters implement them:
+ *
+ * - `DurableRuntime` → `@fabrial/conductor` (PG Conductor), `fabrial/testing` (in memory)
+ * - `ChatPort`       → `@fabrial/chat` (Chat SDK)
+ * - `AgentPort`, `StatePort`, `Evaluator` → `@fabrial/pi` (Pi Durable, pi-ai)
+ *
+ * Method names and shapes mirror PGCONDUCTOR.md so that SHIMs can be deleted as Conductor lands features.
+ */
+import type { EventFilter, Origin } from "./events.ts";
+import type { ExternalIdentity, Principal } from "./identity.ts";
+import type { Json, JsonObject } from "./json.ts";
+import type { ChatMessage, MessageRef, OutboundMessage, Surface, ThreadRef } from "./thread.ts";
+
+/** Serializable invocation context carried by every execution (Conductor execution metadata, item 2). */
+export interface InvocationMetadata extends JsonObject {
+	/** One user request, across handoffs. */
+	interactionId: string;
+	origin: (Origin & JsonObject) | null;
+	/** Where `ctx.thread` points. `null` for executions without a surface (observers, cron without replyTo). */
+	replyTo: (Surface & JsonObject) | null;
+	requestedBy: (Principal & JsonObject) | null;
+	/** True when this execution owns the interaction's thread (renders progress, receives replies). */
+	ownsThread: boolean;
+}
+
+export type DurationInput = string | number;
+
+/** Branch of `waitForAny`. */
+export type WaitBranch =
+	| { kind: "event"; event: string; filter?: EventFilter }
+	| { kind: "execution"; executionId: string }
+	| { kind: "timer"; ms: number };
+
+export type WaitForAnyResult =
+	| { key: string; kind: "event"; event: { name: string; payload: JsonObject } }
+	| { key: string; kind: "execution"; result: ExecutionResult }
+	| { key: string; kind: "timer" };
+
+export type ExecutionResult =
+	| { status: "completed"; output: Json }
+	| { status: "failed"; error: string }
+	| { status: "cancelled"; reason: string };
+
+/** One running attempt of a workflow execution, as seen by core. Replays from the top on every resume. */
+export interface DurableExecution {
+	readonly executionId: string;
+	readonly workflow: string;
+	readonly metadata: InvocationMetadata;
+	/** Aborted on cancellation (cooperative; checked at the next durable operation). */
+	readonly signal: AbortSignal;
+	/** Memoized step: `fn` runs at most once to completion per id (at-least-once on crash). */
+	step<T extends Json | void>(id: string, fn: () => Promise<T> | T): Promise<T>;
+	sleep(id: string, ms: number): Promise<void>;
+	/** Race-safe wait for one event (Conductor item 1). Returns null on timeout. */
+	waitForEvent(
+		id: string,
+		options: { event: string; filter?: EventFilter; timeoutMs?: number },
+	): Promise<{ name: string; payload: JsonObject } | null>;
+	/** First of several branches wins (Conductor item 6). */
+	waitForAny(id: string, branches: Record<string, WaitBranch>): Promise<WaitForAnyResult>;
+	/** Start a child and wait for its result. Cancelled with the parent unless `detached` (Conductor item 5). */
+	invoke(
+		id: string,
+		workflow: string,
+		input: Json,
+		options?: {
+			metadata?: Partial<InvocationMetadata>;
+			detached?: boolean;
+			timeoutMs?: number;
+			mutex?: string;
+		},
+	): Promise<Json>;
+	/** Start an independent execution without waiting; idempotent per id (Conductor item 7). Returns its id. */
+	start(
+		id: string,
+		workflow: string,
+		input: Json,
+		options?: { metadata?: Partial<InvocationMetadata>; dedupeKey?: string; mutex?: string },
+	): Promise<string>;
+	/** Emit an event from inside an execution (not memoized; wrap in `step` if needed). */
+	emit(
+		event: string,
+		payload: JsonObject,
+		options?: { id?: string; metadata?: Partial<InvocationMetadata> },
+	): Promise<void>;
+	cancel(executionId: string, reason?: string): Promise<boolean>;
+}
+
+/** Registered with the runtime by core. Triggers are resolved by core (ownership); see `DurableRuntime.emit`. */
+export interface RuntimeWorkflow {
+	name: string;
+	/** Event triggers. Owner triggers only receive events whose `owner` matches this workflow. */
+	triggers: { event: string; filter?: EventFilter; role: "owner" | "observer" }[];
+	cron?: { schedule: string; name: string }[];
+	concurrency?: number;
+	retries?: { maxAttempts?: number };
+	/** Strict per-key mutual exclusion (Conductor item 4); key computed from input + metadata. */
+	mutex?: (input: Json, metadata: InvocationMetadata) => string | undefined;
+	handler: (input: Json, execution: DurableExecution) => Promise<Json | void>;
+}
+
+export interface RuntimeEvent {
+	name: string;
+	/** Fields filterable by triggers and waits. */
+	filterable: readonly string[];
+}
+
+/** Event emitted by core when any Fabrial execution reaches a terminal state. */
+export const EXECUTION_SETTLED_EVENT = "fabrial.execution.settled";
+
+export interface DurableRuntime {
+	register(definition: { workflows: RuntimeWorkflow[]; events: RuntimeEvent[] }): void;
+	/**
+	 * Emit an event. `owner` names the single workflow (if any) whose owner trigger receives it;
+	 * observer triggers always match. `id` dedupes redeliveries (Conductor item 8).
+	 */
+	emit(
+		event: string,
+		payload: JsonObject,
+		options: { id?: string; metadata: InvocationMetadata; owner?: string },
+	): Promise<void>;
+	invoke(
+		workflow: string,
+		input: Json,
+		options: { metadata: InvocationMetadata; dedupeKey?: string },
+	): Promise<string>;
+	cancel(executionId: string, reason?: string): Promise<boolean>;
+	start(): Promise<void>;
+	stop(): Promise<void>;
+}
+
+/** Live I/O for one chat thread. Not durable by itself; core wraps intentional operations in steps. */
+export interface ThreadIO {
+	readonly ref: ThreadRef;
+	readonly channelId: string;
+	readonly isDM: boolean;
+	post(message: OutboundMessage): Promise<MessageRef>;
+	update(message: MessageRef, content: OutboundMessage): Promise<void>;
+	/** Replaceable progress status ("Thinking…"); `null` clears it. Best effort, never durable. */
+	setStatus(text: string | null): Promise<void>;
+	history(options: { limit?: number; sinceLastBotReply?: boolean }): Promise<ChatMessage[]>;
+	/** Fabrial's routing state in Chat SDK thread state (30-day TTL, refreshed on write). */
+	getState(): Promise<ThreadRoutingState | null>;
+	setState(state: ThreadRoutingState | null): Promise<void>;
+}
+
+export interface ThreadRoutingState extends JsonObject {
+	interactionId: string;
+	handlerExecutionId: string | null;
+	/** True while an agent run drives the thread; replies go to the Pi conversation as steering. */
+	agentActive: boolean;
+	statusMessageId: string | null;
+	/** Replies received while nobody waited; consumed by the next `waitForReply` / `ctx.agent`. */
+	bufferedReplies: ChatMessage[];
+}
+
+/** Port implemented by `@fabrial/chat`. */
+export interface ChatPort {
+	thread(ref: ThreadRef): Promise<ThreadIO>;
+	/** Resolve a surface to a thread, creating a new thread in a channel lazily. */
+	resolve(surface: Surface): Promise<ThreadIO>;
+	openDM(identity: ExternalIdentity): Promise<ThreadIO>;
+	/** Short-lived message visible only to one user (e.g. "you are not an approver"). */
+	postEphemeral(thread: ThreadRef, identity: ExternalIdentity, text: string): Promise<void>;
+}
+
+export interface AgentRunOptions {
+	input: Json;
+	/** Standard Schema for a typed structured result. */
+	output?: unknown;
+	/** Native escape hatch, applied to the Pi conversation before submitting. */
+	configure?: (conversation: unknown) => Promise<void> | void;
+}
+
+/** Port implemented by `@fabrial/pi`. Core calls it from `ctx.agent`. */
+export interface AgentPort {
+	/** Internal workflows the agent bridge needs (e.g. the Session-owning agent run). */
+	workflows(): RuntimeWorkflow[];
+	run(
+		execution: DurableExecution,
+		id: string,
+		agent: AgentRef,
+		options: AgentRunOptions,
+	): Promise<Json>;
+}
+
+/** Minimal shape core needs from `defineAgent` (in `@fabrial/pi`). */
+export interface AgentRef {
+	readonly kind: "fabrial.agent";
+	readonly name: string;
+}
+
+/** Port implemented by `@fabrial/pi` for `ctx.state(S)` in workflow code. Each call is one durable operation. */
+export interface StatePort {
+	get<T extends JsonObject>(
+		execution: DurableExecution,
+		id: string,
+		state: import("./state.ts").StateDefinition<T>,
+	): Promise<T>;
+	update<T extends JsonObject>(
+		execution: DurableExecution,
+		id: string,
+		state: import("./state.ts").StateDefinition<T>,
+		fn: (draft: T) => void | T,
+	): Promise<T>;
+}

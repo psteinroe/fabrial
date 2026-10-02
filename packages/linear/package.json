@@ -32,5 +32,10 @@
 		"@chat-adapter/linear": "catalog:",
 		"@fabrial/chat": "workspace:*",
 		"fabrial": "workspace:*"
+	},
+	"devDependencies": {
+		"@chat-adapter/state-memory": "catalog:",
+		"@chat-adapter/tests": "catalog:",
+		"zod": "catalog:"
 	}
 }

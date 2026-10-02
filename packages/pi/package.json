@@ -32,6 +32,13 @@
 		"@earendil-works/chord": "catalog:",
 		"@earendil-works/pi-ai": "catalog:",
 		"@earendil-works/pi-durable": "catalog:",
-		"fabrial": "workspace:*"
+		"fabrial": "workspace:*",
+		"postgres": "catalog:",
+		"typebox": "catalog:"
+	},
+	"devDependencies": {
+		"@fabrial/conductor": "workspace:*",
+		"@testcontainers/postgresql": "catalog:",
+		"zod": "catalog:"
 	}
 }

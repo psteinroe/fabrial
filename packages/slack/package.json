@@ -31,6 +31,12 @@
 	"dependencies": {
 		"@chat-adapter/slack": "catalog:",
 		"@fabrial/chat": "workspace:*",
+		"@slack/web-api": "catalog:",
 		"fabrial": "workspace:*"
+	},
+	"devDependencies": {
+		"@chat-adapter/state-memory": "catalog:",
+		"@chat-adapter/tests": "catalog:",
+		"zod": "catalog:"
 	}
 }

@@ -27,5 +27,11 @@
 	"scripts": {
 		"build": "tsc -p tsconfig.build.json",
 		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@standard-schema/spec": "catalog:"
+	},
+	"devDependencies": {
+		"zod": "catalog:"
 	}
 }
