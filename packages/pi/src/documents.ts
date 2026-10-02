@@ -8,6 +8,7 @@ import {
 	parseSchema,
 	type InvocationMetadata,
 	type JsonObject,
+	type Json,
 	type StateDefinition,
 } from "fabrial";
 
@@ -38,6 +39,31 @@ export const ChildResults = defineDoc({
 	version: 1,
 	initial: (): { results: Record<string, JsonObject> } => ({ results: {} }),
 });
+export const WorkflowReceipts = defineDocFamily({
+	family: true,
+	kind: "fabrial.workflow-state-receipt",
+	scope: "session",
+	version: 1,
+	initial: (_seed: string): { value: JsonObject | null } => ({ value: null }),
+});
+
+export interface ChildIntent extends JsonObject {
+	workflow: string;
+	input: Json;
+	metadata: InvocationMetadata;
+	dedupeKey: string;
+	detached: boolean;
+	executionId: string | null;
+}
+export const ChildIntents = defineDocFamily({
+	family: true,
+	kind: "fabrial.child-intent",
+	scope: "session",
+	version: 1,
+	initial: (intent: ChildIntent): ChildIntent => intent,
+});
+export const EFFECT_WORKFLOW = "fabrial.pi.effect";
+
 export const Runs = defineDoc({
 	kind: "fabrial.runs",
 	scope: "session",
@@ -48,6 +74,8 @@ export const Runs = defineDoc({
 			{
 				conversationId: number;
 				children: Record<string, { executionId: string; detached: boolean }>;
+				intents?: string[];
+				requests?: Record<string, { content: string; submissionId: number | null }>;
 			}
 		>;
 	} => ({ runs: {} }),

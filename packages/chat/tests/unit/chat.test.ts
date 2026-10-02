@@ -191,14 +191,14 @@ describe("ChatPort", () => {
 		const thread = await env.connection.port.thread(ref);
 		await env.sdk().getState().set(`thread-state:${ref.threadId}`, { other: "kept" });
 		expect(await thread.getState()).toBeNull();
-		await thread.setState(routingState);
+		await thread.updateState(() => routingState);
 		expect(await thread.getState()).toEqual(routingState);
 		expect(set).toHaveBeenLastCalledWith(
 			`thread-state:${ref.threadId}`,
 			{ other: "kept", fabrial: routingState },
 			30 * 24 * 60 * 60 * 1000,
 		);
-		await thread.setState(null);
+		await thread.updateState(() => null);
 		expect(await thread.getState()).toBeNull();
 		expect(await env.state.get(`thread-state:${ref.threadId}`)).toEqual({
 			other: "kept",
@@ -225,7 +225,7 @@ describe("ChatPort", () => {
 		const env = setup();
 		vi.mocked(env.adapter.startTyping).mockRejectedValue(new Error("unsupported"));
 		const thread = await env.connection.port.thread(ref);
-		await thread.setState({ ...routingState, statusMessageId: "old-status" });
+		await thread.updateState(() => ({ ...routingState, statusMessageId: "old-status" }));
 		await thread.setStatus("Thinking");
 		expect(env.adapter.postMessage).not.toHaveBeenCalled();
 		expect(env.adapter.editMessage).toHaveBeenLastCalledWith(ref.threadId, "old-status", {
@@ -282,7 +282,7 @@ describe("ChatPort", () => {
 		});
 		expect(thread.ref.threadId).toBe("provisional:slack:C1");
 		await expect(env.connection.port.thread(thread.ref)).rejects.toThrow("another provider");
-		await expect(thread.setState(routingState)).rejects.toThrow("provisional");
+		await expect(thread.updateState(() => routingState)).rejects.toThrow("provisional");
 		expect(await thread.getState()).toBeNull();
 		await thread.setStatus("Thinking");
 		expect(await thread.history({})).toEqual([]);
@@ -290,7 +290,7 @@ describe("ChatPort", () => {
 		const root = await thread.post("root");
 		expect(root.threadId).toBe(ref.threadId);
 		expect(thread.ref).toEqual(ref);
-		await thread.setState(routingState);
+		await thread.updateState(() => routingState);
 		expect(await thread.getState()).toEqual(routingState);
 		await thread.post("reply");
 		expect(env.adapter.postChannelMessage).toHaveBeenCalledOnce();

@@ -38,10 +38,8 @@ interface Run {
 	metadata: InvocationMetadata;
 	controller: AbortController;
 	cache: Map<string, unknown>;
-	waits: Map<string, { branches: Record<string, WaitBranch>; started: number }>;
+	waits: Map<string, { branches: Record<string, WaitBranch>; sequence: number }>;
 	children: Set<string>;
-	consumed: Set<number>;
-	sequence: number;
 	attempts: number;
 	status: "pending" | "running" | "suspended" | "settled";
 	result?: ExecutionResult;
@@ -97,7 +95,7 @@ export class MemoryRuntime implements DurableRuntime {
 	async emit(
 		name: string,
 		payload: JsonObject,
-		options: { id?: string; metadata: InvocationMetadata; owner?: string; dispatchId?: string },
+		options: Parameters<DurableRuntime["emit"]>[2],
 	): Promise<void> {
 		const key = options.id === undefined ? undefined : JSON.stringify([name, options.id]);
 		if (key && this.emitKeys.has(key)) return;
@@ -110,7 +108,7 @@ export class MemoryRuntime implements DurableRuntime {
 		});
 		for (const run of this.runs.values())
 			if (
-				run.status === "suspended" &&
+				(run.status === "suspended" || run.status === "running") &&
 				[...run.waits.values()].some((wait) =>
 					Object.values(wait.branches).some(
 						(branch) =>
@@ -129,6 +127,11 @@ export class MemoryRuntime implements DurableRuntime {
 					(t.role === "observer" || workflow.name === options.owner),
 			);
 			if (!matching.length) continue;
+			if (
+				options.dispatchOwner?.workflow === workflow.name &&
+				(options.dispatchOwner.event !== name || options.owner !== workflow.name)
+			)
+				continue;
 			const owns = matching.some((t) => t.role === "owner" && workflow.name === options.owner);
 			await this.invoke(workflow.name, payload, {
 				metadata: {
@@ -163,8 +166,6 @@ export class MemoryRuntime implements DurableRuntime {
 			cache: new Map(),
 			waits: new Map(),
 			children: new Set(),
-			consumed: new Set(),
-			sequence: this.emitted.length,
 			attempts: 0,
 			status: "pending",
 		};
@@ -211,10 +212,10 @@ export class MemoryRuntime implements DurableRuntime {
 		this.clock += ms;
 		for (const run of this.runs.values())
 			if (
-				run.status === "suspended" &&
+				(run.status === "suspended" || run.status === "running") &&
 				[...run.waits.values()].some((wait) =>
 					Object.values(wait.branches).some(
-						(branch) => branch.kind === "timer" && wait.started + branch.ms <= this.clock,
+						(branch) => branch.kind === "timer" && branch.at <= this.clock,
 					),
 				)
 			)
@@ -268,7 +269,7 @@ export class MemoryRuntime implements DurableRuntime {
 		this.settlements.add(run.id);
 		for (const waiting of this.runs.values())
 			if (
-				waiting.status === "suspended" &&
+				(waiting.status === "suspended" || waiting.status === "running") &&
 				[...waiting.waits.values()].some((wait) =>
 					Object.values(wait.branches).some(
 						(branch) => branch.kind === "execution" && branch.executionId === run.id,
@@ -324,26 +325,25 @@ export class MemoryRuntime implements DurableRuntime {
 			boundary();
 			if (!Object.keys(branches).length) throw new Error("waitForAny needs at least one branch");
 			for (const branch of Object.values(branches)) {
-				if (branch.kind === "timer" && (!Number.isFinite(branch.ms) || branch.ms < 0))
-					throw new Error("Invalid timer duration");
+				if (branch.kind === "timer" && !Number.isFinite(branch.at))
+					throw new Error("Invalid timer deadline");
 				if (branch.kind === "execution" && !this.runs.has(branch.executionId))
 					throw new Error(`Unknown execution: ${branch.executionId}`);
 			}
 			if (run.cache.has(id)) return clone(run.cache.get(id)) as WaitForAnyResult;
 			let registration = run.waits.get(id);
 			if (!registration) {
-				registration = { branches: clone(branches), started: this.clock };
+				registration = { branches: clone(branches), sequence: this.emitted.length };
 				run.waits.set(id, registration);
 			}
 			const candidates: {
 				time: number;
 				sequence: number;
 				result: WaitForAnyResult;
-				event?: number;
 			}[] = [];
 			for (const [key, branch] of Object.entries(registration.branches)) {
 				if (branch.kind === "timer") {
-					const due = registration.started + branch.ms;
+					const due = branch.at;
 					if (due <= this.clock)
 						candidates.push({ time: due, sequence: Infinity, result: { key, kind: "timer" } });
 				} else if (branch.kind === "execution") {
@@ -357,8 +357,8 @@ export class MemoryRuntime implements DurableRuntime {
 				} else {
 					const event = this.emitted.find(
 						(e) =>
-							e.sequence >= run.sequence &&
-							!run.consumed.has(e.sequence) &&
+							e.sequence >=
+								(branch.after === undefined ? registration.sequence : Number(branch.after)) &&
 							e.name === branch.event &&
 							matchesFilter(e.payload, branch.filter),
 					);
@@ -366,15 +366,18 @@ export class MemoryRuntime implements DurableRuntime {
 						candidates.push({
 							time: event.time,
 							sequence: event.sequence,
-							event: event.sequence,
-							result: { key, kind: "event", event: { name: event.name, payload: event.payload } },
+							result: {
+								key,
+								kind: "event",
+								event: { name: event.name, payload: event.payload },
+								cursor: String(event.sequence + 1),
+							},
 						});
 				}
 			}
 			candidates.sort((a, b) => a.time - b.time || a.sequence - b.sequence);
 			const winner = candidates[0];
 			if (!winner) throw new Suspension();
-			if (winner.event !== undefined) run.consumed.add(winner.event);
 			run.cache.set(id, clone(winner.result));
 			run.waits.delete(id);
 			return clone(winner.result);
@@ -394,29 +397,39 @@ export class MemoryRuntime implements DurableRuntime {
 			metadata: clone(run.metadata),
 			signal: run.controller.signal,
 			step,
+			cursor: (id) => step(id, () => String(this.emitted.length)),
 			sleep: async (id, ms) => {
-				await wait(id, { timer: { kind: "timer", ms } });
+				const at = await step(`fabrial:${id}:deadline`, () => this.clock + ms);
+				await wait(id, { timer: { kind: "timer", at } });
 			},
 			waitForAny: wait,
 			waitForEvent: async (id, options) => {
 				const branches: Record<string, WaitBranch> = {
-					event: { kind: "event", event: options.event, filter: options.filter },
+					event: {
+						kind: "event",
+						event: options.event,
+						filter: options.filter,
+						after: options.after,
+					},
 				};
-				if (options.timeoutMs !== undefined)
-					branches.timeout = { kind: "timer", ms: options.timeoutMs };
+				if (options.deadline !== undefined)
+					branches.timeout = { kind: "timer", at: options.deadline };
 				const result = await wait(id, branches);
-				return result.kind === "event" ? result.event : null;
+				return result.kind === "event" ? { ...result.event, cursor: result.cursor } : null;
 			},
 			start,
 			invoke: async (id, workflow, input, options = {}) => {
-				const childId = await start(`${id}:start`, workflow, input, options);
+				const childId = await start(`fabrial:${id}:start`, workflow, input, options);
 				if (!options.detached) run.children.add(childId);
 				const branches: Record<string, WaitBranch> = {
 					child: { kind: "execution", executionId: childId },
 				};
 				if (options.timeoutMs !== undefined)
-					branches.timeout = { kind: "timer", ms: options.timeoutMs };
-				const result = await wait(`${id}:result`, branches);
+					branches.timeout = {
+						kind: "timer",
+						at: await step(`fabrial:${id}:deadline`, () => this.clock + options.timeoutMs!),
+					};
+				const result = await wait(`fabrial:${id}:result`, branches);
 				if (result.kind !== "execution") throw new Error("Child invocation timed out");
 				if (result.result.status !== "completed")
 					throw new Error(
@@ -503,9 +516,13 @@ class FakeThread implements ThreadIO {
 	async getState(): Promise<ThreadRoutingState | null> {
 		return this.owner.now() >= this.expires ? null : clone(this.state);
 	}
-	async setState(state: ThreadRoutingState | null): Promise<void> {
-		this.state = clone(state);
+	async updateState(
+		fn: (state: ThreadRoutingState | null) => ThreadRoutingState | null,
+	): Promise<ThreadRoutingState | null> {
+		// No await between read and write: atomic within this in-memory process.
+		this.state = clone(fn(this.owner.now() >= this.expires ? null : clone(this.state)));
 		this.expires = this.owner.now() + THREAD_TTL;
+		return clone(this.state);
 	}
 }
 
@@ -552,10 +569,12 @@ class FakeChannelThread implements ThreadIO {
 	async getState(): Promise<ThreadRoutingState | null> {
 		return this.actual ? this.actual.getState() : null;
 	}
-	async setState(state: ThreadRoutingState | null): Promise<void> {
+	async updateState(
+		fn: (state: ThreadRoutingState | null) => ThreadRoutingState | null,
+	): Promise<ThreadRoutingState | null> {
 		if (!this.actual)
 			throw new Error("Cannot persist routing state for a provisional channel thread");
-		await this.actual.setState(state);
+		return this.actual.updateState(fn);
 	}
 }
 

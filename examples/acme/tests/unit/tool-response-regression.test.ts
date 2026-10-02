@@ -2,9 +2,9 @@ import { defineWorkflow, fabrial, trigger, type InvocationMetadata } from "fabri
 import { FakeChat, MemoryRuntime } from "fabrial/testing";
 import { expect, it } from "vitest";
 
-// Expected failure documents the metadata produced by @fabrial/pi/src/context.ts:start.
-// The full integration tests exercise the example-local workaround with real Pi.
-it.fails("a tool child must retain its response thread despite inherited trigger ownership", async () => {
+// Pi clears the driver's trigger markers for tool children. The real-Pi integration
+// scenarios also assert this metadata and the requester's card in the origin thread.
+it("a tool child retains its response thread without inheriting trigger ownership", async () => {
 	const runtime = new MemoryRuntime();
 	const chat = new FakeChat();
 	const child = defineWorkflow({
@@ -27,8 +27,8 @@ it.fails("a tool child must retain its response thread despite inherited trigger
 		replyTo: { kind: "thread", provider: "slack", threadId: "slack:C_SUPPORT:root" },
 		requestedBy: null,
 		ownsThread: false,
-		triggerEvent: "example.mention",
-		ownerWorkflow: owner.name,
+		triggerEvent: null,
+		ownerWorkflow: null,
 	};
 	try {
 		await app.start();

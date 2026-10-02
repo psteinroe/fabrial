@@ -9,7 +9,6 @@ import type { Models } from "@earendil-works/pi-ai";
 import type { StateAdapter } from "chat";
 import type { Sql } from "postgres";
 import { databasePlugin } from "./database.ts";
-import { preserveToolResponse } from "./tool-response-workaround.ts";
 import { identity } from "./identity.ts";
 import { generalAssistant } from "./workflows/general-assistant.ts";
 import { bugIntake } from "./workflows/bug-intake.ts";
@@ -47,7 +46,7 @@ export function createApp(deps: AppDependencies) {
 	const database = databasePlugin(deps.databaseSql ?? deps.sql);
 	const plugins = [slack(deps.slack), github(deps.github), linear(deps.linear), database] as const;
 	return fabrial({
-		runtime: preserveToolResponse(conductor({ sql: deps.sql }, deps.runtimeOptions)),
+		runtime: conductor({ sql: deps.sql }, deps.runtimeOptions),
 		chat: chat({ state: deps.state }),
 		agents: pi({ models: deps.models, sql: deps.sql, settings: deps.piSettings }),
 		plugins,

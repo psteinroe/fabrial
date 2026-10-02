@@ -27,7 +27,17 @@ import {
 	type WorkflowInput,
 	type WorkflowOutput,
 } from "fabrial";
-import { applyState, Binding, ChildResults, stateDraft, Runs, Invocation } from "./documents.ts";
+import {
+	applyState,
+	Binding,
+	ChildResults,
+	stateDraft,
+	Runs,
+	Invocation,
+	ChildIntents,
+	EFFECT_WORKFLOW,
+	type ChildIntent,
+} from "./documents.ts";
 
 export interface BridgeFrame {
 	host: FabrialHost;
@@ -90,6 +100,7 @@ export async function fields(
 	conversationId: ConversationId,
 	api?: ToolExecutionApi,
 	staged = new Map<string, StagedState>(),
+	detached = false,
 ): Promise<FabrialFields> {
 	const bridge = frame(context);
 	const binding = await bridge.harness.snapshot(Binding, conversationId, context);
@@ -103,20 +114,44 @@ export async function fields(
 	const invocation = await bridge.harness.snapshot(Invocation, requestId, context);
 	if (!invocation) throw new Error(`Missing Fabrial invocation ${binding.requestId}`);
 	const metadata = invocation as InvocationMetadata;
-	const prefix = `pi:${conversationId}:${api?.taskId ?? "section"}`;
+	const prefix = `fabrial:pi:${conversationId}:${api?.taskId ?? "section"}`;
 	const ids = new Map<string, number>();
 	const operationId = (id: string) => {
+		if (id.startsWith("fabrial:") || id.includes("#"))
+			throw new Error(`Reserved operation id: ${id}`);
 		const count = ids.get(id) ?? 0;
 		ids.set(id, count + 1);
-		return count ? `${id}:${count}` : id;
+		return count ? `${id}#${count}` : id;
 	};
-	const operation = <T extends Json | void>(id: string, fn: () => Promise<T>) => {
+	const childResult = async (child: string): Promise<Json> => {
+		const result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
+		if (result) {
+			if (result.status !== "completed")
+				throw new Error(JSON.stringify(result.error ?? result.reason ?? result.status));
+			return result.output ?? null;
+		}
+		await registerChild(bridge, api!.taskId, { executionId: child, detached: false }, context);
+		return awaitWithContext(new Promise<never>(() => {}), context);
+	};
+	const operation = async (id: string, method: string, args: Json[]): Promise<Json> => {
 		if (!api) throw new Error("Prompt sections cannot perform managed external operations");
-		return bridge.execution.step(`${prefix}:${operationId(id)}`, fn);
+		const key = `${prefix}:${operationId(id)}`;
+		const child = await startChild(
+			bridge,
+			key,
+			EFFECT_WORKFLOW,
+			{ method, args },
+			metadata,
+			false,
+			context,
+		);
+		return childResult(child);
 	};
 	const start = async <W extends AnyWorkflow>(id: string, workflow: W, input: WorkflowInput<W>) => {
 		if (!api) throw new Error("Prompt sections cannot start workflows");
-		const groups = workflow.definition.access?.invoke;
+		const registered = bridge.host.workflows.find((candidate) => candidate.name === workflow.name);
+		if (!registered) throw new Error(`Workflow ${workflow.name} is not registered`);
+		const groups = registered.definition.access?.invoke;
 		if (
 			groups &&
 			(!metadata.requestedBy ||
@@ -129,14 +164,19 @@ export async function fields(
 				).some(Boolean))
 		)
 			throw new Error(`Not authorized to invoke ${workflow.name}`);
-		const parsed = workflow.definition.input
-			? await parseSchema(workflow.definition.input, input, `${workflow.name} input`)
+		const parsed = registered.definition.input
+			? await parseSchema(registered.definition.input, input, `${registered.name} input`)
 			: input;
 		const key = operationId(id);
-		return bridge.execution.start(`${prefix}:${key}`, workflow.name, parsed, {
-			metadata: { ownsThread: false },
-			dedupeKey: `${requestId}:${prefix}:${key}`,
-		});
+		return startChild(
+			bridge,
+			`${prefix}:${key}`,
+			registered.name,
+			parsed,
+			metadata,
+			detached,
+			context,
+		);
 	};
 	return {
 		actor: metadata.requestedBy,
@@ -146,38 +186,36 @@ export async function fields(
 		thread: bridge.thread
 			? {
 					post: (id, message) =>
-						operation(
-							id,
-							async () => cloneJson(await bridge.thread!.post(message)) as unknown as JsonObject,
-						) as unknown as ReturnType<ThreadIO["post"]>,
-					update: (id, message, content) =>
-						operation(id, () => bridge.thread!.update(message, content)),
-					history: (id, options) => operation(id, () => bridge.thread!.history(options ?? {})),
+						operation(id, "post", [cloneJson(message) as Json]) as unknown as ReturnType<
+							ThreadIO["post"]
+						>,
+					update: async (id, message, content) => {
+						await operation(id, "update", [
+							cloneJson(message) as unknown as Json,
+							cloneJson(content) as Json,
+						]);
+					},
+					history: (id, options) =>
+						operation(id, "history", [options ?? {}]) as ReturnType<ThreadIO["history"]>,
 				}
 			: undefined,
 		start,
 		invoke: async (id, workflow, input) => {
 			if (!api) throw new Error("Prompt sections cannot invoke workflows");
 			const child = await start(id, workflow, input);
-			const result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
-			if (result) {
-				if (result.status !== "completed")
-					throw new Error(JSON.stringify(result.error ?? result.reason ?? result.status));
-				return result.output as WorkflowOutput<typeof workflow>;
-			}
-			await registerChild(bridge, api.taskId, { executionId: child, detached: false }, context);
-			return awaitWithContext(new Promise<never>(() => {}), context);
+			return (await childResult(child)) as WorkflowOutput<typeof workflow>;
 		},
 		evaluate: async (id, request) => {
 			if (!api) throw new Error("Prompt sections cannot evaluate models");
-			const saved = await api.memo(`evaluate:${id}`, context);
+			const key = `fabrial:pi:evaluate:${operationId(id)}`;
+			const saved = await api.memo(key, context);
 			if (saved) return saved as unknown as EvaluateResult<typeof request.questions>;
 			const result = await bridge.evaluator.evaluate(
 				request,
 				context.abortSignal ?? bridge.execution.signal,
 			);
 			return (await api.memo(
-				`evaluate:${id}`,
+				key,
 				cloneJson(result) as unknown as Json,
 				context,
 			)) as unknown as EvaluateResult<typeof request.questions>;
@@ -215,6 +253,52 @@ export async function fields(
 			};
 		},
 	};
+}
+
+/** Persist the cancellation relationship BEFORE starting. A lost start receipt reconciles by global key. */
+export async function startChild(
+	bridge: BridgeFrame,
+	key: string,
+	workflow: string,
+	input: Json,
+	metadata: InvocationMetadata,
+	detached: boolean,
+	context: Context,
+): Promise<string> {
+	const session =
+		metadata.replyTo?.kind === "thread"
+			? `${metadata.replyTo.provider}:${metadata.replyTo.threadId}`
+			: metadata.interactionId;
+	const dedupeKey = JSON.stringify(["fabrial.pi.child", session, key]);
+	const intent = await bridge.harness.commit(async (tx) => {
+		const saved = await tx.doc(ChildIntents, key, {
+			workflow,
+			input: cloneJson(input ?? null),
+			metadata: {
+				...cloneJson(metadata),
+				ownsThread: false,
+				triggerEvent: null,
+				ownerWorkflow: null,
+			},
+			dedupeKey,
+			detached,
+			executionId: null,
+		});
+		const run = (await tx.doc(Runs)).runs[bridge.execution.executionId];
+		if (!run) throw new Error("Missing Pi bridge run binding");
+		run.intents ??= [];
+		if (!run.intents.includes(key)) run.intents.push(key);
+		return cloneJson(saved) as ChildIntent;
+	}, context);
+	if (intent.executionId) return intent.executionId;
+	const executionId = await bridge.execution.start(key, intent.workflow, intent.input, {
+		metadata: intent.metadata,
+		dedupeKey: intent.dedupeKey,
+	});
+	await bridge.harness.commit(async (tx) => {
+		(await tx.doc(ChildIntents, key, intent)).executionId = executionId;
+	}, context);
+	return executionId;
 }
 
 export async function registerChild(

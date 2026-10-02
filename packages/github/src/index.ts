@@ -14,9 +14,13 @@ import {
 } from "fabrial";
 import { z } from "zod";
 
-export type GitHubOptions =
+export type GitHubOptions = (
 	| (Omit<GitHubAdapterPATConfig, "installationId"> & { installationId?: string | number })
-	| GitHubAdapterAppConfig;
+	| GitHubAdapterAppConfig
+) & {
+	/** Repository owner login. PATs default to the authenticated user; set this for org repos. */
+	owner?: string;
+};
 export type GitHubClient = GitHubAdapter["octokit"];
 
 const conversation = z.object({
@@ -64,19 +68,70 @@ async function verify(request: Request, body: string, options: GitHubOptions): P
 		return false;
 	}
 }
+function isPAT(options: GitHubOptions): options is Extract<GitHubOptions, { token: string }> {
+	return typeof options.token === "string";
+}
+
 class ScopedGitHubAdapter extends GitHubAdapter {
-	constructor(options: GitHubOptions) {
+	private owner: Promise<string> | undefined;
+	constructor(private readonly options: GitHubOptions) {
+		let accepts: (payload: unknown) => Promise<boolean>;
 		super({
-			...("token" in options ? { ...options, installationId: undefined } : options),
+			...(isPAT(options) ? { ...options, installationId: undefined } : options),
 			webhookVerifier: async (request, body) => {
 				if (!(await verify(request, body, options))) return false;
-				if ("token" in options) return true;
-				const payload = z
-					.object({ installation: z.object({ id: z.number() }) })
-					.safeParse(JSON.parse(body) as unknown);
-				return payload.success && payload.data.installation.id === options.installationId;
+				try {
+					return await accepts(JSON.parse(body) as unknown);
+				} catch {
+					return false;
+				}
 			},
 		});
+		accepts = (payload) => this.acceptPayload(payload);
+	}
+
+	async acceptPayload(raw: unknown): Promise<boolean> {
+		const parsed = z
+			.object({
+				installation: z.object({ id: z.number() }).optional(),
+				repository: z
+					.object({
+						full_name: z.string().regex(/^[^/:]+\/[^/:]+$/),
+						owner: z.object({ login: z.string() }).optional(),
+					})
+					.optional(),
+			})
+			.safeParse(raw);
+		if (!parsed.success) return false;
+		const payload = parsed.data;
+		if (!isPAT(this.options) && payload.installation?.id !== this.options.installationId)
+			return false;
+		if (
+			isPAT(this.options) &&
+			typeof this.options.installationId === "number" &&
+			payload.installation &&
+			payload.installation.id !== this.options.installationId
+		)
+			return false;
+		if (isPAT(this.options) || this.options.owner) {
+			const owner =
+				this.options.owner ??
+				(await (this.owner ??= this.octokit.rest.users
+					.getAuthenticated()
+					.then(({ data }) => data.login)
+					.catch((error: unknown) => {
+						this.owner = undefined;
+						throw error;
+					})));
+			const repoOwner = payload.repository?.full_name.split("/")[0];
+			if (!repoOwner || repoOwner.toLowerCase() !== owner.toLowerCase()) return false;
+			if (
+				payload.repository?.owner &&
+				payload.repository.owner.login.toLowerCase() !== owner.toLowerCase()
+			)
+				return false;
+		}
+		return true;
 	}
 }
 
@@ -136,7 +191,7 @@ const createPlugin = definePlugin<
 				const parsed = webhook.safeParse(raw);
 				if (!parsed.success) return new Response("Invalid payload", { status: 400 });
 				const payload = parsed.data;
-				if (!("token" in options) && payload.installation?.id !== options.installationId)
+				if (!(await adapter().acceptPayload(raw)))
 					return new Response("Wrong installation", { status: 403 });
 				if (payload.action !== "opened") return new Response(null, { status: 200 });
 				const source = kind === "pull_request" ? payload.pull_request : payload.issue;

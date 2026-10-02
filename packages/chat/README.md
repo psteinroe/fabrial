@@ -2,7 +2,7 @@
 
 `chat({ state, userName?, waitUntil? })` connects one Chat SDK bot to all chat-capable plugins. Routes are `POST /<pluginId>/events`. Supply your deployment's `waitUntil` hook for background ingress; without it the route awaits ingress. Credentials stay in plugin options.
 
-The port supports reconstructed threads, lazy channel roots, DMs, ephemeral messages, text/Markdown/cards, edited messages, best-effort throttled progress, attributed bounded history, and routing state under `thread.state.fabrial`. SDK state writes refresh a 30-day TTL. Card action ids/values are forwarded unchanged to core (including approval cancellation).
+The port supports reconstructed threads, lazy channel roots, DMs, ephemeral messages, text/Markdown/cards, edited messages, best-effort throttled progress, attributed bounded history, and routing state under `thread.state.fabrial`. `ThreadIO.updateState(fn)` performs atomic read-modify-write using the SDK state adapter's distributed, token-owned per-thread lock; all routing-state writers (including fallback status) use it. Lock contention retries for at most 10 seconds; leases last 60 seconds and are checked/renewed before writing, with release in `finally`. Keep callbacks pure: a lost lease can retry them. State writes refresh a 30-day TTL. Card action ids/values are forwarded unchanged to core (including approval cancellation).
 
 ## Provider pattern (GitHub / Linear)
 
@@ -34,7 +34,7 @@ Native Slack stop events forward the authenticated stopper, thread, and stable s
 ## Remaining limitations
 
 - SDK adapters with a fixed platform name cannot represent a second installation under a different plugin id without an id-rewriting adapter. Such aliases fail fast rather than silently crossing installation identity/state.
-- Local ingress serialization is not a distributed routing-state transaction. Multiple webhook replicas need core/state-adapter atomic routing coordination.
+- Cross-process routing-state coordination requires a shared production state adapter (e.g. Postgres). Memory state coordinates only instances sharing that adapter object. Updaters are synchronous and must be bounded; the state adapter lease is not a database fencing transaction if a process is suspended beyond the lease during a write.
 - SDK native stop events do not expose a unique webhook event ID; dedupe uses thread, stopper, and stopped streaming message IDs, scoped by core to the current interaction.
 
 Slack uses SDK assistant status/typing. The SDK Slack adapter swallows native status API errors, so absence of assistant scopes cannot be detected to automatically switch to edited-message fallback. Providers can opt into `status: "message"`; statuses are best effort. There is no attachment field in core's normalized message contract yet.

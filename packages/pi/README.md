@@ -60,17 +60,24 @@ When only those children are running, the harness closes, releasing the lease,
 and the bridge uses `waitForAny` **execution branches**. These are the port's
 race-safe native settlement primitive (rather than filtering the public
 `fabrial.execution.settled` event). Results go into Pi documents before reopening;
-interrupted safe tools reconnect to the same child. Permissions are checked
-before starting, and unauthorized workflow tools are removed from model discovery.
+interrupted safe tools reconnect to the same child. Permissions and input validation use the canonical registered workflow, not the
+supplied tool object. Unauthorized workflow tools are removed from model discovery.
+Children inherit the originating request's actor, interaction, origin and thread,
+clearing the driver's trigger/owner markers so core does not treat them as observers.
 Zod's `toJSONSchema()` is used when available; other Standard Schemas receive a
 permissive object tool schema and are still validated before workflow invocation.
 
-Cancellation during a run aborts the conversation. Suspended cancellation uses
-`RuntimeWorkflow.onSettled`, persisted run/child references, and `runtime.cancel`;
+Cancellation aborts the recorded request/task tree, not a conversation's newer run.
+Child start intents and cancellation relationships commit before starting, and lost
+start receipts reconcile through a Session/task/operation dedupe key. Suspended
+cancellation uses `RuntimeWorkflow.onSettled` and `runtime.cancel`;
 `ctx.agent(id, agent, { input, detached: true })` keeps the agent-run child alive when its caller is cancelled; `asTool({ detached: true })` independently keeps workflow-tool children alive when the agent is cancelled. Progress is best-effort,
 throttled and limited to thinking/tool descriptions, never reasoning or raw
 stream output. Final answers are returned, not posted automatically. Buffered
-replies submit with stable ids and `whenBusy: "steer"`.
+replies get their own authenticated invocation documents, submit with stable ids and
+`whenBusy: "steer"`, and are atomically consumed from routing state only after durable
+submission. The driver drains every accepted submission before returning (or persists
+the request set before releasing the harness to wait for children).
 
 ## Structured output and configuration
 
@@ -92,15 +99,20 @@ explicit native Context arguments remain supported. Sections receive native
 PromptInput plus these fields; managed writes/invocations/evaluation are prohibited
 in sections. Reserved-name collision assertions are compiled and tested.
 
-Managed thread posts, updates and history use Conductor steps keyed by Pi task
-and operation id; repeated operation ids are suffixed. Model evaluations use Pi
+Managed thread posts, updates and history use stable child executions keyed by
+Session, Pi task and operation id, independent of the replaceable Session driver.
+Their Conductor step receipts survive driver changes; an external I/O crash before
+its step receipt remains at-least-once. Repeated operation ids use `#1`, `#2`, etc.;
+`#` and the `fabrial:` framework receipt prefix are reserved. Model evaluations use Pi
 memos. `ctx.start` is independent; `ctx.invoke` is reconnectable workflow work.
 Arbitrary native clients are not automatically durable: use managed operations
 or workflow tools for side effects.
 
 State uses native Pi documents: interaction family keyed by interaction id,
 thread family, and rewindable/forkable agent conversation documents. Workflow
-reads/updates are memoized steps acquiring a short Session lease. Agent-scoped
+reads/updates are memoized steps acquiring a short Session lease. An execution/operation
+receipt stores the returned state value in the same Pi commit as the mutation, so a
+lost runtime step receipt cannot apply it twice. Agent-scoped
 workflow access is rejected because StatePort carries no conversation selector.
 Tool changes are staged, schema validated and merged on the serialized commit
 line with a **native task result receipt**. Pi appends its transcript result in
@@ -145,8 +157,6 @@ Provider errors/aborts become `stopReason: "error"`.
   required independently of installation-specific plugin ids.
 - Conversation/agent selector for workflow agent-scoped StatePort operations.
 - JSON Schema conversion capability on workflow input schemas for all providers.
-- Atomic compare-and-set/update on ChatPort routing state. Read-modify-write
-  steering/progress cannot prevent concurrent ingress writes being lost.
 - Pi tool settlement callback for truly atomic state + native transcript result.
 
 A long-lived execution per Session would not remove takeover/fencing requirements,

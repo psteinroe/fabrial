@@ -57,11 +57,51 @@ const webhookSchema = z.object({
 	updatedFrom: z.record(z.string(), z.json()).optional(),
 });
 
+/** Verify and preserve custom-verifier body rewrites, then enforce installation before any dispatch. */
+async function scopedWebhook(request: Request, body: string, options: LinearOptions) {
+	try {
+		if (options.webhookVerifier) {
+			const result = await options.webhookVerifier(request, body);
+			if (!result) return false;
+			if (typeof result === "string") body = result;
+		} else {
+			const signature = request.headers.get("linear-signature") ?? "";
+			const expected = createHmac("sha256", options.webhookSecret!).update(body).digest("hex");
+			if (
+				signature.length !== expected.length ||
+				!timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
+			)
+				return false;
+		}
+		const parsed = z
+			.object({
+				organizationId: z.string(),
+				webhookTimestamp: z.number().optional(),
+			})
+			.safeParse(JSON.parse(body) as unknown);
+		if (!parsed.success || parsed.data.organizationId !== options.organizationId) return false;
+		if (
+			!options.webhookVerifier &&
+			(parsed.data.webhookTimestamp === undefined ||
+				Math.abs(Date.now() - parsed.data.webhookTimestamp) > 60_000)
+		)
+			return false;
+		return body;
+	} catch {
+		return false;
+	}
+}
+
 /** Linear SDK channels are issue UUIDs. Enrich inbound comment channels to team keys for routing. */
 class TeamLinearAdapter extends LinearAdapter {
 	private readonly teams = new Map<string, string>();
 	constructor(private readonly options: LinearOptions) {
-		super({ ...options, mode: "comments" });
+		super({
+			...options,
+			mode: "comments",
+			// Scope ALL webhook types, not just comments (OAuth revocations, reactions, sessions).
+			webhookVerifier: (request, body) => scopedWebhook(request, body, options),
+		});
 	}
 	protected override async onCommentEvent(...args: Parameters<LinearAdapter["onCommentEvent"]>) {
 		const [payload] = args;

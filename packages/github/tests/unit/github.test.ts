@@ -209,3 +209,69 @@ describe("GitHub comment ingress", () => {
 		expect(env.host.receiveMessage).not.toHaveBeenCalled();
 	});
 });
+
+it("rejects signed foreign repository owners for PATs on both ingress paths", async () => {
+	const plugin = github(options);
+	const adapter = plugin.chat!.adapter() as GitHubAdapter;
+	const emit = vi.fn();
+	const payload = {
+		action: "opened",
+		sender: alice,
+		repository: { ...repository, full_name: "other/app", owner: { ...alice, login: "other" } },
+		issue: {
+			id: 10,
+			number: 5,
+			title: "Issue",
+			body: null,
+			html_url: "https://github.com/other/app/issues/5",
+			user: alice,
+		},
+	};
+	expect((await adapter.handleWebhook(request(payload))).status).toBe(401);
+	expect(
+		(
+			await plugin.routes!["POST /github/webhook"]!(request(payload, "issues"), {
+				emit,
+				clients: plugin.clients!({}),
+			})
+		).status,
+	).toBe(403);
+	expect(emit).not.toHaveBeenCalled();
+});
+
+it("defaults PAT owner isolation to the token's authenticated user", async () => {
+	const adapter = github({ ...options, owner: undefined }).chat!.adapter() as GitHubAdapter;
+	const auth = vi
+		.spyOn(adapter.octokit.rest.users, "getAuthenticated")
+		.mockResolvedValue({ data: { login: "acme" } } as never);
+	const payload = { action: "ignored", repository };
+	expect((await adapter.handleWebhook(request(payload, "issues"))).status).toBe(200);
+	expect(
+		(
+			await adapter.handleWebhook(
+				request({ ...payload, repository: { ...repository, full_name: "other/app" } }, "issues"),
+			)
+		).status,
+	).toBe(401);
+	expect(auth).toHaveBeenCalledOnce();
+});
+
+it("does not treat an App config with an explicitly undefined token as a PAT", async () => {
+	const plugin = github({
+		appId: "1",
+		privateKey: "key",
+		installationId: 42,
+		token: undefined,
+		webhookSecret: "secret",
+	});
+	const adapter = plugin.chat!.adapter() as GitHubAdapter;
+	expect(
+		(await adapter.handleWebhook(request({ installation: { id: 43 }, repository }, "issues")))
+			.status,
+	).toBe(401);
+	expect((await adapter.handleWebhook(request({ repository }, "issues"))).status).toBe(401);
+	expect(
+		(await adapter.handleWebhook(request({ installation: { id: 42 }, repository }, "issues")))
+			.status,
+	).toBe(200);
+});

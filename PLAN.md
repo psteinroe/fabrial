@@ -115,7 +115,7 @@ Workflow context:
 
 Intentional framework operations are wrapped in durable operations automatically, so authors never write `ctx.step` around `ctx.thread.post()`.
 
-- Every durable operation takes an **explicit ID as its first argument** (the Inngest model), the same as `ctx.step(name, fn)`. A repeated ID within one execution (e.g. in a loop) is suffixed automatically (`processed`, `processed:1`, `processed:2`, …). Use a data-derived ID (`processed:${customer.id}`) when the iteration order may change.
+- Every durable operation takes an **explicit ID as its first argument** (the Inngest model), the same as `ctx.step(name, fn)`. A repeated ID within one execution (e.g. in a loop) is suffixed automatically (`processed`, `processed#1`, `processed#2`, …). The `fabrial:` prefix and the `#` character are reserved. Use a data-derived ID (`processed:${customer.id}`) when the iteration order may change.
 - On replay, the saved receipt for that ID is returned and live handles are rebuilt from it.
 - Deploys while executions are in flight: an ID with no saved result runs, and a saved result whose ID is gone is ignored. Renaming an ID re-runs that operation. There is no call-order determinism and no version pinning.
 - Read-only accessors (`ctx.thread`, `ctx.clients`, `ctx.actor`) are not operations and take no ID.
@@ -151,9 +151,10 @@ export const bugInvestigator = defineAgent({
 
 const analysis = await ctx.agent("investigate", bugInvestigator, { input });
 const plan = await ctx.agent("plan", cleanupPlanner, { input, output: CleanupPlan }); // typed structured result
-await ctx.agent("investigate", bugInvestigator, {
-	input,
-	configure: (conversation) => conversation.configure({ cwd: "/work/repo" }), // native escape hatch
+// native escape hatch: `configure` lives on defineAgent, because the agent runs in its own execution
+export const repoAgent = defineAgent({
+	name: "repo-agent",
+	configure: (conversation) => conversation.configure({ cwd: "/work/repo" }),
 });
 ```
 
@@ -598,7 +599,7 @@ Recorded as open questions are resolved.
 - **`run(input, ctx)`, matching Conductor's handler shape.** For triggered runs, `input` is the typed trigger event (a union for multiple triggers). For `ctx.invoke`, `ctx.handoff`, and `asTool()` it is the workflow's typed input.
 - **Plugins: `definePlugin(factory | object)`** with the capability set in [Plugins](#plugins). Chat SDK is just the optional `chat` capability, so non-chat sources like Sentry or internal webhooks are first-class (`events` + `routes`). The shape follows Better Auth and Executor: an option factory, a declarative object, and inferred types. Global hooks are `hooks: { workflow, agent }` in native Conductor-middleware and Pi-hook shapes. Agent-scoped hooks live in `extension`. Trigger helpers are static exports.
 - **Credentials are plugin options.** Executor's provider/account split (an accounts table, secret storage, slots) is deferred until several accounts per provider or per-person credentials are needed. A second installation is a second plugin instance with its own `id`.
-- **Thin `defineAgent`.** It holds `name`, plus plugin extensions by `id`. Everything else (`model`, `thinkingLevel`, `instructions`, `extensions`, `tools`, …) passes through to Pi's `configure()`. `ctx.agent` options include `input`, `output` (typed structured result), and `configure` (native escape hatch). No Fabrial-owned agent features such as memory or per-agent permissions.
+- **Thin `defineAgent`.** It holds `name`, plus plugin extensions by `id`. Everything else (`model`, `thinkingLevel`, `instructions`, `extensions`, `tools`, …) passes through to Pi's `configure()`. `ctx.agent` options are `input`, `output` (typed structured result, validated from a JSON answer), and `detached`. The native `configure` escape hatch is a `defineAgent` field, since a function can't cross into the agent's own execution. No Fabrial-owned agent features such as memory or per-agent permissions.
 - **v1 scope: Slack + the SQL approval flow + GitHub and Linear.**
   - Packages: `fabrial`, `@fabrial/conductor`, `@fabrial/pi`, `@fabrial/chat`, `@fabrial/slack`, `@fabrial/github`, `@fabrial/linear`.
   - Reference flow: a `generalAssistant` workflow (Slack mention) → a support agent → a `runSql.asTool()` workflow with triage approval in a Slack DM → resume → final reply in the thread. It must survive rejection, expiry, duplicate clicks, a deploy during approval, and a crash right after the DB write.

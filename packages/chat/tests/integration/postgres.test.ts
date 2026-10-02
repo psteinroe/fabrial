@@ -1,3 +1,5 @@
+import { fork } from "node:child_process";
+import { once } from "node:events";
 import { createPostgresState } from "@chat-adapter/state-pg";
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { expect, it } from "vitest";
@@ -12,7 +14,45 @@ it("persists thread routing state and subscription through a Postgres-backed res
 		const env = setup(first);
 		const thread = await env.connection.port.thread(ref);
 		await first.set(`thread-state:${ref.threadId}`, { custom: "preserved" });
-		await thread.setState(routingState);
+		await thread.updateState(() => routingState);
+		// Two OS processes, separate Chat instances and pools, one durable lock namespace.
+		const children = ["a", "b"].map((id) =>
+			fork(new URL("./state-worker.ts", import.meta.url), {
+				execArgv: ["--experimental-transform-types", "--disable-warning=ExperimentalWarning"],
+				env: { ...process.env, STATE_URL: container.getConnectionUri(), WORKER_ID: id },
+				stdio: ["ignore", "pipe", "pipe", "ipc"],
+			}),
+		);
+		try {
+			const exits = children.map((child) => once(child, "exit"));
+			await Promise.all(
+				children.map((child) =>
+					Promise.race([
+						once(child, "message"),
+						once(child, "exit").then(([code]) => {
+							throw new Error(`State worker exited early: ${code}`);
+						}),
+					]),
+				),
+			);
+			for (const child of children) child.send("go");
+			expect(await Promise.all(exits)).toEqual([
+				[0, null],
+				[0, null],
+			]);
+			const updated = await thread.getState();
+			expect(updated?.consumedReplyIds).toHaveLength(41);
+			expect(new Set(updated?.consumedReplyIds).size).toBe(41);
+			expect(updated).toMatchObject({
+				requesterId: "alice",
+				participantIds: ["alice", "bob"],
+				cancellationIds: ["stop-1"],
+			});
+			// Restore the codec fixture for the restart/TTL assertions below.
+			await thread.updateState(() => routingState);
+		} finally {
+			for (const child of children) if (child.exitCode === null) child.kill();
+		}
 		await first.disconnect();
 		const restored = setup(second);
 		const restoredThread = await restored.connection.port.thread(ref);
@@ -30,7 +70,7 @@ it("persists thread routing state and subscription through a Postgres-backed res
 		expect(new Date(rows[0].expires_at).getTime() - Date.now()).toBeGreaterThan(
 			29 * 24 * 60 * 60 * 1000,
 		);
-		await restoredThread.setState(null);
+		await restoredThread.updateState(() => null);
 		expect(await restoredThread.getState()).toBeNull();
 	} finally {
 		await first.disconnect();

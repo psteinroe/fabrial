@@ -12,6 +12,7 @@ export const routingState: ThreadRoutingState = {
 	statusMessageId: null,
 	bufferedReplies: [],
 	consumedReplyIds: ["consumed-1"],
+	consumedReplyOperations: { "consumed-1": "operation-1" },
 	requesterId: "alice",
 	participantIds: ["alice", "bob"],
 	cancellationIds: ["stop-1"],

@@ -1,6 +1,7 @@
 import type { App, FabrialConfig, FabrialHost, Logger } from "./app.ts";
 import { createDirectory, identityKey } from "./directory.ts";
-import { filtersOverlap, matchesFilter } from "./internal.ts";
+import { boundedTimeout, filtersOverlap, matchesFilter } from "./internal.ts";
+import { clearInteraction, hasIngress, rememberIngress } from "./routing.ts";
 import type { Json } from "./json.ts";
 import type { Clients } from "./register.ts";
 import { EXECUTION_SETTLED_EVENT } from "./runtime.ts";
@@ -15,6 +16,7 @@ const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 export function fabrial(config: FabrialConfig): App {
 	const runtime = config.runtime;
 	const now = () => runtime.now?.() ?? Date.now();
+	const reservationTimeout = boundedTimeout(config.reservationTimeout ?? "10m");
 	let chat: ReturnType<NonNullable<FabrialConfig["chat"]>["connect"]> | undefined;
 	let agents: ReturnType<NonNullable<FabrialConfig["agents"]>["connect"]> | undefined;
 	let liveClients: Clients | undefined;
@@ -84,6 +86,9 @@ export function fabrial(config: FabrialConfig): App {
 				id: options.id,
 				metadata,
 				owner: selected?.workflow.name,
+				dispatchOwner: selected
+					? { workflow: selected.workflow.name, event: selected.spec.event }
+					: undefined,
 			});
 			return { owner: selected?.workflow.name, observers };
 		},
@@ -95,16 +100,69 @@ export function fabrial(config: FabrialConfig): App {
 				threadId: message.threadId,
 			};
 			const io = await chat?.port.thread(ref);
-			const state = await io?.getState();
 			const actor = await directory.resolveIdentity(message.author.identity);
-			if (state) {
-				state.participantIds = [...new Set([...(state.participantIds ?? []), actor.id])];
-				if (
-					!state.bufferedReplies.some((m) => m.messageId === message.messageId) &&
-					!state.consumedReplyIds?.includes(message.messageId)
-				)
-					state.bufferedReplies.push(message);
-				await io!.setState(state);
+			const events = [...new Set(options.events ?? (options.event ? [options.event] : []))];
+			if (!events.length) throw new Error("Inbound messages need at least one event category");
+			const interactionId = `${message.provider}:${options.dedupeId}`;
+			const receivedAt = now();
+			const decision: {
+				route: "new" | "reply" | "ignored";
+				selected: ReturnType<typeof select>["selected"];
+			} = { route: "new", selected: undefined };
+			// Recompute the local decision on every lock retry; no dispatch/I/O occurs in the updater.
+			const state = await io?.updateState((state) => {
+				decision.selected = undefined;
+				if (hasIngress(state, "message", options.dedupeId)) {
+					decision.route = "ignored";
+					return state;
+				}
+				const stale =
+					state?.handlerExecutionId === null &&
+					(state.reservedAt === undefined || receivedAt - state.reservedAt >= reservationTimeout);
+				if (state?.interactionId != null && !stale) {
+					decision.route = "reply";
+					return rememberIngress(
+						{
+							...state,
+							participantIds: [...new Set([...(state.participantIds ?? []), actor.id])],
+							bufferedReplies:
+								state.bufferedReplies.some((m) => m.messageId === message.messageId) ||
+								state.consumedReplyIds?.includes(message.messageId)
+									? state.bufferedReplies
+									: [...state.bufferedReplies, message],
+						},
+						"message",
+						options.dedupeId,
+						receivedAt,
+					);
+				}
+				decision.route = "new";
+				decision.selected = select(events, message).selected;
+				const idle = clearInteraction(state);
+				return rememberIngress(
+					decision.selected
+						? {
+								...idle,
+								interactionId,
+								handlerExecutionId: null,
+								reservedAt: receivedAt,
+								agentActive: false,
+								statusMessageId: null,
+								bufferedReplies: [],
+								consumedReplyIds: [message.messageId],
+								requesterId: actor.id,
+								participantIds: [actor.id],
+							}
+						: idle,
+					"message",
+					options.dedupeId,
+					receivedAt,
+				);
+			});
+			if (decision.route === "ignored") return "ignored";
+			if (!io) decision.selected = select(events, message).selected;
+			const { selected } = decision;
+			if (decision.route === "reply" && state?.interactionId != null) {
 				await runtime.emit(
 					"fabrial.reply",
 					{
@@ -126,10 +184,6 @@ export function fabrial(config: FabrialConfig): App {
 				);
 				return "reply";
 			}
-			const events = [...new Set(options.events ?? (options.event ? [options.event] : []))];
-			if (!events.length) throw new Error("Inbound messages need at least one event category");
-			const { selected } = select(events, message);
-			const interactionId = `${message.provider}:${options.dedupeId}`;
 			const invocation: InvocationMetadata = {
 				interactionId,
 				origin: { provider: message.provider, messageId: message.messageId },
@@ -147,13 +201,21 @@ export function fabrial(config: FabrialConfig): App {
 					metadata: invocation,
 					owner: event === selected?.spec.event ? selected.workflow.name : undefined,
 					dispatchId: interactionId,
+					dispatchOwner: selected
+						? { workflow: selected.workflow.name, event: selected.spec.event }
+						: undefined,
 				});
 			return "new";
 		},
 		async receiveCancellation(action) {
 			const io = await chat?.port.thread(action.thread);
 			const state = await io?.getState();
-			if (!state?.handlerExecutionId || state.cancellationIds?.includes(action.dedupeId)) return;
+			if (
+				!state?.handlerExecutionId ||
+				hasIngress(state, "cancellation", action.dedupeId) ||
+				state.cancellationIds?.includes(action.dedupeId)
+			)
+				return;
 			const actor = await directory.resolveIdentity(action.actor);
 			const participants = [
 				...new Set([
@@ -174,17 +236,34 @@ export function fabrial(config: FabrialConfig): App {
 				return;
 			}
 			await runtime.cancel(state.handlerExecutionId, `Stopped by ${actor.id}`);
-			const latest = await io!.getState();
-			if (latest?.interactionId === state.interactionId)
-				await io!.setState({
-					...latest,
-					cancellationIds: [...(latest.cancellationIds ?? []), action.dedupeId],
-				});
+			const receivedAt = now();
+			await io!.updateState((latest) =>
+				latest?.interactionId === state.interactionId &&
+				latest.handlerExecutionId === state.handlerExecutionId
+					? rememberIngress(
+							{
+								...latest,
+								cancellationIds: [...new Set([...(latest.cancellationIds ?? []), action.dedupeId])],
+							},
+							"cancellation",
+							action.dedupeId,
+							receivedAt,
+						)
+					: latest,
+			);
 		},
 		async receiveAction(action) {
 			const match = /^fabrial\.approval\.(approve|reject|cancel):(.+)$/.exec(action.actionId);
 			if (!match) return;
 			const actor = await directory.resolveIdentity(action.actor);
+			const io = await chat?.port.thread(action.thread);
+			const receivedAt = now();
+			let duplicate = false;
+			await io?.updateState((state) => {
+				duplicate = hasIngress(state, "action", action.dedupeId);
+				return duplicate ? state : rememberIngress(state, "action", action.dedupeId, receivedAt);
+			});
+			if (duplicate) return;
 			await runtime.emit(
 				"fabrial.approval.decided",
 				{
@@ -221,13 +300,21 @@ export function fabrial(config: FabrialConfig): App {
 		if (metadata.ownsThread && metadata.replyTo?.kind === "thread" && chat) {
 			const io = await chat.port.thread(metadata.replyTo);
 			const state = await io.getState();
-			if (state?.handlerExecutionId === executionId) {
+			if (
+				state?.interactionId === metadata.interactionId &&
+				state.handlerExecutionId === executionId
+			) {
 				try {
 					await io.setStatus(null);
 				} catch (error) {
 					host.logger.warn("Could not clear thread status", { error });
 				}
-				await io.setState(null);
+				await io.updateState((latest) =>
+					latest?.interactionId === metadata.interactionId &&
+					latest.handlerExecutionId === executionId
+						? clearInteraction(latest)
+						: latest,
+				);
 			}
 		}
 		await runtime.emit(
@@ -247,6 +334,7 @@ export function fabrial(config: FabrialConfig): App {
 		cron: workflow.definition.cron?.map((c) => ({
 			schedule: c.schedule,
 			name: c.name ?? workflow.name,
+			replyTo: c.replyTo,
 		})),
 		concurrency: workflow.definition.concurrency,
 		retries: workflow.definition.retries,

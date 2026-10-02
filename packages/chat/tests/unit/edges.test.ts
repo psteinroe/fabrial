@@ -83,7 +83,7 @@ it("expires routing bindings after 30 days", async () => {
 	vi.useFakeTimers();
 	const env = setup();
 	const thread = await env.connection.port.thread(ref);
-	await thread.setState(routingState);
+	await thread.updateState(() => routingState);
 	vi.advanceTimersByTime(30 * 24 * 60 * 60 * 1000 + 1);
 	expect(await thread.getState()).toBeNull();
 });
@@ -91,7 +91,7 @@ it("expires routing bindings after 30 days", async () => {
 it("maps the native platform stop control to actor-aware cancellation ingress", async () => {
 	const env = setup();
 	const thread = await env.connection.port.thread(ref);
-	await thread.setState(routingState);
+	await thread.updateState(() => routingState);
 	const tasks: Promise<unknown>[] = [];
 	env.sdk().processAgentSessionStopped(
 		{
@@ -122,7 +122,7 @@ it("creates one fallback status message and edits it", async () => {
 	const env = setup();
 	vi.mocked(env.adapter.startTyping).mockRejectedValue(new Error("unsupported"));
 	const thread = await env.connection.port.thread(ref);
-	await thread.setState(routingState);
+	await thread.updateState(() => routingState);
 	await thread.setStatus("Thinking");
 	vi.advanceTimersByTime(1001);
 	await thread.setStatus("Searching");
@@ -131,4 +131,72 @@ it("creates one fallback status message and edits it", async () => {
 		markdown: "Searching",
 	});
 	expect((await thread.getState())?.statusMessageId).toBe("msg-1");
+});
+
+it("serializes independent Chat instances and releases the state lock after updater/write failures", async () => {
+	const first = setup();
+	const second = setup(first.state);
+	const a = await first.connection.port.thread(ref);
+	const b = await second.connection.port.thread(ref);
+	await a.updateState(() => routingState);
+	await expect(
+		a.updateState(() => {
+			throw new Error("updater failed");
+		}),
+	).rejects.toThrow("updater failed");
+	const set = vi.spyOn(first.state, "set").mockRejectedValueOnce(new Error("write failed"));
+	await expect(a.updateState(() => routingState)).rejects.toThrow("write failed");
+	set.mockRestore();
+	await Promise.all(
+		Array.from({ length: 20 }, (_, i) =>
+			(i % 2 ? a : b).updateState((state) => ({
+				...state!,
+				participantIds: [...(state?.participantIds ?? []), `user-${i}`],
+			})),
+		),
+	);
+	const state = await a.getState();
+	expect(state?.participantIds).toHaveLength(22);
+	expect(new Set(state?.participantIds).size).toBe(22);
+	// Caller mutation must not change persisted state in memory adapters either.
+	state?.participantIds?.push("outside-mutation");
+	expect((await a.getState())?.participantIds).toHaveLength(22);
+});
+
+it("bounds lock contention retries without force-releasing another updater's lock", async () => {
+	vi.useFakeTimers();
+	const env = setup();
+	const thread = await env.connection.port.thread(ref);
+	const lock = await env.state.acquireLock(`fabrial:routing:${ref.threadId}`, 60_000);
+	const result = expect(thread.updateState(() => routingState)).rejects.toThrow("Timed out");
+	await vi.advanceTimersByTimeAsync(10_001);
+	await result;
+	expect(await env.state.acquireLock(`fabrial:routing:${ref.threadId}`, 60_000)).toBeNull();
+	await env.state.releaseLock(lock!);
+});
+
+it("retries a pure updater after losing its lease and preserves unrelated fields in fallback status writes", async () => {
+	const env = setup();
+	const replica = setup(env.state);
+	const thread = await env.connection.port.thread(ref);
+	const other = await replica.connection.port.thread(ref);
+	await thread.updateState(() => routingState);
+	const extend = vi.spyOn(env.state, "extendLock").mockResolvedValueOnce(false);
+	const updater = vi.fn((state: typeof routingState | null) => state);
+	await thread.updateState(updater);
+	expect(updater).toHaveBeenCalledTimes(2);
+	extend.mockRestore();
+	vi.mocked(env.adapter.startTyping).mockRejectedValue(new Error("unsupported"));
+	vi.mocked(env.adapter.postMessage).mockImplementationOnce(async () => {
+		await other.updateState((current) => ({
+			...current!,
+			participantIds: ["alice", "bob", "carol"],
+		}));
+		return { id: "status-post", threadId: ref.threadId, raw: {} };
+	});
+	await thread.setStatus("Thinking");
+	expect(await thread.getState()).toMatchObject({
+		participantIds: ["alice", "bob", "carol"],
+		statusMessageId: "status-post",
+	});
 });

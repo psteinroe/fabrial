@@ -27,14 +27,26 @@ export interface InvocationMetadata extends JsonObject {
 
 export type DurationInput = string | number;
 
-/** Branch of `waitForAny`. */
+/**
+ * Opaque, durable position in the event stream (Conductor item 1). Events emitted after a cursor satisfy
+ * waits that pass it as `after`, even if they were emitted before the wait registered. Every consumed
+ * event returns its own cursor, so successive waits can continue exactly after the last consumed event.
+ */
+export type EventCursor = string;
+
+/** Branch of `waitForAny`. Timers use an absolute deadline (epoch ms), fixed once by the caller. */
 export type WaitBranch =
-	| { kind: "event"; event: string; filter?: EventFilter }
+	| { kind: "event"; event: string; filter?: EventFilter; after?: EventCursor }
 	| { kind: "execution"; executionId: string }
-	| { kind: "timer"; ms: number };
+	| { kind: "timer"; at: number };
 
 export type WaitForAnyResult =
-	| { key: string; kind: "event"; event: { name: string; payload: JsonObject } }
+	| {
+			key: string;
+			kind: "event";
+			event: { name: string; payload: JsonObject };
+			cursor: EventCursor;
+	  }
 	| { key: string; kind: "execution"; result: ExecutionResult }
 	| { key: string; kind: "timer" };
 
@@ -50,14 +62,23 @@ export interface DurableExecution {
 	readonly metadata: InvocationMetadata;
 	/** Aborted on cancellation (cooperative; checked at the next durable operation). */
 	readonly signal: AbortSignal;
+	/**
+	 * Operation ids: core reserves the `fabrial:` prefix for framework operations and the `#` character for
+	 * repetition suffixes (`x`, `x#1`, `x#2`). Adapters namespace their own receipts under `fabrial:`.
+	 */
 	/** Memoized step: `fn` runs at most once to completion per id (at-least-once on crash). */
 	step<T extends Json | void>(id: string, fn: () => Promise<T> | T): Promise<T>;
 	sleep(id: string, ms: number): Promise<void>;
-	/** Race-safe wait for one event (Conductor item 1). Returns null on timeout. */
+	/** Memoized: the current event-stream position, for later `after` waits (take it before side effects). */
+	cursor(id: string): Promise<EventCursor>;
+	/**
+	 * Wait for one matching event emitted after `after` (or after registration when omitted), until the
+	 * absolute `deadline` (epoch ms). Returns null on timeout (Conductor item 1).
+	 */
 	waitForEvent(
 		id: string,
-		options: { event: string; filter?: EventFilter; timeoutMs?: number },
-	): Promise<{ name: string; payload: JsonObject } | null>;
+		options: { event: string; filter?: EventFilter; after?: EventCursor; deadline?: number },
+	): Promise<{ name: string; payload: JsonObject; cursor: EventCursor } | null>;
 	/** First of several branches wins (Conductor item 6). */
 	waitForAny(id: string, branches: Record<string, WaitBranch>): Promise<WaitForAnyResult>;
 	/** Start a child and wait for its result. Cancelled with the parent unless `detached` (Conductor item 5). */
@@ -93,7 +114,8 @@ export interface RuntimeWorkflow {
 	name: string;
 	/** Event triggers. Owner triggers only receive events whose `owner` matches this workflow. */
 	triggers: { event: string; filter?: EventFilter; role: "owner" | "observer" }[];
-	cron?: { schedule: string; name: string }[];
+	/** Cron deliveries carry replyTo into invocation metadata and own the thread when a surface is supplied. */
+	cron?: { schedule: string; name: string; replyTo?: Surface }[];
 	concurrency?: number;
 	retries?: { maxAttempts?: number };
 	/** Strict per-key mutual exclusion (Conductor item 4); key computed from input + metadata. */
@@ -134,6 +156,11 @@ export interface DurableRuntime {
 			owner?: string;
 			/** One ingress spanning event categories: dedupe triggered runs by (dispatchId, workflow). */
 			dispatchId?: string;
+			/**
+			 * The ingress's canonical owner, passed on every emission of that ingress: the owner workflow only
+			 * runs from this event (as owner), never from a competing observer emission.
+			 */
+			dispatchOwner?: { workflow: string; event: string };
 		},
 	): Promise<void>;
 	invoke(
@@ -158,12 +185,24 @@ export interface ThreadIO {
 	history(options: { limit?: number; sinceLastBotReply?: boolean }): Promise<ChatMessage[]>;
 	/** Fabrial's routing state in Chat SDK thread state (30-day TTL, refreshed on write). */
 	getState(): Promise<ThreadRoutingState | null>;
-	setState(state: ThreadRoutingState | null): Promise<void>;
+	/**
+	 * Atomic read-modify-write of the routing state under a per-thread lock (Chat SDK state adapter lock),
+	 * across processes. `fn` may run more than once; keep it pure. Returning `null` clears the state.
+	 * Every writer (ingress, binding, handoff, buffering, consumption, settlement) must use this.
+	 */
+	updateState(
+		fn: (state: ThreadRoutingState | null) => ThreadRoutingState | null,
+	): Promise<ThreadRoutingState | null>;
 }
 
 export type ThreadRoutingState = JsonObject & {
-	interactionId: string;
+	/** null explicitly means no active interaction; the state may still hold ingress tombstones. */
+	interactionId: string | null;
 	handlerExecutionId: string | null;
+	/** Epoch ms when an unbound slot was reserved. Missing on legacy states (ingress treats these as stale). */
+	reservedAt?: number;
+	/** Last 100 accepted message/action dedupe ids, retained across settlement (subject to thread TTL). */
+	ingestedDedupeIds?: { kind: "message" | "action" | "cancellation"; id: string; at: number }[];
 	/** True while an agent run drives the thread; replies go to the Pi conversation as steering. */
 	agentActive: boolean;
 	statusMessageId: string | null;
@@ -171,6 +210,8 @@ export type ThreadRoutingState = JsonObject & {
 	bufferedReplies: ChatMessage[];
 	/** Message ids already delivered to a workflow reply wait (buffer/event deduplication). */
 	consumedReplyIds?: string[];
+	/** Idempotent acknowledgement owner per message; a replay of the same consuming operation is accepted. */
+	consumedReplyOperations?: Record<string, string>;
 	/** Cancellation authority is scoped to the current interaction. */
 	requesterId?: string;
 	participantIds?: string[];

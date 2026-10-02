@@ -6,18 +6,28 @@ import {
 	fauxProvider,
 	fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
-import { defineExtension, hook, GenerationTask } from "@earendil-works/pi-durable";
+import {
+	createRegistry,
+	createSession,
+	Harness,
+	LiveDoc,
+	defineExtension,
+	hook,
+	GenerationTask,
+} from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import {
 	defineState,
 	defineWorkflow,
+	type DurableExecution,
 	type FabrialHost,
 	type InvocationMetadata,
 	type RuntimeWorkflow,
 } from "fabrial";
 import { FakeChat, MemoryRuntime } from "fabrial/testing";
 import postgres, { type Sql } from "postgres";
-import { afterAll, beforeAll, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
+import { ChildIntents, Invocation, Runs } from "../../src/documents.ts";
 import { z } from "zod";
 import {
 	abortOrphans,
@@ -66,6 +76,12 @@ function fixture(plugins: FabrialHost["plugins"] = []) {
 		chat: () => chat,
 		logger: { warn() {}, error() {}, debug() {}, info() {} },
 		directory: { isMember: async () => true },
+		resolvePrincipal: async (identity: { subjectId: string }) => ({
+			id: identity.subjectId,
+			known: true,
+			identities: [],
+			name: identity.subjectId,
+		}),
 	} as unknown as FabrialHost;
 	const integration = pi({ models, sql, settings: { retry: { enabled: false } } }).connect(host);
 	return { runtime, chat, faux, integration, metadata, host };
@@ -97,6 +113,7 @@ it("runs durable structured answers, memoizes submissions, and continues one age
 		name: randomUUID(),
 		triggers: [],
 		handler: async (_input, execution) => {
+			await execution.step("answer:output", () => "user receipt");
 			const first = await f.integration.agents.run(execution, "answer", agent, {
 				input: "Question",
 				output: z.object({ answer: z.number() }),
@@ -201,11 +218,14 @@ it("binds adapter identity, clients, sections and durable posts; commits tool st
 
 it("releases the Session while a workflow tool waits and reconnects with a stable child id", async () => {
 	const f = fixture();
+	f.metadata.triggerEvent = "slack.mentioned";
+	f.metadata.ownerWorkflow = "router";
 	const child = defineWorkflow({
 		name: randomUUID(),
 		input: z.object({ value: z.string() }),
 		run: async () => "unused",
 	});
+	(f.host.workflows as unknown as (typeof child)[]).push(child);
 	const agent = defineAgent({
 		name: randomUUID(),
 		model: { provider: f.faux.provider.id, modelId: f.faux.getModel().id },
@@ -227,7 +247,13 @@ it("releases the Session while a workflow tool waits and reconnects with a stabl
 		{
 			name: child.name,
 			triggers: [],
-			handler: async () => {
+			handler: async (_input, execution) => {
+				expect(execution.metadata).toMatchObject({
+					...f.metadata,
+					ownsThread: false,
+					triggerEvent: null,
+					ownerWorkflow: null,
+				});
 				const storage = await PostgresStorage.open(sql, sessionKey(f.metadata));
 				await storage.close(BACKGROUND_CONTEXT);
 				return "ok";
@@ -299,15 +325,20 @@ it("detects missing live task kinds and explicitly aborts their ownership tree",
 	).resolves.toBeUndefined();
 });
 
-it.each([false, true])(
-	"honors detached=%s when the agent caller is cancelled",
-	async (detached) => {
+it.each([
+	[false, false],
+	[true, false],
+	[false, true],
+])(
+	"honors agent detached=%s and tool detached=%s when the agent caller is cancelled",
+	async (detached, toolDetached) => {
 		const f = fixture();
 		const child = defineWorkflow({ name: randomUUID(), run: async () => null });
+		(f.host.workflows as unknown as (typeof child)[]).push(child);
 		const agent = defineAgent({
 			name: randomUUID(),
 			model: { provider: f.faux.provider.id, modelId: f.faux.getModel().id },
-			tools: [child.asTool()],
+			tools: [child.asTool({ detached: toolDetached })],
 		});
 		f.faux.setResponses([
 			fauxAssistantMessage(fauxToolCall(child.asTool().name, {}), { stopReason: "toolUse" }),
@@ -347,7 +378,8 @@ it.each([false, true])(
 				output: "approved",
 			});
 		} else {
-			expect(f.runtime.executions(child.name)[0]?.result?.status).toBe("cancelled");
+			if (toolDetached) expect(f.runtime.executions(child.name)[0]?.status).toBe("suspended");
+			else expect(f.runtime.executions(child.name)[0]?.result?.status).toBe("cancelled");
 			expect(f.runtime.executions("fabrial.pi.run")[0]?.result?.status).toBe("cancelled");
 		}
 		await f.integration.stop();
@@ -398,7 +430,7 @@ it("installs plugin hooks globally but does not select unrequested plugin extens
 it("consumes buffered steering replies with stable request ids", async () => {
 	const f = fixture();
 	const io = await f.chat.resolve(f.metadata.replyTo!);
-	await io.setState({
+	await io.updateState(() => ({
 		interactionId: f.metadata.interactionId,
 		handlerExecutionId: null,
 		agentActive: false,
@@ -411,8 +443,8 @@ it("consumes buffered steering replies with stable request ids", async () => {
 				messageId: "steer",
 				text: "Use the new account",
 				author: {
-					identity: { provider: "slack-test", installationId: "test", subjectId: "alice" },
-					name: "Alice",
+					identity: { provider: "slack-test", installationId: "test", subjectId: "bob" },
+					name: "Bob",
 					isBot: false,
 				},
 				isMention: false,
@@ -420,19 +452,68 @@ it("consumes buffered steering replies with stable request ids", async () => {
 				sentAt: new Date().toISOString(),
 			},
 		],
-	});
+	}));
 	const agent = defineAgent({
 		name: randomUUID(),
 		model: { provider: f.faux.provider.id, modelId: f.faux.getModel().id },
 	});
-	f.faux.setResponses([fauxAssistantMessage("ok"), fauxAssistantMessage("steered")]);
+	const routing = await io.getState();
+	// Admit steering only after the original input finishes. The driver must still drain it.
+	vi.spyOn(io, "getState").mockImplementationOnce(async () => {
+		await expect
+			.poll(async () => {
+				const rows =
+					await sql`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${sessionKey(f.metadata)}`;
+				return rows.some((row) =>
+					(JSON.parse(String(row.writes)) as { type: string; value?: { status?: string } }[]).some(
+						(write) => write.type === "submission" && write.value?.status === "done",
+					),
+				);
+			})
+			.toBe(true);
+		return routing;
+	});
+	f.faux.setResponses([
+		fauxAssistantMessage("ok"),
+		async () => {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			return fauxAssistantMessage("steered");
+		},
+	]);
 	const { result } = await execute(f, {
 		name: randomUUID(),
 		triggers: [],
 		handler: (_input, execution) =>
 			f.integration.agents.run(execution, "agent", agent, { input: "Hello" }),
 	});
-	expect(result?.status).toBe("completed");
+	expect(result).toEqual({ status: "completed", output: "steered" });
+	expect(f.faux.state.callCount).toBe(2);
+	const storage = await PostgresStorage.open(sql, sessionKey(f.metadata));
+	const session = createSession(storage);
+	try {
+		const requestId = JSON.stringify([
+			"fabrial.pi.reply",
+			f.metadata.interactionId,
+			"slack-test",
+			"steer",
+		]);
+		expect(await session.snapshot(Invocation, requestId, BACKGROUND_CONTEXT)).toMatchObject({
+			requestedBy: { id: "bob" },
+			actor: { id: "bob" },
+			interactionId: f.metadata.interactionId,
+			replyTo: f.metadata.replyTo,
+			origin: { provider: "slack-test", threadId: io.ref.threadId, messageId: "steer" },
+		});
+		const runs = await session.snapshot(Runs, BACKGROUND_CONTEXT);
+		const requests = Object.values(runs!.runs).flatMap((run) => Object.values(run.requests ?? {}));
+		expect(requests).toHaveLength(2);
+		for (const request of requests)
+			expect(
+				(await storage.submission(request.submissionId as never, BACKGROUND_CONTEXT))?.status,
+			).toBe("done");
+	} finally {
+		await session.close(BACKGROUND_CONTEXT);
+	}
 	expect((await io.getState())?.bufferedReplies).toHaveLength(0);
 	expect((await io.getState())?.agentActive).toBe(false);
 	await f.integration.stop();
@@ -469,4 +550,130 @@ it("does not promote an unposted channel locator to a Pi Session key", async () 
 	expect(f.runtime.executions("fabrial.pi.run")).toHaveLength(0);
 	expect(f.chat.threads.size).toBe(0);
 	await f.integration.stop();
+});
+
+it("replays a workflow state update after a lost runtime receipt without applying twice", async () => {
+	const f = fixture();
+	const state = defineState({
+		name: randomUUID(),
+		scope: "thread",
+		schema: z.object({ count: z.number() }),
+		initial: () => ({ count: 0 }),
+	});
+	const execution = {
+		executionId: randomUUID(),
+		metadata: f.metadata,
+		signal: new AbortController().signal,
+		step: async (_id: string, fn: () => Promise<unknown>) => fn(),
+	} as DurableExecution;
+	const change = vi.fn((draft: { count: number }) => {
+		draft.count++;
+	});
+	const step = vi.spyOn(execution, "step");
+	step.mockImplementationOnce(async (_id, fn) => {
+		await fn();
+		throw new Error("runtime receipt lost");
+	});
+	await expect(f.integration.state.update(execution, "increment", state, change)).rejects.toThrow(
+		"runtime receipt lost",
+	);
+	await f.integration.state.update(execution, "other", state, (draft) => {
+		draft.count += 10;
+	});
+	expect(await f.integration.state.update(execution, "increment", state, change)).toEqual({
+		count: 1,
+	});
+	expect(change).toHaveBeenCalledTimes(1);
+	expect(await f.integration.state.get(execution, "read", state)).toEqual({ count: 11 });
+});
+
+it("delayed cancellation reconciles lost start receipts and leaves a newer conversation run intact", async () => {
+	const f = fixture();
+	const childWorkflow: RuntimeWorkflow = {
+		name: randomUUID(),
+		triggers: [],
+		handler: async () => null,
+	};
+	f.runtime.register({ workflows: [childWorkflow], events: [] });
+	const key = "fabrial:pi:lost-start";
+	const dedupeKey = JSON.stringify([sessionKey(f.metadata), key]);
+	const child = await f.runtime.invoke(childWorkflow.name, null, {
+		metadata: f.metadata,
+		dedupeKey,
+	});
+	const storage = await PostgresStorage.open(sql, sessionKey(f.metadata));
+	const harness = await Harness.open(
+		storage,
+		{ models: createModels(), registry: createRegistry() },
+		BACKGROUND_CONTEXT,
+	);
+	const conversation = await harness.createConversation(
+		{ ownership: { kind: "ownerless" } },
+		BACKGROUND_CONTEXT,
+	);
+	const oldRequest = "old-request";
+	const current = await harness.commit(async (tx) => {
+		const live = await tx.doc(LiveDoc, conversation.id);
+		const runs = await tx.doc(Runs);
+		await tx.doc(ChildIntents, key, {
+			workflow: childWorkflow.name,
+			input: null,
+			metadata: f.metadata,
+			dedupeKey,
+			detached: false,
+			executionId: null,
+		});
+		const old = await tx.createSubmission({
+			conversationId: conversation.id,
+			requestId: oldRequest,
+			type: "input",
+			status: "queued",
+		});
+		const entry = await tx.appendEntry(conversation.id, {
+			kind: "pi.user",
+			model: [{ role: "user", content: "new request", timestamp: Date.now() }],
+		});
+		const submission = await tx.createSubmission({
+			conversationId: conversation.id,
+			requestId: "new-request",
+			type: "input",
+			status: "placed",
+			entry: entry.id,
+		});
+		const task = await tx.createTask(
+			GenerationTask,
+			{},
+			{ conversationId: conversation.id, ownership: { kind: "conversation" } },
+		);
+		live.run = { taskId: task, inputs: [submission.id] };
+		runs.runs.old = {
+			conversationId: conversation.id,
+			children: {},
+			intents: [key],
+			requests: { [oldRequest]: { content: "old", submissionId: old.id } },
+		};
+		return { task, submission: submission.id, old: old.id };
+	}, BACKGROUND_CONTEXT);
+	await harness.close(BACKGROUND_CONTEXT);
+	await f.integration.workflows.find((workflow) => workflow.name === "fabrial.pi.run")!.onSettled!(
+		"old",
+		f.metadata,
+		{ status: "cancelled", reason: "late cancellation" },
+	);
+	expect(f.runtime.executions(childWorkflow.name)).toHaveLength(1);
+	expect(f.runtime.result(child)).toMatchObject({ status: "cancelled" });
+	const reopened = await PostgresStorage.open(sql, sessionKey(f.metadata));
+	const session = createSession(reopened);
+	try {
+		expect((await reopened.task(current.task, BACKGROUND_CONTEXT))?.abortRequested).toBe(false);
+		expect((await reopened.submission(current.submission, BACKGROUND_CONTEXT))?.status).toBe(
+			"placed",
+		);
+		expect((await reopened.submission(current.old, BACKGROUND_CONTEXT))?.status).toBe("unanswered");
+		expect(
+			(await session.snapshot(LiveDoc, conversation.id, BACKGROUND_CONTEXT))?.run?.taskId,
+		).toBe(current.task);
+	} finally {
+		await session.close(BACKGROUND_CONTEXT);
+	}
 });

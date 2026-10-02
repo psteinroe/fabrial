@@ -5,6 +5,7 @@ import { github } from "@fabrial/github";
 
 const plugin = github({
 	token: process.env.GITHUB_TOKEN!,
+	owner: "acme", // set explicitly for organization repositories
 	webhookSecret: process.env.GITHUB_WEBHOOK_SECRET!,
 	installationId: "acme", // optional for PATs; defaults to "default"
 	userName: "fabrial[bot]",
@@ -30,3 +31,5 @@ Helpers are named exports and properties on `github`:
 Inbound identities use stable numeric GitHub user IDs, including lifecycle authors. Login identities support profile lookup, but **are not automatically equated to numeric identities by core**. Use `userId` in `defineUser` for inbound principal/approval matching. Login alias canonicalization needs an identity-directory contract extension.
 
 Lifecycle routes use core's `EmitOptions.replyTo` for the PR/issue thread and `requestedBy` for its author (not the webhook sender). Multiple plugin aliases and request-scoped multi-tenant clients are not supported by the current Chat provider-id contract.
+
+Both ingress paths reject payloads outside the configured App installation. PATs restrict repository owners to `owner`, or default to the token's authenticated user (resolved via GitHub API and cached; failures remain retryable). An explicit `owner` additionally restricts App repositories. The owner in `repository.full_name` and, when present, `repository.owner.login` must agree with that scope. A numeric PAT `installationId` also rejects conflicting payload installation IDs when present; string installation IDs remain identity namespaces.

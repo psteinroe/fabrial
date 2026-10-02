@@ -39,6 +39,7 @@ export function connect(plugin: AnyPlugin) {
 
 export const options = {
 	token: "token",
+	owner: "acme",
 	webhookSecret: "secret",
 	userName: "bot",
 	botUserId: 99,

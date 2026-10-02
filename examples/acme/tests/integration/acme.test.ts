@@ -65,6 +65,7 @@ beforeEach(async () => {
 	vi.spyOn(engineeringTriage, "resolve").mockImplementation(() => [weeklyRotationForTest()]);
 	const sdkSlack = slack({
 		workspace: "acme",
+		teamId: "T_ACME",
 		botToken: "xoxb-test",
 		signingSecret: "slack-secret",
 	}).chat!.adapter() as Adapter & { webClient: WebClient };
@@ -75,7 +76,7 @@ beforeEach(async () => {
 		calls.push({ method, args, ts });
 		switch (method) {
 			case "auth.test":
-				return { ok: true, user_id: "U_BOT", bot_id: "B_BOT", user: "fabrial" };
+				return { ok: true, team_id: "T_ACME", user_id: "U_BOT", bot_id: "B_BOT", user: "fabrial" };
 			case "users.info":
 				return {
 					ok: true,
@@ -151,11 +152,17 @@ function newApp() {
 		models,
 		piSettings: { retry: { enabled: false } },
 		logger,
-		slack: { workspace: "acme", botToken: "xoxb-test", signingSecret: "slack-secret" },
+		slack: {
+			workspace: "acme",
+			teamId: "T_ACME",
+			botToken: "xoxb-test",
+			signingSecret: "slack-secret",
+		},
 		github: {
 			token: "github-test",
+			owner: "acme",
 			webhookSecret: "github-secret",
-			installationId: "acme",
+			installationId: 42,
 			botUserId: 99,
 			userName: "fabrial",
 			logger,
@@ -273,14 +280,8 @@ async function approval() {
 	const card = calls.find(
 		(c) => c.method === "chat.postMessage" && c.args.channel === "D_U_BOB" && button(c, "Approve"),
 	)!;
-	// Native event waits do not retain pre-registration events; ensure the approval race has subscribed.
-	await expect
-		.poll(async () => {
-			const rows =
-				await sql`SELECT 1 FROM pgconductor._private_custom_event_subscriptions s JOIN pgconductor._private_executions e ON e.id = s.execution_id WHERE e.task_key = 'run-sql' AND e.locked_by IS NULL`;
-			return rows.length;
-		}, poll)
-		.toBe(1);
+	// Click as soon as the card exists: the durable cursor retains decisions even
+	// when delivery precedes wait registration (also after an unauthorized click).
 	return card;
 }
 async function click(card: SlackCall, label: string, user = "U_BOB", receipt = randomUUID()) {
@@ -329,7 +330,9 @@ async function finalReply(text: string) {
 	const thread = await app.host
 		.chat()!
 		.thread({ kind: "thread", provider: "slack", threadId: "slack:C_SUPPORT:1700000000.000001" });
-	await expect.poll(() => thread.getState(), poll).toBeNull();
+	await expect
+		.poll(() => thread.getState(), poll)
+		.toMatchObject({ interactionId: null, handlerExecutionId: null, agentActive: false });
 	expect(calls.some((c) => c.method === "assistant.threads.setStatus" && c.args.status)).toBe(true);
 	// Results, including findings and tool receipts, really reached Pi's Postgres log.
 	expect((await sql`SELECT 1 FROM fabrial_pi.commits`).length).toBeGreaterThan(0);
@@ -345,6 +348,11 @@ it("Slack → Pi tools → triage DM approval → SQL → original thread, inclu
 	await click(card, "Approve", "U_BOB", receipt);
 	await click(card, "Approve", "U_BOB", receipt);
 	await finalReply("Repair applied");
+	// Redelivery of the same Slack message after settlement must not start a new interaction.
+	await mention();
+	const owners = await sql`SELECT id FROM pgconductor._private_executions
+		WHERE task_key = 'general-assistant'`;
+	expect(owners).toHaveLength(1);
 	expect(await balances()).toEqual([{ balance: 10 }, { balance: 100 }]);
 	expect(toolResult).toContain("executed");
 	expect(faux.state.callCount).toBe(3);
@@ -372,6 +380,18 @@ it("requester Cancel request updates the card to Cancelled without writing SQL",
 			c.args.channel === "C_SUPPORT" &&
 			button(c, "Cancel request"),
 	)!;
+	expect(status).toBeDefined();
+	expect(status.args.thread_ts).toBe("1700000000.000001");
+	const [child] = await sql`SELECT payload -> '__fabrial' -> 'metadata' AS metadata
+		FROM pgconductor._private_executions WHERE task_key = 'run-sql'`;
+	expect(child?.metadata).toMatchObject({
+		requestedBy: { id: "alice" },
+		origin: { provider: "slack" },
+		replyTo: { kind: "thread", provider: "slack", threadId: "slack:C_SUPPORT:1700000000.000001" },
+		ownsThread: false,
+		triggerEvent: null,
+		ownerWorkflow: null,
+	});
 	await click(status, "Cancel request", "U_ALICE");
 	await finalReply("declined");
 	expect(await balances()).toEqual([{ balance: 0 }, { balance: 100 }]);
@@ -404,6 +424,16 @@ it("restarts Conductor, Pi and Chat during approval and completes exactly once",
 	scriptRepair();
 	await mention();
 	const card = await approval();
+	// This scenario restarts suspended work, not a still-running card delivery.
+	await expect
+		.poll(async () => {
+			const [row] = await sql`SELECT count(*)::int AS count
+				FROM pgconductor._private_custom_event_subscriptions s
+				JOIN pgconductor._private_executions e ON e.id = s.execution_id
+				WHERE e.task_key = 'run-sql' AND e.locked_by IS NULL`;
+			return row?.count;
+		}, poll)
+		.toBe(1);
 	await app.stop();
 	app = newApp();
 	await app.start();
@@ -437,7 +467,8 @@ it("signed GitHub PR opened webhook has one PR-thread owner plus a changelog obs
 	const payload = {
 		action: "opened",
 		sender: { id: 1, login: "alice" },
-		repository: { full_name: "acme/app" },
+		installation: { id: 42 },
+		repository: { full_name: "acme/app", owner: { login: "acme" } },
 		pull_request: {
 			id: 7,
 			number: 7,
@@ -471,6 +502,7 @@ it("signed GitHub PR opened webhook has one PR-thread owner plus a changelog obs
 	const thread = await app.host
 		.chat()!
 		.thread({ kind: "thread", provider: "github", threadId: "github:acme/app:7" });
+	// Lifecycle ingress emits directly; unlike chat messages it creates no routing tombstone.
 	await expect.poll(() => thread.getState(), poll).toBeNull();
 	await expect
 		.poll(async () => {
@@ -515,7 +547,9 @@ it("#bugs hands off to bugIntake rather than answering in the router", async () 
 	const thread = await app.host
 		.chat()!
 		.thread({ kind: "thread", provider: "slack", threadId: "slack:C_BUGS:1700000000.000001" });
-	await expect.poll(() => thread.getState(), poll).toBeNull();
+	await expect
+		.poll(() => thread.getState(), poll)
+		.toMatchObject({ interactionId: null, handlerExecutionId: null, agentActive: false });
 	expect(calls.some((c) => String(c.args.text).includes("I'll investigate this bug report"))).toBe(
 		true,
 	);

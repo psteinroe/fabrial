@@ -190,9 +190,37 @@ describe("Linear comment ingress", () => {
 		const issue = vi.spyOn(adapter.linearClient, "issue");
 		const env = connect(plugin);
 		expect((await env.connection.routes["POST /linear/events"]!(request({}, "bad"))).status).toBe(
-			400,
+			401,
 		);
 		expect(issue).not.toHaveBeenCalled();
 		expect(env.host.receiveMessage).not.toHaveBeenCalled();
 	});
+});
+
+it.each(["Comment", "Reaction", "OAuthApp", "AgentSessionEvent"])(
+	"rejects signed foreign-organization %s before dispatch",
+	async (type) => {
+		const plugin = linear(options);
+		const adapter = plugin.chat!.adapter() as LinearAdapter;
+		const issue = vi.spyOn(adapter.linearClient, "issue");
+		const response = await adapter.handleWebhook(
+			request({
+				type,
+				action: "create",
+				organizationId: "other",
+				webhookTimestamp: Date.now(),
+				data: {},
+			}),
+		);
+		expect(response.status).toBe(401);
+		expect(issue).not.toHaveBeenCalled();
+	},
+);
+
+it("scopes custom-verifier rewritten bodies as well", async () => {
+	const adapter = linear({
+		...options,
+		webhookVerifier: () => JSON.stringify({ type: "OAuthApp", organizationId: "other" }),
+	}).chat!.adapter() as LinearAdapter;
+	expect((await adapter.handleWebhook(request({ organizationId: "org" }))).status).toBe(401);
 });

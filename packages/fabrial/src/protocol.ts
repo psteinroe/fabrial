@@ -13,6 +13,16 @@ interface ApprovalContext extends ContextOptions {
 	race(id: string, awaitables: Record<string, Awaitable>): Promise<{ key: string; value: Json }>;
 }
 
+function canonical(value: Json): string {
+	if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+	if (value !== null && typeof value === "object")
+		return `{${Object.keys(value)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${canonical(value[key]!)}`)
+			.join(",")}}`;
+	return JSON.stringify(value);
+}
+
 export async function createApproval(
 	id: string,
 	options: ApprovalOptions,
@@ -22,6 +32,7 @@ export async function createApproval(
 	const chat = host.chat();
 	if (!chat) throw new Error("Approvals require a chat integration");
 	const approvalId = `${execution.executionId}:${id}`;
+	const originatingProvider = metadata.origin?.provider ?? metadata.replyTo?.provider;
 	const targets = Array.isArray(options.approvers) ? options.approvers : [options.approvers];
 	const request = await execution.step(`fabrial:${id}:request`, async () => {
 		const resolved: Principal[] = [];
@@ -47,6 +58,11 @@ export async function createApproval(
 			card: options.card ? (options.card as unknown as Json) : null,
 		};
 	});
+	if (request.title !== options.title || canonical(request.details) !== canonical(options.details))
+		throw new Error(
+			`Approval ${id} proposal changed: title/details must match the persisted request`,
+		);
+	const after = await execution.cursor(`fabrial:${id}:cursor`);
 	const approvers = request.approvers as unknown as Principal[];
 	await execution.start(
 		`fabrial:${id}:cleanup`,
@@ -55,6 +71,7 @@ export async function createApproval(
 			executionId: execution.executionId,
 			approvalId,
 			presentationId: approvalId,
+			after,
 			title: request.title,
 		},
 		{
@@ -67,55 +84,74 @@ export async function createApproval(
 			},
 		},
 	);
-	const cards: MessageRef[] = [];
-	for (const [index, approver] of approvers.entries()) {
-		const identity =
-			approver.identities.find((i) => i.provider === metadata.replyTo?.provider) ??
-			approver.identities[0];
-		if (!identity) throw new Error(`Approver ${approver.id} has no chat identity`);
-		const ref = await execution.step(`fabrial:${id}:card:${index}`, async () => {
-			const dm = await chat.openDM(identity);
-			const receipt = await dm.post({
-				card: {
-					...((request.card as unknown as ApprovalOptions["card"]) ?? {
+	const status = metadata.replyTo
+		? ctx.post(
+				`fabrial:${id}:status`,
+				{
+					card: {
 						title: request.title,
-						text:
-							typeof request.details === "string"
-								? request.details
-								: JSON.stringify(request.details),
-					}),
-					actions: [
-						{ id: `fabrial.approval.approve:${approvalId}`, label: "Approve", style: "primary" },
-						{ id: `fabrial.approval.reject:${approvalId}`, label: "Reject", style: "danger" },
-					],
+						text: "Waiting for approval",
+						actions:
+							request.requesterControls === false
+								? []
+								: [{ id: `fabrial.approval.cancel:${approvalId}`, label: "Cancel request" }],
+					},
 				},
-			});
-			await execution.emit(
-				PRESENTATION_EVENT,
-				{ presentationId: approvalId, ref: receipt as unknown as JsonObject },
-				{ id: `${approvalId}:card:${index}` },
-			);
-			return receipt as unknown as JsonObject;
-		});
-		cards.push(ref as unknown as MessageRef);
+				approvalId,
+			)
+		: undefined;
+	const deliveries = await Promise.allSettled([
+		...approvers.map(async (approver, index) => {
+			return (await execution.step(`fabrial:${id}:card:${index}`, async () => {
+				const identities = approver.identities
+					.map((identity, index) => ({ identity, index }))
+					.sort(
+						(a, b) =>
+							Number(b.identity.provider === originatingProvider) -
+								Number(a.identity.provider === originatingProvider) || a.index - b.index,
+					);
+				let dm: Awaited<ReturnType<typeof chat.openDM>> | undefined;
+				for (const { identity } of identities) {
+					try {
+						dm = await chat.openDM(identity);
+						break;
+					} catch {
+						/* Try the next provider identity. */
+					}
+				}
+				if (!dm)
+					throw new Error(`Approver ${approver.id} has no identity whose provider can open DMs`);
+				const receipt = await dm.post({
+					card: {
+						...((request.card as unknown as ApprovalOptions["card"]) ?? {
+							title: request.title,
+							text:
+								typeof request.details === "string"
+									? request.details
+									: JSON.stringify(request.details),
+						}),
+						actions: [
+							{ id: `fabrial.approval.approve:${approvalId}`, label: "Approve", style: "primary" },
+							{ id: `fabrial.approval.reject:${approvalId}`, label: "Reject", style: "danger" },
+						],
+					},
+				});
+				await execution.emit(
+					PRESENTATION_EVENT,
+					{ presentationId: approvalId, ref: receipt as unknown as JsonObject },
+					{ id: `${approvalId}:card:${index}` },
+				);
+				return receipt as unknown as JsonObject;
+			})) as unknown as MessageRef;
+		}),
+		...(status ? [status] : []),
+	]);
+	const cards: MessageRef[] = [];
+	for (const delivery of deliveries) {
+		if (delivery.status === "fulfilled") cards.push(delivery.value);
 	}
-	if (metadata.replyTo) {
-		const ref = await ctx.post(
-			`fabrial:${id}:status`,
-			{
-				card: {
-					title: request.title,
-					text: "Waiting for approval",
-					actions:
-						request.requesterControls === false
-							? []
-							: [{ id: `fabrial.approval.cancel:${approvalId}`, label: "Cancel request" }],
-				},
-			},
-			approvalId,
-		);
-		cards.push(ref as unknown as MessageRef);
-	}
+	const failed = deliveries.find((delivery) => delivery.status === "rejected");
+	if (failed?.status === "rejected") throw failed.reason;
 
 	const render = async (decision: ApprovalDecision, reason?: string) => {
 		const label =
@@ -150,6 +186,7 @@ export async function createApproval(
 			kind: "event",
 			event: "fabrial.approval.decided",
 			filter: { approvalId: [approvalId] },
+			after,
 		},
 		deadline: request.deadline,
 		prepare: async () => ({ ready: !!resolution, value: (resolution as unknown as Json) ?? null }),

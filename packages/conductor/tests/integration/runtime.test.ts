@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "vitest
 import {
 	EXECUTION_SETTLED_EVENT,
 	defineEvent,
+	defineUser,
 	definePlugin,
 	defineWorkflow,
 	fabrial,
@@ -14,6 +15,7 @@ import {
 	type Json,
 	type RuntimeWorkflow,
 	type WaitBranch,
+	type EventCursor,
 } from "fabrial";
 import { FakeChat } from "fabrial/testing";
 import { z } from "zod";
@@ -157,13 +159,16 @@ test("event wait suspends, filters payload fields, resumes and returns a clean e
 			const event = await ctx.waitForEvent("wait", {
 				event: "test.event",
 				filter: { key: ["yes"], amount: [{ numeric: [">", 2] }] },
-				timeoutMs: 5_000,
+				deadline: await ctx.step("deadline", () => Date.now() + 5_000),
 			});
 			received.push(event);
 			return event;
 		}),
 		workflow("timeout", async (_input, ctx) => {
-			const result = await ctx.waitForEvent("wait", { event: "test.other", timeoutMs: 30 });
+			const result = await ctx.waitForEvent("wait", {
+				event: "test.other",
+				deadline: await ctx.step("deadline", () => Date.now() + 30),
+			});
 			received.push(result);
 			return result;
 		}),
@@ -173,16 +178,319 @@ test("event wait suspends, filters payload fields, resumes and returns a clean e
 	await runtime.emit("test.event", { key: "no", amount: 4 }, { metadata });
 	await runtime.emit("test.event", { key: "yes", amount: 4 }, { metadata });
 	await expect.poll(() => completed(id), poll).toBe(true);
-	expect(received).toEqual([{ name: "test.event", payload: { key: "yes", amount: 4 } }]);
+	expect(received).toEqual([
+		{ name: "test.event", payload: { key: "yes", amount: 4 }, cursor: expect.any(String) },
+	]);
 	expect(effects).toBe(1);
 	const timeout = await runtime.invoke("timeout", {}, { metadata });
 	await expect.poll(() => completed(timeout), poll).toBe(true);
 	expect(received.at(-1)).toBeNull();
 });
 
-test.todo(
-	"SHIM(conductor#1): a reply emitted in the preceding side-effect step must satisfy the subsequent wait",
-);
+test("SHIM(conductor#1): pre-registration replies after a memoized cursor are buffered; chained cursors lose nothing", async () => {
+	const cursors: EventCursor[] = [];
+	const received: Json[] = [];
+	let effects = 0;
+	const runtime = await setup([
+		workflow("approval", async (_input, ctx) => {
+			await ctx.step("stale", () => ctx.emit("test.event", { key: "approval", amount: 0 }));
+			const after = await ctx.cursor("before-card");
+			cursors.push(after);
+			const deadline = await ctx.step("deadline", () => Date.now() + 5_000);
+			await ctx.step("post-card", async () => {
+				effects++;
+				// Two fast clicks arrive while posting the card, before either wait registers.
+				await Promise.all(
+					[1, 2].map((amount) => ctx.emit("test.event", { key: "approval", amount })),
+				);
+				await ctx.emit("test.event", { key: "different-approval", amount: 3 });
+			});
+			const first = await ctx.waitForEvent("first", {
+				event: "test.event",
+				filter: { key: ["approval"] },
+				after,
+				deadline,
+			});
+			expect(first).not.toBeNull();
+			const second = await ctx.waitForEvent("second", {
+				event: "test.event",
+				filter: { key: ["approval"] },
+				after: first!.cursor,
+				deadline,
+			});
+			expect(second).not.toBeNull();
+			received.push([first, second]);
+			await ctx.sleep("replay", 20);
+			return [first, second];
+		}),
+	]);
+	const id = await runtime.invoke("approval", null, { metadata });
+	await expect.poll(() => completed(id), poll).toBe(true);
+	expect(effects).toBe(1);
+	expect(new Set(cursors).size).toBe(1);
+	expect(received[1]).toEqual(received[0]);
+	const events = received[0] as { payload: { amount: number }; cursor: string }[];
+	expect(events.map((event) => event.payload.amount).sort((a, b) => a - b)).toEqual([1, 2]);
+	expect(BigInt(events[0]!.cursor.split(":")[1]!)).toBeLessThan(
+		BigInt(events[1]!.cursor.split(":")[1]!),
+	);
+});
+
+test("cursor waits ignore pre-cursor events, even when retained and correlated", async () => {
+	let received: Json | undefined;
+	const runtime = await setup([
+		workflow("stale", async (_input, ctx) => {
+			await ctx.step("old-click", () => ctx.emit("test.event", { key: "approval" }));
+			const after = await ctx.cursor("before-card");
+			received = await ctx.waitForEvent("decision", {
+				event: "test.event",
+				filter: { key: ["approval"] },
+				after,
+				deadline: await ctx.step("deadline", () => Date.now() + 200),
+			});
+			return received;
+		}),
+	]);
+	const id = await runtime.invoke("stale", null, { metadata });
+	await expect.poll(() => completed(id), poll).toBe(true);
+	expect(received).toBeNull();
+});
+
+test("receipt retention supports correlated waits at 30 days and survives restart", async () => {
+	let received: Json | undefined;
+	const definition = workflow("retained", async (_input, ctx) => {
+		const after = await ctx.cursor("before-card");
+		await ctx.waitForEvent("gate", { event: "test.other" });
+		received = await ctx.waitForEvent("approval", {
+			event: "test.event",
+			filter: { key: ["approval"] },
+			after,
+			deadline: await ctx.step("deadline", () => Date.now() + 1_000),
+		});
+		return received;
+	});
+	const first = await setup([definition]);
+	const id = await first.invoke("retained", null, { metadata });
+	await waiting(id);
+	await first.emit("test.event", { key: "approval" }, { metadata, id: "click" });
+	await sql`update pgconductor._private_executions set created_at = now() - interval '30 days'
+		where task_key = 'pgconductor.event-dispatch' and payload ->> 'eventKey' = 'test.event'`;
+	await first.stop();
+	runtimes = runtimes.filter((entry) => entry !== first);
+	const second = await setup([definition]);
+	await second.emit("test.other", {}, { metadata });
+	await expect.poll(() => completed(id), poll).toBe(true);
+	expect(received).toEqual({
+		name: "test.event",
+		payload: { key: "approval" },
+		cursor: expect.any(String),
+	});
+});
+
+test("cursor capture waits for concurrent emitter commit, not just sequence allocation", async () => {
+	const received: Json[] = [];
+	const runtime = await setup([
+		workflow("capture", async (_input, ctx) => {
+			const after = await ctx.cursor("capture");
+			received.push(
+				await ctx.waitForEvent("wait", {
+					event: "test.event",
+					after,
+					deadline: await ctx.step("deadline", () => Date.now() + 150),
+				}),
+			);
+			return null;
+		}),
+	]);
+	// Block an emit AFTER it allocates its position but BEFORE its receipt commits.
+	await sql.unsafe(`create function public.delay_receipt() returns trigger language plpgsql as $$
+		begin
+			if new.task_key = 'pgconductor.event-dispatch' then perform pg_advisory_xact_lock(724831, 2); end if;
+			return new;
+		end $$;
+		create trigger delay_receipt before insert on pgconductor._private_executions
+		for each row execute function public.delay_receipt()`);
+	let unblock!: () => void;
+	let held!: () => void;
+	const ready = new Promise<void>((resolve) => {
+		held = resolve;
+	});
+	const blocking = sql.begin(async (transaction) => {
+		await transaction`select pg_advisory_xact_lock(724831, 2)`;
+		held();
+		await new Promise<void>((resolve) => {
+			unblock = resolve;
+		});
+	});
+	await ready;
+	let id: string | undefined;
+	const emitting = runtime.emit("test.event", { key: "before-cursor" }, { metadata });
+	try {
+		await expect
+			.poll(async () => {
+				const [row] = await sql<{ waiting: boolean }[]>`select exists(select 1 from pg_locks
+				where locktype = 'advisory' and classid = 724831 and objid = 2 and not granted) as waiting`;
+				return row?.waiting;
+			}, poll)
+			.toBe(true);
+		id = await runtime.invoke("capture", null, { metadata });
+		await expect
+			.poll(async () => {
+				const [row] = await sql<{ waiting: boolean }[]>`select exists(select 1 from pg_locks
+				where locktype = 'advisory' and classid = 724831 and objid = 1 and not granted) as waiting`;
+				return row?.waiting;
+			}, poll)
+			.toBe(true);
+	} finally {
+		unblock();
+		await blocking;
+		await emitting;
+	}
+	await expect.poll(() => completed(id!), poll).toBe(true);
+	// The delayed emit committed before capture completed: it must be excluded.
+	expect(received).toEqual([null]);
+});
+
+for (const timely of [true, false]) {
+	test(`buffered event emitted ${timely ? "before" : "after"} deadline competes deterministically with expired timer`, async () => {
+		let received: Json | undefined;
+		const runtime = await setup([
+			workflow("deadline-race", async (_input, ctx) => {
+				const after = await ctx.cursor("before-card");
+				const deadline = await ctx.step("deadline", () => Date.now() + 150);
+				await ctx.step("side-effect", async () => {
+					if (!timely) await sql`select pg_sleep(0.2)`;
+					await ctx.emit("test.event", { key: "approval" });
+					if (timely) await sql`select pg_sleep(0.2)`;
+				});
+				received = await ctx.waitForEvent("decision", { event: "test.event", after, deadline });
+				return received;
+			}),
+		]);
+		const id = await runtime.invoke("deadline-race", null, { metadata });
+		await expect.poll(() => completed(id), poll).toBe(true);
+		expect(received).toEqual(
+			timely
+				? { name: "test.event", payload: { key: "approval" }, cursor: expect.any(String) }
+				: null,
+		);
+	});
+}
+
+for (const kind of ["event", "timer"] as const) {
+	test(`absolute ${kind} deadline does not drift earlier across polling replays`, async () => {
+		let began = 0;
+		let ended = 0;
+		let attempts = 0;
+		const runtime = await setup([
+			workflow("deadline", async (_input, ctx) => {
+				attempts++;
+				began = await ctx.step("began", () => Date.now());
+				const at = began + 600;
+				if (kind === "event")
+					expect(await ctx.waitForEvent("wait", { event: "test.event", deadline: at })).toBeNull();
+				else
+					expect(await ctx.waitForAny("wait", { timeout: { kind: "timer", at } })).toEqual({
+						key: "timeout",
+						kind: "timer",
+					});
+				ended = Date.now();
+				return null;
+			}),
+		]);
+		const id = await runtime.invoke("deadline", null, { metadata });
+		await expect.poll(() => completed(id), poll).toBe(true);
+		expect(attempts).toBeGreaterThan(2);
+		expect(ended - began).toBeGreaterThanOrEqual(590);
+	});
+}
+
+test("dispatchOwner wins concurrent owner/observer emissions on the same workflow, including observer-first insertion", async () => {
+	const seen: { input: Json; metadata: InvocationMetadata }[] = [];
+	const withThread: InvocationMetadata = {
+		...metadata,
+		replyTo: { kind: "thread", provider: "test", threadId: "thread" },
+	};
+	const definitions = [
+		workflow(
+			"mixed",
+			async (input, ctx) => {
+				seen.push({ input, metadata: ctx.metadata });
+				return null;
+			},
+			{
+				triggers: [
+					{ event: "test.event", role: "owner" },
+					{ event: "test.other", role: "observer" },
+				],
+			},
+		),
+	];
+	const first = await setup(definitions);
+	for (let i = 0; i < 12; i++) {
+		const options = {
+			metadata: withThread,
+			id: `delivery-${i}`,
+			dispatchId: `ingress-${i}`,
+			dispatchOwner: { workflow: "mixed", event: "test.event" },
+		};
+		await Promise.all([
+			first.emit("test.other", { key: `observer-${i}` }, options),
+			first.emit("test.event", { key: `owner-${i}` }, { ...options, owner: "mixed" }),
+		]);
+	}
+	// Force the old bug: observer routing completes before the owner even emits.
+	const options = {
+		metadata: withThread,
+		id: "delayed",
+		dispatchId: "delayed",
+		dispatchOwner: { workflow: "mixed", event: "test.event" },
+	};
+	await first.emit("test.other", { key: "observer-delayed" }, options);
+	await expect
+		.poll(async () => {
+			const [row] = await sql<
+				{ done: boolean }[]
+			>`select completed_at is not null as done from pgconductor._private_executions
+			where task_key = 'fabrial.route:mixed' and payload -> 'payload' ->> 'key' = 'observer-delayed'`;
+			return row?.done;
+		}, poll)
+		.toBe(true);
+	await first.emit("test.event", { key: "owner-delayed" }, { ...options, owner: "mixed" });
+	await expect.poll(() => seen.length, poll).toBe(13);
+	expect(seen.every((entry) => (entry.input as { key: string }).key.startsWith("owner-"))).toBe(
+		true,
+	);
+	for (const entry of seen) expect(entry.metadata).toEqual(withThread);
+	// Handler bodies are replayable: wait for native settlement before restarting.
+	await expect
+		.poll(async () => {
+			const [row] = await sql<
+				{ count: number }[]
+			>`select count(*)::int as count from pgconductor._private_executions
+			where task_key = 'mixed' and completed_at is not null`;
+			return row?.count;
+		}, poll)
+		.toBe(13);
+	await first.stop();
+	runtimes = runtimes.filter((entry) => entry !== first);
+	const second = await setup(definitions);
+	await second.emit("test.other", { key: "observer-redelivery" }, { ...options, id: "again" });
+	await second.emit(
+		"test.event",
+		{ key: "owner-redelivery" },
+		{ ...options, id: "again", owner: "mixed" },
+	);
+	await expect
+		.poll(async () => {
+			const [row] = await sql<
+				{ count: number }[]
+			>`select count(*)::int as count from pgconductor._private_executions where task_key = 'fabrial.route:mixed' and completed_at is not null`;
+			return row?.count;
+		}, poll)
+		.toBe(28);
+	expect(seen).toHaveLength(13);
+});
 
 test("owner routing, observers, overlapping subscriptions, clean payload and concurrent emit dedupe", async () => {
 	const seen: { workflow: string; input: Json; metadata: InvocationMetadata }[] = [];
@@ -310,7 +618,13 @@ for (const winner of ["first", "second", "child", "timer"] as const) {
 					first: { kind: "event", event: "test.event", filter: { key: ["first"] } },
 					second: { kind: "event", event: "test.event", filter: { key: ["second"] } },
 					child: { kind: "execution", executionId: childId },
-					timer: { kind: "timer", ms: winner === "timer" ? 1_000 : 10_000 },
+					timer: {
+						kind: "timer",
+						at: await ctx.step(
+							"deadline",
+							() => Date.now() + (winner === "timer" ? 1_000 : 10_000),
+						),
+					},
 				};
 				result = await ctx.waitForAny("race", branches);
 				await ctx.sleep("replay-winner", 30);
@@ -329,7 +643,12 @@ for (const winner of ["first", "second", "child", "timer"] as const) {
 				? { key: "child", kind: "execution", result: { status: "completed", output: 42 } }
 				: winner === "timer"
 					? { key: "timer", kind: "timer" }
-					: { key: winner, kind: "event", event: { name: "test.event", payload: { key: winner } } },
+					: {
+							key: winner,
+							kind: "event",
+							event: { name: "test.event", payload: { key: winner } },
+							cursor: expect.any(String),
+						},
 		);
 		const [row] = await sql<
 			{ count: number }[]
@@ -481,7 +800,11 @@ test("restart preserves native wait subscriptions and memoized effects", async (
 	await second.emit("test.event", { key: "restart" }, { metadata });
 	await expect.poll(() => completed(id), poll).toBe(true);
 	expect(effects).toBe(1);
-	expect(result).toEqual({ name: "test.event", payload: { key: "restart" } });
+	expect(result).toEqual({
+		name: "test.event",
+		payload: { key: "restart" },
+		cursor: expect.any(String),
+	});
 });
 
 test("retry exhaustion and suspended cancellation emit terminal notifications the core cannot see", async () => {
@@ -654,7 +977,7 @@ test("waitForAny resumes across restart and can wait on the execution-settled ev
 				event: EXECUTION_SETTLED_EVENT,
 				filter: { executionId: [input as string] },
 			},
-			timeout: { kind: "timer", ms: 10_000 },
+			timeout: { kind: "timer", at: await ctx.step("deadline", () => Date.now() + 10_000) },
 		});
 		return result;
 	});
@@ -676,6 +999,7 @@ test("waitForAny resumes across restart and can wait on the execution-settled ev
 	expect(result).toEqual({
 		key: "settled",
 		kind: "event",
+		cursor: expect.any(String),
 		event: {
 			name: EXECUTION_SETTLED_EVENT,
 			payload: { executionId: row!.payload.input, result: { status: "completed", output: "done" } },
@@ -1130,7 +1454,7 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 			const event = await execution.waitForEvent("reply", {
 				event: "test.reply",
 				filter: { key: ["reply"] },
-				timeoutMs: 5_000,
+				deadline: await ctx.step("deadline", () => Date.now() + 5_000),
 			});
 			return { output, event };
 		},
@@ -1143,7 +1467,7 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 	const thread = await chat.thread(surface);
 	expect((await thread.getState())?.handlerExecutionId).toBe(parentId);
 	expect(thread.posts).toHaveLength(1);
-	// Do not emit before registration: the native wait still has the documented #1 gap.
+	// With no after cursor this wait intentionally starts at registration.
 	await app.emit("test.reply", { key: "wrong" });
 	await app.emit("test.reply", { key: "reply" }, { id: "reply" });
 	await expect.poll(() => completed(parentId!), poll).toBe(true);
@@ -1157,7 +1481,7 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 	`;
 	expect(row?.result.result).toEqual({
 		output: "go:child",
-		event: { name: "test.reply", payload: { key: "reply" } },
+		event: { name: "test.reply", payload: { key: "reply" }, cursor: expect.any(String) },
 	});
 	await expect
 		.poll(async () => {
@@ -1211,4 +1535,78 @@ test("start reconnects to its completed child after losing the memoized submissi
 		{ id: string }[]
 	>`select id from pgconductor._private_executions where task_key = 'child'`;
 	expect(rows).toHaveLength(1);
+});
+
+test("core approval accepts an authenticated click during card delivery, before registration", async () => {
+	const runtime = conductor(
+		{ sql },
+		{
+			logger,
+			worker: { pollIntervalMs: 20, flushIntervalMs: 20, concurrency: 8 },
+			pollIntervalMs: 50,
+		},
+	);
+	runtimes.push(runtime);
+	const chat = new FakeChat();
+	const alice = defineUser({
+		id: "alice",
+		name: "Alice",
+		identities: [{ provider: "test", installationId: "workspace", subjectId: "alice" }],
+	});
+	const dm = await chat.openDM(alice.identities[0]!);
+	const post = dm.post.bind(dm);
+	let clicks = 0;
+	dm.post = async (content) => {
+		const ref = await post(content);
+		if (typeof content === "object" && "card" in content) {
+			const action = content.card.actions?.find((action) =>
+				action.id.startsWith("fabrial.approval.approve:"),
+			);
+			if (action) {
+				const approvalId = action.id.slice("fabrial.approval.approve:".length);
+				const [row] = await sql<
+					{ count: number }[]
+				>`select count(*)::int as count from pgconductor._private_custom_event_subscriptions
+					where execution_id = ${approvalId.split(":")[0]!}::uuid and event_key = 'fabrial.approval.decided'`;
+				expect(row?.count).toBe(0);
+				clicks++;
+				await chat.click(ref, action.id, alice.identities[0]!, { dedupeId: "fast-click" });
+			}
+		}
+		return ref;
+	};
+	let parentId: string | undefined;
+	let decision: Json | undefined;
+	const plugin = definePlugin({
+		id: "test",
+		events: { begin: defineEvent({ payload: z.object({ key: z.string() }) }) },
+	});
+	const parent = defineWorkflow({
+		name: "core-approval",
+		triggers: [trigger({ event: "test.begin" })],
+		run: async (_input, ctx) => {
+			parentId = ctx.executionId;
+			decision = (
+				await ctx.waitForApproval("approve-sql", {
+					title: "Run SQL?",
+					details: "select 1",
+					approvers: alice,
+					timeout: 5_000,
+				})
+			).status;
+			await ctx.sleep("replay", 20);
+			return decision;
+		},
+	});
+	const app = fabrial({ runtime, chat, plugins: [plugin], workflows: [parent], identity: [alice] });
+	await app.start();
+	await app.emit("test.begin", { key: "go" }, { id: "approval" });
+	await expect.poll(() => parentId, poll).toBeDefined();
+	await expect.poll(() => completed(parentId!), poll).toBe(true);
+	expect(decision).toBe("approved");
+	expect(clicks).toBe(1);
+	expect(dm.posts).toHaveLength(1);
+	expect(dm.posts[0]!.content).toMatchObject({ card: { text: "Approved by Alice", actions: [] } });
+	await app.stop();
+	runtimes = runtimes.filter((entry) => entry !== runtime);
 });

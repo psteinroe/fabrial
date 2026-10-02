@@ -11,13 +11,13 @@ import {
 	type WaitBranch,
 	type WaitForAnyResult,
 	type ExecutionResult,
+	type EventCursor,
 } from "fabrial";
 import {
 	Conductor,
 	Orchestrator,
 	TaskSchemas,
 	EventSchemas,
-	WaitForEventTimeoutError,
 	type TaskContext,
 	type AnyTask,
 	type Logger,
@@ -30,6 +30,7 @@ import {
 const RESERVED = "__fabrial";
 const DISPATCH_QUEUE = "pgconductor.internal";
 const DISPATCH_TASK = "pgconductor.event-dispatch";
+const EVENT_STREAM_LOCK = [724831, 1] as const;
 const emptyMetadata = (interactionId: string): InvocationMetadata => ({
 	interactionId,
 	origin: null,
@@ -42,6 +43,7 @@ type Carrier = {
 	metadata: InvocationMetadata;
 	owner?: string;
 	dispatchId?: string;
+	dispatchOwner?: { workflow: string; event: string };
 	parent?: string;
 	cancelReason?: string;
 };
@@ -59,7 +61,7 @@ function release(ctx: TaskContext, ms: number): Promise<never> {
 	).opts.abortController.abort({
 		__pgconductorTaskAborted: true,
 		reason: "released",
-		reschedule_in_ms: ms,
+		reschedule_in_ms: Math.ceil(ms),
 	});
 	return new Promise(() => {});
 }
@@ -178,6 +180,10 @@ function retainDispatchReceipts(orchestrator: Orchestrator): void {
 function operationId(id: string): string {
 	if (id.startsWith("__fabrial:")) throw new Error("Reserved Fabrial operation id");
 	return id;
+}
+function cursorPosition(cursor: EventCursor): string {
+	if (!/^pgconductor:[0-9]+$/.test(cursor)) throw new Error("Invalid event cursor");
+	return cursor.slice("pgconductor:".length);
 }
 function duration(ms: number): number {
 	if (!Number.isFinite(ms) || ms < 0) throw new Error("Invalid duration");
@@ -347,6 +353,15 @@ class ConductorRuntime implements DurableRuntime {
 												.terms,
 										),
 								);
+							// Canonical ownership is carried on every category of the ingress. Suppress
+							// this workflow's competing observer submissions BEFORE insert-on-conflict.
+							const dispatchOwner = payload && carrier(payload).dispatchOwner;
+							if (
+								dispatchOwner &&
+								dispatchOwner.workflow === definition.name &&
+								(event.name !== dispatchOwner.event || !isOwner)
+							)
+								return {};
 							const metadata = {
 								...inherited,
 								ownsThread: Boolean(isOwner && inherited.ownsThread),
@@ -404,8 +419,10 @@ class ConductorRuntime implements DurableRuntime {
 		payload: JsonObject,
 		dedupe?: string,
 		group?: string,
+		isEvent = false,
 	): Promise<string> {
 		return this.sql.begin(async (sql) => {
+			if (isEvent) payload = { ...payload, __fabrialCursor: await this.position(sql) };
 			const rows = await sql<{ id: string }[]>`
 				insert into pgconductor._private_executions (task_key, queue, payload, dedupe_key, "group")
 				values (${task}, ${queue}, ${sql.json(payload)}, ${dedupe ?? null}, ${group ?? null})
@@ -418,6 +435,23 @@ class ConductorRuntime implements DurableRuntime {
 			if (!existing) throw new Error("Execution receipt was removed concurrently");
 			return existing.id;
 		});
+	}
+	// SHIM(conductor#1): nextval alone is not enough: an earlier emitter could commit
+	// after a cursor and disappear behind it. Hold the same database-wide lock through
+	// receipt commit and cursor capture. Sequence gaps (rollback/dedupe) are harmless.
+	private async position(sql: postgres.TransactionSql): Promise<EventCursor> {
+		await sql`select pg_advisory_xact_lock(${EVENT_STREAM_LOCK[0]}, ${EVENT_STREAM_LOCK[1]})`;
+		const [existing] = await sql<
+			{ exists: boolean }[]
+		>`select to_regclass('pgconductor.__fabrial_event_position') is not null as exists`;
+		if (!existing!.exists) await sql`create sequence pgconductor.__fabrial_event_position`;
+		const [row] = await sql<{ position: string }[]>`
+			select nextval('pgconductor.__fabrial_event_position')::text as position
+		`;
+		return `pgconductor:${row!.position}`;
+	}
+	private captureCursor(): Promise<EventCursor> {
+		return this.sql.begin((sql) => this.position(sql));
 	}
 	private async launch(
 		name: string,
@@ -449,7 +483,13 @@ class ConductorRuntime implements DurableRuntime {
 	async emit(
 		event: string,
 		payload: JsonObject,
-		options: { id?: string; metadata: InvocationMetadata; owner?: string; dispatchId?: string },
+		options: {
+			id?: string;
+			metadata: InvocationMetadata;
+			owner?: string;
+			dispatchId?: string;
+			dispatchOwner?: { workflow: string; event: string };
+		},
 	): Promise<void> {
 		this.assertReady();
 		this.event(event);
@@ -466,11 +506,14 @@ class ConductorRuntime implements DurableRuntime {
 						metadata: options.metadata,
 						...(options.owner ? { owner: options.owner } : {}),
 						...(options.dispatchId !== undefined ? { dispatchId: options.dispatchId } : {}),
+						...(options.dispatchOwner ? { dispatchOwner: options.dispatchOwner } : {}),
 					},
 					__fabrialOwner: options.owner ?? null,
 				},
 			},
 			options.id === undefined ? undefined : JSON.stringify([event, options.id]),
+			undefined,
+			true,
 		);
 	}
 
@@ -611,22 +654,23 @@ class ConductorRuntime implements DurableRuntime {
 				await raw.checkpoint();
 				await raw.sleep(id, ms);
 			},
+			cursor: (id) => raw.step(operationId(id), () => this.captureCursor()),
 			waitForEvent: async (id, options) => {
 				operationId(id);
-				await raw.checkpoint();
-				try {
-					// SHIM(conductor#1): earlier events (including fast replies before registration) are
-					// lost. Use the native wait; do not pretend this is race-safe until upstream fixes it.
-					const event = await raw.waitForEvent(id, {
-						event: this.event(options.event),
-						filter: options.filter as never,
-						timeout: options.timeoutMs,
-					});
-					return { name: event.name, payload: clean(event.payload) };
-				} catch (error) {
-					if (error instanceof WaitForEventTimeoutError) return null;
-					throw error;
-				}
+				const branches: Record<string, WaitBranch> = {
+					event: {
+						kind: "event",
+						event: options.event,
+						filter: options.filter,
+						after: options.after,
+					},
+				};
+				if (options.deadline !== undefined)
+					branches.timeout = { kind: "timer", at: options.deadline };
+				const winner = await this.waitForAny(raw, id, branches);
+				if (winner.kind === "timer") return null;
+				if (winner.kind !== "event") throw new Error("Invalid event result");
+				return { ...winner.event, cursor: winner.cursor };
 			},
 			waitForAny: (id, branches) => this.waitForAny(raw, operationId(id), branches),
 			start,
@@ -649,7 +693,15 @@ class ConductorRuntime implements DurableRuntime {
 					child: { kind: "execution", executionId: child },
 				};
 				if (options?.timeoutMs !== undefined)
-					branches.timeout = { kind: "timer", ms: options.timeoutMs };
+					branches.timeout = {
+						kind: "timer",
+						at: await raw.step(`__fabrial:invoke:${id}:deadline`, async () => {
+							const [row] = await this.sql<
+								{ at: number }[]
+							>`select extract(epoch from pgconductor._private_current_time())::double precision * 1000 as at`;
+							return row!.at + options.timeoutMs!;
+						}),
+					};
 				const winner = await this.waitForAny(raw, id, branches);
 				if (winner.kind === "timer") {
 					if (!options?.detached) await this.cancel(child, "Parent invocation timed out");
@@ -676,8 +728,8 @@ class ConductorRuntime implements DurableRuntime {
 		const entries = Object.entries(branches);
 		if (!entries.length) throw new Error("waitForAny requires at least one branch");
 		for (const [, branch] of entries)
-			if (branch.kind === "timer" && (!Number.isFinite(branch.ms) || branch.ms < 0))
-				throw new Error("Invalid timer duration");
+			if (branch.kind === "timer" && (!Number.isFinite(branch.at) || branch.at < 0))
+				throw new Error("Invalid timer deadline");
 		await raw.checkpoint();
 		const execution = nativeExecution(raw);
 		const key = `__fabrial:any:${id}`;
@@ -689,35 +741,52 @@ class ConductorRuntime implements DurableRuntime {
 		// SHIM(conductor#6): register native subscriptions under branch keys, then poll durable
 		// receipts/results/timers. No worker is occupied while waiting. Losing subscriptions are
 		// removed in the transaction saving the winner. Ready branches use database timestamps, with
-		// record order breaking millisecond ties. Retained dispatch receipts bridge claim-time races.
-		const began = await raw.step(`${key}:began`, async () => {
-			const [row] = await this.sql<
-				{ now: string }[]
-			>`select pgconductor._private_current_time()::text as now`;
-			return row!.now;
-		});
+		// stream order breaking event ties, then record order. Retained dispatch receipts bridge claim-time races.
+		const boundary = await raw.step(`${key}:cursor`, () => this.captureCursor());
+		const positions = entries.flatMap(([, branch]) =>
+			branch.kind === "event" ? [cursorPosition(branch.after ?? boundary)] : [],
+		);
+		const earliest = positions.reduce(
+			(a, b) => (BigInt(a) < BigInt(b) ? a : b),
+			cursorPosition(boundary),
+		);
 		// One statement observes every branch and its clock together; serial branch reads could
 		// otherwise pick a late event over a timer that expired while another branch was queried.
-		const observed = await this.sql<
-			(Omit<TerminalRow, "id"> & { id: string | null; created_at: Date; observed_at: Date })[]
-		>`
+		// Observe only committed receipts: an in-flight pre-deadline emitter must finish
+		// before an expired timer can win. Later emitters timestamp their receipt after this clock.
+		const observed = await this.sql.begin(async (sql) => {
+			await sql`select pg_advisory_xact_lock(${EVENT_STREAM_LOCK[0]}, ${EVENT_STREAM_LOCK[1]})`;
+			return sql<
+				(Omit<TerminalRow, "id"> & {
+					id: string | null;
+					event_at: number;
+					settled_at: number | null;
+					observed_at: number;
+				})[]
+			>`
 			with clock as materialized (select pgconductor._private_current_time() as observed_at)
-			select e.*, s.result, clock.observed_at from clock
+			select e.*, s.result,
+				extract(epoch from clock.observed_at)::double precision * 1000 as observed_at,
+				extract(epoch from e.created_at)::double precision * 1000 as event_at,
+				extract(epoch from coalesce(e.failed_at, e.completed_at))::double precision * 1000 as settled_at
+			from clock
 			left join pgconductor._private_executions e on (
 				(e.queue = ${DISPATCH_QUEUE} and e.task_key = ${DISPATCH_TASK}
 				and e.payload ->> 'eventKey' = any(${entries.flatMap(([, branch]) => (branch.kind === "event" ? [branch.event] : []))}::text[])
-				and e.created_at > ${began}::timestamptz)
+				and (e.payload ->> '__fabrialCursor') like 'pgconductor:%'
+				and substring(e.payload ->> '__fabrialCursor' from 13)::bigint > ${earliest}::bigint)
 				or e.id = any(${entries.flatMap(([, branch]) => (branch.kind === "execution" ? [branch.executionId] : []))}::uuid[])
 			)
 			left join pgconductor._private_steps s on s.execution_id = e.id and s.key = '__fabrial:output'
-			order by e.created_at, e.id
+			order by substring(e.payload ->> '__fabrialCursor' from 13)::bigint, e.created_at, e.id
 		`;
-		const now = observed[0]!.observed_at.getTime();
-		const candidates: { result: WaitForAnyResult; at: number }[] = [];
+		});
+		const now = observed[0]!.observed_at;
+		const candidates: { result: WaitForAnyResult; at: number; position?: string }[] = [];
 		let delay = this.pollMs;
 		for (const [name, branch] of entries) {
 			if (branch.kind === "timer") {
-				const at = new Date(began).getTime() + branch.ms;
+				const at = branch.at;
 				const remaining = at - now;
 				if (remaining <= 0) candidates.push({ result: { key: name, kind: "timer" }, at });
 				if (remaining > 0) delay = Math.min(delay, remaining);
@@ -728,7 +797,7 @@ class ConductorRuntime implements DurableRuntime {
 				if (result)
 					candidates.push({
 						result: { key: name, kind: "execution", result },
-						at: (row.failed_at ?? row.completed_at)?.getTime() ?? now,
+						at: row.settled_at ?? now,
 					});
 			} else {
 				const branchKey = `${key}:event:${name}`;
@@ -738,6 +807,8 @@ class ConductorRuntime implements DurableRuntime {
 						row.id !== null &&
 						row.task_key === DISPATCH_TASK &&
 						row.payload.eventKey === branch.event &&
+						BigInt(cursorPosition(row.payload.__fabrialCursor as string)) >
+							BigInt(cursorPosition(branch.after ?? boundary)) &&
 						matchesTerms(row.payload.payload as JsonObject, compiled.terms),
 				);
 				if (event) {
@@ -746,8 +817,10 @@ class ConductorRuntime implements DurableRuntime {
 							key: name,
 							kind: "event",
 							event: { name: branch.event, payload: clean(event.payload.payload as JsonObject) },
+							cursor: event.payload.__fabrialCursor as string,
 						},
-						at: event.created_at.getTime(),
+						at: event.event_at,
+						position: cursorPosition(event.payload.__fabrialCursor as string),
 					});
 					continue;
 				}
@@ -775,7 +848,11 @@ class ConductorRuntime implements DurableRuntime {
 				if (!registered) return release(raw, 0);
 			}
 		}
-		const winner = candidates.sort((a, b) => a.at - b.at)[0]?.result;
+		const winner = candidates.sort(
+			(a, b) =>
+				a.at - b.at ||
+				(a.position && b.position ? Number(BigInt(a.position) - BigInt(b.position)) : 0),
+		)[0]?.result;
 		if (!winner) return release(raw, delay);
 		const saved = await this.sql.begin(async (sql) => {
 			const [claim] = await sql<{ id: string }[]>`

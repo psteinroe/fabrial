@@ -18,6 +18,7 @@ import type { AnyWorkflow, WorkflowContext } from "./workflow.ts";
 export interface InternalAwaitable extends Awaitable {
 	branch: WaitBranch;
 	deadline?: number;
+	timerMs?: number;
 	prepare?: (id: string) => Promise<{ ready: boolean; value: Json }>;
 	accept?: (id: string, value: Json) => Promise<{ accepted: boolean; value: Json }>;
 }
@@ -37,42 +38,51 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 	const op = (id: string): string => {
 		if (!id || typeof id !== "string")
 			throw new Error("Durable operations require a non-empty explicit id");
-		if (id.startsWith("fabrial:"))
-			throw new Error("Operation ids beginning with fabrial: are reserved");
+		if (id.startsWith("fabrial:") || id.includes("#"))
+			throw new Error("Operation ids beginning with fabrial: or containing # are reserved");
 		let count = ids.get(id) ?? 0;
-		let key = count === 0 ? id : `${id}:${count}`;
-		while (used.has(key)) key = `${id}:${++count}`;
+		let key = count === 0 ? id : `${id}#${count}`;
+		while (used.has(key)) key = `${id}#${++count}`;
 		ids.set(id, count + 1);
 		used.add(key);
 		return key;
 	};
 	let io: ThreadIO | undefined;
 	let realThread = metadata.replyTo?.kind === "thread";
+	const reserve = async (thread: ThreadIO) => {
+		if (!metadata.ownsThread || metadata.initialMessageId || metadata.handoffFrom) return;
+		await execution.step("fabrial:thread:reserve", async () => {
+			const reservedAt = now();
+			await thread.updateState((state) =>
+				state?.interactionId != null
+					? state
+					: {
+							interactionId: metadata.interactionId,
+							handlerExecutionId: null,
+							reservedAt,
+							...(state?.ingestedDedupeIds ? { ingestedDedupeIds: state.ingestedDedupeIds } : {}),
+							agentActive: false,
+							statusMessageId: null,
+							bufferedReplies: [],
+							...(metadata.requestedBy
+								? {
+										requesterId: metadata.requestedBy.id,
+										participantIds: [metadata.requestedBy.id],
+									}
+								: {}),
+						},
+			);
+		});
+	};
 	const bind = async (thread: ThreadIO) => {
 		if (!metadata.ownsThread) return;
-		const state = await thread.getState();
-		if (
+		await thread.updateState((state) =>
 			state?.interactionId === metadata.interactionId &&
-			state.handlerExecutionId &&
-			state.handlerExecutionId !== execution.executionId &&
-			state.handlerExecutionId !== metadata.handoffFrom
-		)
-			return;
-		await thread.setState(
-			state?.interactionId === metadata.interactionId
+			(!state.handlerExecutionId ||
+				state.handlerExecutionId === execution.executionId ||
+				state.handlerExecutionId === metadata.handoffFrom)
 				? { ...state, handlerExecutionId: execution.executionId }
-				: {
-						interactionId: metadata.interactionId,
-						handlerExecutionId: execution.executionId,
-						agentActive: false,
-						statusMessageId: null,
-						bufferedReplies: [],
-						consumedReplyIds:
-							typeof metadata.initialMessageId === "string" ? [metadata.initialMessageId] : [],
-						...(metadata.requestedBy
-							? { requesterId: metadata.requestedBy.id, participantIds: [metadata.requestedBy.id] }
-							: {}),
-					},
+				: state,
 		);
 	};
 	const getIO = async (): Promise<ThreadIO> => {
@@ -82,7 +92,10 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 			metadata.replyTo.kind === "thread"
 				? await host.chat()!.thread(metadata.replyTo)
 				: await host.chat()!.resolve(metadata.replyTo);
-		if (realThread) await bind(io);
+		if (realThread) {
+			await reserve(io);
+			await bind(io);
+		}
 		return io;
 	};
 	if (metadata.replyTo?.kind === "thread" && host.chat()) await getIO();
@@ -96,6 +109,9 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 			metadata.ownsThread && metadata.replyTo?.kind === "channel"
 				? `${execution.executionId}:thread`
 				: undefined;
+		const presentationCursor = threadPresentation
+			? await execution.cursor("fabrial:thread:cursor")
+			: undefined;
 		if (threadPresentation)
 			await execution.start(
 				"fabrial:thread:cleanup",
@@ -103,6 +119,7 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 				{
 					executionId: execution.executionId,
 					presentationId: threadPresentation,
+					after: presentationCursor!,
 				},
 				{
 					metadata: {
@@ -134,31 +151,43 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 		realThread = true;
 		metadata.replyTo = io.ref as InvocationMetadata["replyTo"];
 		execution.metadata.replyTo = metadata.replyTo;
-		if (!execution.signal.aborted) await bind(io);
+		if (!execution.signal.aborted) {
+			await reserve(io);
+			await bind(io);
+		}
 		return ref;
 	};
 
 	const reply = (from?: import("./identity.ts").Principal): InternalAwaitable => {
-		const consume = async (
-			id: string,
+		const eligible = async (
 			message: ChatMessage,
-		): Promise<{ accepted: boolean; value: Json }> =>
-			execution.step(id, async () => {
-				const thread = await getIO();
-				const state = await thread.getState();
-				if (state?.consumedReplyIds?.includes(message.messageId))
-					return { accepted: false, value: null };
-				if (from && (await host.resolvePrincipal(message.author.identity)).id !== from.id)
-					return { accepted: false, value: null };
-				if (state) {
-					state.bufferedReplies = state.bufferedReplies.filter(
-						(m) => m.messageId !== message.messageId,
-					);
-					state.consumedReplyIds = [...(state.consumedReplyIds ?? []), message.messageId];
-					await thread.setState(state);
-				}
-				return { accepted: true, value: message };
+			state: Awaited<ReturnType<ThreadIO["getState"]>>,
+		) =>
+			!state?.consumedReplyIds?.includes(message.messageId) &&
+			(!from || (await host.resolvePrincipal(message.author.identity)).id === from.id);
+		const acknowledge = async (id: string, message: ChatMessage) => {
+			const state = await (
+				await getIO()
+			).updateState((state) => {
+				if (state?.interactionId !== metadata.interactionId) return state;
+				const owner = state.consumedReplyOperations?.[message.messageId];
+				if (
+					(owner && owner !== id) ||
+					(!owner && state.consumedReplyIds?.includes(message.messageId))
+				)
+					return state;
+				return {
+					...state,
+					bufferedReplies: state.bufferedReplies.filter((m) => m.messageId !== message.messageId),
+					consumedReplyIds: [...new Set([...(state.consumedReplyIds ?? []), message.messageId])],
+					consumedReplyOperations: { ...state.consumedReplyOperations, [message.messageId]: id },
+				};
 			});
+			return (
+				state?.interactionId === metadata.interactionId &&
+				state.consumedReplyOperations?.[message.messageId] === id
+			);
+		};
 		return {
 			kind: "fabrial.awaitable",
 			branch: {
@@ -166,27 +195,29 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 				event: "fabrial.reply",
 				filter: { interactionId: [metadata.interactionId], ...(from ? { from: [from.id] } : {}) },
 			},
-			prepare: async (id) =>
-				execution.step(id, async () => {
-					const thread = await getIO();
-					const state = await thread.getState();
-					for (const message of state?.bufferedReplies ?? []) {
-						if (state?.consumedReplyIds?.includes(message.messageId)) continue;
-						if (from && (await host.resolvePrincipal(message.author.identity)).id !== from.id)
-							continue;
-						state!.bufferedReplies = state!.bufferedReplies.filter(
-							(m) => m.messageId !== message.messageId,
-						);
-						state!.consumedReplyIds = [...(state!.consumedReplyIds ?? []), message.messageId];
-						await thread.setState(state!);
-						return { ready: true, value: message };
-					}
+			prepare: async (id) => {
+				// Persist selection BEFORE removing the message. A crash during acknowledgement can replay it.
+				const selected = await execution.step(id, async () => {
+					const state = await (await getIO()).getState();
+					if (state?.interactionId === metadata.interactionId)
+						for (const message of state.bufferedReplies)
+							if (await eligible(message, state)) return { ready: true, value: message };
 					return { ready: false, value: null };
-				}),
-			accept: async (id, value) =>
-				value === null
-					? { accepted: true, value: null }
-					: consume(id, (value as JsonObject).message as ChatMessage),
+				});
+				if (selected.ready && !(await acknowledge(id, selected.value as ChatMessage)))
+					return { ready: false, value: null };
+				return selected;
+			},
+			accept: async (id, value) => {
+				if (value === null) return { accepted: true, value: null };
+				const selected = await execution.step(id, async () => {
+					const message = (value as JsonObject).message as ChatMessage;
+					return (await eligible(message, await (await getIO()).getState())) ? message : null;
+				});
+				return selected && (await acknowledge(id, selected))
+					? { accepted: true, value: selected }
+					: { accepted: false, value: null };
+			},
 		};
 	};
 	const race = async (
@@ -195,22 +226,36 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 	): Promise<{ key: string; value: Json }> => {
 		const entries = Object.entries(awaitables) as [string, InternalAwaitable][];
 		if (!entries.length) throw new Error("race needs at least one awaitable");
+		const cursor = await execution.cursor(`fabrial:${id}:cursor`);
+		const eventBranches: Record<string, WaitBranch> = {};
 		for (const [key, awaitable] of entries) {
 			if (!awaitable.branch) throw new Error("Invalid Fabrial awaitable");
+			eventBranches[key] =
+				awaitable.branch.kind === "event"
+					? { ...awaitable.branch, after: awaitable.branch.after ?? cursor }
+					: awaitable.branch;
+			if (awaitable.timerMs !== undefined)
+				eventBranches[key] = {
+					kind: "timer",
+					at: await execution.step(`fabrial:${id}:timer:${key}`, () => now() + awaitable.timerMs!),
+				};
 			const prepared = await awaitable.prepare?.(`fabrial:${id}:prepare:${key}`);
 			if (prepared?.ready) return { key, value: prepared.value };
 		}
 		for (let attempt = 0; ; attempt++) {
 			const branches: Record<string, WaitBranch> = {};
 			for (const [key, awaitable] of entries) {
-				branches[key] = awaitable.branch;
+				branches[key] = eventBranches[key]!;
 				if (awaitable.deadline !== undefined)
 					branches[`fabrial:timeout:${key}`] = {
 						kind: "timer",
-						ms: Math.max(0, awaitable.deadline - now()),
+						at: awaitable.deadline,
 					};
 			}
 			const winner = await execution.waitForAny(`fabrial:${id}:wait:${attempt}`, branches);
+			if (winner.kind === "event")
+				for (const [key, branch] of Object.entries(eventBranches))
+					if (branch.kind === "event") eventBranches[key] = { ...branch, after: winner.cursor };
 			const timeout = winner.key.startsWith("fabrial:timeout:");
 			const key = timeout ? winner.key.slice("fabrial:timeout:".length) : winner.key;
 			const awaitable = entries.find(([k]) => k === key)![1];
@@ -347,13 +392,14 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 		waitForApproval: async (id, opts) => {
 			const key = op(id);
 			const approval = await createApproval(key, opts, { ...options, post, race, op });
-			return approval.wait(`${key}:decision`);
+			return (await race(`${key}:decision`, { decision: approval.decision() })).value as never;
 		},
 		race: async (id, awaitables) => (await race(op(id), awaitables)) as never,
 		timer: (value) =>
 			({
 				kind: "fabrial.awaitable",
-				branch: { kind: "timer", ms: duration(value) },
+				branch: { kind: "timer", at: 0 },
+				timerMs: duration(value),
 			}) as InternalAwaitable as Awaitable<null>,
 		invoke: async (id, workflow, input, opts) => {
 			const key = op(id);
@@ -377,12 +423,12 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 			if (thread && realThread)
 				await execution.step(`fabrial:${key}:transfer`, async () => {
 					const dest = await getIO();
-					const state = await dest.getState();
-					if (
+					await dest.updateState((state) =>
 						state?.interactionId === metadata.interactionId &&
 						state.handlerExecutionId === execution.executionId
-					)
-						await dest.setState({ ...state, handlerExecutionId: target });
+							? { ...state, handlerExecutionId: target }
+							: state,
+					);
 				});
 			return { handedOffTo: workflow.name, executionId: target };
 		},

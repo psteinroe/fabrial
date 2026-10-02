@@ -118,6 +118,8 @@ export interface FabrialConfig<P extends readonly AnyPlugin[] = readonly AnyPlug
 	workflows: readonly AnyWorkflow[];
 	identity?: readonly (UserDefinition | GroupDefinition)[];
 	logger?: Logger;
+	/** Grace period for an ingress reservation with no bound handler. Default: 10m; must be below 30 days. */
+	reservationTimeout?: import("./runtime.ts").DurationInput;
 }
 
 export interface App {

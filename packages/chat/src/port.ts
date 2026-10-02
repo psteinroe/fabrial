@@ -6,6 +6,7 @@ import {
 	Field,
 	Fields,
 	type Adapter,
+	type StateAdapter,
 	type AdapterPostableMessage,
 	type ChatElement,
 	toCardElement,
@@ -57,6 +58,7 @@ class LiveThread implements ThreadIO {
 		private readonly provider: string,
 		private readonly capability: ChatPluginCapability,
 		private readonly host: FabrialHost,
+		private readonly stateAdapter: StateAdapter,
 	) {
 		this.fallbackStatus = capability.status === "message";
 	}
@@ -113,7 +115,9 @@ class LiveThread implements ThreadIO {
 			} else {
 				this.statusMessageId = (await this.sdk.post({ markdown: text })).id;
 			}
-			if (state) await this.setState({ ...state, statusMessageId: this.statusMessageId });
+			await this.updateState((current) =>
+				current ? { ...current, statusMessageId: this.statusMessageId } : null,
+			);
 		} catch (error) {
 			this.host.logger.debug("Chat status update failed", { threadId: this.sdk.id, error });
 		}
@@ -139,12 +143,37 @@ class LiveThread implements ThreadIO {
 	}
 
 	async getState(): Promise<ThreadRoutingState | null> {
-		return (await this.sdk.state)?.fabrial ?? null;
+		return structuredClone((await this.sdk.state)?.fabrial ?? null);
 	}
 
-	async setState(state: ThreadRoutingState | null): Promise<void> {
-		await this.sdk.setState({ fabrial: state });
-		if (state) await this.sdk.subscribe();
+	async updateState(
+		fn: (state: ThreadRoutingState | null) => ThreadRoutingState | null,
+	): Promise<ThreadRoutingState | null> {
+		// Separate from SDK ingress locks: a handler may update state while holding those.
+		// StateAdapter locks are token-owned and shared by all replicas (Postgres/Redis).
+		const key = `fabrial:routing:${this.sdk.id}`;
+		const deadline = Date.now() + 10_000;
+		const leaseMs = 60_000;
+		while (Date.now() < deadline) {
+			const lock = await this.stateAdapter.acquireLock(key, leaseMs);
+			if (!lock) {
+				await new Promise((resolve) => setTimeout(resolve, 25));
+				continue;
+			}
+			try {
+				const next = structuredClone(fn(await this.getState()));
+				// A slow updater may outlive its lease. Never knowingly commit a stale read;
+				// reacquire and recompute instead (callbacks must therefore be pure).
+				if (!(await this.stateAdapter.extendLock(lock, leaseMs))) continue;
+				// SDK merges unrelated keys and refreshes the 30-day TTL, including clears.
+				await this.sdk.setState({ fabrial: next });
+				if (next) await this.sdk.subscribe();
+				return structuredClone(next);
+			} finally {
+				await this.stateAdapter.releaseLock(lock);
+			}
+		}
+		throw new Error(`Timed out acquiring routing state lock for ${this.sdk.id}`);
 	}
 }
 
@@ -217,10 +246,10 @@ class LazyThread implements ThreadIO {
 	async getState() {
 		return this.live ? this.live.getState() : null;
 	}
-	async setState(state: ThreadRoutingState | null) {
+	async updateState(fn: (state: ThreadRoutingState | null) => ThreadRoutingState | null) {
 		if (!this.live)
 			throw new Error("Cannot persist routing state for a provisional channel thread");
-		await this.live.setState(state);
+		return this.live.updateState(fn);
 	}
 }
 
@@ -249,7 +278,7 @@ export function createChatPort(
 			await bot.initialize();
 			let io = threads.get(ref.threadId);
 			if (!io) {
-				io = new LiveThread(bot.thread(ref.threadId), ref.provider, config, host);
+				io = new LiveThread(bot.thread(ref.threadId), ref.provider, config, host, bot.getState());
 				// Presentation caching is bounded; durable state remains in the SDK adapter.
 				if (threads.size >= 1000) threads.delete(threads.keys().next().value!);
 				threads.set(ref.threadId, io);

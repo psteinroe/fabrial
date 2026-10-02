@@ -19,6 +19,9 @@ import {
 	type HarnessSettings,
 	type HookRegistration,
 	type ToolRegistration,
+	LiveDoc,
+	type Submission,
+	type SubmissionId,
 } from "@earendil-works/pi-durable";
 import {
 	parseSchema,
@@ -39,7 +42,17 @@ import {
 import type { Sql } from "postgres";
 import { definedAgents, type DefinedAgent } from "./agent.ts";
 import { BridgeKey, cloneJson, fields, registerChild, type BridgeFrame } from "./context.ts";
-import { applyState, Binding, ChildResults, Conversations, Invocation, Runs } from "./documents.ts";
+import {
+	applyState,
+	Binding,
+	ChildResults,
+	Conversations,
+	Invocation,
+	Runs,
+	WorkflowReceipts,
+	ChildIntents,
+	EFFECT_WORKFLOW,
+} from "./documents.ts";
 import { createEvaluator } from "./evaluate.ts";
 import { LeaseLost, PostgresStorage, SessionBusy } from "./storage.ts";
 
@@ -148,7 +161,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			name: tool.name,
 			description: tool.description,
 			parameters: (() => {
-				const schema = tool.workflow.definition.input;
+				const schema = host.workflows.find((candidate) => candidate.name === tool.workflow.name)
+					?.definition.input;
 				if (schema && "toJSONSchema" in schema && typeof schema.toJSONSchema === "function")
 					return schema.toJSONSchema() as import("typebox").TSchema;
 				return Type.Object({}, { additionalProperties: true });
@@ -157,7 +171,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			execute: async (input, api, context) => {
 				const frame = context.value(BridgeKey);
 				if (!frame) throw new Error("Workflow tools require a Fabrial bridge");
-				const ctx = await fields(context, api.conversationId, api);
+				const ctx = await fields(context, api.conversationId, api, undefined, tool.detached);
 				const child = await ctx.start("workflow", tool.workflow, input);
 				const result = (await frame.harness.snapshot(ChildResults, context))?.results[child];
 				if (result)
@@ -261,7 +275,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				const offered = (await conversation.agent(context)).tools;
 				const allowed = await Promise.all(
 					offered.map(async (tool) => {
-						const workflow = workflowTools.get(tool)?.workflow;
+						const supplied = workflowTools.get(tool)?.workflow;
+						const workflow =
+							supplied && host.workflows.find((candidate) => candidate.name === supplied.name);
+						if (supplied && !workflow) return false;
 						const groups = workflow?.definition.access?.invoke;
 						if (!groups) return true;
 						if (!execution.metadata.requestedBy) return false;
@@ -279,7 +296,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						{ tools: offered.filter((_tool, index) => allowed[index]) },
 						context,
 					);
-				const originContext = await execution.step("pi:origin", async () => {
+				const originContext = await execution.step("fabrial:pi:origin", async () => {
 					if (!execution.metadata.origin) return "";
 					const sections = await Promise.all(
 						host.plugins.map(async (plugin) =>
@@ -322,15 +339,40 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				]
 					.filter(Boolean)
 					.join("\n\n");
-				const submission = await conversation.submit(
-					{ type: "input", content, requestId: request.requestId },
-					context,
-				);
-				while (outcome === undefined) {
-					if (execution.signal.aborted) {
-						await conversation.abort(BACKGROUND_CONTEXT);
-						execution.signal.throwIfAborted();
+				// Persist admission intents before submit; re-opening drains the same durable request set.
+				const admit = async (requestId: string, content: string, metadata: InvocationMetadata) => {
+					await frame.harness.commit(async (tx) => {
+						await tx.doc(Invocation, requestId, cloneJson(metadata));
+						const run = (await tx.doc(Runs)).runs[execution.executionId]!;
+						run.requests ??= {};
+						run.requests[requestId] ??= { content, submissionId: null };
+					}, context);
+				};
+				await admit(request.requestId, content, execution.metadata);
+				const submissions = new Map<string, Submission>();
+				const submitPending = async () => {
+					const run = (await frame.harness.snapshot(Runs, context))!.runs[execution.executionId]!;
+					for (const [requestId, pending] of Object.entries(run.requests ?? {})) {
+						if (submissions.has(requestId)) continue;
+						const submission =
+							pending.submissionId === null
+								? await conversation!.submit(
+										{ type: "input", content: pending.content, requestId, whenBusy: "steer" },
+										context,
+									)
+								: await frame.harness.submission(pending.submissionId as SubmissionId, context);
+						if (!submission) throw new Error(`Missing Pi submission ${requestId}`);
+						submissions.set(requestId, submission);
+						await frame.harness.commit(async (tx) => {
+							(await tx.doc(Runs)).runs[execution.executionId]!.requests![requestId]!.submissionId =
+								submission.id;
+						}, context);
 					}
+				};
+				await submitPending();
+				frame.harness.resume();
+				while (outcome === undefined) {
+					execution.signal.throwIfAborted();
 					if (storage.lost.signal.aborted) throw new LeaseLost("Pi Session ownership lost");
 					if (io && execution.metadata.ownsThread) {
 						const routing = await io.getState();
@@ -338,45 +380,75 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 							routing?.interactionId === execution.metadata.interactionId &&
 							routing.bufferedReplies.length
 						) {
-							for (const reply of routing.bufferedReplies)
-								await conversation.submit(
+							const delivered = new Set<string>();
+							for (const reply of routing.bufferedReplies) {
+								const requestId = JSON.stringify([
+									"fabrial.pi.reply",
+									routing.interactionId,
+									reply.provider,
+									reply.messageId,
+								]);
+								const actor = await host.resolvePrincipal(reply.author.identity);
+								await admit(
+									requestId,
+									`${reply.author.name ?? reply.author.identity.subjectId}: ${reply.text}`,
 									{
-										type: "input",
-										content: `${reply.author.name ?? reply.author.identity.subjectId}: ${reply.text}`,
-										whenBusy: "steer",
-										requestId: `reply:${reply.provider}:${reply.messageId}`,
+										...execution.metadata,
+										requestedBy: actor as InvocationMetadata["requestedBy"],
+										origin: {
+											provider: reply.provider,
+											threadId: reply.threadId,
+											messageId: reply.messageId,
+										},
+										triggerEvent: null,
+										ownerWorkflow: null,
 									},
-									context,
 								);
-							const delivered = new Set(routing.bufferedReplies.map((reply) => reply.messageId));
-							const latest = await io.getState();
-							if (latest?.interactionId === routing.interactionId)
-								await io.setState({
-									...latest,
-									bufferedReplies: latest.bufferedReplies.filter(
-										(reply) => !delivered.has(reply.messageId),
-									),
-									consumedReplyIds: [
-										...new Set([...(latest.consumedReplyIds ?? []), ...delivered]),
-									],
-								});
+								await submitPending();
+								delivered.add(reply.messageId);
+							}
+							// Only acknowledge durably admitted submissions, preserving concurrent ingress.
+							await io.updateState((latest) =>
+								latest?.interactionId === routing.interactionId
+									? {
+											...latest,
+											bufferedReplies: latest.bufferedReplies.filter(
+												(reply) => !delivered.has(reply.messageId),
+											),
+											consumedReplyIds: [
+												...new Set([...(latest.consumedReplyIds ?? []), ...delivered]),
+											],
+										}
+									: latest,
+							);
 						}
 					}
-					const status = await submission.status(context);
-					if (status.status === "unanswered")
-						throw new Error(`Pi run unanswered: ${status.reason}`);
-					if (status.status === "done" && status.type === "input") {
-						const entry = await conversation.commit((tx) => tx.entry(status.answer), context);
-						outcome =
-							entry?.model
-								?.flatMap((message) =>
-									message.role === "assistant"
-										? message.content
-												.filter((block) => block.type === "text")
-												.map((block) => block.text)
-										: [],
-								)
-								.join("\n") ?? "";
+					let complete = true;
+					let answer: Json | undefined;
+					for (const submission of submissions.values()) {
+						const status = await submission.status(context);
+						if (status.status === "unanswered")
+							throw new Error(`Pi run unanswered: ${status.reason}`);
+						if (status.status !== "done") {
+							complete = false;
+							continue;
+						}
+						if (status.type === "input") {
+							const entry = await conversation.commit((tx) => tx.entry(status.answer), context);
+							answer =
+								entry?.model
+									?.flatMap((message) =>
+										message.role === "assistant"
+											? message.content
+													.filter((block) => block.type === "text")
+													.map((block) => block.text)
+											: [],
+									)
+									.join("\n") ?? "";
+						}
+					}
+					if (complete) {
+						outcome = answer ?? "";
 						break;
 					}
 					const inspection = await frame.harness.inspect(context);
@@ -398,20 +470,29 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					await new Promise<void>((resolve) => setTimeout(resolve, 25));
 				}
 			} finally {
-				if (execution.signal.aborted && conversationId && frame.harness) {
-					const conversation = await frame.harness.conversation(conversationId, BACKGROUND_CONTEXT);
-					await conversation?.abort(BACKGROUND_CONTEXT);
-				}
-				if (execution.signal.aborted)
-					for (const child of frame.children.values())
-						if (!child.detached) await execution.cancel(child.executionId, "Agent cancelled");
-				await events?.stop();
-				await frame.harness?.close(BACKGROUND_CONTEXT);
-				await storage.close(BACKGROUND_CONTEXT);
-				active.delete(frame);
-				if (execution.metadata.ownsThread && io) {
-					await setActive(io, execution.metadata.interactionId, false);
-					await io.setStatus(null).catch(() => {});
+				try {
+					if (execution.signal.aborted && frame.harness)
+						await cancelRun(
+							frame.harness,
+							execution.executionId,
+							execution.signal.reason?.message ?? "Agent cancelled",
+						);
+				} finally {
+					// A failed cleanup is retried by onSettled; it must not retain the Session lease.
+					try {
+						await events?.stop();
+					} finally {
+						try {
+							await frame.harness?.close(BACKGROUND_CONTEXT);
+						} finally {
+							await storage.close(BACKGROUND_CONTEXT);
+							active.delete(frame);
+							if (execution.metadata.ownsThread && io) {
+								await setActive(io, execution.metadata.interactionId, false);
+								await io.setStatus(null).catch(() => {});
+							}
+						}
+					}
 				}
 			}
 			if (outcome !== undefined) return outcome;
@@ -421,7 +502,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					{ kind: "execution" as const, executionId: child.executionId },
 				]),
 			);
-			const settled = await execution.waitForAny(`pi:children:${cycle++}`, branches);
+			const waitId = `fabrial:pi:children${cycle ? `#${cycle}` : ""}`;
+			cycle++;
+			const settled = await execution.waitForAny(waitId, branches);
 			if (settled.kind !== "execution")
 				throw new Error("Pi bridge expected an execution settlement");
 			const storageForResult = await acquire(options.sql, request.session, execution.signal);
@@ -436,6 +519,38 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				await session.close(BACKGROUND_CONTEXT);
 			}
 		}
+	}
+
+	async function cancelRun(harness: Harness, executionId: string, reason: string) {
+		const context = BACKGROUND_CONTEXT;
+		const run = (await harness.snapshot(Runs, context))?.runs[executionId];
+		if (!run) return;
+		// Even a start whose receipt was lost has a durable cancellation relationship.
+		for (const key of run.intents ?? []) {
+			const intent = await harness.snapshot(ChildIntents, key, context);
+			if (!intent || intent.detached) continue;
+			const child =
+				intent.executionId ??
+				(await host.runtime.invoke(intent.workflow, intent.input, {
+					metadata: intent.metadata,
+					dedupeKey: intent.dedupeKey,
+				}));
+			await host.runtime.cancel(child, reason);
+		}
+		for (const child of Object.values(run.children))
+			if (!child.detached) await host.runtime.cancel(child.executionId, reason);
+		const inspection = await harness.inspect(context);
+		const requests = new Set(Object.keys(run.requests ?? {}));
+		const ids = new Set<number>();
+		for (const submission of inspection.submissions) {
+			if (!submission.requestId || !requests.has(submission.requestId)) continue;
+			ids.add(submission.id);
+			await (await harness.submission(submission.id, context))?.abort(context);
+		}
+		// Abort only the task tree that owns these inputs, never a continuation's newer run.
+		const live = await harness.snapshot(LiveDoc, run.conversationId as ConversationId, context);
+		if (live?.run?.inputs.some((id) => ids.has(id)))
+			await harness.abortTask(live.run.taskId, context);
 	}
 
 	const workflow: RuntimeWorkflow = {
@@ -460,22 +575,39 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				BACKGROUND_CONTEXT,
 			);
 			try {
-				const run = (await harness.snapshot(Runs, BACKGROUND_CONTEXT))?.runs[executionId];
-				if (!run) return;
-				for (const child of Object.values(run.children))
-					if (!child.detached) await host.runtime.cancel(child.executionId, result.reason);
-				const conversation = await harness.conversation(
-					run.conversationId as ConversationId,
-					BACKGROUND_CONTEXT,
-				);
-				await conversation?.abort(BACKGROUND_CONTEXT);
+				await cancelRun(harness, executionId, result.reason);
 			} finally {
 				await harness.close(BACKGROUND_CONTEXT);
 			}
 		},
 	};
+	// Effects run in a stable child execution, never in the Session's replaceable driver.
+	const effect: RuntimeWorkflow = {
+		name: EFFECT_WORKFLOW,
+		triggers: [],
+		handler: async (input, execution) =>
+			execution.step("fabrial:pi:effect", async () => {
+				const io = await thread(execution);
+				if (!io) throw new Error("Managed Pi thread operation has no thread");
+				const { method, args } = input as { method: string; args: Json[] };
+				if (method === "post")
+					return cloneJson(
+						await io.post(args[0] as Parameters<ThreadIO["post"]>[0]),
+					) as unknown as Json;
+				if (method === "update") {
+					await io.update(
+						args[0] as unknown as Parameters<ThreadIO["update"]>[0],
+						args[1] as Parameters<ThreadIO["update"]>[1],
+					);
+					return null;
+				}
+				if (method === "history")
+					return cloneJson(await io.history(args[0] as Parameters<ThreadIO["history"]>[0]));
+				throw new Error(`Unknown Pi effect ${method}`);
+			}),
+	};
 	const port: AgentPort = {
-		workflows: () => [workflow],
+		workflows: () => [workflow, effect],
 		async run(execution, id, agent: AgentRef, request) {
 			if (request.configure)
 				throw new Error(
@@ -498,7 +630,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				{ mutex: key, metadata, detached: request.detached },
 			);
 			if (!request.output) return answer;
-			return execution.step(`${id}:output`, async () =>
+			return execution.step(`fabrial:pi:output:${id}`, async () =>
 				parseSchema(
 					request.output as Schema<Json>,
 					JSON.parse(typeof answer === "string" ? answer : JSON.stringify(answer)),
@@ -519,11 +651,24 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				const context = withAbortSignal(execution.signal, BACKGROUND_CONTEXT);
 				const session = createSession(storage);
 				try {
-					return await session.commit(
-						(tx) =>
-							applyState(tx, definition, execution.metadata.interactionId, undefined, [change]),
-						context,
-					);
+					return await session.commit(async (tx) => {
+						const receipt = await tx.doc(
+							WorkflowReceipts,
+							JSON.stringify([execution.executionId, id]),
+							"",
+						);
+						if (receipt.value !== null)
+							return cloneJson(receipt.value) as ReturnType<typeof definition.initial>;
+						const value = await applyState(
+							tx,
+							definition,
+							execution.metadata.interactionId,
+							undefined,
+							[change],
+						);
+						receipt.value = cloneJson(value);
+						return value;
+					}, context);
 				} finally {
 					await session.close(BACKGROUND_CONTEXT);
 				}
@@ -533,7 +678,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		agents: port,
 		state,
 		evaluator,
-		workflows: [workflow],
+		workflows: [workflow, effect],
 		async start() {
 			await PostgresStorage.migrate(options.sql);
 			for (const plugin of host.plugins)
@@ -560,8 +705,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 }
 
 async function setActive(io: ThreadIO, interactionId: string, agentActive: boolean) {
-	const routing = await io.getState();
-	if (routing?.interactionId === interactionId) await io.setState({ ...routing, agentActive });
+	await io.updateState((routing) =>
+		routing?.interactionId === interactionId ? { ...routing, agentActive } : routing,
+	);
 }
 
 export async function checkOrphans(sql: Sql, installedKinds: readonly string[]): Promise<void> {

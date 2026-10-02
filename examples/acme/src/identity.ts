@@ -8,7 +8,7 @@ export const alice = defineUser({
 	name: "Alice",
 	identities: [
 		slack.identity({ workspace: "acme", userId: "U_ALICE" }),
-		github.identity({ installationId: "acme", userId: 1 }),
+		github.identity({ installationId: "42", userId: 1 }),
 		linear.identity({ organizationId: "acme", userId: "lin_alice" }),
 	],
 });
@@ -17,7 +17,7 @@ export const bob = defineUser({
 	name: "Bob",
 	identities: [
 		slack.identity({ workspace: "acme", userId: "U_BOB" }),
-		github.identity({ installationId: "acme", userId: 2 }),
+		github.identity({ installationId: "42", userId: 2 }),
 		linear.identity({ organizationId: "acme", userId: "lin_bob" }),
 	],
 });
