@@ -128,13 +128,18 @@ const createPlugin = definePlugin<
 	typeof events,
 	{ linear: LinearClient }
 >((options) => {
-	if (!options.organizationId) throw new Error("Linear requires organizationId");
-	if (!options.webhookSecret && !options.webhookVerifier)
-		throw new Error("Linear requires webhookSecret or webhookVerifier");
 	let instance: TeamLinearAdapter | undefined;
 	const adapter = () => (instance ??= new TeamLinearAdapter(options));
 	return {
 		id: "linear",
+		init() {
+			if (!options.organizationId) throw new Error("Linear requires organizationId");
+			if (!options.webhookSecret && !options.webhookVerifier)
+				throw new Error("Linear requires webhookSecret or webhookVerifier");
+		},
+		shutdown() {
+			instance = undefined;
+		},
 		events,
 		chat: chatCapability({
 			adapter,

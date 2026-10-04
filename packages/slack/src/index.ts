@@ -77,6 +77,11 @@ const createPlugin = definePlugin<
 	{ slack: WebClient }
 >((options) => ({
 	id: "slack",
+	init() {
+		if (!options.workspace) throw new Error("Slack requires workspace");
+		if (!options.botToken) throw new Error("Slack requires botToken");
+		if (!options.signingSecret) throw new Error("Slack requires signingSecret");
+	},
 	events: chatEvents(),
 	chat: chatCapability({
 		adapter: () => new ScopedSlackAdapter(options),

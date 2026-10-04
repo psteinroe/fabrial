@@ -26,4 +26,4 @@ const workflow = f.defineWorkflow({
 const app = f.app({ runtime, chat, workflows: [workflow] });
 ```
 
-`userGroup` resolves through a structurally typed group context containing a Slack WebClient. It works with any catalog that includes Slack and fails explicitly if the live client is missing. Test overrides use `f.app({ …, plugins: { slack: slack(testOptions) } })`.
+`userGroup` resolves through a structurally typed group context containing a Slack WebClient. It works with any catalog that includes Slack and fails explicitly if the live client is missing. Configure plugin values once in `createFabrial`; tests spy on `app.host.clients().slack`. The factory is side-effect free; credentials are checked at `app.start()`.

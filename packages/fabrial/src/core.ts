@@ -24,7 +24,12 @@ export function buildApp(config: CoreConfig): App {
 			{},
 			...config.plugins.map((p) => p.clients?.({ chat: chat?.port }) ?? {}),
 		));
-	const directory = createDirectory(config.identity ?? [], config.plugins, clients, now);
+	const directory = createDirectory(
+		config.identity ?? [],
+		config.plugins,
+		() => host.clients(),
+		now,
+	);
 	const triggers = config.workflows.flatMap((workflow) =>
 		(workflow.definition.triggers ?? []).map((spec: TriggerSpec) => ({ workflow, spec })),
 	);
@@ -290,7 +295,6 @@ export function buildApp(config: CoreConfig): App {
 			);
 		},
 	};
-	chat = config.chat?.connect(host);
 	agents = config.agents?.connect(host);
 	async function settled(
 		executionId: string,
@@ -421,7 +425,7 @@ export function buildApp(config: CoreConfig): App {
 				const route = plugin.routes?.[key];
 				if (route)
 					return route(request, {
-						clients: clients(),
+						clients: host.clients(),
 						emit: async (event, payload, options = {}) => {
 							await host.ingest(`${plugin.id}.${event}`, payload, options);
 						},
@@ -434,7 +438,8 @@ export function buildApp(config: CoreConfig): App {
 				throw new Error("Duplicate plugin id");
 			if (new Set(workflows.map((w) => w.name)).size !== workflows.length)
 				throw new Error("Duplicate workflow name");
-			if (config.plugins.some((p) => p.chat) && !chat) throw new Error("Chat integration required");
+			if (config.plugins.some((p) => p.chat) && !config.chat)
+				throw new Error("Chat integration required");
 			for (let i = 0; i < triggers.length; i++)
 				for (const b of triggers.slice(i + 1)) {
 					const a = triggers[i]!;
@@ -451,6 +456,7 @@ export function buildApp(config: CoreConfig): App {
 						);
 				}
 			for (const plugin of config.plugins) await plugin.init?.();
+			chat = config.chat?.connect(host);
 			await chat?.start?.();
 			await agents?.start();
 			await runtime.start();
@@ -460,6 +466,7 @@ export function buildApp(config: CoreConfig): App {
 			await agents?.stop();
 			await chat?.stop?.();
 			for (const plugin of [...config.plugins].reverse()) await plugin.shutdown?.();
+			liveClients = undefined;
 		},
 		async emit(event, payload, options = {}) {
 			await host.ingest(event, payload, options);

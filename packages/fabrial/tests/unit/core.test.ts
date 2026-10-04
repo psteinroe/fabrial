@@ -66,7 +66,7 @@ function setup(
 		chat,
 		plugins: [plugin],
 		workflows,
-		identity: [alice, bob, outsider, team],
+		identity: [alice, bob, outsider],
 		...extra,
 	};
 	const { plugins, identity: identities, logger, ...appConfig } = config;
@@ -1321,7 +1321,7 @@ describe("additional port and correlation guarantees", () => {
 	it("recognizes users discovered through dynamic groups and provider-scoped membership", async () => {
 		const user = defineUser({ id: "dynamic", identities: [identity("D")] });
 		const group = defineGroup({ id: "dynamic-group", resolve: () => [user] });
-		const test = setup([], { identity: [group] });
+		const test = setup([], { identity: [] });
 		const before = await test.app.host.resolvePrincipal(identity("D"));
 		expect(before.known).toBe(false);
 		expect(await test.app.host.directory.isMember(before, group)).toBe(true);

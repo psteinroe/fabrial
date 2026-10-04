@@ -55,26 +55,33 @@ All code below is the proposed Fabrial API.
 
 ### The instance: `createFabrial`
 
-Like PG Conductor (`Conductor.create({ context })` → `conductor.createTask`, wired later by `Orchestrator.create`), a Fabrial instance carries the plugin types, so definitions get typed `ctx.clients` without global type augmentation. The instance holds plugins and identity only, never workflows, so definition files can import it without cycles. Runtime wiring happens separately in `f.app()`.
+Like PG Conductor (`Conductor.create({ context })` → `conductor.createTask`, wired later by `Orchestrator.create`), a Fabrial instance carries the plugin types, so definitions get typed `ctx.clients` without global type augmentation. The instance holds plugins (with their configuration) and users only, never workflows, so definition files can import it without cycles. Runtime wiring happens separately in `f.app()`.
+
+Plugins carry their values at definition, read from env when the module loads (the Better Auth / Inngest style). Plugin factories are side-effect free: nothing connects or validates credentials until `app.start()`, so unset env at import time is fine. Tests configure the same way, through env set in a test `globalSetup`.
 
 ```ts
 // fabrial.ts
 export const f = createFabrial({
-	plugins: [slack({ ... }), github({ ... }), linear({ ... }), database({ ... })],
-	identity: [alice, bob, support, engineeringTriage],
+	plugins: [
+		slack({ botToken: env.SLACK_BOT_TOKEN, signingSecret: env.SLACK_SIGNING_SECRET, workspace: "acme" }),
+		github({ ... }),
+		linear({ ... }),
+		database({ url: env.APP_DATABASE_URL }),
+	],
+	identity: [alice, bob], // users; groups are referenced where they're used
 });
 export const { defineTool, defineAgent, section } = withPi(f); // from @fabrial/pi
 
-// workflows, tools, agents use f (or the bound Pi helpers): ctx.clients is typed from f's plugins
+// workflows, tools, agents, groups use f (or the bound Pi helpers): ctx.clients is typed from f's plugins
 export const runSql = f.defineWorkflow({ name: "run-sql", async run(input, ctx) { /* ctx.clients.database */ } });
+export const linearTriage = f.defineGroup({ id: "linear-triage", resolve: (ctx) => ctx.clients.linear.triageResponsibility({ team: "ENG" }) });
 
-// app.ts: runtime wiring; plugin values can be overridden by id (type-checked), e.g. in tests
+// app.ts: runtime wiring only
 export const app = f.app({
-	runtime: conductor({ sql }),
+	runtime: conductor({ connectionString: env.DATABASE_URL }),
 	chat: chat({ state }),
 	agents: pi({ models, sql }),
 	workflows: [generalAssistant, runSql],
-	plugins: { database: database({ sql: testSql }) },
 });
 ```
 
@@ -329,9 +336,10 @@ interface IdentityDirectory {
 { provider: "slack", installationId: "workspace-acme", subjectId: "U123" }
 ```
 
-Users are defined in code. Groups are defined in code or backed by Slack user groups, and `resolve` handles anything else:
+Users are defined in code and registered with `createFabrial({ identity: users })`. Groups are defined with `f.defineGroup` (typed `ctx.clients`) or backed by Slack user groups, and are referenced where they're used (`approvers`, `access.invoke`); they need no registration:
 
 ```ts
+// users.ts
 export const alice = defineUser({
 	id: "alice",
 	identities: [
@@ -341,9 +349,9 @@ export const alice = defineUser({
 	],
 });
 
-// code-defined
-export const engineering = defineGroup({ id: "engineering", members: [alice, bob] });
-export const backendTriage = defineGroup({
+// groups.ts: code-defined
+export const engineering = f.defineGroup({ id: "engineering", members: [alice, bob] });
+export const backendTriage = f.defineGroup({
 	id: "backend-triage",
 	resolve: () => [weeklyRotation([alice, bob], { start: "2026-01-05" })],
 });
@@ -352,7 +360,7 @@ export const backendTriage = defineGroup({
 export const engineeringTriage = slack.userGroup({ id: "engineering-triage", handle: "triage" });
 
 // anything else
-export const linearTriage = defineGroup({
+export const linearTriage = f.defineGroup({
 	id: "linear-triage",
 	resolve: (ctx) => ctx.clients.linear.triageResponsibility({ team: "ENG" }),
 });
@@ -461,7 +469,7 @@ export const f = createFabrial({
 		langfuse({ publicKey: env.LANGFUSE_PK, secretKey: env.LANGFUSE_SK }),
 		triageRotation,
 	],
-	identity: [alice, support, engineeringTriage],
+	identity: [alice, bob],
 });
 
 // app.ts: runtime wiring
@@ -630,7 +638,8 @@ Recorded as open questions are resolved.
 - **Cancellation is structured by default, with a per-call `detached` opt-out.** Cancelling an execution cancels every call it made: `ctx.agent` (Pi conversation abort), `ctx.invoke`, and `asTool()` workflows, recursively. A pending `waitForApproval` updates its card to "Cancelled" and rejects later clicks. Opt out per call with `{ detached: true }`, or per tool with `workflow.asTool({ detached: true })`. Handoffs are always independent, because the receiver owns the interaction. Cancellation is cooperative: a running step finishes and its result is recorded, and cancellation takes effect at the next durable operation. A "stop" in a thread cancels the interaction's current handler.
 - **`run(input, ctx)`, matching Conductor's handler shape.** For triggered runs, `input` is the typed trigger event (a union for multiple triggers). For `ctx.invoke`, `ctx.handoff`, and `asTool()` it is the workflow's typed input.
 - **Plugins: `definePlugin(factory | object)`** with the capability set in [Plugins](#plugins). Chat SDK is just the optional `chat` capability, so non-chat sources like Sentry or internal webhooks are first-class (`events` + `routes`). The shape follows Better Auth and Executor: an option factory, a declarative object, and inferred types. Global hooks are `hooks: { workflow, agent }` in native Conductor-middleware and Pi-hook shapes. Agent-scoped hooks live in `extension`. Trigger helpers are static exports.
-- **Typed clients come from a Conductor-style instance, not global type augmentation.** `createFabrial({ plugins, identity })` returns `f`; `f.defineWorkflow` and `withPi(f)`'s `defineTool`/`defineAgent`/`section` get `ctx.clients` and plugin extension ids typed from `f`'s plugins, and a misspelled client is a type error. The instance holds no workflows (no import cycles); `f.app({ runtime, chat, agents, workflows, plugins? })` does the runtime wiring, and `plugins` overrides values by plugin id (type-checked), e.g. for tests. There are no free `defineWorkflow`/`fabrial()` functions and no `declare module` registration. Most backend frameworks do it this way (Conductor, Inngest, tRPC, Hono); global `Register` augmentation is a frontend-library pattern and felt like magic.
+- **Typed clients come from a Conductor-style instance, not global type augmentation.** `createFabrial({ plugins, identity })` returns `f`; `f.defineWorkflow`, `f.defineGroup`, and `withPi(f)`'s `defineTool`/`defineAgent`/`section` get `ctx.clients` and plugin extension ids typed from `f`'s plugins, and a misspelled client is a type error. The instance holds no workflows (no import cycles); `f.app({ runtime, chat, agents, workflows })` does the runtime wiring. `identity` lists users only; groups are referenced where they're used. There are no free `defineWorkflow`/`fabrial()` functions and no `declare module` registration. Most backend frameworks do it this way (Conductor, Inngest, tRPC, Hono); global `Register` augmentation is a frontend-library pattern and felt like magic.
+- **Plugin values at definition, from env (the Better Auth / Inngest style).** Plugins get their options when passed to `createFabrial`, typically read from env when the module loads. Factories are side-effect free and nothing connects until `app.start()`. Tests set env in a `globalSetup` (e.g. testcontainers URLs, test secrets) before importing the app, and use spies on `app.host.clients()` for fake clients. There is one way to configure plugins: no `f.app()` overrides and no type/value split (the NestJS / Effect style was considered and rejected as heavier).
 - **Credentials are plugin options.** Executor's provider/account split (an accounts table, secret storage, slots) is deferred until several accounts per provider or per-person credentials are needed. A second installation is a second plugin instance with its own `id`.
 - **Thin `defineAgent`.** It holds `name`, plus plugin extensions by `id`. Everything else (`model`, `thinkingLevel`, `instructions`, `extensions`, `tools`, …) passes through to Pi's `configure()`. `ctx.agent` options are `input`, `output` (typed structured result, validated from a JSON answer), and `detached`. The native `configure` escape hatch is a `defineAgent` field, since a function can't cross into the agent's own execution. No Fabrial-owned agent features such as memory or per-agent permissions.
 - **v1 scope: Slack + the SQL approval flow + GitHub and Linear.**

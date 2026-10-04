@@ -17,15 +17,10 @@ export type ClientsOf<P extends readonly AnyPlugin[]> = [PluginClients<P[number]
 	? {}
 	: UnionToIntersection<PluginClients<P[number]>>;
 
-export type PluginOverrides<P extends readonly AnyPlugin[]> = {
-	readonly [Id in P[number]["id"]]?: Extract<P[number], { id: Id }>;
-};
-
-export type FabrialConfig<P extends readonly AnyPlugin[]> = Omit<
+export type FabrialConfig = Omit<
 	CoreConfig,
 	"plugins" | "identity" | "logger" | "definitionScope"
 > & {
-	plugins?: PluginOverrides<P>;
 	logger?: Logger;
 };
 
@@ -44,18 +39,13 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 		this: void,
 		definition: Parameters<typeof defineGroup<ClientsOf<P>>>[0],
 	): GroupDefinition<ClientsOf<P>>;
-	app<const Overrides extends PluginOverrides<P> = PluginOverrides<P>>(
-		this: void,
-		config: Omit<FabrialConfig<P>, "plugins"> & {
-			plugins?: Overrides & Record<Exclude<keyof Overrides, P[number]["id"]>, never>;
-		},
-	): App<ClientsOf<P>>;
+	app(this: void, config: FabrialConfig): App<ClientsOf<P>>;
 }
 
-/** Define the typed catalog once; wire independent runtimes and plugin values with f.app(). */
+/** Define the typed catalog once; wire independent runtimes with f.app(). */
 export function createFabrial<const P extends readonly AnyPlugin[]>(config: {
 	plugins: P;
-	identity?: readonly (UserDefinition | GroupDefinition)[];
+	identity?: readonly UserDefinition[];
 	logger?: Logger;
 }): Fabrial<P> {
 	const plugins = Object.freeze([...config.plugins]) as unknown as P;
@@ -65,23 +55,12 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(config: {
 		defineWorkflow: defineWorkflow as Fabrial<P>["defineWorkflow"],
 		defineGroup,
 		app(appConfig) {
-			for (const [id, override] of Object.entries(appConfig.plugins ?? {}) as [
-				string,
-				AnyPlugin | undefined,
-			][]) {
-				if (!plugins.some((plugin) => plugin.id === id))
-					throw new Error(`Unknown plugin override: ${id}`);
-				if (override && override.id !== id)
-					throw new Error(`Plugin override ${id} has id ${override.id}`);
-			}
 			return buildApp({
 				...config,
 				...appConfig,
 				definitionScope: instance,
 				logger: appConfig.logger ?? config.logger,
-				plugins: plugins.map(
-					(plugin) => appConfig.plugins?.[plugin.id as P[number]["id"]] ?? plugin,
-				),
+				plugins,
 			}) as App<ClientsOf<P>>;
 		},
 	};

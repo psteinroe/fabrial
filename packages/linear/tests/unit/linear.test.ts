@@ -72,8 +72,10 @@ describe("Linear provider", () => {
 		await expect(plugin.identity!.lookup!(subject, clients)).rejects.toThrow("outage");
 	});
 	it("requires organization and webhook verification", () => {
-		expect(() => linear({ apiKey: "key", organizationId: "org" })).toThrow("webhookSecret");
-		expect(() => linear({ ...options, organizationId: "" })).toThrow("organizationId");
+		const plugin = linear({ apiKey: "", organizationId: "org" });
+		expect(() => plugin.init!()).toThrow("webhookSecret");
+		const unconfigured = linear({ ...options, organizationId: "" });
+		expect(() => unconfigured.init!()).toThrow("organizationId");
 	});
 });
 

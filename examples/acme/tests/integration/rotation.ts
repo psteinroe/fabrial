@@ -1,5 +1,6 @@
 import { weeklyRotation } from "fabrial";
-import { alice, bob, engineeringTriage } from "../../src/identity.ts";
+import { alice, bob } from "../../src/users.ts";
+import { engineeringTriage } from "../../src/groups.ts";
 export { bob, engineeringTriage };
 export function weeklyRotationForTest() {
 	return weeklyRotation([bob, alice], {

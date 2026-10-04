@@ -62,7 +62,9 @@ export interface PluginDefinition<
 		agent?: unknown[];
 	};
 	identity?: IdentityCapability<TClients>;
+	/** Validate definition-time options and acquire owned resources at app.start(), never in the factory. */
 	init?: () => Promise<void> | void;
+	/** Release owned resources at app.stop(). */
 	shutdown?: () => Promise<void> | void;
 }
 
@@ -75,7 +77,8 @@ export type PluginClients<P> = P extends { clients?: (deps: never) => infer C }
 	: never;
 
 /**
- * Define a plugin. Pass a factory for plugins with options, or a plain object.
+ * Define a plugin. Pass a side-effect-free factory with definition-time options, or a plain object.
+ * Defer credential validation and connections to init/adapter startup; unset env at import is safe.
  *
  * ```ts
  * export const sentry = definePlugin((options: SentryOptions) => ({ id: "sentry", events: {…}, routes: {…} }));

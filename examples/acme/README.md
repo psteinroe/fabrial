@@ -4,38 +4,55 @@ A private workspace example, not a hosted service. The app has one Slack entry
 workflow, a support agent, a SQL repair workflow with triage approval, bug handoff,
 a GitHub PR review owner/changelog observer, and Linear issue triage.
 
-`src/fabrial.ts` owns the typed plugin/identity catalog and exports `withPi(f)` helpers. Definitions import that module; it never imports workflows. Its catalog-only placeholder credentials/database are replaced by `createApp(deps)` using `f.app({ ..., plugins: { slack, github, linear, database } })`. Tests inject live/fake values through those type-checked overrides; there is no `declare module` augmentation.
+`src/fabrial.ts` reads plugin values from `process.env` at definition and exports
+`withPi(f)` helpers. It imports only plugins and `src/users.ts`, never workflows
+or groups. `src/groups.ts` uses `f.defineGroup` for typed clients and is imported
+by workflows; groups are referenced directly, not registered in `identity`.
+Factories are side-effect free: importing the app with unset env is safe, but
+`app.start()` requires valid configuration. Set env **before importing** the app;
+changing env after import does not reconfigure plugins.
 
 ## Run / embed
 
-Supply Postgres pools, a Chat SDK state adapter, Pi AI `Models`, and provider
-credentials to `createApp` in `src/app.ts`:
+Configure these environment variables:
+
+| Variable                 | Purpose                                                                                                          |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`           | Runtime, Pi, and Chat state Postgres database (caller-owned pools).                                              |
+| `APP_DATABASE_URL`       | Separate least-privilege business database; the database plugin creates its pool at start and closes it at stop. |
+| `SLACK_BOT_TOKEN`        | Slack bot token.                                                                                                 |
+| `SLACK_SIGNING_SECRET`   | Slack webhook signing secret.                                                                                    |
+| `SLACK_WORKSPACE`        | Stable identity namespace, shared with users.                                                                    |
+| `SLACK_TEAM_ID`          | Native team ID; optional, resolved through `auth.test` if omitted.                                               |
+| `GITHUB_TOKEN`           | GitHub PAT.                                                                                                      |
+| `GITHUB_WEBHOOK_SECRET`  | GitHub webhook signing secret.                                                                                   |
+| `GITHUB_OWNER`           | Repository owner login (defaults to authenticated PAT user if omitted).                                          |
+| `GITHUB_INSTALLATION_ID` | Numeric installation namespace, matching user identities and signed payloads when present.                       |
+| `GITHUB_BOT_USER_ID`     | Numeric GitHub bot user ID.                                                                                      |
+| `LINEAR_API_KEY`         | Linear API key.                                                                                                  |
+| `LINEAR_WEBHOOK_SECRET`  | Linear webhook signing secret.                                                                                   |
+| `LINEAR_ORGANIZATION_ID` | Linear organization ID, shared with users and signed payloads.                                                   |
+
+Supply only runtime dependencies to `createApp` in `src/app.ts`:
 
 ```ts
+const sql = postgres(process.env.DATABASE_URL!);
 const app = createApp({
 	sql, // caller-owned postgres.js pool for runtime + Pi
-	databaseSql, // optional separate application database pool
-	state, // e.g. createPostgresState({ url: DATABASE_URL })
-	models, // Pi AI Models with authenticated providers
-	slack: { workspace: "acme", teamId: "T_ACME", botToken, signingSecret },
-	github: { owner: "acme", installationId: 42, token, webhookSecret, botUserId: 99 },
-	linear: { organizationId: "acme", apiKey, webhookSecret: linearSecret },
+	state: createPostgresState({ url: process.env.DATABASE_URL! }),
+	models, // Pi AI Models with authenticated providers (injectable in tests)
 });
 await app.start();
 // Mount app.fetch in your Node HTTP server; call app.stop() on shutdown.
-// Close caller-owned pools after stopping the app.
+// Disconnect Chat state and close caller-owned pools after stopping the app.
 ```
 
-Load `schema.sql` in the application database. Replace the sample external user
-IDs, channel IDs, installation namespaces, and model references in source with
-your own. Slack's `workspace` is the identity namespace; `teamId` is the native
-team ID (or omit it to resolve via `auth.test`). GitHub's `owner` scopes repositories;
-the numeric installation ID must match signed payloads when present. Linear's
-`organizationId` must match signed lifecycle and comment payloads. These values
-must also agree with the identities in `src/identity.ts`. `supportAgent` uses
-`anthropic/claude-sonnet-4-5`; routing uses a Jev classifier registered as `jev/route`. A missing/erroring classifier explicitly
-falls back to support; `#bugs` always hands off. Models are injectable, not fetched
-or initialized by the app. Define agents before `app.start()`.
+Load `schema.sql` in `APP_DATABASE_URL`. Replace the sample external user IDs,
+channel IDs, team keys, and model references in source with your own.
+`supportAgent` uses `anthropic/claude-sonnet-4-5`; routing uses a Jev classifier
+registered as `jev/route`. A missing/erroring classifier explicitly falls back to
+support; `#bugs` always hands off. Models are injectable, not fetched or
+initialized by the app. Define agents before `app.start()`.
 
 Endpoints:
 
@@ -55,7 +72,7 @@ least-privilege database roles, enforce tenant authorization/RLS, and restrict
 resource usage before deploying. Single-statement prepared execution prevents
 multi-statement transaction escapes; Postgres enforces read-only queries. The
 organisation setting alone does not enforce tenant access. Runtime/Pi credentials
-should not be exposed to application SQL in production (`databaseSql`).
+should not be exposed to application SQL in production (`APP_DATABASE_URL`).
 
 ## Tests
 
@@ -73,7 +90,9 @@ Postgres Chat state**, not `FakeChat`. Signed Slack mentions/actions and signed
 GitHub/Linear lifecycle webhooks go through `app.fetch`. Outbound Slack Web API,
 Octokit and Linear API responses are mocked; Linear's startup profile lookup is
 seeded. `@chat-adapter/tests` supplies the inspectable logger. No live tokens or
-model network calls are needed. Separate databases isolate each scenario; the
+model network calls are needed. Global setup starts Postgres and sets both database URLs and provider test values
+before importing the app. Each scenario resets durable/Chat state and business
+tables on those same databases; the
 restart test uses new runtime, Pi and Chat instances on the same database.
 
 Coverage: approval + duplicate click, rejection, requester cancellation,

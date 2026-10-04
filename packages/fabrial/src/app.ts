@@ -1,12 +1,6 @@
 import type { EmitOptions, Origin } from "./events.ts";
 import type { Evaluator } from "./evaluate.ts";
-import type {
-	ExternalIdentity,
-	GroupDefinition,
-	IdentityDirectory,
-	Principal,
-	UserDefinition,
-} from "./identity.ts";
+import type { ExternalIdentity, IdentityDirectory, Principal, UserDefinition } from "./identity.ts";
 import type { JsonObject } from "./json.ts";
 import type { AnyPlugin } from "./plugin.ts";
 import type { AgentPort, ChatPort, DurableRuntime, RuntimeWorkflow, StatePort } from "./runtime.ts";
@@ -29,9 +23,9 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 	readonly runtime: DurableRuntime;
 	readonly directory: IdentityDirectory;
 	readonly logger: Logger;
-	/** Live clients of all plugins (built once per process; plugin `clients()` must be cheap and stateless). */
+	/** Live clients of all plugins (built once per app; plugin `clients()` must be cheap and stateless). */
 	clients(): TClients;
-	/** Chat port, once `@fabrial/chat` is configured. */
+	/** Chat port, after app.start() connects `@fabrial/chat`. */
 	chat(): ChatPort | undefined;
 
 	/**
@@ -118,7 +112,8 @@ export interface CoreConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[
 	agents?: AgentIntegration;
 	plugins: P;
 	workflows: readonly AnyWorkflow[];
-	identity?: readonly (UserDefinition | GroupDefinition)[];
+	/** Known users only; groups are resolved directly by reference in access/approval options. */
+	identity?: readonly UserDefinition[];
 	logger?: Logger;
 	/** Grace period for an ingress reservation with no bound handler. Default: 10m; must be below 30 days. */
 	reservationTimeout?: import("./runtime.ts").DurationInput;

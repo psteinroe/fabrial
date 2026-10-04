@@ -142,12 +142,17 @@ const createPlugin = definePlugin<
 	{ github: GitHubClient }
 >((options) => {
 	const installationId = String(options.installationId ?? "default");
-	if (!options.webhookSecret && !options.webhookVerifier)
-		throw new Error("GitHub requires webhookSecret or webhookVerifier");
 	let instance: ScopedGitHubAdapter | undefined;
 	const adapter = () => (instance ??= new ScopedGitHubAdapter(options));
 	return {
 		id: "github",
+		init() {
+			if (!options.webhookSecret && !options.webhookVerifier)
+				throw new Error("GitHub requires webhookSecret or webhookVerifier");
+		},
+		shutdown() {
+			instance = undefined;
+		},
 		events,
 		chat: chatCapability({
 			adapter,

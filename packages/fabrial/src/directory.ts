@@ -1,10 +1,4 @@
-import type {
-	ExternalIdentity,
-	GroupDefinition,
-	IdentityDirectory,
-	Principal,
-	UserDefinition,
-} from "./identity.ts";
+import type { ExternalIdentity, IdentityDirectory, Principal, UserDefinition } from "./identity.ts";
 import type { AnyPlugin } from "./plugin.ts";
 
 export function identityKey(identity: ExternalIdentity): string {
@@ -21,7 +15,7 @@ export function samePrincipal(a: Principal, b: Principal): boolean {
 }
 
 export function createDirectory(
-	definitions: readonly (UserDefinition | GroupDefinition)[],
+	definitions: readonly UserDefinition[],
 	plugins: readonly AnyPlugin[],
 	clients: () => Record<string, unknown>,
 	now: () => number,
@@ -40,10 +34,7 @@ export function createDirectory(
 			identities.set(key, user);
 		}
 	}
-	for (const definition of definitions) {
-		if (definition.kind === "fabrial.user") add(definition);
-		else for (const user of definition.members ?? []) add(user);
-	}
+	for (const user of definitions) add(user);
 	const principal = (user: UserDefinition): Principal => {
 		add(user);
 		return {

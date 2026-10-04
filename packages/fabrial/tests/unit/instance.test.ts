@@ -1,5 +1,5 @@
-import { expect, expectTypeOf, it } from "vitest";
-import { createFabrial, definePlugin, defineUser, type AnyPlugin } from "../../src/index.ts";
+import { expect, expectTypeOf, it, vi } from "vitest";
+import { createFabrial, definePlugin, defineUser } from "../../src/index.ts";
 import { createTestApp, MemoryRuntime } from "fabrial/testing";
 
 const database = definePlugin((value: string) => ({
@@ -27,39 +27,22 @@ const workflow = f.defineWorkflow({
 	},
 });
 
-// Compiled only: overrides must retain the registered id and client contract.
-function invalidOverrides() {
+// Compiled only: plugins have one configuration point, at definition.
+function invalidConfig() {
 	const runtime = new MemoryRuntime();
-	// @ts-expect-error Unknown override key.
-	f.app({ runtime, workflows: [], plugins: { unknown: database("fake") } });
-	f.app({
-		runtime,
-		workflows: [],
-		// @ts-expect-error Different plugin id, even with identical clients.
-		plugins: { database: { id: "other", clients: () => ({ database: { query: () => "fake" } }) } },
-	});
-	f.app({
-		runtime,
-		workflows: [],
-		plugins: {
-			// @ts-expect-error Same id with an incompatible client contract.
-			database: definePlugin({
-				id: "database",
-				clients: () => ({ database: { query: () => 42 } }),
-			}),
-		},
-	});
-	const overrides = { database: database("fake"), unknown: database("fake") };
-	// @ts-expect-error Unknown keys must fail for variables too, not only fresh object literals.
-	f.app({ runtime, workflows: [], plugins: overrides });
+	// @ts-expect-error Plugins cannot be passed to f.app().
+	f.app({ runtime, workflows: [], plugins: { database: database("fake") } });
+	// @ts-expect-error Groups are referenced by workflows, not registered as users.
+	createFabrial({ plugins: [], identity: [group] });
 	// @ts-expect-error The introspection catalog cannot be mutated.
 	f.plugins.push(database("fake"));
 }
-void invalidOverrides;
+void invalidConfig;
 
-it("reuses plain definitions across isolated apps with typed plugin overrides", async () => {
+it("reuses definitions across isolated apps with definition-time plugins and spied clients", async () => {
 	const production = createTestApp(f, { workflows: [workflow] });
-	const test = createTestApp(f, { workflows: [workflow], plugins: { database: database("fake") } });
+	const test = createTestApp(f, { workflows: [workflow] });
+	vi.spyOn(test.app.host, "clients").mockReturnValue({ database: { query: () => "fake" } });
 	expect(f.plugins[0]!.clients!({}).database.query()).toBe("production");
 	expect(Object.isFrozen(f.plugins)).toBe(true);
 	for (const [fixture, value] of [
@@ -79,6 +62,7 @@ it("reuses plain definitions across isolated apps with typed plugin overrides", 
 			});
 			await fixture.runtime.flush();
 			expect(fixture.runtime.result(id)).toEqual({ status: "completed", output: value });
+			// This group was never registered in identity.
 			expect(await fixture.app.host.directory.members(group)).toMatchObject([{ id: "alice" }]);
 			expect(fixture.app.host.clients().database.query()).toBe(value);
 		} finally {
@@ -114,20 +98,18 @@ it("isolates instance client types and supports client-less catalogs", () => {
 	});
 });
 
-it("rejects unknown and mismatched override ids at runtime for untyped callers", () => {
-	const config = { runtime: new MemoryRuntime(), workflows: [] };
-	const untyped = f.app as (config: {
-		runtime: MemoryRuntime;
-		workflows: [];
-		plugins: Record<string, AnyPlugin>;
-	}) => unknown;
-	expect(() =>
-		untyped({ ...config, workflows: [], plugins: { unknown: database("fake") } }),
-	).toThrow("Unknown plugin override: unknown");
-	expect(() =>
-		f.app({
-			...config,
-			plugins: { database: { id: "other" } as unknown as ReturnType<typeof database> },
-		}),
-	).toThrow("Plugin override database has id other");
+it("does not connect chat adapters until startup", async () => {
+	const connect = vi.fn(() => ({ port: {} as never, routes: {} }));
+	const instance = createFabrial({
+		plugins: [{ id: "chat", chat: { installationId: "", adapter: vi.fn() } }],
+	});
+	const app = instance.app({
+		runtime: new MemoryRuntime(),
+		workflows: [],
+		chat: { kind: "fabrial.chat", connect },
+	});
+	expect(connect).not.toHaveBeenCalled();
+	await app.start();
+	expect(connect).toHaveBeenCalledOnce();
+	await app.stop();
 });

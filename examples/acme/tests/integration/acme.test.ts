@@ -10,9 +10,8 @@ import {
 import { WebClient } from "@slack/web-api";
 import { slack } from "@fabrial/slack";
 import type { Adapter } from "chat";
-import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import postgres, { type Sql } from "postgres";
-import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createApp } from "../../src/app.ts";
 import { bob, engineeringTriage, weeklyRotationForTest } from "./rotation.ts";
 import { supportModel } from "../../src/agents/support.ts";
@@ -25,10 +24,9 @@ interface SlackCall {
 	args: Record<string, unknown>;
 	ts: string;
 }
-let container: StartedPostgreSqlContainer;
-let admin: Sql;
+let applicationSql: Sql;
 let sql: Sql;
-let url: string;
+const url = process.env.DATABASE_URL!;
 let app: ReturnType<typeof createApp>;
 let calls: SlackCall[];
 let states: ReturnType<typeof createPostgresState>[];
@@ -39,24 +37,19 @@ let nextMessage: number;
 let toolResult: string;
 let approvalDelivery: (() => Promise<void>) | undefined;
 
-beforeAll(async () => {
-	container = await new PostgreSqlContainer("postgres:17-alpine").start();
-	admin = postgres(container.getConnectionUri());
-});
-afterAll(async () => {
-	await admin?.end();
-	await container?.stop();
-});
 beforeEach(async () => {
-	const name = `acme_${randomUUID().replaceAll("-", "")}`;
-	await admin.unsafe(`CREATE DATABASE ${name}`);
-	const address = new URL(container.getConnectionUri());
-	address.pathname = name;
-	url = address.toString();
-	sql = postgres(url, { max: 20 });
-	await sql`CREATE TABLE acme_accounts (organisation_id text PRIMARY KEY, balance integer NOT NULL)`;
-	await sql`INSERT INTO acme_accounts VALUES ('org-acme', 0), ('org-other', 100)`;
-	await sql`CREATE TABLE acme_changelog (repo text, number integer, title text, PRIMARY KEY (repo, number))`;
+	sql = postgres(url, { max: 20, onnotice: () => {} });
+	applicationSql = postgres(process.env.APP_DATABASE_URL!, { onnotice: () => {} });
+	// Reuse the definition-time URLs, but isolate every scenario's durable and business state.
+	await sql`DROP SCHEMA IF EXISTS pgconductor CASCADE`;
+	await sql`DROP SCHEMA IF EXISTS fabrial_pi CASCADE`;
+	await sql`DROP SCHEMA public CASCADE`;
+	await sql`CREATE SCHEMA public`;
+	await applicationSql`DROP SCHEMA public CASCADE`;
+	await applicationSql`CREATE SCHEMA public`;
+	await applicationSql`CREATE TABLE acme_accounts (organisation_id text PRIMARY KEY, balance integer NOT NULL)`;
+	await applicationSql`INSERT INTO acme_accounts VALUES ('org-acme', 0), ('org-other', 100)`;
+	await applicationSql`CREATE TABLE acme_changelog (repo text, number integer, title text, PRIMARY KEY (repo, number))`;
 	calls = [];
 	states = [];
 	nextMessage = 1;
@@ -66,10 +59,10 @@ beforeEach(async () => {
 	// Pin the app's on-call clock to the first week, independent of the wall-clock test date.
 	vi.spyOn(engineeringTriage, "resolve").mockImplementation(() => [weeklyRotationForTest()]);
 	const sdkSlack = slack({
-		workspace: "acme",
-		teamId: "T_ACME",
-		botToken: "xoxb-test",
-		signingSecret: "slack-secret",
+		workspace: process.env.SLACK_WORKSPACE!,
+		teamId: process.env.SLACK_TEAM_ID,
+		botToken: process.env.SLACK_BOT_TOKEN!,
+		signingSecret: process.env.SLACK_SIGNING_SECRET!,
 	}).chat!.adapter() as Adapter & { webClient: WebClient };
 	const prototype = Object.getPrototypeOf(sdkSlack.webClient) as WebClient;
 	const apiCall = vi.fn<WebClient["apiCall"]>(async (method, options) => {
@@ -78,7 +71,13 @@ beforeEach(async () => {
 		calls.push({ method, args, ts });
 		switch (method) {
 			case "auth.test":
-				return { ok: true, team_id: "T_ACME", user_id: "U_BOT", bot_id: "B_BOT", user: "fabrial" };
+				return {
+					ok: true,
+					team_id: process.env.SLACK_TEAM_ID,
+					user_id: "U_BOT",
+					bot_id: "B_BOT",
+					user: "fabrial",
+				};
 			case "users.info":
 				return {
 					ok: true,
@@ -144,6 +143,7 @@ afterEach(async () => {
 	await app?.stop();
 	for (const state of states ?? []) await state.disconnect();
 	await sql?.end();
+	await applicationSql?.end();
 	vi.restoreAllMocks();
 });
 
@@ -156,28 +156,6 @@ function newApp() {
 		models,
 		piSettings: { retry: { enabled: false } },
 		logger,
-		slack: {
-			workspace: "acme",
-			teamId: "T_ACME",
-			botToken: "xoxb-test",
-			signingSecret: "slack-secret",
-		},
-		github: {
-			token: "github-test",
-			owner: "acme",
-			webhookSecret: "github-secret",
-			installationId: 42,
-			botUserId: 99,
-			userName: "fabrial",
-			logger,
-		},
-		linear: {
-			apiKey: "linear-test",
-			webhookSecret: "linear-secret",
-			organizationId: "acme",
-			userName: "fabrial",
-			logger,
-		},
 		runtimeOptions: {
 			logger,
 			worker: { concurrency: 8, pollIntervalMs: 20, flushIntervalMs: 20, fetchBatchSize: 10 },
@@ -189,7 +167,7 @@ function newApp() {
 		Object.assign(adapter, {
 			chat: sdk,
 			defaultBotUserId: "lin_bot",
-			defaultOrganizationId: "acme",
+			defaultOrganizationId: process.env.LINEAR_ORGANIZATION_ID,
 		});
 	});
 	return instance;
@@ -233,7 +211,7 @@ async function slackRequest(payload: unknown, action = false) {
 	const body = action
 		? new URLSearchParams({ payload: JSON.stringify(payload) }).toString()
 		: JSON.stringify(payload);
-	const signature = createHmac("sha256", "slack-secret")
+	const signature = createHmac("sha256", process.env.SLACK_SIGNING_SECRET!)
 		.update(`v0:${timestamp}:${body}`)
 		.digest("hex");
 	return app.fetch(
@@ -251,7 +229,7 @@ async function slackRequest(payload: unknown, action = false) {
 async function mention(channel = "C_SUPPORT") {
 	const response = await slackRequest({
 		type: "event_callback",
-		team_id: "T_ACME",
+		team_id: process.env.SLACK_TEAM_ID,
 		event_id: randomUUID(),
 		event: {
 			type: "app_mention",
@@ -294,7 +272,7 @@ async function click(card: SlackCall, label: string, user = "U_BOB", receipt = r
 	const response = await slackRequest(
 		{
 			type: "block_actions",
-			team: { id: "T_ACME" },
+			team: { id: process.env.SLACK_TEAM_ID },
 			user: { id: user, username: user },
 			trigger_id: receipt,
 			channel: { id: card.args.channel },
@@ -312,7 +290,7 @@ async function click(card: SlackCall, label: string, user = "U_BOB", receipt = r
 	expect(response.status).toBe(200);
 }
 async function balances() {
-	return sql`SELECT balance FROM acme_accounts ORDER BY organisation_id`;
+	return applicationSql`SELECT balance FROM acme_accounts ORDER BY organisation_id`;
 }
 async function finalReply(text: string) {
 	await expect
@@ -499,8 +477,8 @@ it("signed GitHub PR opened webhook has one PR-thread owner plus a changelog obs
 	const payload = {
 		action: "opened",
 		sender: { id: 1, login: "alice" },
-		installation: { id: 42 },
-		repository: { full_name: "acme/app", owner: { login: "acme" } },
+		installation: { id: Number(process.env.GITHUB_INSTALLATION_ID) },
+		repository: { full_name: "acme/app", owner: { login: process.env.GITHUB_OWNER } },
 		pull_request: {
 			id: 7,
 			number: 7,
@@ -518,7 +496,7 @@ it("signed GitHub PR opened webhook has one PR-thread owner plus a changelog obs
 			headers: {
 				"x-github-event": "pull_request",
 				"x-github-delivery": "pr-7",
-				"x-hub-signature-256": `sha256=${createHmac("sha256", "github-secret").update(body).digest("hex")}`,
+				"x-hub-signature-256": `sha256=${createHmac("sha256", process.env.GITHUB_WEBHOOK_SECRET!).update(body).digest("hex")}`,
 			},
 		});
 	expect((await app.fetch(request())).status).toBe(200);
@@ -530,7 +508,9 @@ it("signed GitHub PR opened webhook has one PR-thread owner plus a changelog obs
 		issue_number: 7,
 		body: expect.stringContaining("Fix missing credits"),
 	});
-	await expect.poll(async () => (await sql`SELECT * FROM acme_changelog`).length, poll).toBe(1);
+	await expect
+		.poll(async () => (await applicationSql`SELECT * FROM acme_changelog`).length, poll)
+		.toBe(1);
 	const thread = await app.host
 		.chat()!
 		.thread({ kind: "thread", provider: "github", threadId: "github:acme/app:7" });
@@ -605,7 +585,7 @@ it("signed Linear issue created webhook posts a triage comment", async () => {
 	const body = JSON.stringify({
 		type: "Issue",
 		action: "create",
-		organizationId: "acme",
+		organizationId: process.env.LINEAR_ORGANIZATION_ID,
 		webhookTimestamp: Date.now(),
 		actor: { id: "lin_alice" },
 		data: {
@@ -625,7 +605,9 @@ it("signed Linear issue created webhook posts a triage comment", async () => {
 			body,
 			headers: {
 				"linear-delivery": "issue-1",
-				"linear-signature": createHmac("sha256", "linear-secret").update(body).digest("hex"),
+				"linear-signature": createHmac("sha256", process.env.LINEAR_WEBHOOK_SECRET!)
+					.update(body)
+					.digest("hex"),
 			},
 		}),
 	);

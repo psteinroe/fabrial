@@ -8,7 +8,7 @@ Status: early development. See [PLAN.md](./PLAN.md) for the design and [PGCONDUC
 
 ## API
 
-Create an explicit typed catalog with `createFabrial({ plugins, identity })` in a module without workflows. Define workflows with `f.defineWorkflow` and bind Pi helpers with `withPi(f)`. Wire runtime integrations with `f.app({ runtime, chat, agents, workflows })`; tests can override plugin values by existing id via `plugins: { database: database(testOptions) }`. No global module augmentation is needed.
+Create an explicit typed catalog with `createFabrial({ plugins, identity })` in a module without workflows. Define workflows with `f.defineWorkflow` and bind Pi helpers with `withPi(f)`. Wire runtime integrations with `f.app({ runtime, chat, agents, workflows })`; plugins carry their values at definition, and tests spy on `app.host.clients()` for fake clients. `identity` contains users only; define groups with `f.defineGroup` in a separate module and reference them directly in access/approval options. Factories are side-effect free; credentials are validated and connections started by `app.start()`. No global module augmentation is needed.
 
 See [core](./packages/fabrial/README.md), [Pi](./packages/pi/README.md), and the [Acme example](./examples/acme/README.md).
 

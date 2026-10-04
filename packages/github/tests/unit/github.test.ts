@@ -83,7 +83,8 @@ describe("GitHub provider", () => {
 		expect(lookup).toHaveBeenCalledTimes(2);
 	});
 	it("requires explicit webhook verification", () => {
-		expect(() => github({ token: "test" })).toThrow("webhookSecret");
+		const plugin = github({ token: "" });
+		expect(() => plugin.init!()).toThrow("webhookSecret");
 	});
 });
 

@@ -722,7 +722,7 @@ export function createTestRuntime(
 /** Build an isolated in-memory app from the same typed catalog as production. */
 export function createTestApp<const P extends readonly import("./plugin.ts").AnyPlugin[]>(
 	instance: import("./instance.ts").Fabrial<P>,
-	config: Omit<import("./instance.ts").FabrialConfig<P>, "runtime" | "chat" | "agents"> & {
+	config: Omit<import("./instance.ts").FabrialConfig, "runtime" | "chat" | "agents"> & {
 		now?: number | Date;
 		agents?: AgentIntegration;
 	},

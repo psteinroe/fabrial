@@ -1,6 +1,6 @@
 import { f } from "../fabrial.ts";
 import { z } from "zod";
-import { engineeringTriage, support } from "../identity.ts";
+import { engineeringTriage, support } from "../groups.ts";
 
 export const runSql = f.defineWorkflow({
 	name: "run-sql",
