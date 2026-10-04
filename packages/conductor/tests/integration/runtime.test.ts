@@ -1538,8 +1538,9 @@ test("start reconnects to its completed child after losing the memoized submissi
 	const second = await setup(definitions);
 	await second.emit("test.other", {}, { metadata });
 	await expect.poll(() => completed(parent), poll).toBe(true);
-	expect(children).toHaveLength(2);
-	expect(children[1]).toBe(children[0]);
+	// Replays are at-least-once; every replay after the lost step must reconnect to the same child.
+	expect(children.length).toBeGreaterThanOrEqual(2);
+	expect(new Set(children)).toEqual(new Set([children[0]]));
 	expect(effects).toBe(1);
 	const rows = await sql<
 		{ id: string }[]
