@@ -1,0 +1,3 @@
+# SHIM(conductor#9): vendored submodule keeps its own formatting
+vendor/
+pnpm-lock.yaml

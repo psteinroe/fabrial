@@ -1,0 +1,28 @@
+{
+	"name": "fabrial-monorepo",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"build": "pnpm -r --filter './packages/*' build",
+		"typecheck": "pnpm -r --filter './packages/*' --filter './examples/*' typecheck",
+		"test": "vitest run",
+		"test:unit": "vitest run --project unit",
+		"test:integration": "vitest run --project integration",
+		"lint": "oxlint --type-aware --deny-warnings --ignore-pattern 'vendor/**'",
+		"format": "oxfmt"
+	},
+	"devDependencies": {
+		"@testcontainers/postgresql": "catalog:",
+		"@types/node": "catalog:",
+		"oxfmt": "catalog:",
+		"oxlint": "catalog:",
+		"oxlint-tsgolint": "catalog:",
+		"postgres": "catalog:",
+		"typescript": "catalog:",
+		"vitest": "catalog:"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"packageManager": "pnpm@11.25.0"
+}
