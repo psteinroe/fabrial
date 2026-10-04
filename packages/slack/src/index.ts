@@ -1,7 +1,13 @@
 import { SlackAdapter } from "@chat-adapter/slack";
 import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "@fabrial/chat";
 import { WebClient } from "@slack/web-api";
-import { defineGroup, definePlugin, type ExternalIdentity, type Surface } from "fabrial";
+import {
+	defineGroup,
+	definePlugin,
+	type ExternalIdentity,
+	type GroupResolveContext,
+	type Surface,
+} from "fabrial";
 
 export interface SlackOptions {
 	botToken: string;
@@ -129,8 +135,8 @@ export function identity(options: { workspace: string; userId: string }): Extern
 export function userGroup(options: { id: string; handle: string }) {
 	return defineGroup({
 		id: options.id,
-		async resolve(ctx) {
-			const client = ctx.clients.slack as WebClient | undefined;
+		async resolve(ctx: GroupResolveContext<{ slack: WebClient }>) {
+			const client = ctx.clients.slack;
 			if (!client) throw new Error("Slack user group resolution requires clients.slack");
 			const { usergroups } = await client.usergroups.list({ include_disabled: false });
 			const group = usergroups?.find(

@@ -19,14 +19,20 @@ import {
 	type StagedState,
 } from "./context.ts";
 
+export type ToolDefinition<P extends TSchema, D extends JsonValue, TClients> = Omit<
+	ToolRegistration<P, D>,
+	"execute"
+> & {
+	execute(
+		args: Static<P>,
+		ctx: BoundToolApi<D> & FabrialFields<TClients>,
+		context: Context,
+	): Promise<ToolExecutionResult<D>>;
+};
+
+/** Untyped runtime adapter. Use withPi(f) in application code. */
 export function defineTool<P extends TSchema, D extends JsonValue = JsonValue>(
-	definition: Omit<ToolRegistration<P, D>, "execute"> & {
-		execute(
-			args: Static<P>,
-			ctx: BoundToolApi<D> & FabrialFields,
-			context: Context,
-		): Promise<ToolExecutionResult<D>>;
-	},
+	definition: ToolDefinition<P, D, Record<string, unknown>>,
 ): ToolRegistration<P, D> {
 	return piTool({
 		...definition,
@@ -71,6 +77,7 @@ export function defineTool<P extends TSchema, D extends JsonValue = JsonValue>(
 	});
 }
 
+/** Untyped runtime adapter. Use withPi(f) in application code. */
 export function section(
 	key: string,
 	render: (

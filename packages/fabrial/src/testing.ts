@@ -718,3 +718,23 @@ export function createTestRuntime(
 ): MemoryRuntime {
 	return new MemoryRuntime(options);
 }
+
+/** Build an isolated in-memory app from the same typed catalog as production. */
+export function createTestApp<const P extends readonly import("./plugin.ts").AnyPlugin[]>(
+	instance: import("./instance.ts").Fabrial<P>,
+	config: Omit<import("./instance.ts").FabrialConfig<P>, "runtime" | "chat" | "agents"> & {
+		now?: number | Date;
+		agents?: AgentIntegration;
+	},
+) {
+	const { now, ...appConfig } = config;
+	const runtime = new MemoryRuntime({ now });
+	const chat = new FakeChat(() => runtime.now());
+	const app = instance.app({
+		...appConfig,
+		runtime,
+		chat,
+		agents: config.agents ?? fakeAgents(),
+	} as Parameters<typeof instance.app>[0]);
+	return { app, runtime, chat };
+}

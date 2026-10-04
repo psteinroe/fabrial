@@ -1,13 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
+	createFabrial,
 	defineEvent,
 	defineGroup,
 	definePlugin,
 	defineState,
 	defineUser,
-	defineWorkflow,
-	fabrial,
 	trigger,
 	weeklyRotation,
 } from "../../src/index.ts";
@@ -22,6 +21,7 @@ import type {
 	WorkflowContext,
 } from "../../src/index.ts";
 import { FakeChat, fakeAgents, MemoryRuntime } from "fabrial/testing";
+const { defineWorkflow } = createFabrial({ plugins: [] });
 
 const identity = (subjectId: string): ExternalIdentity => ({
 	provider: "chat",
@@ -55,17 +55,22 @@ const plugin = definePlugin({
 		message: defineEvent({ payload: z.record(z.string(), z.json()), filterable: ["channelId"] }),
 	},
 });
-function setup(workflows: AnyWorkflow[], extra: Partial<Parameters<typeof fabrial>[0]> = {}) {
+function setup(
+	workflows: AnyWorkflow[],
+	extra: Partial<import("../../src/app.ts").CoreConfig> = {},
+) {
 	const runtime = new MemoryRuntime();
 	const chat = new FakeChat(() => runtime.now());
-	const app = fabrial({
+	const config = {
 		runtime,
 		chat,
 		plugins: [plugin],
 		workflows,
 		identity: [alice, bob, outsider, team],
 		...extra,
-	});
+	};
+	const { plugins, identity: identities, logger, ...appConfig } = config;
+	const app = createFabrial({ plugins, identity: identities, logger }).app(appConfig);
 	return { runtime, chat, app };
 }
 const workflow = (
@@ -880,9 +885,7 @@ describe("lazy channel threads and cancellation ingress", () => {
 		const runtime = new MemoryRuntime();
 		const chat = new FakeChat(() => runtime.now());
 		const agents = fakeAgents();
-		const app = fabrial({
-			runtime,
-			workflows: [],
+		const app = createFabrial({
 			plugins: [
 				definePlugin({
 					id: "lifecycle",
@@ -894,6 +897,9 @@ describe("lazy channel threads and cancellation ingress", () => {
 					},
 				}),
 			],
+		}).app({
+			runtime,
+			workflows: [],
 			chat: {
 				kind: "fabrial.chat",
 				connect: (host) => ({

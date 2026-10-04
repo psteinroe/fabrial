@@ -2,6 +2,7 @@
 
 ```ts
 import { linear } from "@fabrial/linear";
+import { createFabrial } from "fabrial";
 
 const plugin = linear({
 	apiKey: process.env.LINEAR_API_KEY!, // or accessToken: a fixed OAuth token
@@ -9,6 +10,8 @@ const plugin = linear({
 	organizationId: "your-organization-uuid",
 	userName: "fabrial",
 });
+const f = createFabrial({ plugins: [plugin] });
+// Define workflows with f.defineWorkflow; wire runtime/chat with f.app({ runtime, chat, workflows }).
 ```
 
 Supports single-organization API keys and fixed OAuth access tokens. Verification requires an explicit `webhookSecret` or `webhookVerifier`. Organization identity is configured, never inferred from an untrusted inbound display name. Comment mode is intentional; agent sessions, OAuth installation management and client-credentials token lifecycle are outside this plugin's v1 surface.

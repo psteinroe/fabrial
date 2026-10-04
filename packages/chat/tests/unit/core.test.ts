@@ -1,22 +1,22 @@
 // oxlint-disable typescript/unbound-method -- Referenced adapter methods are Vitest mocks.
 import { createTestMessage } from "@chat-adapter/tests";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import { defineWorkflow, fabrial, trigger, type WorkflowContext } from "fabrial";
+import { createFabrial, trigger, type WorkflowContext } from "fabrial";
 import { z } from "zod";
 import { MemoryRuntime } from "fabrial/testing";
 import { expect, it, vi } from "vitest";
 import { chat, chatTrigger } from "../../src/index.ts";
 import { setup } from "../helper.ts";
+const { defineWorkflow } = createFabrial({ plugins: [] });
 
 it("dispatches a mention to its owner and all matching observers without duplicate runs", async () => {
 	const env = setup();
 	const runtime = new MemoryRuntime();
 	const owner = vi.fn(async () => {});
 	const observer = vi.fn(async () => {});
-	const app = fabrial({
+	const app = createFabrial({ plugins: env.host.plugins }).app({
 		runtime,
 		chat: chat({ state: createMemoryState() }),
-		plugins: env.host.plugins,
 		workflows: [
 			defineWorkflow({ name: "owner", triggers: [chatTrigger("slack", "mentioned")], run: owner }),
 			defineWorkflow({
@@ -69,10 +69,9 @@ it("rebinds a lazy channel from the durable first-post receipt on replay and chi
 		},
 	});
 	const refs: string[] = [];
-	const app = fabrial({
+	const app = createFabrial({ plugins: env.host.plugins }).app({
 		runtime,
 		chat: chat({ state: createMemoryState() }),
-		plugins: env.host.plugins,
 		workflows: [
 			child,
 			defineWorkflow({
@@ -111,10 +110,9 @@ it("authorizes native stop actors through core rather than cancelling the handle
 	const env = setup();
 	const state = createMemoryState();
 	const runtime = new MemoryRuntime();
-	const app = fabrial({
+	const app = createFabrial({ plugins: env.host.plugins }).app({
 		runtime,
 		chat: chat({ state }),
-		plugins: env.host.plugins,
 		workflows: [
 			defineWorkflow({
 				name: "owner",

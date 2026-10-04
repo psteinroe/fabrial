@@ -1,10 +1,11 @@
 import { createHmac } from "node:crypto";
 import { GitHubAdapter } from "@chat-adapter/github";
-import { defineWorkflow, fabrial, type WorkflowContext } from "fabrial";
+import { createFabrial, type WorkflowContext } from "fabrial";
 import { FakeChat, MemoryRuntime } from "fabrial/testing";
 import { describe, expect, it, vi } from "vitest";
 import { github, pullRequestOpened, issueOpened } from "../../src/index.ts";
 import { alice, options, repository, request } from "../helper.ts";
+const { defineWorkflow } = createFabrial({ plugins: [] });
 
 const conversation = {
 	id: 3,
@@ -36,10 +37,9 @@ describe("GitHub lifecycle webhooks", () => {
 			const observer = vi.fn(async (_input: unknown, ctx: WorkflowContext) => {
 				expect(ctx.thread).toBeUndefined();
 			});
-			const app = fabrial({
+			const app = createFabrial({ plugins: [plugin] }).app({
 				runtime,
 				chat,
-				plugins: [plugin],
 				workflows: [
 					defineWorkflow({ name: "owner", triggers: [trigger({ repo: "acme/app" })], run }),
 					defineWorkflow({

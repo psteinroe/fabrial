@@ -1,6 +1,6 @@
-import { defineWorkflow } from "fabrial";
+import { f } from "../fabrial.ts";
 import { linear } from "@fabrial/linear";
-export const linearTriage = defineWorkflow({
+export const linearTriage = f.defineWorkflow({
 	name: "linear-triage",
 	triggers: [linear.issueCreated({ team: "ENG" })],
 	async run(issue, ctx) {

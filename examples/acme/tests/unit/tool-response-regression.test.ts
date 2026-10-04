@@ -1,6 +1,7 @@
-import { defineWorkflow, fabrial, trigger, type InvocationMetadata } from "fabrial";
+import { createFabrial, trigger, type InvocationMetadata } from "fabrial";
 import { FakeChat, MemoryRuntime } from "fabrial/testing";
 import { expect, it } from "vitest";
+const { defineWorkflow } = createFabrial({ plugins: [] });
 
 // Pi clears the driver's trigger markers for tool children. The real-Pi integration
 // scenarios also assert this metadata and the requester's card in the origin thread.
@@ -20,7 +21,7 @@ it("a tool child retains its response thread without inheriting trigger ownershi
 			return null;
 		},
 	});
-	const app = fabrial({ runtime, chat, plugins: [], workflows: [owner, child] });
+	const app = createFabrial({ plugins: [] }).app({ runtime, chat, workflows: [owner, child] });
 	const metadata: InvocationMetadata = {
 		interactionId: "interaction",
 		origin: null,

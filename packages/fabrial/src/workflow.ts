@@ -2,7 +2,6 @@ import type { ApprovalDecision, ApprovalHandle, ApprovalOptions } from "./approv
 import type { EvaluateQuestion, EvaluateRequest, EvaluateResult } from "./evaluate.ts";
 import type { GroupDefinition, Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
-import type { Clients } from "./register.ts";
 import type { AgentRef, AgentRunOptions, InvocationMetadata } from "./runtime.ts";
 import type { Schema } from "./schema.ts";
 import type { JsonObject as StateValue } from "./json.ts";
@@ -10,12 +9,12 @@ import type { StateDefinition, WorkflowStateHandle } from "./state.ts";
 import type { Awaitable, Thread } from "./thread.ts";
 import type { TriggerPayload, TriggerSpec } from "./trigger.ts";
 
-export interface WorkflowContext {
+export interface WorkflowContext<TClients = Record<string, unknown>> {
 	readonly executionId: string;
 	readonly interactionId: string;
 	/** The thread this execution replies into. Absent for observers and executions without a surface. */
 	readonly thread: Thread | undefined;
-	readonly clients: Clients;
+	readonly clients: TClients;
 	/** Who asked for this work. */
 	readonly actor: Principal | null;
 	readonly metadata: InvocationMetadata;
@@ -93,6 +92,7 @@ export interface WorkflowDefinition<
 	TInput extends Json,
 	TOutput extends Json | void,
 	TTriggers extends readonly TriggerSpec<any>[],
+	TClients = Record<string, unknown>,
 > {
 	name: TName;
 	/** Shown to agents when exposed as a tool. */
@@ -108,7 +108,7 @@ export interface WorkflowDefinition<
 	run(
 		this: void,
 		input: TInput | TriggerPayload<TTriggers[number]>,
-		ctx: WorkflowContext,
+		ctx: WorkflowContext<TClients>,
 	): Promise<TOutput>;
 }
 

@@ -17,8 +17,8 @@ import {
 } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import {
+	createFabrial,
 	defineState,
-	defineWorkflow,
 	type DurableExecution,
 	type FabrialHost,
 	type InvocationMetadata,
@@ -32,14 +32,15 @@ import { z } from "zod";
 import {
 	abortOrphans,
 	checkOrphans,
-	defineAgent,
-	defineTool,
 	pi,
 	PostgresStorage,
-	section,
+	withPi,
 	sessionKey,
 } from "../../src/index.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+const definitions = createFabrial({ plugins: [] });
+const { defineWorkflow } = definitions;
+const { defineAgent, defineTool, section } = withPi(definitions);
 
 let sql: Sql;
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
@@ -53,7 +54,7 @@ afterAll(async () => {
 	await container?.stop();
 });
 
-function fixture(plugins: FabrialHost["plugins"] = []) {
+function fixture(plugins: FabrialHost["plugins"] = [], definitionScope: object = definitions) {
 	const runtime = new MemoryRuntime();
 	const chat = new FakeChat();
 	const faux = fauxProvider();
@@ -69,6 +70,7 @@ function fixture(plugins: FabrialHost["plugins"] = []) {
 		triggerEvent: null,
 	};
 	const host = {
+		definitionScope,
 		plugins,
 		workflows: [],
 		runtime,
@@ -737,4 +739,14 @@ it("stop joins driver routing cleanup after the harness has closed", async () =>
 		await driving;
 		await f.integration.stop();
 	}
+});
+
+it("does not install agents from an unrelated Fabrial catalog", async () => {
+	const unrelated = createFabrial({ plugins: [{ id: "unrelated", extension: () => ({}) }] });
+	withPi(unrelated).defineAgent({ name: randomUUID(), extensions: ["unrelated"] });
+	const local = createFabrial({ plugins: [] });
+	const f = fixture([], local);
+	// Installing the unrelated agent would fail: this host has no unrelated plugin extension.
+	await f.integration.start();
+	await f.integration.stop();
 });

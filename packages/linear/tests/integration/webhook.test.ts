@@ -1,9 +1,10 @@
 import { createHmac } from "node:crypto";
-import { defineWorkflow, fabrial, type WorkflowContext } from "fabrial";
+import { createFabrial, type WorkflowContext } from "fabrial";
 import { FakeChat, MemoryRuntime } from "fabrial/testing";
 import { describe, expect, it, vi } from "vitest";
 import { linear, issueCreated, issueUpdated } from "../../src/index.ts";
 import { options, request } from "../helper.ts";
+const { defineWorkflow } = createFabrial({ plugins: [] });
 
 const payload = (action = "create") => ({
 	type: "Issue",
@@ -36,10 +37,9 @@ describe("Linear lifecycle webhooks", () => {
 			const run = vi.fn(async (_input: unknown, ctx: WorkflowContext) => {
 				await ctx.thread!.post("reply", "Thanks!");
 			});
-			const app = fabrial({
+			const app = createFabrial({ plugins: [plugin] }).app({
 				runtime,
 				chat,
-				plugins: [plugin],
 				workflows: [
 					defineWorkflow({
 						name: "owner",

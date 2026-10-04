@@ -1,6 +1,6 @@
-import { defineWorkflow } from "fabrial";
+import { f } from "../fabrial.ts";
 import { github } from "@fabrial/github";
-export const prReview = defineWorkflow({
+export const prReview = f.defineWorkflow({
 	name: "pr-review",
 	triggers: [github.pullRequestOpened({ repo: "acme/app" })],
 	async run(pr, ctx) {

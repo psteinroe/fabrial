@@ -1,9 +1,12 @@
 # @fabrial/pi
 
 ```ts
-import { pi, defineAgent, defineTool, defineState } from "@fabrial/pi";
+import { pi, withPi, defineState } from "@fabrial/pi";
+import { f } from "./fabrial.ts";
 
-const agents = pi({ models, sql }); // pass as fabrial({ agents, ... })
+const { defineAgent, defineTool, section } = withPi(f);
+
+const agents = pi({ models, sql }); // pass as f.app({ agents, runtime, workflows, ... })
 const investigator = defineAgent({
 	name: "investigator",
 	model: { provider: "anthropic", modelId: "your-model" },
@@ -92,7 +95,7 @@ It must be idempotent and must not produce unmanaged external effects.
 
 ## Native adapters and state
 
-`defineTool` and `section` return native Pi objects. Tool handlers receive the
+`withPi(f)` supplies `defineTool`, `defineAgent`, and `section`; there are no free definition-helper exports. Clients in tools/sections and plugin ids in agent `extensions` are inferred from `f`, not from global types. `defineTool` and `section` return native Pi objects. Tool handlers receive the
 native API plus actor, requestedBy, clients, thread, state, invoke, start,
 evaluate and interaction. Chord Context is bound automatically to native methods;
 explicit native Context arguments remain supported. Sections receive native
@@ -128,12 +131,7 @@ interruption semantics. State renders only on agents listing it.
 Only the internal extension is selected by host defaults. Agents explicitly
 select their extensions; plugin hooks are in the internal extension globally.
 Installation includes plugin extensions and extensions/tools/state sections of
-agents defined before start. **Current discovery is module-level defineAgent
-registration**, not exact workflow reachability: JavaScript closures and core's
-AnyWorkflow contract do not expose captured agents. This can over-install unused
-extensions and is unsuitable for isolated applications with conflicting agent
-names in one process. Exact reachability needs `WorkflowDefinition.agents` or a
-host-provided agent registry. Agents must be defined before start.
+agents defined through `withPi(f)` before start. Discovery is **instance-scoped**, not exact workflow reachability: closures do not expose captured agents. Apps from the same `f` share definitions; unrelated catalogs do not install each other's agents. Unused agents within the same catalog may still be installed. Agents must be defined before start.
 
 `checkOrphans(sql, installedKinds)` checks latest task records across Sessions
 without taking their leases. Missing live kinds fail startup with recovery advice.

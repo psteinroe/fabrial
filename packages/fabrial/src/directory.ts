@@ -6,7 +6,6 @@ import type {
 	UserDefinition,
 } from "./identity.ts";
 import type { AnyPlugin } from "./plugin.ts";
-import type { Clients } from "./register.ts";
 
 export function identityKey(identity: ExternalIdentity): string {
 	return `${identity.provider}:${identity.installationId}:${identity.subjectId}`;
@@ -24,7 +23,7 @@ export function samePrincipal(a: Principal, b: Principal): boolean {
 export function createDirectory(
 	definitions: readonly (UserDefinition | GroupDefinition)[],
 	plugins: readonly AnyPlugin[],
-	clients: () => Clients,
+	clients: () => Record<string, unknown>,
 	now: () => number,
 ): IdentityDirectory {
 	const users = new Map<string, UserDefinition>();

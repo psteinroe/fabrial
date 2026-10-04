@@ -8,7 +8,7 @@ import {
 	type ToolExecutionApi,
 } from "@earendil-works/pi-durable";
 import {
-	defineWorkflow,
+	createFabrial,
 	type DurableExecution,
 	type FabrialHost,
 	type InvocationMetadata,
@@ -17,6 +17,7 @@ import { expect, it, vi } from "vitest";
 import { z } from "zod";
 import { BridgeKey, fields, type BridgeFrame } from "../../src/context.ts";
 import { Binding, ChildIntents, ChildResults, Invocation, Runs } from "../../src/documents.ts";
+const { defineWorkflow } = createFabrial({ plugins: [] });
 
 async function fixture(workflows: FabrialHost["workflows"] = []) {
 	const harness = await Harness.open(

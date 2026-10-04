@@ -6,9 +6,12 @@ import type {
 } from "@earendil-works/pi-durable";
 import type { AgentRef, StateDefinition, WorkflowTool } from "fabrial";
 
-export interface AgentDefinition extends Omit<AgentChange, "extensions" | "tools"> {
+export interface AgentDefinition<TId extends string = string> extends Omit<
+	AgentChange,
+	"extensions" | "tools"
+> {
 	name: string;
-	extensions?: readonly (string | Extension)[];
+	extensions?: readonly (TId | Extension)[];
 	tools?: readonly (ToolRegistration | WorkflowTool)[];
 	state?: readonly StateDefinition<any>[];
 	/** Process-local configuration. Call-time configure cannot cross a durable child boundary. */
@@ -18,11 +21,13 @@ export interface DefinedAgent extends AgentRef {
 	readonly definition: AgentDefinition;
 }
 
-/** Core currently has no declaration of the agents captured by a workflow closure. */
-export const definedAgents = new Set<DefinedAgent>();
-export function defineAgent(definition: AgentDefinition): DefinedAgent {
+/** Discovery is scoped to the Fabrial instance, not to the importing process. */
+export const definedAgents = new WeakMap<object, Set<DefinedAgent>>();
+export function defineAgent(definition: AgentDefinition, scope: object): DefinedAgent {
 	if (!definition.name) throw new Error("Agent name must not be empty");
 	const agent: DefinedAgent = { kind: "fabrial.agent", name: definition.name, definition };
-	definedAgents.add(agent);
+	let agents = definedAgents.get(scope);
+	if (!agents) definedAgents.set(scope, (agents = new Set()));
+	agents.add(agent);
 	return agent;
 }

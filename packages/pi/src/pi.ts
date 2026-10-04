@@ -699,7 +699,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					pluginExtensions.set(plugin.id, extension);
 					registry.install(extension);
 				}
-			for (const agent of definedAgents) install(agent);
+			for (const agent of definedAgents.get(host.definitionScope ?? host) ?? []) install(agent);
 			await checkOrphans(
 				options.sql,
 				registry

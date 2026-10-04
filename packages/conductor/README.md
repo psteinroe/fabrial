@@ -13,7 +13,7 @@ const runtime = conductor(
 		pollIntervalMs: 250,
 	},
 );
-// Pass runtime to fabrial({ runtime, ... }); core registers workflows and events.
+// Pass runtime to f.app({ runtime, workflows, ... }) after createFabrial({ plugins, identity }); core registers workflows and events.
 ```
 
 Alternatively supply `{ sql }` with a `postgres.Sql` pool. An injected pool belongs to the caller; `stop()` does not close it. An adapter-created pool is closed on stop; create a new runtime instance to restart it. `logger` accepts Conductor's logger interface. `worker` accepts partial native `WorkerConfig`; `pollIntervalMs` separately controls fallback races and settlement reconciliation. Keep the queue's workflow catalog consistent across instances. `now()` exposes the wall clock used by core; durable wait deadlines use Postgres's clock.
@@ -68,7 +68,7 @@ Without a hook the monitor emits settlement events for failures/cancellations th
 
 ### Contract coordination / PGCONDUCTOR.md
 
-The updated port's `cursor`/`after`, absolute `deadline`/`at`, consumed cursors, and canonical `dispatchOwner` are implemented. Core captures cursors before approval/reply side effects and supplies `dispatchOwner` on each ingress category. Tests include a real-Postgres approval through `fabrial()` whose authenticated click arrives during card delivery, before the wait registers.
+The updated port's `cursor`/`after`, absolute `deadline`/`at`, consumed cursors, and canonical `dispatchOwner` are implemented. Core captures cursors before approval/reply side effects and supplies `dispatchOwner` on each ingress category. Tests include a real-Postgres approval through `f.app()` whose authenticated click arrives during card delivery, before the wait registers.
 
 `PGCONDUCTOR.md` describes the upstream gaps: its Findings for **#1** (native wait, unresolved todo) and **cross-category dispatch** (first-submission ownership race) are historical for this adapter. The shims above close those adapter gaps, not the corresponding native Conductor gaps. Strict mutex guarantees still need upstream claims/fencing, not weaker port documentation.
 

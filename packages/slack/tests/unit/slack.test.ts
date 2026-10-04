@@ -96,7 +96,11 @@ describe("Slack user groups", () => {
 			.spyOn(clients.slack.usergroups.users, "list")
 			.mockResolvedValueOnce({ ok: true, users: ["U1", "U2"] })
 			.mockResolvedValueOnce({ ok: true, users: ["U3"] });
-		const ctx: GroupResolveContext = { clients, now: new Date(), principal: vi.fn() };
+		const ctx: GroupResolveContext<typeof clients> = {
+			clients,
+			now: new Date(),
+			principal: vi.fn(),
+		};
 		const group = userGroup({ id: "triage-approvers", handle: "@triage" });
 		expect(group.kind).toBe("fabrial.group");
 		expect(await group.resolve!(ctx)).toEqual([
@@ -116,6 +120,7 @@ describe("Slack user groups", () => {
 			"not found",
 		);
 		await expect(
+			// @ts-expect-error Deliberately missing the required Slack client.
 			group.resolve!({ clients: {}, now: new Date(), principal: vi.fn() }),
 		).rejects.toThrow("clients.slack");
 	});

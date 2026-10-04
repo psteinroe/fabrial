@@ -1,7 +1,7 @@
-import { defineWorkflow } from "fabrial";
+import { f } from "../fabrial.ts";
 import { z } from "zod";
 import { supportAgent } from "../agents/support.ts";
-export const bugIntake = defineWorkflow({
+export const bugIntake = f.defineWorkflow({
 	name: "bug-intake",
 	input: z.object({ message: z.object({ text: z.string(), channelId: z.string() }) }),
 	async run({ message }, ctx) {

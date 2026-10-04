@@ -53,12 +53,39 @@ Fabrial owns no tables. Its per-thread routing state (active interaction, curren
 
 All code below is the proposed Fabrial API.
 
-### `defineWorkflow`
+### The instance: `createFabrial`
+
+Like PG Conductor (`Conductor.create({ context })` → `conductor.createTask`, wired later by `Orchestrator.create`), a Fabrial instance carries the plugin types, so definitions get typed `ctx.clients` without global type augmentation. The instance holds plugins and identity only, never workflows, so definition files can import it without cycles. Runtime wiring happens separately in `f.app()`.
+
+```ts
+// fabrial.ts
+export const f = createFabrial({
+	plugins: [slack({ ... }), github({ ... }), linear({ ... }), database({ ... })],
+	identity: [alice, bob, support, engineeringTriage],
+});
+export const { defineTool, defineAgent, section } = withPi(f); // from @fabrial/pi
+
+// workflows, tools, agents use f (or the bound Pi helpers): ctx.clients is typed from f's plugins
+export const runSql = f.defineWorkflow({ name: "run-sql", async run(input, ctx) { /* ctx.clients.database */ } });
+
+// app.ts: runtime wiring; plugin values can be overridden by id (type-checked), e.g. in tests
+export const app = f.app({
+	runtime: conductor({ sql }),
+	chat: chat({ state }),
+	agents: pi({ models, sql }),
+	workflows: [generalAssistant, runSql],
+	plugins: { database: database({ sql: testSql }) },
+});
+```
+
+Definitions are plain data, so any app built from `f` can register them. Reusable tools shipped inside plugin packages don't use `f`; they get typed clients through the plugin's own `extension: (clients) => …` closure.
+
+### `f.defineWorkflow`
 
 The main abstraction. It registers a Conductor task, turns plugin triggers into Conductor subscriptions, and rebuilds the invocation context on every start or resume. Conductor execution options (concurrency, retries, …) are passed through.
 
 ```ts
-export const repairCustomer = defineWorkflow({
+export const repairCustomer = f.defineWorkflow({
 	name: "repair-customer",
 	triggers: [slack.mentioned({ channel: "C_SUPPORT" })],
 	access: { invoke: support },
@@ -134,7 +161,7 @@ Step memoization does not give exactly-once external effects. Integration operat
 
 ### Agents (Pi)
 
-Agents run on Pi Durable. App authors write agents (`defineAgent`), tools (`defineTool`, or `workflow.asTool()` for anything durable or long-running), and shared state (`defineState`). Pi tasks and raw Pi documents are Pi's internal machinery and an advanced escape hatch only; app authors don't need them.
+Agents run on Pi Durable. App authors write agents (`defineAgent`), tools (`defineTool`, or `workflow.asTool()` for anything durable or long-running), and shared state (`defineState`). `defineAgent`, `defineTool`, and `section` come from `withPi(f)`, so their `ctx.clients` and plugin extension ids are typed from the instance. Pi tasks and raw Pi documents are Pi's internal machinery and an advanced escape hatch only; app authors don't need them.
 
 `defineAgent` is a thin wrapper over Pi's per-conversation agent config (`conversation.configure()`). It adds a stable `name` (used for the continuation key, tracing, and progress labels), plugin extensions referenced by plugin `id` (they are built at runtime from live clients), and the `state` the agent can see. Every other field passes through, and unset fields follow host defaults as in Pi:
 
@@ -161,7 +188,7 @@ export const repoAgent = defineAgent({
 Tools and sections use thin `@fabrial/pi` adapters that return **native Pi objects**. Their handlers receive `ctx` = Pi's `api` plus Fabrial context:
 
 ```ts
-import { defineTool, section } from "@fabrial/pi";
+import { defineTool, section } from "./fabrial.ts"; // = withPi(f)
 import { defineExtension } from "@earendil-works/pi-durable";
 
 export const addFinding = defineTool({
@@ -341,7 +368,7 @@ Plugins are how everything outside the core plugs in: chat providers (Slack via 
 
 The design borrows from Better Auth (option factory, declarative object, inferred types, plugins extend the core via hooks), Executor (`definePlugin(() => ({ … }))`, one canonical implementation reused by every caller), and Pi (native extension/hook shapes, no side effects in the factory).
 
-`definePlugin` takes a factory (for plugins with options) or a plain object, and infers types for `ctx.clients`, events, and triggers:
+`definePlugin` takes a factory (for plugins with options) or a plain object, and infers types for its clients, events, and triggers. Those types reach `ctx.clients` through the `createFabrial` instance the plugin is passed to:
 
 ```ts
 // @fabrial/sentry: non-chat provider
@@ -422,10 +449,8 @@ export const triageRotation = definePlugin({
 	clients: () => ({ rotations: new RotationService(env.DATABASE_URL) }),
 });
 
-// app
-export const app = fabrial({
-	conductor,
-	pi: { models },
+// fabrial.ts: the instance carries plugin types for every definition
+export const f = createFabrial({
 	plugins: [
 		slack({
 			botToken: env.SLACK_BOT_TOKEN,
@@ -436,8 +461,15 @@ export const app = fabrial({
 		langfuse({ publicKey: env.LANGFUSE_PK, secretKey: env.LANGFUSE_SK }),
 		triageRotation,
 	],
-	workflows: [generalAssistant, bugIntake, runSql],
 	identity: [alice, support, engineeringTriage],
+});
+
+// app.ts: runtime wiring
+export const app = f.app({
+	runtime: conductor({ sql }),
+	chat: chat({ state }),
+	agents: pi({ models, sql }),
+	workflows: [generalAssistant, bugIntake, runSql],
 });
 
 export default { fetch: app.fetch }; // one handler for /slack/events, /sentry/webhook, …
@@ -447,7 +479,7 @@ await app.start(); // Conductor workers + Pi bridge
 A workflow using both providers:
 
 ```ts
-export const bugIntake = defineWorkflow({
+export const bugIntake = f.defineWorkflow({
 	name: "bug-intake",
 	input: z.object({ message: SlackMessage }), // #bugs messages arrive via handoff from generalAssistant
 	triggers: [
@@ -515,7 +547,7 @@ A Slack-bound execution gets two guarantees:
 The single entry point is an ordinary workflow with triggers and plain `if/else`. There is no routing DSL.
 
 ```ts
-export const generalAssistant = defineWorkflow({
+export const generalAssistant = f.defineWorkflow({
 	name: "general-assistant",
 	triggers: [slack.mentioned(), slack.newThread({ channel: channels.bugs })],
 
@@ -573,14 +605,14 @@ fabrial/
     └── acme/         # v1 reference app
 ```
 
-| Package                                                | Contents                                                                                                                        |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
-| `fabrial`                                              | Core: `defineWorkflow`, plugin lifecycle, invocation-context contract, identity, approvals, response context.                   |
-| `@fabrial/conductor`                                   | Event registration, context enrichment, durable dispatch helpers.                                                               |
-| `@fabrial/pi`                                          | Pi Postgres storage, Conductor ↔ Pi bridges, `defineAgent`, `defineTool`/`section` adapters, `defineState`, progress rendering. |
-| `@fabrial/chat`                                        | Chat SDK ingestion, thread reconstruction, default renderers.                                                                   |
-| `@fabrial/slack`, `@fabrial/github`, `@fabrial/linear` | Provider events, clients, auth, context loaders, identities.                                                                    |
-| `@fabrial/sentry`, `@fabrial/langfuse`                 | After v1.                                                                                                                       |
+| Package                                                | Contents                                                                                                                                              |
+| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fabrial`                                              | Core: `createFabrial` (`f.defineWorkflow`, `f.app`), plugin lifecycle, invocation-context contract, identity, approvals, response context.            |
+| `@fabrial/conductor`                                   | Event registration, context enrichment, durable dispatch helpers.                                                                                     |
+| `@fabrial/pi`                                          | Pi Postgres storage, Conductor ↔ Pi bridges, `withPi(f)` (`defineAgent`, `defineTool`/`section` adapters), `defineState` storage, progress rendering. |
+| `@fabrial/chat`                                        | Chat SDK ingestion, thread reconstruction, default renderers.                                                                                         |
+| `@fabrial/slack`, `@fabrial/github`, `@fabrial/linear` | Provider events, clients, auth, context loaders, identities.                                                                                          |
+| `@fabrial/sentry`, `@fabrial/langfuse`                 | After v1.                                                                                                                                             |
 
 These are packages, not services. They can all run in one process.
 
@@ -598,6 +630,7 @@ Recorded as open questions are resolved.
 - **Cancellation is structured by default, with a per-call `detached` opt-out.** Cancelling an execution cancels every call it made: `ctx.agent` (Pi conversation abort), `ctx.invoke`, and `asTool()` workflows, recursively. A pending `waitForApproval` updates its card to "Cancelled" and rejects later clicks. Opt out per call with `{ detached: true }`, or per tool with `workflow.asTool({ detached: true })`. Handoffs are always independent, because the receiver owns the interaction. Cancellation is cooperative: a running step finishes and its result is recorded, and cancellation takes effect at the next durable operation. A "stop" in a thread cancels the interaction's current handler.
 - **`run(input, ctx)`, matching Conductor's handler shape.** For triggered runs, `input` is the typed trigger event (a union for multiple triggers). For `ctx.invoke`, `ctx.handoff`, and `asTool()` it is the workflow's typed input.
 - **Plugins: `definePlugin(factory | object)`** with the capability set in [Plugins](#plugins). Chat SDK is just the optional `chat` capability, so non-chat sources like Sentry or internal webhooks are first-class (`events` + `routes`). The shape follows Better Auth and Executor: an option factory, a declarative object, and inferred types. Global hooks are `hooks: { workflow, agent }` in native Conductor-middleware and Pi-hook shapes. Agent-scoped hooks live in `extension`. Trigger helpers are static exports.
+- **Typed clients come from a Conductor-style instance, not global type augmentation.** `createFabrial({ plugins, identity })` returns `f`; `f.defineWorkflow` and `withPi(f)`'s `defineTool`/`defineAgent`/`section` get `ctx.clients` and plugin extension ids typed from `f`'s plugins, and a misspelled client is a type error. The instance holds no workflows (no import cycles); `f.app({ runtime, chat, agents, workflows, plugins? })` does the runtime wiring, and `plugins` overrides values by plugin id (type-checked), e.g. for tests. There are no free `defineWorkflow`/`fabrial()` functions and no `declare module` registration. Most backend frameworks do it this way (Conductor, Inngest, tRPC, Hono); global `Register` augmentation is a frontend-library pattern and felt like magic.
 - **Credentials are plugin options.** Executor's provider/account split (an accounts table, secret storage, slots) is deferred until several accounts per provider or per-person credentials are needed. A second installation is a second plugin instance with its own `id`.
 - **Thin `defineAgent`.** It holds `name`, plus plugin extensions by `id`. Everything else (`model`, `thinkingLevel`, `instructions`, `extensions`, `tools`, …) passes through to Pi's `configure()`. `ctx.agent` options are `input`, `output` (typed structured result, validated from a JSON answer), and `detached`. The native `configure` escape hatch is a `defineAgent` field, since a function can't cross into the agent's own execution. No Fabrial-owned agent features such as memory or per-agent permissions.
 - **v1 scope: Slack + the SQL approval flow + GitHub and Linear.**

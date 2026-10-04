@@ -2,12 +2,11 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import postgres from "postgres";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import {
+	createFabrial,
 	EXECUTION_SETTLED_EVENT,
 	defineEvent,
 	defineUser,
 	definePlugin,
-	defineWorkflow,
-	fabrial,
 	trigger,
 	type DurableExecution,
 	type DurableRuntime,
@@ -26,6 +25,7 @@ import {
 	type Conductor,
 	type AnyTask,
 } from "../../src/index.ts";
+const { defineWorkflow } = createFabrial({ plugins: [] });
 
 let container: StartedPostgreSqlContainer;
 let admin: postgres.Sql;
@@ -1465,7 +1465,11 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 			return { output, event };
 		},
 	});
-	const app = fabrial({ runtime, chat, plugins: [plugin], workflows: [parent, child] });
+	const app = createFabrial({ plugins: [plugin] }).app({
+		runtime,
+		chat,
+		workflows: [parent, child],
+	});
 	await app.start();
 	await app.emit("test.begin", { key: "go" }, { id: "delivery", replyTo: surface });
 	await expect.poll(() => parentId, poll).toBeDefined();
@@ -1604,7 +1608,11 @@ test("core approval accepts an authenticated click during card delivery, before 
 			return decision;
 		},
 	});
-	const app = fabrial({ runtime, chat, plugins: [plugin], workflows: [parent], identity: [alice] });
+	const app = createFabrial({ plugins: [plugin], identity: [alice] }).app({
+		runtime,
+		chat,
+		workflows: [parent],
+	});
 	await app.start();
 	await app.emit("test.begin", { key: "go" }, { id: "approval" });
 	await expect.poll(() => parentId, poll).toBeDefined();

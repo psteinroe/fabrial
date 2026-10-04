@@ -9,7 +9,6 @@ import type {
 } from "./identity.ts";
 import type { JsonObject } from "./json.ts";
 import type { AnyPlugin } from "./plugin.ts";
-import type { Clients } from "./register.ts";
 import type { AgentPort, ChatPort, DurableRuntime, RuntimeWorkflow, StatePort } from "./runtime.ts";
 import type { ChatMessage, Surface, ThreadRef } from "./thread.ts";
 import type { AnyWorkflow } from "./workflow.ts";
@@ -22,14 +21,16 @@ export interface Logger {
 }
 
 /** What core exposes to adapter packages (`@fabrial/chat`, `@fabrial/pi`). Not for app code. */
-export interface FabrialHost {
+export interface FabrialHost<TClients = Record<string, unknown>> {
+	/** Definition catalog identity, used by adapters to isolate instance-local definitions. */
+	readonly definitionScope?: object;
 	readonly plugins: readonly AnyPlugin[];
 	readonly workflows: readonly AnyWorkflow[];
 	readonly runtime: DurableRuntime;
 	readonly directory: IdentityDirectory;
 	readonly logger: Logger;
 	/** Live clients of all plugins (built once per process; plugin `clients()` must be cheap and stateless). */
-	clients(): Clients;
+	clients(): TClients;
 	/** Chat port, once `@fabrial/chat` is configured. */
 	chat(): ChatPort | undefined;
 
@@ -107,7 +108,8 @@ export interface AgentIntegration extends HostIntegration<{
 	readonly kind: "fabrial.agents";
 }
 
-export interface FabrialConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[]> {
+export interface CoreConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[]> {
+	definitionScope?: object;
 	/** Durable workflow runtime, e.g. `conductor({ sql })` from `@fabrial/conductor`. */
 	runtime: DurableRuntime;
 	/** Chat SDK integration from `@fabrial/chat`. Required when any plugin has a `chat` capability. */
@@ -122,7 +124,7 @@ export interface FabrialConfig<P extends readonly AnyPlugin[] = readonly AnyPlug
 	reservationTimeout?: import("./runtime.ts").DurationInput;
 }
 
-export interface App {
+export interface App<TClients = Record<string, unknown>> {
 	/** One fetch handler for all plugin routes and chat webhooks. */
 	fetch(request: Request): Promise<Response>;
 	/** Validates (trigger ties, orphaned Pi tasks, …), runs plugin `init`, starts the runtime. */
@@ -134,5 +136,5 @@ export interface App {
 		payload: JsonObject,
 		options?: EmitOptions & { replyTo?: Surface },
 	): Promise<void>;
-	readonly host: FabrialHost;
+	readonly host: FabrialHost<TClients>;
 }

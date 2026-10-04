@@ -1,4 +1,5 @@
-import { defineAgent, defineState, defineTool } from "@fabrial/pi";
+import { defineState } from "@fabrial/pi";
+import { defineAgent, defineTool } from "../fabrial.ts";
 import { Type } from "typebox";
 import { z } from "zod";
 import { runSql } from "../workflows/run-sql.ts";

@@ -2,6 +2,7 @@
 
 ```ts
 import { github } from "@fabrial/github";
+import { createFabrial } from "fabrial";
 
 const plugin = github({
 	token: process.env.GITHUB_TOKEN!,
@@ -11,6 +12,8 @@ const plugin = github({
 	userName: "fabrial[bot]",
 	botUserId: 12345,
 });
+const f = createFabrial({ plugins: [plugin] });
+// Define workflows with f.defineWorkflow; wire runtime/chat with f.app({ runtime, chat, workflows }).
 ```
 
 Supports PAT credentials or a single GitHub App installation (`appId`, `privateKey`, numeric `installationId`). Credentials and adapter options are passed through to Chat SDK. Set `botUserId` to prevent self-reply loops. Verification requires an explicit `webhookSecret` or `webhookVerifier`; it does not silently use environment credentials.

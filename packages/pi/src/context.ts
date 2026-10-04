@@ -10,7 +10,6 @@ import type {
 import {
 	parseSchema,
 	type AnyWorkflow,
-	type Clients,
 	type DurableExecution,
 	type EvaluateQuestion,
 	type EvaluateRequest,
@@ -48,10 +47,10 @@ export interface BridgeFrame {
 	children: Map<number, { executionId: string; detached: boolean }>;
 }
 export const BridgeKey = createContextKey<BridgeFrame>("fabrial.pi.bridge");
-export interface FabrialFields {
+export interface FabrialFields<TClients = Record<string, unknown>> {
 	actor: Principal | null;
 	requestedBy: Principal | null;
-	clients: Clients;
+	clients: TClients;
 	interaction: InvocationMetadata;
 	thread:
 		| {
@@ -79,8 +78,10 @@ export interface FabrialFields {
 		request: EvaluateRequest<Q>,
 	): Promise<EvaluateResult<Q>>;
 }
-export type ToolContext = import("./bind.ts").BoundToolApi & FabrialFields;
-export type SectionContext = PromptInput & FabrialFields;
+export type ToolContext<TClients = Record<string, unknown>> = import("./bind.ts").BoundToolApi &
+	FabrialFields<TClients>;
+export type SectionContext<TClients = Record<string, unknown>> = PromptInput &
+	FabrialFields<TClients>;
 export type StagedState = {
 	definition: StateDefinition;
 	interactionId: string;

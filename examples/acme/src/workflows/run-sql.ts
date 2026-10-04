@@ -1,8 +1,8 @@
-import { defineWorkflow } from "fabrial";
+import { f } from "../fabrial.ts";
 import { z } from "zod";
 import { engineeringTriage, support } from "../identity.ts";
 
-export const runSql = defineWorkflow({
+export const runSql = f.defineWorkflow({
 	name: "run-sql",
 	description: "Execute a customer repair SQL statement after a human reviews the exact proposal.",
 	input: z.object({

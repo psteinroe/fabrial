@@ -1,5 +1,3 @@
-import type { Clients } from "./register.ts";
-
 /** An identity in an external system, scoped to a provider installation. */
 export interface ExternalIdentity {
 	/** Plugin id, e.g. "slack". */
@@ -36,30 +34,30 @@ export function defineUser(definition: {
 }
 
 /** Context available to dynamic group resolvers. */
-export interface GroupResolveContext {
-	readonly clients: Clients;
+export interface GroupResolveContext<TClients = Record<string, unknown>> {
+	readonly clients: TClients;
 	readonly now: Date;
 	/** Resolve a user definition or external identity to a principal. */
 	principal(user: UserDefinition | ExternalIdentity): Promise<Principal>;
 }
 
-export interface GroupDefinition {
+export interface GroupDefinition<TClients = Record<string, unknown>> {
 	readonly kind: "fabrial.group";
 	readonly id: string;
 	/** Static members, or a resolver for dynamic membership (rotations, Slack user groups, …). */
 	readonly members?: readonly UserDefinition[];
-	readonly resolve?: (
-		ctx: GroupResolveContext,
-	) =>
+	resolve?(
+		ctx: GroupResolveContext<TClients>,
+	):
 		| Promise<readonly (UserDefinition | ExternalIdentity | Principal)[]>
 		| readonly (UserDefinition | ExternalIdentity | Principal)[];
 }
 
-export function defineGroup(
+export function defineGroup<TClients = Record<string, unknown>>(
 	definition:
 		| { id: string; members: UserDefinition[] }
-		| { id: string; resolve: GroupDefinition["resolve"] & {} },
-): GroupDefinition {
+		| { id: string; resolve: GroupDefinition<TClients>["resolve"] & {} },
+): GroupDefinition<TClients> {
 	return { kind: "fabrial.group", ...definition };
 }
 

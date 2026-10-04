@@ -4,6 +4,8 @@ A private workspace example, not a hosted service. The app has one Slack entry
 workflow, a support agent, a SQL repair workflow with triage approval, bug handoff,
 a GitHub PR review owner/changelog observer, and Linear issue triage.
 
+`src/fabrial.ts` owns the typed plugin/identity catalog and exports `withPi(f)` helpers. Definitions import that module; it never imports workflows. Its catalog-only placeholder credentials/database are replaced by `createApp(deps)` using `f.app({ ..., plugins: { slack, github, linear, database } })`. Tests inject live/fake values through those type-checked overrides; there is no `declare module` augmentation.
+
 ## Run / embed
 
 Supply Postgres pools, a Chat SDK state adapter, Pi AI `Models`, and provider

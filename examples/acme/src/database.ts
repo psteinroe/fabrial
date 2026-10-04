@@ -7,7 +7,12 @@ const singleStatement = { prepare: true, simple: false };
 
 /** Use a dedicated, least-privilege database role in production; SQL is not a sandbox. */
 export class Database {
-	constructor(private readonly sql: Sql) {}
+	constructor(private readonly pool?: Sql) {}
+	private get sql(): Sql {
+		if (!this.pool)
+			throw new Error("Database plugin requires a SQL pool; supply a database override to f.app()");
+		return this.pool;
+	}
 	async query(organisationId: string, query: string): Promise<Json> {
 		return this.sql.begin(async (tx) => {
 			await tx`SET TRANSACTION READ ONLY`;
@@ -31,7 +36,7 @@ export class Database {
 			.sql`INSERT INTO acme_changelog (repo, number, title) VALUES (${pr.repo}, ${pr.number}, ${pr.title}) ON CONFLICT (repo, number) DO NOTHING`;
 	}
 }
-export const databasePlugin = definePlugin((sql: Sql) => ({
+export const databasePlugin = definePlugin((sql?: Sql) => ({
 	id: "database",
 	clients: () => ({ database: new Database(sql) }),
 }));

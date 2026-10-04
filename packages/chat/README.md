@@ -1,6 +1,6 @@
 # @fabrial/chat
 
-`chat({ state, userName?, waitUntil? })` connects one Chat SDK bot to all chat-capable plugins. Routes are `POST /<pluginId>/events`. Supply your deployment's `waitUntil` hook for background ingress; without it the route awaits ingress. Credentials stay in plugin options.
+`chat({ state, userName?, waitUntil? })` connects one Chat SDK bot to all chat-capable plugins. Routes are `POST /<pluginId>/events`. Supply your deployment's `waitUntil` hook for background ingress; without it the route awaits ingress. Credentials stay in plugin options. Create a catalog with `createFabrial({ plugins, identity })`, define workflows with `f.defineWorkflow`, then wire `f.app({ runtime, workflows, chat: chat({ state }) })`.
 
 The port supports reconstructed threads, lazy channel roots, DMs, ephemeral messages, text/Markdown/cards, edited messages, best-effort throttled progress, attributed bounded history, and routing state under `thread.state.fabrial`. `ThreadIO.updateState(fn)` performs atomic read-modify-write using the SDK state adapter's distributed, token-owned per-thread lock; all routing-state writers (including fallback status) use it. Lock contention retries for at most 10 seconds; leases last 60 seconds and are checked/renewed before writing, with release in `finally`. Keep callbacks pure: a lost lease can retry them. State writes refresh a 30-day TTL. Card action ids/values are forwarded unchanged to core (including approval cancellation).
 

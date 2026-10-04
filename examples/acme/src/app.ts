@@ -1,4 +1,4 @@
-import { fabrial, type Logger } from "fabrial";
+import type { Logger } from "fabrial";
 import { conductor } from "@fabrial/conductor";
 import { pi, type PiOptions } from "@fabrial/pi";
 import { chat } from "@fabrial/chat";
@@ -9,7 +9,7 @@ import type { Models } from "@earendil-works/pi-ai";
 import type { StateAdapter } from "chat";
 import type { Sql } from "postgres";
 import { databasePlugin } from "./database.ts";
-import { identity } from "./identity.ts";
+import { f } from "./fabrial.ts";
 import { generalAssistant } from "./workflows/general-assistant.ts";
 import { bugIntake } from "./workflows/bug-intake.ts";
 import { runSql } from "./workflows/run-sql.ts";
@@ -30,28 +30,19 @@ export interface AppDependencies {
 	runtimeOptions?: Parameters<typeof conductor>[1];
 	piSettings?: PiOptions["settings"];
 }
-type Plugins = readonly [
-	ReturnType<typeof slack>,
-	ReturnType<typeof github>,
-	ReturnType<typeof linear>,
-	ReturnType<typeof databasePlugin>,
-];
-declare module "fabrial" {
-	interface Register {
-		plugins: Plugins;
-	}
-}
 export const workflows = [generalAssistant, bugIntake, runSql, prReview, changelog, linearTriage];
 export function createApp(deps: AppDependencies) {
-	const database = databasePlugin(deps.databaseSql ?? deps.sql);
-	const plugins = [slack(deps.slack), github(deps.github), linear(deps.linear), database] as const;
-	return fabrial({
+	return f.app({
 		runtime: conductor({ sql: deps.sql }, deps.runtimeOptions),
 		chat: chat({ state: deps.state }),
 		agents: pi({ models: deps.models, sql: deps.sql, settings: deps.piSettings }),
-		plugins,
+		plugins: {
+			slack: slack(deps.slack),
+			github: github(deps.github),
+			linear: linear(deps.linear),
+			database: databasePlugin(deps.databaseSql ?? deps.sql),
+		},
 		workflows,
-		identity,
 		logger: deps.logger,
 	});
 }

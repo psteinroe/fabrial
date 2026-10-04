@@ -1,9 +1,8 @@
-import type { App, FabrialConfig, FabrialHost, Logger } from "./app.ts";
+import type { App, CoreConfig, FabrialHost, Logger } from "./app.ts";
 import { createDirectory, identityKey } from "./directory.ts";
 import { boundedTimeout, filtersOverlap, matchesFilter } from "./internal.ts";
 import { clearInteraction, hasIngress, rememberIngress } from "./routing.ts";
 import type { Json } from "./json.ts";
-import type { Clients } from "./register.ts";
 import { EXECUTION_SETTLED_EVENT } from "./runtime.ts";
 import type { ExecutionResult, InvocationMetadata, RuntimeWorkflow } from "./runtime.ts";
 import { createContext } from "./context.ts";
@@ -13,14 +12,14 @@ import type { TriggerSpec } from "./trigger.ts";
 const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
 /** Compose integrations and register the core workflow/context protocol with the durable runtime. */
-export function fabrial(config: FabrialConfig): App {
+export function buildApp(config: CoreConfig): App {
 	const runtime = config.runtime;
 	const now = () => runtime.now?.() ?? Date.now();
 	const reservationTimeout = boundedTimeout(config.reservationTimeout ?? "10m");
-	let chat: ReturnType<NonNullable<FabrialConfig["chat"]>["connect"]> | undefined;
-	let agents: ReturnType<NonNullable<FabrialConfig["agents"]>["connect"]> | undefined;
-	let liveClients: Clients | undefined;
-	const clients = (): Clients =>
+	let chat: ReturnType<NonNullable<CoreConfig["chat"]>["connect"]> | undefined;
+	let agents: ReturnType<NonNullable<CoreConfig["agents"]>["connect"]> | undefined;
+	let liveClients: Record<string, unknown> | undefined;
+	const clients = (): Record<string, unknown> =>
 		(liveClients ??= Object.assign(
 			{},
 			...config.plugins.map((p) => p.clients?.({ chat: chat?.port }) ?? {}),
@@ -54,6 +53,7 @@ export function fabrial(config: FabrialConfig): App {
 		};
 	};
 	const host: FabrialHost = {
+		definitionScope: config.definitionScope,
 		plugins: config.plugins,
 		workflows: config.workflows,
 		runtime,
