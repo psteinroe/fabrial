@@ -1,7 +1,5 @@
-import type { StateAdapter } from "chat";
-import { chat } from "@fabrial/chat";
 import { createFabrial } from "fabrial";
-import { MemoryRuntime } from "fabrial/testing";
+import { MemoryRuntime, testApp } from "fabrial/testing";
 import postgres from "postgres";
 import { afterEach, expect, it, vi } from "vitest";
 import { databasePlugin } from "../../src/database.ts";
@@ -18,14 +16,7 @@ it("imports Acme's definitions and app with unset env without creating clients o
 		if (/^(SLACK_|GITHUB_|LINEAR_|APP_DATABASE_URL$)/.test(key)) vi.stubEnv(key, undefined);
 	}
 	vi.resetModules();
-	const { f } = await import("../../src/fabrial.ts");
-	await import("../../src/app.ts");
-	const app = f.app({
-		runtime: new MemoryRuntime(),
-		// No state method may be called before credential validation.
-		chat: chat({ state: {} as StateAdapter }),
-		workflows: [],
-	});
+	const { app } = await import("../../src/app.ts");
 	expect(postgres).not.toHaveBeenCalled();
 	await expect(app.start()).rejects.toThrow("Slack requires workspace");
 	expect(postgres).not.toHaveBeenCalled();
@@ -37,7 +28,7 @@ it("creates the application pool only on start, closes it on stop, and can resta
 	const url = "postgres://localhost/acme";
 	const options = { max: 2 };
 	const plugin = databasePlugin(url, options);
-	const app = createFabrial({ plugins: [plugin] }).app({
+	const app = testApp(createFabrial({ plugins: [plugin] }), {
 		runtime: new MemoryRuntime(),
 		workflows: [],
 	});
@@ -56,7 +47,7 @@ it("creates the application pool only on start, closes it on stop, and can resta
 });
 
 it("defers missing application URL validation until startup", async () => {
-	const app = createFabrial({ plugins: [databasePlugin(undefined)] }).app({
+	const app = testApp(createFabrial({ plugins: [databasePlugin(undefined)] }), {
 		runtime: new MemoryRuntime(),
 		workflows: [],
 	});

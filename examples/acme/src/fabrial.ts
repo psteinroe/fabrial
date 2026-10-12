@@ -1,5 +1,4 @@
 import { createFabrial } from "fabrial";
-import { withPi } from "@fabrial/pi";
 import { slack } from "@fabrial/slack";
 import { github } from "@fabrial/github";
 import { linear } from "@fabrial/linear";
@@ -10,6 +9,8 @@ const env = process.env;
 
 // Values at definition; factories do not connect or validate credentials at import time.
 export const f = createFabrial({
+	database: env.DATABASE_URL,
+	models: { anthropic: { apiKey: env.ANTHROPIC_API_KEY } },
 	plugins: [
 		slack({
 			workspace: env.SLACK_WORKSPACE!,
@@ -33,4 +34,3 @@ export const f = createFabrial({
 	],
 	identity: users,
 });
-export const { defineTool, defineAgent, section } = withPi(f);

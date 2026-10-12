@@ -1,18 +1,13 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { createPostgresState } from "@chat-adapter/state-pg";
 import { createMockLogger } from "@chat-adapter/tests";
-import { createModels } from "@earendil-works/pi-ai/models";
-import {
-	fauxAssistantMessage,
-	fauxProvider,
-	fauxToolCall,
-} from "@earendil-works/pi-ai/providers/faux";
+import { createIntegrationApp, reply, scriptedModels, type ScriptedModel } from "fabrial/testing";
 import { WebClient } from "@slack/web-api";
 import { slack } from "@fabrial/slack";
 import type { Adapter } from "chat";
 import postgres, { type Sql } from "postgres";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { createApp } from "../../src/app.ts";
+import { workflows } from "../../src/app.ts";
+import { f } from "../../src/fabrial.ts";
 import { bob, engineeringTriage, weeklyRotationForTest } from "./rotation.ts";
 import { supportModel } from "../../src/agents/support.ts";
 
@@ -27,11 +22,10 @@ interface SlackCall {
 let applicationSql: Sql;
 let sql: Sql;
 const url = process.env.DATABASE_URL!;
-let app: ReturnType<typeof createApp>;
+let app: ReturnType<typeof f.app>;
 let calls: SlackCall[];
-let states: ReturnType<typeof createPostgresState>[];
-let faux: ReturnType<typeof fauxProvider>;
-let models: ReturnType<typeof createModels>;
+let faux: ScriptedModel;
+let models: ReturnType<typeof scriptedModels>;
 let logger: ReturnType<typeof createMockLogger>;
 let nextMessage: number;
 let toolResult: string;
@@ -51,7 +45,6 @@ beforeEach(async () => {
 	await applicationSql`INSERT INTO acme_accounts VALUES ('org-acme', 0), ('org-other', 100)`;
 	await applicationSql`CREATE TABLE acme_changelog (repo text, number integer, title text, PRIMARY KEY (repo, number))`;
 	calls = [];
-	states = [];
 	nextMessage = 1;
 	toolResult = "";
 	approvalDelivery = undefined;
@@ -119,49 +112,22 @@ beforeEach(async () => {
 	});
 	vi.spyOn(prototype, "apiCall").mockImplementation(apiCall);
 	vi.spyOn(WebClient.prototype, "apiCall").mockImplementation(apiCall);
-	faux = fauxProvider({ provider: supportModel.provider, models: [{ id: supportModel.modelId }] });
-	models = createModels();
-	models.setProvider(faux.provider);
-	const classifier = fauxProvider({ provider: "jev" });
-	models.setProvider({
-		...classifier.provider,
-		getAllModels: () => [{ ...classifier.getModel(), id: "route", type: "classifier" as const }],
-		classify: async () => ({
-			api: classifier.api,
-			provider: "jev",
-			model: "route",
-			answers: { bug: { type: "bool", probability: 0.01 } },
-			stopReason: "stop",
-			timestamp: Date.now(),
-		}),
-	});
+	models = scriptedModels();
+	faux = models.model(supportModel);
+	models.classifier("jev/route", () => ({ bug: { probability: 0.01 } }));
 	app = newApp();
 	// No Linear API calls are needed in these Slack/GitHub tests. Skip only Linear's startup profile lookup.
 	await app.start();
 });
 afterEach(async () => {
 	await app?.stop();
-	for (const state of states ?? []) await state.disconnect();
 	await sql?.end();
 	await applicationSql?.end();
 	vi.restoreAllMocks();
 });
 
 function newApp() {
-	const state = createPostgresState({ url });
-	states.push(state);
-	const instance = createApp({
-		sql,
-		state,
-		models,
-		piSettings: { retry: { enabled: false } },
-		logger,
-		runtimeOptions: {
-			logger,
-			worker: { concurrency: 8, pollIntervalMs: 20, flushIntervalMs: 20, fetchBatchSize: 10 },
-			pollIntervalMs: 40,
-		},
-	});
+	const instance = createIntegrationApp(f, { workflows, models, logger });
 	const adapter = instance.host.plugins.find((p) => p.id === "linear")!.chat!.adapter() as Adapter;
 	vi.spyOn(adapter, "initialize").mockImplementation(async (sdk) => {
 		Object.assign(adapter, {
@@ -173,32 +139,26 @@ function newApp() {
 	return instance;
 }
 function scriptRepair() {
-	faux.setResponses([
-		fauxAssistantMessage(
-			fauxToolCall("read_only_query", {
-				organisationId: "org-acme",
-				sql: "SELECT balance FROM acme_accounts WHERE organisation_id = current_setting('acme.organisation_id')",
-			}),
-			{ stopReason: "toolUse" },
-		),
+	faux.respond([
+		reply.toolCall("read_only_query", {
+			organisationId: "org-acme",
+			sql: "SELECT balance FROM acme_accounts WHERE organisation_id = current_setting('acme.organisation_id')",
+		}),
 		(context) => {
 			// The prior read-only tool committed Findings and Pi rendered it into this turn.
 			expect(JSON.stringify(context.messages)).toContain("Queried organisation org-acme");
-			return fauxAssistantMessage(
-				fauxToolCall("run_sql", {
-					organisationId: "org-acme",
-					sql: repair,
-					reason: "Repair the customer's missing credit",
-				}),
-				{ stopReason: "toolUse" },
-			);
+			return reply.toolCall("run_sql", {
+				organisationId: "org-acme",
+				sql: repair,
+				reason: "Repair the customer's missing credit",
+			});
 		},
 		(context) => {
 			const result = context.messages
 				.filter((message) => message.role === "toolResult" && message.toolName === "run_sql")
 				.at(-1);
 			toolResult = JSON.stringify(result);
-			return fauxAssistantMessage(
+			return reply.text(
 				toolResult.includes("declined")
 					? "The request was declined; no SQL executed."
 					: "Repair applied to your organisation.",
@@ -337,7 +297,7 @@ it("Slack → Pi tools → triage DM approval → SQL → original thread, inclu
 	expect(owners).toHaveLength(1);
 	expect(await balances()).toEqual([{ balance: 10 }, { balance: 100 }]);
 	expect(toolResult).toContain("executed");
-	expect(faux.state.callCount).toBe(3);
+	expect(faux.calls).toBe(3);
 	expect(
 		calls.some(
 			(c) => c.method === "chat.update" && JSON.stringify(c.args).includes("Approved by Bob"),
@@ -422,7 +382,7 @@ it("restarts Conductor, Pi and Chat during approval and completes exactly once",
 	await click(card, "Approve");
 	await finalReply("Repair applied");
 	expect(await balances()).toEqual([{ balance: 10 }, { balance: 100 }]);
-	expect(faux.state.callCount).toBe(3);
+	expect(faux.calls).toBe(3);
 	expect(
 		calls.filter(
 			(c) =>
@@ -540,9 +500,7 @@ it("read-only query rejects writes at the database, not by a model instruction",
 	expect(await balances()).toEqual([{ balance: 0 }, { balance: 100 }]);
 });
 it("#bugs hands off to bugIntake rather than answering in the router", async () => {
-	faux.setResponses([
-		fauxAssistantMessage("Investigated the bug; engineering should add a regression test."),
-	]);
+	faux.respond([reply.text("Investigated the bug; engineering should add a regression test.")]);
 	await mention("C_BUGS");
 	await expect
 		.poll(

@@ -1,5 +1,5 @@
 import { createFabrial, trigger, type InvocationMetadata } from "fabrial";
-import { FakeChat, MemoryRuntime } from "fabrial/testing";
+import { FakeChat, MemoryRuntime, testApp } from "fabrial/testing";
 import { expect, it } from "vitest";
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
@@ -21,7 +21,7 @@ it("a tool child retains its response thread without inheriting trigger ownershi
 			return null;
 		},
 	});
-	const app = createFabrial({ plugins: [] }).app({ runtime, chat, workflows: [owner, child] });
+	const app = testApp(createFabrial({ plugins: [] }), { runtime, chat, workflows: [owner, child] });
 	const metadata: InvocationMetadata = {
 		interactionId: "interaction",
 		origin: null,
