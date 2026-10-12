@@ -4,9 +4,10 @@ A private workspace example, not a hosted service. The app has one Slack entry
 workflow, a support agent, a SQL repair workflow with triage approval, bug handoff,
 a GitHub PR review owner/changelog observer, and Linear issue triage.
 
-`src/fabrial.ts` reads plugin values from `process.env` at definition and exports
-`withPi(f)` helpers. It imports only plugins and `src/users.ts`, never workflows
-or groups. `src/groups.ts` uses `f.defineGroup` for typed clients and is imported
+`src/fabrial.ts` creates the instance with `createFabrial({ database, models,
+plugins, identity })`, reading values from `process.env` at definition. It imports
+only plugins and `src/users.ts`, never workflows or groups. Agents, tools, and state
+are defined with `f.defineAgent`, `f.defineTool`, and `f.defineState`. `src/groups.ts` uses `f.defineGroup` for typed clients and is imported
 by workflows; groups are referenced directly, not registered in `identity`.
 Factories are side-effect free: importing the app with unset env is safe, but
 `app.start()` requires valid configuration. Set env **before importing** the app;
@@ -18,7 +19,8 @@ Configure these environment variables:
 
 | Variable                 | Purpose                                                                                                          |
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`           | Runtime, Pi, and Chat state Postgres database (caller-owned pools).                                              |
+| `DATABASE_URL`           | Fabrial's Postgres database: workflows, agent sessions, and chat state.                                          |
+| `ANTHROPIC_API_KEY`      | Model credentials for the support agent.                                                                         |
 | `APP_DATABASE_URL`       | Separate least-privilege business database; the database plugin creates its pool at start and closes it at stop. |
 | `SLACK_BOT_TOKEN`        | Slack bot token.                                                                                                 |
 | `SLACK_SIGNING_SECRET`   | Slack webhook signing secret.                                                                                    |
@@ -33,26 +35,21 @@ Configure these environment variables:
 | `LINEAR_WEBHOOK_SECRET`  | Linear webhook signing secret.                                                                                   |
 | `LINEAR_ORGANIZATION_ID` | Linear organization ID, shared with users and signed payloads.                                                   |
 
-Supply only runtime dependencies to `createApp` in `src/app.ts`:
+`src/app.ts` is the whole wiring:
 
 ```ts
-const sql = postgres(process.env.DATABASE_URL!);
-const app = createApp({
-	sql, // caller-owned postgres.js pool for runtime + Pi
-	state: createPostgresState({ url: process.env.DATABASE_URL! }),
-	models, // Pi AI Models with authenticated providers (injectable in tests)
-});
-await app.start();
+export const app = f.app({ workflows });
+await app.start(); // migrates Postgres, validates credentials, starts workers
 // Mount app.fetch in your Node HTTP server; call app.stop() on shutdown.
-// Disconnect Chat state and close caller-owned pools after stopping the app.
 ```
 
 Load `schema.sql` in `APP_DATABASE_URL`. Replace the sample external user IDs,
 channel IDs, team keys, and model references in source with your own.
-`supportAgent` uses `anthropic/claude-sonnet-4-5`; routing uses a Jev classifier
-registered as `jev/route`. A missing/erroring classifier explicitly falls back to
-support; `#bugs` always hands off. Models are injectable, not fetched or
-initialized by the app. Define agents before `app.start()`.
+`supportAgent` uses `"anthropic/claude-sonnet-4-5"`; routing calls
+`ctx.evaluate` with the classifier `"jev/route"`. Point it at a classifier you
+have credentials for in `models` (e.g. `"typesafe/jev-latest"`). A missing or erroring
+classifier explicitly falls back to support; `#bugs` always hands off. Define
+agents before `app.start()`.
 
 Endpoints:
 
@@ -71,7 +68,7 @@ SQL. The support agent records read-only query findings in rendered thread state
 least-privilege database roles, enforce tenant authorization/RLS, and restrict
 resource usage before deploying. Single-statement prepared execution prevents
 multi-statement transaction escapes; Postgres enforces read-only queries. The
-organisation setting alone does not enforce tenant access. Runtime/Pi credentials
+organisation setting alone does not enforce tenant access. Fabrial's database credentials
 should not be exposed to application SQL in production (`APP_DATABASE_URL`).
 
 ## Tests
@@ -83,9 +80,10 @@ pnpm oxlint --type-aware --deny-warnings examples/acme
 pnpm oxfmt examples/acme
 ```
 
-Docker is required. Integration tests use **real PostgreSQL 17 (testcontainers),
-real Conductor, real Pi Durable and Pi AI's scripted faux provider**, including a
-scripted classifier. They use the **real Chat SDK, Slack plugin/adapter and
+Docker is required. Integration tests build the app with
+`createIntegrationApp(f, { workflows, models: scriptedModels() })` from
+`fabrial/testing`: **real PostgreSQL 17 (testcontainers), the real durable runtime
+and agent sessions, and scripted models**, including a scripted classifier. They use the **real Chat SDK, Slack plugin/adapter and
 Postgres Chat state**, not `FakeChat`. Signed Slack mentions/actions and signed
 GitHub/Linear lifecycle webhooks go through `app.fetch`. Outbound Slack Web API,
 Octokit and Linear API responses are mocked; Linear's startup profile lookup is
@@ -93,7 +91,7 @@ seeded. `@chat-adapter/tests` supplies the inspectable logger. No live tokens or
 model network calls are needed. Global setup starts Postgres and sets both database URLs and provider test values
 before importing the app. Each scenario resets durable/Chat state and business
 tables on those same databases; the
-restart test uses new runtime, Pi and Chat instances on the same database.
+restart test stops the app and starts a new one on the same database.
 
 Coverage: approval + duplicate click, rejection, requester cancellation,
 non-approver notice then approval, restart during approval, PR owner + observer,
@@ -103,23 +101,18 @@ pin the on-call week so Bob is the approver regardless of the calendar.
 
 ## Explicit limits
 
-Pi workflow-tool children now retain the originating thread without inheriting
+Workflow-tool children retain the originating thread without inheriting
 trigger ownership; no example-local runtime workaround is needed. The passing
-unit regression checks the child metadata contract, and the real-Pi cancellation
+unit regression checks the child metadata contract, and the real cancellation
 scenario checks the emitted child metadata and requester card in the origin thread.
 Settled chat-message routing state retains ingress tombstones with
 `interactionId: null`, rather than disappearing. Direct lifecycle ingress creates
 no routing tombstone. Approval tests click on card delivery without waiting for a
 native subscription: durable event cursors retain pre-registration decisions.
 
-1. **Ambient Timer visibility:** the vendored Conductor source references `Timer`;
-   `@fabrial/conductor`'s package-local ambient declaration is not transitively
-   included by an app typecheck. `src/conductor-node.d.ts` supplies the same Node
-   timer alias locally. Without it, app typecheck reports TS2304 at
-   `vendor/postgres-conductor/packages/pgconductor-js/src/lib/batching-async-queue.ts:31`.
-2. **Existing Conductor boundaries still apply:** strict mutexes are soft across
-   workers. See `packages/conductor/README.md`. The restart test waits for suspended
-   approval work before stopping, and proves one write in that scenario, **not exactly-once SQL across a crash during a database effect**.
-   Conductor step memoization cannot atomically commit an external DB write and
-   its runtime receipt. A production repair needs business-level idempotency or
-   reconciliation. No extra execution/approval tables are introduced here.
+- **Conductor boundaries still apply:** strict mutexes are soft across
+  workers. See the shim table in `packages/fabrial/README.md`. The restart test waits for suspended
+  approval work before stopping, and proves one write in that scenario, **not exactly-once SQL across a crash during a database effect**.
+  Conductor step memoization cannot atomically commit an external DB write and
+  its runtime receipt. A production repair needs business-level idempotency or
+  reconciliation. No extra execution/approval tables are introduced here.

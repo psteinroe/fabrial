@@ -20,7 +20,7 @@ Supports PAT credentials or a single GitHub App installation (`appId`, `privateK
 
 Configure two GitHub webhook subscriptions:
 
-- `POST /github/events`: issue comments (both issues and PR conversations), plus PR review comments; standard `mentioned`, `message`, `dm` events supplied by `@fabrial/chat`.
+- `POST /github/events`: issue comments (both issues and PR conversations), plus PR review comments; standard `mentioned`, `message`, `dm` events supplied by `chatEvents()` from `fabrial`.
 - `POST /github/webhook`: `pull_request` and `issues` opened events. Unsupported actions are acknowledged without emitting. Invalid signatures/payloads fail closed, and `x-github-delivery` supplies durable dedupe.
 
 Use with `chat({ state })`. `ctx.clients.github` is the adapter's authenticated Octokit. Lifecycle events provide `repo`, `id`, `number`, `title`, `body`, `url`, `authorId`, `authorLogin`, `threadId`, installation-scoped origin/actor metadata, and a reply destination on the conversation. PR threads are `github:owner/repo:number`; issue threads are `github:owner/repo:issue:number`; reviews retain their own SDK review-thread codec. History is bounded to 50 messages; status uses edited messages.

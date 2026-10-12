@@ -29,7 +29,7 @@ Current behavior was checked against `main` @ `33228e3` ("fix(workflows): comple
 | 10  | Terminal-state hooks                                | Gap: adapter polls for settled executions                | P1                                       |
 | 11  | Stop hangs on queued claims                         | Bug: workers enter handlers with an aborted signal       | **P0**: shutdown can hang forever        |
 
-How `@fabrial/conductor` works around each item today, and what it learned along the way, is in [Findings from the Fabrial adapter](#findings-from-the-fabrial-adapter) at the end.
+How Fabrial's Conductor runtime (`packages/fabrial/src/runtime/conductor`) works around each item today, and what it learned along the way, is in [Findings from the Fabrial adapter](#findings-from-the-fabrial-adapter) at the end.
 
 Fabrial can be prototyped against 1–3 and 8 alone. Items 4–7 are needed before the v1 reference flow (Slack → agent → `run-sql` tool workflow → approval in a DM → resume) is reliable.
 
@@ -178,7 +178,7 @@ Losing subscriptions are removed atomically when one wins, and the result is cac
 **Why Fabrial needs it.**
 
 - `ctx.handoff(id, workflow, input)` starts a workflow that takes over the interaction, and the caller then ends.
-- `workflow.asTool()` from a Pi agent starts or reconnects to a workflow by a stable key and is awaited later through a separate wake-up.
+- A workflow in an agent's `tools` starts or reconnects to a workflow by a stable key and is awaited later through a separate wake-up.
 
 **Needed.**
 
@@ -227,9 +227,9 @@ Dedup window and scope must be documented: per event name or global, and retenti
 - `src/lib/batching-async-queue.ts` uses Bun's global `Timer` type.
 - npm is far behind `main`.
 
-The source itself runs fine on Node. Fabrial's smoke test (`packages/conductor/tests/integration/pgconductor.test.ts`) runs a task with a memoized step on Node against Postgres 17.
+The source itself runs fine on Node. Fabrial's smoke test (`packages/fabrial/tests/integration/conductor/pgconductor.test.ts`) runs a task with a memoized step on Node against Postgres 17.
 
-**What Fabrial does meanwhile** (all marked `SHIM(conductor#9)`): `vendor/postgres-conductor` is a git submodule pinned to a commit and included in Fabrial's pnpm workspace, which supplies the catalog versions. `@fabrial/conductor` imports source subpaths (`pgconductor-js/src/...`), vitest inlines it, and a `.d.ts` declares `Timer`.
+**What Fabrial does meanwhile** (all marked `SHIM(conductor#9)`): `vendor/postgres-conductor` is a git submodule pinned to a commit and included in Fabrial's pnpm workspace, which supplies the catalog versions. Fabrial's Conductor runtime imports source subpaths (`pgconductor-js/src/...`), vitest inlines it, and a `.d.ts` declares `Timer`.
 
 **Needed.**
 
@@ -247,7 +247,7 @@ The source itself runs fine on Node. Fabrial's smoke test (`packages/conductor/t
 
 **Current.** Nothing notifies application code when an execution reaches a terminal state outside its own handler, e.g. retries exhausted or cancelled while suspended. Fabrial needs this to clear thread routing state and to emit `fabrial.execution.settled`, which waiting parents and agent bridges wake on.
 
-**What Fabrial does meanwhile.** `@fabrial/conductor` runs a restart-safe monitor that polls for terminal executions and calls `RuntimeWorkflow.onSettled` at least once, isolating hooks that fail repeatedly.
+**What Fabrial does meanwhile.** Fabrial's Conductor runtime runs a restart-safe monitor that polls for terminal executions and calls `RuntimeWorkflow.onSettled` at least once, isolating hooks that fail repeatedly.
 
 **Needed.** A native `onSettled(execution, result)` per task, or a terminal-state event: at-least-once, restart-safe, covering completion, failure (incl. retry exhaustion), and cancellation in every state, with the cancellation reason preserved.
 
@@ -259,7 +259,7 @@ The source itself runs fine on Node. Fabrial's smoke test (`packages/conductor/t
 
 **Current.** When `orchestrator.stop()` aborts a worker, the worker still drains executions it already claimed. Their task signal is created already aborted, before the worker installs its abort listener, so a handler that reaches a checkpoint or step hangs up forever and the worker's abort race never resolves. `stop()` never returns. Fabrial's CI hit this with a restart during an approval on a slow runner.
 
-**What Fabrial does meanwhile** (`SHIM(conductor#11)`, `packages/conductor/src/shutdown.ts`): wraps each worker's `executeSingleTask`/`executeBatchTask` so that once the worker is aborted, queued claims are returned as `released` instead of entering handlers, preserving them for the next start.
+**What Fabrial does meanwhile** (`SHIM(conductor#11)`, `packages/fabrial/src/runtime/conductor/shutdown.ts`): wraps each worker's `executeSingleTask`/`executeBatchTask` so that once the worker is aborted, queued claims are returned as `released` instead of entering handlers, preserving them for the next start.
 
 **Needed.** Workers must not start handlers after stop; release unstarted claims instead. Install abort listeners before creating task signals.
 
@@ -274,7 +274,7 @@ The source itself runs fine on Node. Fabrial's smoke test (`packages/conductor/t
 
 ## Findings from the Fabrial adapter
 
-`@fabrial/conductor` implements every item above on the pinned Conductor revision. `packages/conductor/README.md` has the full shim table. What it learned, per item:
+Fabrial's Conductor runtime implements every item above on the pinned Conductor revision. `packages/fabrial/README.md` has the full shim table. What it learned, per item:
 
 - **#1:** Native `waitForEvent` is used as is. The pre-registration race is the one gap with no workaround (`test.todo` in the adapter suite), so approvals are not production-safe until Conductor fixes it.
 - **#2:** Metadata travels in a payload envelope, with reserved top-level fields (`__fabrial`, `__fabrialOwner`) on events. Filters on payload fields keep working.

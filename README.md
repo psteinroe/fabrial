@@ -8,9 +8,9 @@ Status: early development. See [PLAN.md](./PLAN.md) for the design and [PGCONDUC
 
 ## API
 
-Create an explicit typed catalog with `createFabrial({ plugins, identity })` in a module without workflows. Define workflows with `f.defineWorkflow` and bind Pi helpers with `withPi(f)`. Wire runtime integrations with `f.app({ runtime, chat, agents, workflows })`; plugins carry their values at definition, and tests spy on `app.host.clients()` for fake clients. `identity` contains users only; define groups with `f.defineGroup` in a separate module and reference them directly in access/approval options. Factories are side-effect free; credentials are validated and connections started by `app.start()`. No global module augmentation is needed.
+Install `fabrial` and the plugins you need. Create the instance with `createFabrial({ database, models, plugins, identity })` in a module without workflows: `database` is a Postgres connection string, and `models` holds credentials per model provider. Define workflows, agents, tools, toolkits, and state on it with `f.defineWorkflow`, `f.defineAgent`, `f.defineTool`, `f.defineToolkit`, and `f.defineState`; agents name models as `"provider/model"` strings and list tools and workflows in `tools`. Build the app with `f.app({ workflows })`. Plugins carry their values at definition, and factories are side-effect free: credentials are validated and connections opened by `app.start()`. `identity` contains users only; define groups with `f.defineGroup` in a separate module and reference them directly in access/approval options. Tests use `fabrial/testing`: `createTestApp` in memory, or `createIntegrationApp` with `scriptedModels()` against a real database.
 
-See [core](./packages/fabrial/README.md), [Pi](./packages/pi/README.md), and the [Acme example](./examples/acme/README.md).
+See the [fabrial package](./packages/fabrial/README.md) and the [Acme example](./examples/acme/README.md).
 
 ## Development
 
