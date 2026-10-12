@@ -54,7 +54,7 @@ export interface PluginDefinition<
 	/** Canonical live clients, exposed as `ctx.clients.*` and rebuilt on every run/resume. */
 	clients?: (deps: { chat?: unknown }) => TClients;
 	/** Tools and instructions for agents that list this plugin's id in `toolkits`. */
-	toolkit?: (clients: TClients) => PluginToolkit<TClients>;
+	toolkit?: PluginToolkitFactory<TClients>;
 	/** Model context for a trigger's origin, loaded durably when an agent starts from it. */
 	context?: (origin: Origin, clients: TClients) => Promise<string | undefined>;
 	hooks?: {
@@ -75,7 +75,18 @@ export interface PluginToolkit<TClients = Record<string, unknown>> {
 	instructions?: Instructions<TClients> | readonly Instructions<TClients>[];
 }
 
+export type PluginToolkitFactory<TClients = Record<string, unknown>> = (
+	clients: TClients,
+) => PluginToolkit<TClients>;
+
 export type AnyPlugin = PluginDefinition<string, any, any>;
+
+/** A plugin known to provide a toolkit; only these ids are accepted in an agent's `toolkits`. */
+export type ToolkitPlugin<
+	TId extends string = string,
+	TEvents extends Record<string, EventDefinition<any>> = Record<string, EventDefinition<any>>,
+	TClients extends Record<string, unknown> = Record<string, unknown>,
+> = PluginDefinition<TId, TEvents, TClients> & { toolkit: PluginToolkitFactory<TClients> };
 
 export type PluginClients<P> = P extends { clients?: (deps: never) => infer C }
 	? C extends object
@@ -98,8 +109,21 @@ export function definePlugin<
 	TEvents extends Record<string, EventDefinition<any>> = {},
 	TClients extends Record<string, unknown> = {},
 >(
+	factory: (...args: TArgs) => ToolkitPlugin<TId, TEvents, TClients>,
+): (...args: TArgs) => ToolkitPlugin<TId, TEvents, TClients>;
+export function definePlugin<
+	TArgs extends unknown[],
+	const TId extends string,
+	TEvents extends Record<string, EventDefinition<any>> = {},
+	TClients extends Record<string, unknown> = {},
+>(
 	factory: (...args: TArgs) => PluginDefinition<TId, TEvents, TClients>,
 ): (...args: TArgs) => PluginDefinition<TId, TEvents, TClients>;
+export function definePlugin<
+	const TId extends string,
+	TEvents extends Record<string, EventDefinition<any>> = {},
+	TClients extends Record<string, unknown> = {},
+>(plugin: ToolkitPlugin<TId, TEvents, TClients>): ToolkitPlugin<TId, TEvents, TClients>;
 export function definePlugin<
 	const TId extends string,
 	TEvents extends Record<string, EventDefinition<any>> = {},

@@ -14,7 +14,7 @@ import type { ModelCredentials } from "./agents/models.ts";
 import { buildApp } from "./core.ts";
 import { defineGroup, type GroupDefinition, type UserDefinition } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
-import type { AnyPlugin, PluginClients } from "./plugin.ts";
+import type { AnyPlugin, PluginClients, ToolkitPlugin } from "./plugin.ts";
 import { production, type ProductionOverrides } from "./production.ts";
 import { defineState, type StateDefinition, type StateScope } from "./state.ts";
 import type { Schema } from "./schema.ts";
@@ -37,8 +37,12 @@ export type ClientsOf<P extends readonly AnyPlugin[]> = [PluginClients<P[number]
 	? {}
 	: UnionToIntersection<PluginClients<P[number]>>;
 
-/** Plugin ids agents can list in `toolkits`; a plugin without a toolkit fails at app.start(). */
-export type ToolkitIdsOf<P extends readonly AnyPlugin[]> = P[number]["id"];
+/** Ids of plugins that define a toolkit; agents list them in `toolkits`. app.start() checks again. */
+export type ToolkitIdsOf<P extends readonly AnyPlugin[]> = P[number] extends infer Plugin
+	? Plugin extends ToolkitPlugin<string, any, any>
+		? Plugin["id"]
+		: never
+	: never;
 
 export interface FabrialConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[]> {
 	/** Postgres connection string. Workflows, agent sessions, and chat state share it. */

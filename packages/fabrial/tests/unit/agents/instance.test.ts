@@ -7,9 +7,14 @@ const f = createFabrial({
 		definePlugin({
 			id: "example",
 			clients: () => ({ example: { read: (): string => "value" } }),
-			toolkit: () => ({ tools: [] }),
+			toolkit: (clients) => {
+				expectTypeOf(clients.example.read()).toEqualTypeOf<string>();
+				return { tools: [] };
+			},
 		}),
 		definePlugin({ id: "plain", clients: () => ({}) }),
+		definePlugin((id: "factory") => ({ id, toolkit: () => ({ tools: [] }) }))("factory"),
+		definePlugin((id: "plain-factory") => ({ id }))("plain-factory"),
 	],
 });
 
@@ -39,6 +44,11 @@ const toolkit = f.defineToolkit({
 function invalidDefinitions() {
 	// @ts-expect-error Only this catalog's toolkit plugin ids are permitted.
 	f.defineAgent({ name: "wrong", toolkits: ["exmaple"] });
+	// @ts-expect-error Plugins without a toolkit cannot be selected.
+	f.defineAgent({ name: "wrong", toolkits: ["plain"] });
+	// @ts-expect-error Plugin factories record a missing toolkit too.
+	f.defineAgent({ name: "wrong", toolkits: ["plain-factory"] });
+	f.defineAgent({ name: "factory", toolkits: ["factory"] });
 	const other = createFabrial({ plugins: [] });
 	// @ts-expect-error Other instances do not inherit this catalog's ids.
 	other.defineAgent({ name: "wrong", toolkits: ["example"] });
