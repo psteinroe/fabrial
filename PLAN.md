@@ -40,18 +40,18 @@ Reference for chat UX: Vercel [Eve](https://github.com/vercel/eve). Its persiste
 
 App authors see one programming model: workflows, agents, tools, toolkits, state, groups, and plugins, all defined on the Fabrial instance. Conductor, Pi, and Chat SDK run underneath and never appear in app code: no runtime packages to install or wire, no runtime types in signatures, and no escape hatch to native handles. While Fabrial ships preview releases, a missing capability becomes a Fabrial field, not a pass-through.
 
-| Concern                                                         | Public API                               | Implemented with                  |
-| --------------------------------------------------------------- | ---------------------------------------- | --------------------------------- |
-| Event-driven and scheduled workflows, steps, retries, waits     | `f.defineWorkflow`, `ctx.step`, triggers | PG Conductor                      |
-| Agent conversations, model execution                            | `f.defineAgent`, `ctx.agent`, `ctx.send` | Pi Durable, Pi AI                 |
-| Routing outside events into conversations                       | `f.subscribe`, `ctx.subscribe`           | Fabrial (`fabrial.subscriptions`) |
-| Tools and tool bundles                                          | `f.defineTool`, `f.defineToolkit`        | Pi tools and extensions           |
-| Session/conversation state                                      | `f.defineState`                          | Pi documents                      |
-| Platform messages, threads, cards                               | `ctx.thread`, `Card`, `ChatMessage`      | Chat SDK, inside the chat plugins |
-| Provider events → triggers, context reconstruction, clients     | Plugins (`definePlugin`)                 | Fabrial                           |
-| Workflow ↔ agent bridges, approvals, response context, identity | `ctx.*`, `f.defineGroup`                 | Fabrial                           |
+| Concern                                                         | Public API                               | Implemented with                    |
+| --------------------------------------------------------------- | ---------------------------------------- | ----------------------------------- |
+| Event-driven and scheduled workflows, steps, retries, waits     | `f.defineWorkflow`, `ctx.step`, triggers | PG Conductor                        |
+| Agent conversations, model execution                            | `f.defineAgent`, `ctx.agent`, `ctx.send` | Pi Durable, Pi AI (`fabrial.inbox`) |
+| Routing outside events into conversations                       | `f.subscribe`, `ctx.subscribe`           | Fabrial (`fabrial.subscriptions`)   |
+| Tools and tool bundles                                          | `f.defineTool`, `f.defineToolkit`        | Pi tools and extensions             |
+| Session/conversation state                                      | `f.defineState`                          | Pi documents                        |
+| Platform messages, threads, cards                               | `ctx.thread`, `Card`, `ChatMessage`      | Chat SDK, inside the chat plugins   |
+| Provider events → triggers, context reconstruction, clients     | Plugins (`definePlugin`)                 | Fabrial                             |
+| Workflow ↔ agent bridges, approvals, response context, identity | `ctx.*`, `f.defineGroup`                 | Fabrial                             |
 
-Everything lives in the one configured Postgres database. The runtimes keep their own schemas: Conductor step results, events, and metadata; Pi Sessions and documents; and Chat SDK state, which holds per-thread routing state (active interaction, current handler, response message refs). Fabrial owns one table, `fabrial.subscriptions`, because no runtime owns that state and it must be looked up by resource. It never duplicates runtime state.
+Everything lives in the one configured Postgres database. The runtimes keep their own schemas: Conductor step results, events, and metadata; Pi Sessions and documents; and Chat SDK state, which holds per-thread routing state (active interaction, current handler, response message refs). Fabrial owns two tables in the `fabrial` schema, because no runtime owns that state: `fabrial.subscriptions`, looked up by resource, and `fabrial.inbox`, which queues sent input for a busy Session across processes until its driver admits it to Pi. It never duplicates runtime state.
 
 ## Public API
 
@@ -830,7 +830,7 @@ Recorded as open questions are resolved.
 - **The agent registry is derived, and nothing is selected by default.** There is no app-level toolkit list. Installed = Fabrial's internal toolkit + every plugin's `toolkit` + every toolkit referenced by an agent reachable from the registered workflows. Each agent gets exactly what its `toolkits` and `tools` list. On startup, Fabrial aborts pending agent work whose toolkit is no longer installed and logs it.
 - **Approval is explicit code only.** A tool that needs approval is a workflow that calls `ctx.waitForApproval`, listed in an agent's `tools`. The approval sits next to the logic, so previews, conditions, and multiple approvals are plain code. Not for now: a declarative `approval` option on `defineWorkflow`, or a `requireApproval` option on `f.defineTool`. Add them later if needed.
 - **Conversations are addressable; subscriptions route events into them.** Sessions get app-chosen keys (default per thread), `ctx.send` complements `ctx.agent`, inputs carry a kind and priority that choose Pi's `steer`/`followUp`/`write`, and subscriptions (static or created at runtime, durable, many per conversation) generalize thread routing state. Subagents are Pi-native with `brief` and `fork` modes. See [Sessions, conversations, and subscriptions](#sessions-conversations-and-subscriptions).
-- **Subscriptions and send (resolved open questions).** Names are `f.subscribe` (static, a trigger as source), `ctx.subscribe`/`ctx.unsubscribe` (dynamic), and `ctx.send` next to `ctx.agent`. Sessions are chosen per send or subscription: `"thread"` (default), `"channel"`, or a custom key. Sent runs answer through a built-in `reply` tool that targets a request; nothing is posted automatically. Subscriptions are stored in a Fabrial-owned `fabrial.subscriptions` table, the one table Fabrial owns, because no runtime owns this state and it is looked up by resource.
+- **Subscriptions and send (resolved open questions).** Names are `f.subscribe` (static, a trigger as source), `ctx.subscribe`/`ctx.unsubscribe` (dynamic), and `ctx.send` next to `ctx.agent`. Sessions are chosen per send or subscription: `"thread"` (default), `"channel"`, or a custom key. Sent runs answer through a built-in `reply` tool that targets a request; nothing is posted automatically. Subscriptions are stored in a Fabrial-owned `fabrial.subscriptions` table, because no runtime owns this state and it is looked up by resource. Sent input waits in `fabrial.inbox`, the other Fabrial-owned table: a busy Session's driver may run in another process, so `ctx.send` queues the input and notifies (`LISTEN`/`NOTIFY`, with a slow fallback poll). The driver deletes a row once Pi has admitted it; a later redelivery is dropped by Pi's request-ID dedup. Low-priority notifications use Pi `write` as planned: verified that the written entry does not wake the agent and is seen by the model on the next run.
 - **Orphaned agent work is aborted at startup.** When a deploy removes a toolkit that pending agent work still needs, `app.start()` aborts that work and logs it instead of failing the deploy.
 - **Webhooks wait for durable ingress.** Chat and plugin routes respond only after the event is stored. There is no `waitUntil`: ingress is a fast insert, and acknowledging earlier risks losing events.
 - **Permissions only on tools.** Agents are offered every tool their definition lists, regardless of who is talking. There are no access lists on workflows, triggers, or tools (`access.invoke` is removed); a tool that needs permission asks its fixed approvers. This keeps shared conversations unambiguous: participants shape proposals, approvers authorize actions.
@@ -850,7 +850,3 @@ Conductor behaviors Fabrial relies on, checked against Conductor `main` @ `33228
 9. **Node-compatible package** (P0). Today's build is Bun-only, with no exports or types. Fabrial vendors Conductor as a pinned submodule until this ships.
 10. **Terminal-state hooks** (P1). Notify on completion, failure, and cancellation in every state. The adapter polls for settled executions meanwhile.
 11. **Stop hangs on queued claims** (P0). Workers enter handlers with an already-aborted signal after stop, so `stop()` can hang forever. The adapter releases those claims meanwhile.
-
-## Open questions
-
-- **Pi `write` visibility.** Low-priority notifications rely on a written entry reaching the model on the next run. Verify that a `write` entry with model content is shown to the model; if not, low priority falls back to `followUp` when idle.
