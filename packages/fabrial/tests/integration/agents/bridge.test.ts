@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
+import type { Message, ToolResultMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
 	fauxAssistantMessage,
@@ -19,6 +20,7 @@ import {
 	type FabrialHost,
 	type InvocationMetadata,
 	type RuntimeWorkflow,
+	type ToolCall,
 } from "../../../src/index.ts";
 import { FakeChat, MemoryRuntime } from "../../../src/testing.ts";
 import postgres, { type Sql } from "postgres";
@@ -417,6 +419,141 @@ it("installs plugin observers globally but does not select unrequested plugin to
 	});
 	expect(result).toEqual({ status: "completed", output: "ok" });
 	expect(requests).toBe(1);
+	await f.integration.stop();
+});
+
+/** The tool results the model sees on its next request. */
+function toolResults(messages: readonly Message[]): ToolResultMessage[] {
+	return messages.filter((message): message is ToolResultMessage => message.role === "toolResult");
+}
+
+it("notifies onToolCall after a tool settles and logs observers that throw", async () => {
+	const calls: ToolCall[] = [];
+	const f = fixture([
+		{ id: "throws", hooks: { agent: { onToolCall: () => Promise.reject(new Error("boom")) } } },
+		{ id: "records", hooks: { agent: { onToolCall: (call) => void calls.push(call) } } },
+	]);
+	const warn = vi.spyOn(f.host.logger, "warn");
+	const agent = defineAgent({
+		name: randomUUID(),
+		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
+		tools: [
+			defineTool({
+				name: "lookup",
+				description: "Look up a key",
+				input: z.object({ key: z.string() }),
+				run: async ({ key }) => `value of ${key}`,
+			}),
+		],
+	});
+	f.faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("lookup", { key: "a" }), { stopReason: "toolUse" }),
+		fauxAssistantMessage("done"),
+	]);
+	const { result } = await execute(f, {
+		name: randomUUID(),
+		triggers: [],
+		handler: (_input, execution) =>
+			f.integration.agents.run(execution, "agent", agent, { input: "Look up a" }),
+	});
+	expect(result).toEqual({ status: "completed", output: "done" });
+	expect(calls).toEqual([
+		{
+			agent: agent.name,
+			callId: expect.any(String),
+			name: "lookup",
+			arguments: { key: "a" },
+			result: "value of a",
+			isError: false,
+		},
+	]);
+	expect(warn).toHaveBeenCalledWith("Agent observer failed", { error: new Error("boom") });
+	await f.integration.stop();
+});
+
+it("returns input that fails the tool schema to the model without running the tool", async () => {
+	const f = fixture();
+	let runs = 0;
+	const agent = defineAgent({
+		name: randomUUID(),
+		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
+		tools: [
+			defineTool({
+				name: "deploy",
+				description: "Deploy a version",
+				// The JSON Schema the model sees cannot express the refinement; only the Standard Schema checks it.
+				input: z.object({
+					version: z.string().refine((value) => /^v\d+$/.test(value), "Expected vN"),
+				}),
+				run: async () => {
+					runs++;
+					return "deployed";
+				},
+			}),
+		],
+	});
+	let seen: ReturnType<typeof toolResults> = [];
+	f.faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("deploy", { version: "latest" }), { stopReason: "toolUse" }),
+		(context) => {
+			seen = toolResults(context.messages);
+			return fauxAssistantMessage("fixed nothing");
+		},
+	]);
+	const { result } = await execute(f, {
+		name: randomUUID(),
+		triggers: [],
+		handler: (_input, execution) =>
+			f.integration.agents.run(execution, "agent", agent, { input: "Deploy" }),
+	});
+	expect(result).toEqual({ status: "completed", output: "fixed nothing" });
+	expect(runs).toBe(0);
+	expect(seen).toMatchObject([
+		{
+			toolName: "deploy",
+			isError: true,
+			content: [{ type: "text", text: "Invalid input for deploy: Expected vN" }],
+		},
+	]);
+	await f.integration.stop();
+});
+
+it("sends a non-string tool result to the model as serialized JSON", async () => {
+	const f = fixture();
+	const agent = defineAgent({
+		name: randomUUID(),
+		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
+		tools: [
+			defineTool({
+				name: "query",
+				description: "Run a query",
+				input: z.object({ sql: z.string() }),
+				run: async () => ({ rows: [{ id: 1, name: "a" }], truncated: false }),
+			}),
+		],
+	});
+	let seen: ReturnType<typeof toolResults> = [];
+	f.faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("query", { sql: "select 1" }), { stopReason: "toolUse" }),
+		(context) => {
+			seen = toolResults(context.messages);
+			return fauxAssistantMessage("one row");
+		},
+	]);
+	const { result } = await execute(f, {
+		name: randomUUID(),
+		triggers: [],
+		handler: (_input, execution) =>
+			f.integration.agents.run(execution, "agent", agent, { input: "Query" }),
+	});
+	expect(result).toEqual({ status: "completed", output: "one row" });
+	expect(seen).toMatchObject([
+		{
+			toolName: "query",
+			isError: false,
+			content: [{ type: "text", text: '{"rows":[{"id":1,"name":"a"}],"truncated":false}' }],
+		},
+	]);
 	await f.integration.stop();
 });
 
