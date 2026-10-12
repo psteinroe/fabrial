@@ -51,7 +51,7 @@ export const cloneJson = <T>(value: T): T => JSON.parse(JSON.stringify(value)) a
 
 export function frame(context: Context): BridgeFrame {
 	const value = context.value(BridgeKey);
-	if (!value) throw new Error("Fabrial Pi adapters must run inside the @fabrial/pi bridge");
+	if (!value) throw new Error("Fabrial tools and instructions must run inside an agent run");
 	return value;
 }
 

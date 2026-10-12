@@ -5,7 +5,7 @@ export type StateScope = "interaction" | "thread" | "agent";
 
 /**
  * State that agents see and change and that outlives a single step. Backed by Pi documents in the
- * thread's Pi Session (implemented by `@fabrial/pi`).
+ * thread's Pi Session (implemented in `src/agents`).
  */
 export interface StateDefinition<T extends JsonObject = JsonObject> {
 	readonly kind: "fabrial.state";

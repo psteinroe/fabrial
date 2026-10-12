@@ -33,7 +33,7 @@ export interface ChatMessage extends JsonObject {
 	sentAt: string;
 }
 
-/** Provider-neutral card, rendered by `@fabrial/chat` to Block Kit / Markdown / … */
+/** Provider-neutral card, rendered by the Chat SDK integration to Block Kit / Markdown / … */
 export interface Card {
 	title: string;
 	text?: string;

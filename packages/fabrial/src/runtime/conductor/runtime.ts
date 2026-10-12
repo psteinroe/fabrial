@@ -191,7 +191,7 @@ function duration(ms: number): number {
 	return ms;
 }
 
-/** Native handles remain available under core's ctx.raw.execution.raw. */
+/** The live Conductor `TaskContext` stays internal to the runtime; apps never see it. */
 export type ConductorExecution = DurableExecution & { readonly raw: TaskContext };
 export type ConductorOptions = { sql: postgres.Sql } | { connectionString: string };
 export interface ConductorConfig {
