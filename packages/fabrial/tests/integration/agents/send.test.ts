@@ -7,7 +7,7 @@ import {
 	fauxProvider,
 	fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
-import { createSession } from "@earendil-works/pi-durable";
+import { createSession, type StorageWrite } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import postgres, { type Sql } from "postgres";
 import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
@@ -21,7 +21,7 @@ import {
 	type ExternalIdentity,
 	type JsonObject,
 } from "../../../src/index.ts";
-import { pi, PostgresStorage } from "../../../src/agents/index.ts";
+import { Inbox, pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { Conversations, Invocation, Runs } from "../../../src/agents/documents.ts";
 import { FakeChat, MemoryRuntime, testApp } from "../../../src/testing.ts";
 
@@ -50,6 +50,16 @@ afterEach(async () => {
 });
 
 const text = (messages: readonly Message[]) => JSON.stringify(messages);
+/** Request ids Pi accepted in a Session, in order, read from its commit log without taking the lease. */
+async function submitted(session: string): Promise<string[]> {
+	const rows =
+		await sql`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${session} ORDER BY seq`;
+	const ids = new Set<string>();
+	for (const row of rows)
+		for (const write of JSON.parse(String(row.writes)) as StorageWrite[])
+			if (write.type === "submission" && write.value.requestId) ids.add(write.value.requestId);
+	return [...ids];
+}
 type Response = Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0][number];
 
 /** One app on a fresh channel: a channel-wide subscription and a notify workflow on a custom key. */
@@ -184,11 +194,12 @@ it("lands messages from different threads in one channel conversation; reply tar
 	// Both replies went to thread t1 (the default latest request, then the targeted one); t2 got none.
 	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Answer one", "Back to one"]);
 	expect(await t.posts("t2")).toEqual([]);
-	const rows =
-		await sql`SELECT request_id, metadata FROM fabrial_pi.inbox WHERE session_key = ${session} ORDER BY seq`;
-	expect(rows).toHaveLength(2);
+	const requests = await submitted(session);
+	expect(requests).toHaveLength(2);
+	// Admitted input is pruned from the inbox.
+	expect(await sql`SELECT 1 FROM fabrial.inbox WHERE session_key = ${session}`).toHaveLength(0);
 	const invocation = await t.read(session, (s) =>
-		s.snapshot(Invocation, String(rows[1]!.request_id), BACKGROUND_CONTEXT),
+		s.snapshot(Invocation, requests[1]!, BACKGROUND_CONTEXT),
 	);
 	expect(invocation).toMatchObject({
 		replyTo: { kind: "thread", threadId: `chat:${t.channel}:t2` },
@@ -227,13 +238,7 @@ it("steers a busy run with a second message and drops a redelivered event", asyn
 		expect(await other.chat.receive(t.message("m2", "t2", "also this"))).toBe("ignored");
 		void other.runtime.flush();
 		await expect
-			.poll(
-				async () =>
-					(
-						await sql`SELECT 1 FROM fabrial_pi.inbox WHERE session_key = ${`chat:channel:${t.channel}`} AND admitted`
-					).length,
-				{ timeout: 10_000 },
-			)
+			.poll(async () => (await submitted(`chat:channel:${t.channel}`)).length, { timeout: 10_000 })
 			.toBe(2);
 	} finally {
 		release();
@@ -310,13 +315,7 @@ it("maps notification priorities to write, followUp, and steer; written entries 
 		await notify({ text: "urgent: changes requested", priority: "urgent" }, other.runtime);
 		void other.runtime.flush();
 		await expect
-			.poll(
-				async () =>
-					(
-						await sql`SELECT 1 FROM fabrial_pi.inbox WHERE session_key = ${`app:ops-${t.channel}`} AND admitted`
-					).length,
-				{ timeout: 10_000 },
-			)
+			.poll(async () => (await submitted(`app:ops-${t.channel}`)).length, { timeout: 10_000 })
 			.toBe(4);
 	} finally {
 		release();
@@ -341,4 +340,33 @@ it("maps notification priorities to write, followUp, and steer; written entries 
 			.sort((a, b) => a.localeCompare(b));
 	});
 	expect(deliveries).toEqual(["followUp", "followUp", "steer", "write"]);
+});
+
+it("inbox notifies watchers of a Session and prunes admitted input", async () => {
+	const inbox = new Inbox(sql);
+	await inbox.start();
+	const session = `app:inbox-${randomUUID()}`;
+	const watcher = inbox.watch(session);
+	try {
+		// A new watcher reads once; then only a notification (or the slow fallback) makes it due.
+		expect(watcher.due()).toBe(true);
+		expect(watcher.due()).toBe(false);
+		const row = {
+			request_id: randomUUID(),
+			session_key: session,
+			agent: "a",
+			content: "hi",
+			delivery: "steer" as const,
+			metadata: {} as never,
+		};
+		await inbox.enqueue(row);
+		await expect.poll(() => watcher.due(), { timeout: 1_000, interval: 10 }).toBe(true);
+		await inbox.enqueue(row);
+		expect(await inbox.pending(session, "a")).toHaveLength(1);
+		await inbox.remove([row.request_id]);
+		expect(await inbox.pending(session, "a")).toEqual([]);
+	} finally {
+		watcher.close();
+		await inbox.stop();
+	}
 });

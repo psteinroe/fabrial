@@ -59,6 +59,7 @@ import {
 	type BridgeFrame,
 } from "./context.ts";
 import { threadSession, type Delivery } from "../send.ts";
+import { Inbox } from "./inbox.ts";
 import {
 	applyState,
 	Binding,
@@ -189,6 +190,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		plugin.hooks?.agent ? [plugin.hooks.agent] : [],
 	);
 	const reply = replyTool();
+	const inbox = new Inbox(options.sql);
 	const internal = defineExtension({
 		name: "fabrial.internal",
 		tools: [reply],
@@ -347,6 +349,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			);
 			let conversationId: ConversationId | undefined;
 			let events: Awaited<ReturnType<typeof watchEvents>> | undefined;
+			let watcher: ReturnType<Inbox["watch"]> | undefined;
 			let outcome: Json | undefined;
 			let children: { executionId: string; detached: boolean }[] = [];
 			let finish!: () => void;
@@ -505,26 +508,18 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						}, context);
 					}
 				};
-				// Sent input for this conversation, admitted durably before it is marked as taken.
+				// Sent input for this conversation, admitted durably before its inbox row is pruned.
 				const drain = async () => {
-					const rows = await options.sql<
-						{
-							request_id: string;
-							content: string;
-							delivery: Delivery;
-							metadata: InvocationMetadata;
-						}[]
-					>`SELECT request_id, content, delivery, metadata FROM fabrial_pi.inbox
-						WHERE session_key = ${request.session} AND agent = ${request.agent} AND NOT admitted
-						ORDER BY seq`;
+					if (!watcher?.due()) return;
+					const rows = await inbox.pending(request.session, request.agent);
 					if (!rows.length) return;
 					if (!replying) await offer(true);
 					for (const row of rows)
 						await admit(row.request_id, row.content, row.metadata, row.delivery);
 					await submitPending();
-					await options.sql`UPDATE fabrial_pi.inbox SET admitted = true
-						WHERE request_id IN ${options.sql(rows.map((row) => row.request_id))}`;
+					await inbox.remove(rows.map((row) => row.request_id));
 				};
+				watcher = inbox.watch(request.session);
 				await submitPending();
 				await drain();
 				frame.harness.resume();
@@ -639,6 +634,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 							);
 					} finally {
 						// A failed cleanup is retried by onSettled; it must not retain the Session lease.
+						watcher?.close();
 						try {
 							await events?.stop();
 						} finally {
@@ -775,11 +771,14 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		workflows: () => [workflow, effect],
 		async send(execution, id, agent, request) {
 			await execution.step(`fabrial:pi:enqueue:${id}`, async () => {
-				await options.sql`INSERT INTO fabrial_pi.inbox
-					(request_id, session_key, agent, content, delivery, metadata)
-					VALUES (${request.requestId}, ${request.session}, ${agent.name}, ${request.content},
-						${request.delivery}, ${options.sql.json(request.metadata as never)})
-					ON CONFLICT (request_id) DO NOTHING`;
+				await inbox.enqueue({
+					request_id: request.requestId,
+					session_key: request.session,
+					agent: agent.name,
+					content: request.content,
+					delivery: request.delivery,
+					metadata: request.metadata,
+				});
 			});
 			// Every send ensures a driver; one queued behind a busy Session finds its input already taken.
 			await execution.start(
@@ -870,6 +869,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		workflows: [workflow, effect],
 		async start() {
 			await PostgresStorage.migrate(options.sql);
+			await inbox.start();
 			for (const plugin of host.plugins)
 				if (plugin.toolkit) {
 					const built = plugin.toolkit(host.clients());
@@ -899,6 +899,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			// handlers rather than joining their finally blocks. Join the entire
 			// cleanup, not just Harness.close, before core shuts down Chat.
 			await Promise.all(active.values());
+			await inbox.stop();
 		},
 	};
 }

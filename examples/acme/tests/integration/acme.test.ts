@@ -38,6 +38,7 @@ beforeEach(async () => {
 	// Reuse the definition-time URLs, but isolate every scenario's durable and business state.
 	await sql`DROP SCHEMA IF EXISTS pgconductor CASCADE`;
 	await sql`DROP SCHEMA IF EXISTS fabrial_pi CASCADE`;
+	await sql`DROP SCHEMA IF EXISTS fabrial CASCADE`;
 	await sql`DROP SCHEMA public CASCADE`;
 	await sql`CREATE SCHEMA public`;
 	await applicationSql`DROP SCHEMA public CASCADE`;
@@ -634,6 +635,7 @@ it("support channel: two threads share one conversation, reply posts to the aske
 	expect(replies()[1]!.args.thread_ts).toBe("1700000200.000001");
 	expect(String(replies()[1]!.args.text)).toContain("Answer 2");
 	expect(calls.some((c) => String(c.args.text).includes("never posted"))).toBe(false);
-	const conversations = await sql`SELECT DISTINCT session_key FROM fabrial_pi.inbox`;
-	expect(conversations.map((row) => row.session_key)).toEqual(["slack:channel:C_HELP"]);
+	const sessions = await sql`SELECT key FROM fabrial_pi.sessions WHERE key LIKE '%C_HELP%'`;
+	expect(sessions.map((row) => row.key)).toEqual(["slack:channel:C_HELP"]);
+	expect(await sql`SELECT 1 FROM fabrial.inbox`).toHaveLength(0);
 });

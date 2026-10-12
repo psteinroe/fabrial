@@ -236,7 +236,7 @@ Keep `#1`, `#2`, `#8`, and `#9` as P0. Native retained, idempotent emit receipts
 
 ### Agent sessions (Pi)
 
-`src/agents` runs agents on Pi Durable. `app.start()` migrates the `fabrial_pi` schema under a transactional advisory lock, builds the registry, and rejects missing live task kinds before admitting work.
+`src/agents` runs agents on Pi Durable. `app.start()` migrates the `fabrial_pi` schema and the `fabrial.inbox` table under transactional advisory locks, builds the registry, and rejects missing live task kinds before admitting work.
 
 **Storage and leases.** A Session is a Postgres commit log plus Pi's native `MemoryStorage` materializer. Pi validates transactions, documents, forks, copies, ancestry, and rewind reads; Postgres atomically persists the detached, validated write batch before adoption. The log stores JSON text, not jsonb, because Pi permits lone-surrogate strings that jsonb cannot represent. Reopening replays the log. There is no log compaction or indexed read path yet; memory and startup cost grow with Session history.
 
@@ -302,7 +302,7 @@ await ctx.send("deliver", supportAgent, {
 | `notification` normal | same                                                               | follow-up (next run)                         |
 | `notification` low    | same                                                               | written; seen on the next run, does not wake |
 
-Agents running sent input get a built-in `reply({ text, request? })` tool. It posts to the request's `replyTo`, by default the latest request in the run. The final answer of a sent run is not posted. Each input's request ID comes from the send's operation ID, so retries and redeliveries are submitted once.
+Agents running sent input get a built-in `reply({ text, request? })` tool. It posts to the request's `replyTo`, by default the latest request in the run. The final answer of a sent run is not posted. Each input's request ID comes from the send's operation ID, so retries and redeliveries are submitted once. Sent input waits in `fabrial.inbox` until the conversation's driver admits it to Pi, then the row is deleted. Drivers wake on Postgres `NOTIFY` and poll every few seconds for missed notifications. A redelivery after the row was pruned is deduplicated by Pi's request ID.
 
 Static subscriptions route a trigger's events into a conversation. They compete for trigger ownership like workflows, but never hold the thread, so every message in the channel or thread is delivered:
 
