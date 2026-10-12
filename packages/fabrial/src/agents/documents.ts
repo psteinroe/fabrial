@@ -25,6 +25,14 @@ export const Invocation = defineDocFamily({
 	version: 1,
 	initial: (metadata: InvocationMetadata) => ({ ...metadata, actor: metadata.requestedBy }),
 });
+/** A short request id, as rendered to the model, to its full request id. */
+export const RequestAlias = defineDocFamily({
+	family: true,
+	kind: "fabrial.request-alias",
+	scope: "session",
+	version: 1,
+	initial: (requestId: string): { requestId: string } => ({ requestId }),
+});
 export const Binding = defineDoc({
 	kind: "fabrial.binding",
 	scope: "conversation",

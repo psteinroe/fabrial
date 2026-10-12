@@ -38,6 +38,7 @@ import {
 	stateDraft,
 	Runs,
 	Invocation,
+	RequestAlias,
 	ChildIntents,
 	EFFECT_WORKFLOW,
 	type ChildIntent,
@@ -353,7 +354,10 @@ export function replyTool(): ToolRegistration {
 					: undefined;
 				return invocation?.send ? invocation : undefined;
 			};
-			let target = request ? await sent(request) : undefined;
+			const alias = request
+				? await bridge.harness.snapshot(RequestAlias, request, context)
+				: undefined;
+			let target = request ? await sent(alias?.requestId ?? request) : undefined;
 			if (!request) {
 				const live = await bridge.harness.snapshot(LiveDoc, api.conversationId, context);
 				for (const id of [...(live?.run?.inputs ?? [])].reverse()) {

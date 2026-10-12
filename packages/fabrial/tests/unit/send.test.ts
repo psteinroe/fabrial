@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
@@ -11,6 +12,9 @@ import {
 } from "../../src/index.ts";
 import { deliveryFor, escapeXml, renderInput } from "../../src/send.ts";
 import { createTestApp, fakeAgents } from "../../src/testing.ts";
+
+/** Short request id the model sees: the first 8 hex digits of its SHA-256. */
+const short = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 8);
 
 const message = (id: string, threadId: string, text = id): ChatMessage => ({
 	provider: "chat",
@@ -33,10 +37,10 @@ describe("renderInput", () => {
 	it("renders attributed messages and escapes XML-unsafe content", () => {
 		const input = message("m1", 'chat:general:"t1"', "a < b & c > d");
 		expect(renderInput({ input, kind: "message", requestId: "r1" })).toBe(
-			'<message from="Alice" thread="chat:general:&quot;t1&quot;" request="r1">a &lt; b &amp; c &gt; d</message>',
+			`<message from="Alice" thread="chat:general:&quot;t1&quot;" request="${short("r1")}">a &lt; b &amp; c &gt; d</message>`,
 		);
 		expect(renderInput({ input: "hi", kind: "message", requestId: "r2", from: "Bob" })).toBe(
-			'<message from="Bob" request="r2">hi</message>',
+			`<message from="Bob" request="${short("r2")}">hi</message>`,
 		);
 	});
 	it("renders notifications with source, kind and priority", () => {
@@ -50,7 +54,7 @@ describe("renderInput", () => {
 				event: "github.review",
 			}),
 		).toBe(
-			'<notification source="github" kind="github.review" priority="urgent" request="r3">{&quot;state&quot;:&quot;changes_requested&quot;}</notification>',
+			`<notification source="github" kind="github.review" priority="urgent" request="${short("r3")}">{&quot;state&quot;:&quot;changes_requested&quot;}</notification>`,
 		);
 		expect(escapeXml(`'&'`)).toBe("&apos;&amp;&apos;");
 	});

@@ -201,6 +201,13 @@ it("lands messages from different threads in one channel conversation; reply tar
 	// Both replies went to thread t1 (the default latest request, then the targeted one); t2 got none.
 	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Answer one", "Back to one"]);
 	expect(await t.posts("t2")).toEqual([]);
+	// The model saw short request ids, and the sent run showed progress on the reply thread.
+	expect(second).toMatch(/request=\\"[0-9a-f]{8}\\"/);
+	const statuses = (
+		await t.chat.thread({ kind: "thread", provider: "chat", threadId: `chat:${t.channel}:t1` })
+	).statuses;
+	expect(statuses).toContain("Thinking…");
+	expect(statuses.at(-1)).toBeNull();
 	const requests = await submitted(session);
 	expect(requests).toHaveLength(2);
 	// Admitted input is pruned from the inbox.

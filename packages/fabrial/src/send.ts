@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { FabrialHost } from "./app.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { InvocationMetadata } from "./runtime.ts";
@@ -85,6 +86,10 @@ const attributes = (values: Record<string, string | null | undefined>) =>
 const text = (input: Json) =>
 	isChatMessage(input) ? input.text : typeof input === "string" ? input : JSON.stringify(input);
 
+/** The short id the model sees in `request="…"`; `reply` maps it back to the full request id. */
+export const shortRequestId = (requestId: string) =>
+	createHash("sha256").update(requestId).digest("hex").slice(0, 8);
+
 /** Render an input for the model, with attribution and the request id `reply` can target. */
 export function renderInput(options: {
 	input: Json;
@@ -106,14 +111,14 @@ export function renderInput(options: {
 		return `<message${attributes({
 			from: message ? (message.author.name ?? message.author.identity.subjectId) : options.from,
 			thread: message?.threadId ?? options.thread,
-			request: requestId,
+			request: shortRequestId(requestId),
 		})}>${escapeXml(text(input))}</message>`;
 	}
 	return `<notification${attributes({
 		source: options.source,
 		kind: options.event,
 		priority: options.priority ?? "normal",
-		request: requestId,
+		request: shortRequestId(requestId),
 		...Object.fromEntries(
 			Object.entries(options.attributes ?? {})
 				.filter(([key]) => !["source", "kind", "priority", "request"].includes(key))

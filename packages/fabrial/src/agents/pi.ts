@@ -58,7 +58,13 @@ import {
 	replyTool,
 	type BridgeFrame,
 } from "./context.ts";
-import { prepareSend, threadSession, type Delivery, type SendOptions } from "../send.ts";
+import {
+	prepareSend,
+	shortRequestId,
+	threadSession,
+	type Delivery,
+	type SendOptions,
+} from "../send.ts";
 import {
 	prepareSubscribe,
 	prepareUnsubscribe,
@@ -72,6 +78,7 @@ import {
 	ChildResults,
 	Conversations,
 	Invocation,
+	RequestAlias,
 	Runs,
 	WorkflowReceipts,
 	ChildIntents,
@@ -359,6 +366,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			let watcher: ReturnType<Inbox["watch"]> | undefined;
 			let outcome: Json | undefined;
 			let children: { executionId: string; detached: boolean }[] = [];
+			const shown = new Set<ThreadIO>();
 			let finish!: () => void;
 			active.set(
 				frame,
@@ -434,10 +442,18 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				if (execution.metadata.ownsThread && io)
 					await setActive(io, execution.metadata.interactionId, true);
 				let lastStatus = 0;
-				if (execution.metadata.ownsThread && io) {
+				// Progress shows on the owned thread, or on the reply thread of the latest sent request.
+				let progress = execution.metadata.ownsThread ? io : undefined;
+				const showStatus = async (text: string) => {
+					if (!progress) return;
+					shown.add(progress);
+					lastStatus = Date.now();
+					await progress.setStatus(text).catch(() => {});
+				};
+				if (sending || (execution.metadata.ownsThread && io)) {
 					events = await watchEvents(frame.harness, conversationId!, context);
 					events.start(async (batch) => {
-						if (Date.now() - lastStatus < 750) return;
+						if (!progress || Date.now() - lastStatus < 750) return;
 						const tool = batch.find((event) => event.type === "tool_execution_start");
 						const text =
 							tool?.type === "tool_execution_start"
@@ -445,10 +461,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 										(each) => each.name === tool.toolName,
 									)?.description ?? "Using a tool…")
 								: "Thinking…";
-						lastStatus = Date.now();
-						await io.setStatus(text).catch(() => {});
+						await showStatus(text);
 					});
-					await io.setStatus("Thinking…").catch(() => {});
+					await showStatus("Thinking…");
 				}
 				const content = [
 					originContext,
@@ -469,6 +484,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				) => {
 					await frame.harness.commit(async (tx) => {
 						await tx.doc(Invocation, requestId, cloneJson(metadata));
+						await tx.doc(RequestAlias, shortRequestId(requestId), requestId);
 						(await tx.doc(Binding, conversationId!)).requestId ??= requestId;
 						const run = (await tx.doc(Runs)).runs[execution.executionId]!;
 						run.requests ??= {};
@@ -489,7 +505,15 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					const run = (await frame.harness.snapshot(Runs, context))!.runs[execution.executionId]!;
 					for (const [requestId, pending] of Object.entries(run.requests ?? {})) {
 						if (submissions.has(requestId)) continue;
-						if (pending.sent) sent.add(requestId);
+						if (pending.sent) {
+							sent.add(requestId);
+							const replyTo = (await frame.harness.snapshot(Invocation, requestId, context))
+								?.replyTo;
+							if (replyTo?.kind === "thread" && host.chat()) {
+								progress = await host.chat()!.resolve(replyTo);
+								await showStatus("Thinking…");
+							}
+						}
 						// Pi dedupes by request id, so a request re-admitted after a crash is submitted once.
 						const submission =
 							pending.submissionId !== null
@@ -682,6 +706,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 									await setActive(io, execution.metadata.interactionId, false);
 									await io.setStatus(null).catch(() => {});
 								}
+								for (const surface of shown)
+									if (surface !== io || !execution.metadata.ownsThread)
+										await surface.setStatus(null).catch(() => {});
 							}
 						}
 					}
