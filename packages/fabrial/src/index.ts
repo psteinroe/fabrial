@@ -52,7 +52,6 @@ export type {
 	HandoffResult,
 	ExecutionInfo,
 	WorkflowMiddleware,
-	WorkflowAccess,
 	WorkflowDefinition,
 	Workflow,
 	AnyWorkflow,

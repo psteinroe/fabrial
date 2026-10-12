@@ -80,14 +80,6 @@ export type WorkflowMiddleware = (
 	next: (ctx: WorkflowContext) => Promise<Json | void>,
 ) => Promise<Json | void>;
 
-export interface WorkflowAccess {
-	/**
-	 * Who may invoke this workflow from another workflow (`ctx.invoke`, `ctx.handoff`). Not checked when
-	 * an agent calls it as a tool: tools carry their own approvals.
-	 */
-	invoke?: GroupDefinition | readonly GroupDefinition[];
-}
-
 export interface WorkflowDefinition<
 	TName extends string,
 	TInput extends Json,
@@ -103,7 +95,6 @@ export interface WorkflowDefinition<
 	output?: Schema<TOutput>;
 	triggers?: TTriggers;
 	cron?: { schedule: string; name?: string; replyTo?: import("./thread.ts").Surface }[];
-	access?: WorkflowAccess;
 	concurrency?: number;
 	retries?: { maxAttempts?: number };
 	run(

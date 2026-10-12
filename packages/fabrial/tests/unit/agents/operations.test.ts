@@ -110,18 +110,14 @@ it("ordinary tool children carry request identity, not the driver's trigger owne
 	}
 });
 
-it("checks canonical registered input, not invoke access, rejecting forged workflow definitions", async () => {
-	const restricted = defineWorkflow({
-		name: "restricted",
-		access: { invoke: { kind: "fabrial.group", id: "admins", members: [] } },
-		run: async () => null,
-	});
+it("checks canonical registered input, rejecting forged workflow definitions", async () => {
+	const other = defineWorkflow({ name: "other", run: async () => null });
 	const canonical = defineWorkflow({
 		name: "validated",
 		input: z.object({ count: z.number() }),
 		run: async () => null,
 	});
-	const f = await fixture([restricted, canonical]);
+	const f = await fixture([other, canonical]);
 	try {
 		const ctx = await fields(f.context, f.conversation.id, f.api);
 		await expect(
@@ -143,8 +139,7 @@ it("checks canonical registered input, not invoke access, rejecting forged workf
 			),
 		).rejects.toThrow("not registered");
 		expect(f.start).not.toHaveBeenCalled();
-		// Tools carry their own approvals, so the requester's group membership is not checked.
-		await ctx.start("restricted", restricted, undefined as never);
+		await ctx.start("other", other, undefined as never);
 		expect(f.start).toHaveBeenCalledTimes(1);
 	} finally {
 		await f.harness.close(BACKGROUND_CONTEXT);

@@ -329,19 +329,6 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 	const checkInput = async (workflow: AnyWorkflow, input: Json): Promise<Json> => {
 		const registered = host.workflows.find((w) => w.name === workflow.name);
 		if (!registered) throw new Error(`Unregistered workflow: ${workflow.name}`);
-		const groups = registered.definition.access?.invoke;
-		if (
-			groups &&
-			(!metadata.requestedBy ||
-				!(
-					await Promise.all(
-						(Array.isArray(groups) ? groups : [groups]).map((g) =>
-							host.directory.isMember(metadata.requestedBy!, g),
-						),
-					)
-				).some(Boolean))
-		)
-			throw new Error(`Not authorized to invoke ${workflow.name}`);
 		return registered.definition.input
 			? parseSchema(registered.definition.input, input, `${workflow.name} input`)
 			: input;

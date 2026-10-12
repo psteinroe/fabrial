@@ -546,7 +546,7 @@ describe("approvals", () => {
 	});
 });
 
-describe("children, access and identity", () => {
+describe("children and identity", () => {
 	it("invokes children with metadata, validates schemas, and starts independently", async () => {
 		const child = defineWorkflow({
 			name: "child",
@@ -635,23 +635,16 @@ describe("children, access and identity", () => {
 			expect(test.runtime.result(childId)).toMatchObject({ status: "completed" });
 		} else expect(test.runtime.result(childId)).toMatchObject({ status: "cancelled" });
 	});
-	it("checks access.invoke against the actor", async () => {
-		const restricted = defineWorkflow({
-			name: "restricted",
+	it("invokes another workflow without a permission check", async () => {
+		const other = defineWorkflow({
+			name: "other",
 			input: z.object({}),
-			access: { invoke: defineGroup({ id: "only-bob", members: [bob] }) },
 			run: async () => "secret",
 		});
-		const test = setup([
-			workflow(async (_i, ctx) => ctx.invoke("restricted", restricted, {})),
-			restricted,
-		]);
+		const test = setup([workflow(async (_i, ctx) => ctx.invoke("other", other, {})), other]);
 		await enter(test);
-		expect(test.runtime.executions("restricted")).toHaveLength(0);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-			status: "failed",
-			error: "Not authorized to invoke restricted",
-		});
+		expect(test.runtime.executions("other")).toHaveLength(1);
+		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "secret" });
 	});
 	it("resolves known and unknown identities, static/dynamic groups and names", async () => {
 		const lookup = definePlugin({
@@ -1181,24 +1174,6 @@ describe("runtime fidelity", () => {
 		await enter(test);
 		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: [1, 1] });
 	});
-	it("does not rerun access checks for an already authorized child", async () => {
-		let members = [alice];
-		const access = defineGroup({ id: "access", resolve: () => members });
-		const child = defineWorkflow({
-			name: "child",
-			input: z.object({}),
-			access: { invoke: access },
-			run: async (_i, ctx) => {
-				await ctx.sleep("pause", 100);
-				return "done";
-			},
-		});
-		const test = setup([workflow(async (_i, ctx) => ctx.invoke("child", child, {})), child]);
-		await enter(test);
-		members = [];
-		await test.runtime.advanceBy(100);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "done" });
-	});
 });
 
 describe("additional port and correlation guarantees", () => {
@@ -1385,24 +1360,23 @@ describe("additional port and correlation guarantees", () => {
 			expect.arrayContaining(["x", "x:1", "x#1"]),
 		);
 	});
-	it("does not permit an alternate workflow object to bypass registered access", async () => {
-		const restricted = defineWorkflow({
-			name: "restricted",
-			input: z.object({}),
-			access: { invoke: defineGroup({ id: "bob-only", members: [bob] }) },
+	it("does not permit an alternate workflow object to bypass registered input validation", async () => {
+		const registered = defineWorkflow({
+			name: "registered",
+			input: z.object({ count: z.number() }),
 			run: async () => "secret",
 		});
 		const impostor = defineWorkflow({
-			name: "restricted",
+			name: "registered",
 			input: z.object({}),
 			run: async () => "fake",
 		});
-		const test = setup([workflow(async (_i, ctx) => ctx.invoke("call", impostor, {})), restricted]);
+		const test = setup([workflow(async (_i, ctx) => ctx.invoke("call", impostor, {})), registered]);
 		await enter(test);
-		expect(test.runtime.executions("restricted")).toHaveLength(0);
+		expect(test.runtime.executions("registered")).toHaveLength(0);
 		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
 			status: "failed",
-			error: "Not authorized to invoke restricted",
+			error: expect.stringContaining("Invalid registered input"),
 		});
 	});
 });

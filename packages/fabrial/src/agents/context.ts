@@ -111,7 +111,6 @@ export async function fields(
 		if (!api) throw new Error("Prompt sections cannot start workflows");
 		const registered = bridge.host.workflows.find((candidate) => candidate.name === workflow.name);
 		if (!registered) throw new Error(`Workflow ${workflow.name} is not registered`);
-		// No access.invoke check: agents use workflows as tools, and tools carry their own approvals.
 		const parsed = registered.definition.input
 			? await parseSchema(registered.definition.input, input, `${registered.name} input`)
 			: input;

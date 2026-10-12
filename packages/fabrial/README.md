@@ -50,7 +50,7 @@ await app.start(); // migrates Postgres, validates credentials, starts workers
 
 `createFabrial({ database, models, plugins, identity })` creates an explicit, typed instance. There is no global `Register` augmentation. `database` is one Postgres connection string shared by workflows, agent sessions, and chat state. `models` holds credentials per model provider (`{ anthropic: { apiKey } }`); agents and `ctx.evaluate` name models as `"provider/model"` strings.
 
-`f.defineWorkflow`, `f.defineAgent`, `f.defineTool`, `f.defineToolkit`, `f.defineState`, and `f.defineGroup({ id, resolve(ctx) { … } })` infer precise `ctx.clients` and plugin toolkit ids from the instance. Definitions are plain data and can be reused by any app made from `f`; groups can be referenced directly in access/approval options. `f.plugins` is a readonly catalog for introspection.
+`f.defineWorkflow`, `f.defineAgent`, `f.defineTool`, `f.defineToolkit`, `f.defineState`, and `f.defineGroup({ id, resolve(ctx) { … } })` infer precise `ctx.clients` and plugin toolkit ids from the instance. Definitions are plain data and can be reused by any app made from `f`; groups can be referenced directly as approvers. `f.plugins` is a readonly catalog for introspection.
 
 `f.app({ workflows, logger? })` builds the app and exposes `app.fetch`, `app.start`, `app.stop`, and authenticated adapter ingress through `app.host`. Plugins carry their values at definition and factories must stay side-effect free: importing the app with unset environment is safe. The database pool opens, credentials are validated, and connections start at `app.start()`, not at import or `f.app()`. Chat-capable plugins are served at `POST /<pluginId>/events`; routes await ingress before responding.
 
@@ -110,7 +110,7 @@ Each inbound message carries all matching categories: channel messages emit `mes
 
 ## Routing and identity
 
-`identity` accepts `readonly UserDefinition[]` only. Define groups in a separate module with `f.defineGroup` for typed `ctx.clients`. Access and approvers resolve group references directly; groups do not require registration, including dynamically resolved groups.
+`identity` accepts `readonly UserDefinition[]` only. Define groups in a separate module with `f.defineGroup` for typed `ctx.clients`. Approvers resolve group references directly; groups do not require registration, including dynamically resolved groups.
 
 Owner specificity is `trigger.specificity ?? Object.keys(trigger.filter ?? {}).length`. Fields are ANDed, alternatives ORed, with Conductor's scalar, prefix, numeric, exists, and anything-but semantics. Observers run without the owner's thread. Triggers on the same workflow are merged.
 
