@@ -58,7 +58,7 @@ import {
 	replyTool,
 	type BridgeFrame,
 } from "./context.ts";
-import { threadSession, type Delivery } from "../send.ts";
+import { prepareSend, threadSession, type Delivery, type SendOptions } from "../send.ts";
 import { Inbox } from "./inbox.ts";
 import {
 	applyState,
@@ -746,11 +746,31 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	const effect: RuntimeWorkflow = {
 		name: EFFECT_WORKFLOW,
 		triggers: [],
-		handler: async (input, execution) =>
-			execution.step("fabrial:pi:effect", async () => {
+		handler: async (input, execution) => {
+			const { method, args } = input as { method: string; args: Json[] };
+			if (method === "send") {
+				const [agent, options] = args as [string, SendOptions];
+				const request = await execution.step("fabrial:pi:send", () =>
+					prepareSend(
+						host,
+						execution.metadata,
+						{
+							current: execution.metadata.replyTo,
+							channelId: async () => {
+								const io = await thread(execution);
+								if (!io) throw new Error("Managed Pi send has no chat surface");
+								return io.channelId;
+							},
+						},
+						`${execution.executionId}:send`,
+						options,
+					),
+				);
+				return port.send(execution, "send", { kind: "fabrial.agent", name: agent }, request);
+			}
+			return execution.step("fabrial:pi:effect", async () => {
 				const io = await thread(execution);
 				if (!io) throw new Error("Managed Pi thread operation has no thread");
-				const { method, args } = input as { method: string; args: Json[] };
 				if (method === "post")
 					return cloneJson(
 						await io.post(args[0] as Parameters<ThreadIO["post"]>[0]),
@@ -765,7 +785,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				if (method === "history")
 					return cloneJson(await io.history(args[0] as Parameters<ThreadIO["history"]>[0]));
 				throw new Error(`Unknown Pi effect ${method}`);
-			}),
+			});
+		},
 	};
 	const port: AgentPort = {
 		workflows: () => [workflow, effect],

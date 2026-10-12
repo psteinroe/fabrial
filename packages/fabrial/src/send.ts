@@ -1,3 +1,4 @@
+import type { FabrialHost } from "./app.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { InvocationMetadata } from "./runtime.ts";
 import type { ChatMessage, Surface, Thread } from "./thread.ts";
@@ -112,4 +113,85 @@ export function renderInput(options: {
 		priority: options.priority ?? "normal",
 		request: requestId,
 	})}>${escapeXml(text(input))}</notification>`;
+}
+
+/**
+ * Resolve the Session, actor, and reply surface of a send, and render its input. Shared by workflow and
+ * tool `ctx.send`; `surface.current` is the sender's chat surface.
+ */
+export async function prepareSend(
+	host: FabrialHost,
+	metadata: InvocationMetadata,
+	surface: { current: InvocationMetadata["replyTo"]; channelId: () => Promise<string> },
+	requestId: string,
+	opts: SendOptions,
+): Promise<SendRequest> {
+	const kind = opts.kind ?? "message";
+	const priority = opts.priority ?? "normal";
+	const current = surface.current;
+	const option = opts.session ?? "thread";
+	let session: string;
+	if (option === "thread" || option === "channel") {
+		if (!current) throw new Error(`Session "${option}" needs an execution with a chat surface`);
+		if (option === "thread") {
+			if (current.kind !== "thread")
+				throw new Error(
+					"Post to the channel with ctx.thread.post before sending; a channel is not a thread",
+				);
+			session = threadSession(current.provider, current.threadId);
+		} else
+			session = channelSession(
+				current.provider,
+				current.kind === "channel" ? current.channelId : await surface.channelId(),
+			);
+	} else session = customSession(option);
+	const replyTo =
+		opts.replyTo === undefined
+			? current
+			: opts.replyTo === null
+				? null
+				: "post" in opts.replyTo
+					? opts.replyTo.ref
+					: opts.replyTo;
+	const message = isChatMessage(opts.input) ? opts.input : undefined;
+	const actor = message
+		? await host.resolvePrincipal(message.author.identity)
+		: metadata.requestedBy;
+	const origin = message
+		? { provider: message.provider, threadId: message.threadId, messageId: message.messageId }
+		: metadata.origin;
+	const context = origin
+		? (
+				await Promise.all(
+					host.plugins.map(async (plugin) => plugin.context?.(origin, host.clients())),
+				)
+			).filter(Boolean)
+		: [];
+	const event = typeof metadata.triggerEvent === "string" ? metadata.triggerEvent : null;
+	const rendered = renderInput({
+		input: opts.input,
+		kind,
+		priority,
+		requestId,
+		from: actor?.name ?? actor?.id,
+		thread: current?.kind === "thread" ? current.threadId : null,
+		source: metadata.origin?.provider ?? event?.split(".")[0],
+		event,
+	});
+	return {
+		session,
+		requestId,
+		content: [...context, rendered].join("\n\n"),
+		delivery: deliveryFor(kind, priority),
+		metadata: {
+			...metadata,
+			requestedBy: actor as InvocationMetadata["requestedBy"],
+			replyTo: replyTo as InvocationMetadata["replyTo"],
+			origin: origin as InvocationMetadata["origin"],
+			ownsThread: false,
+			ownerWorkflow: null,
+			triggerEvent: null,
+			send: { kind, priority } satisfies SentRequest,
+		},
+	};
 }

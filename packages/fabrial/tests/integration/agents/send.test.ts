@@ -17,6 +17,7 @@ import {
 	defineEvent,
 	definePlugin,
 	trigger,
+	type AgentRef,
 	type ChatMessage,
 	type ExternalIdentity,
 	type JsonObject,
@@ -63,7 +64,12 @@ async function submitted(session: string): Promise<string[]> {
 type Response = Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0][number];
 
 /** One app on a fresh channel: a channel-wide subscription and a notify workflow on a custom key. */
-async function setup() {
+async function setup(
+	tools: (
+		channel: string,
+		self: () => AgentRef,
+	) => Parameters<typeof f.defineAgent>[0]["tools"] = () => [],
+) {
 	const channel = `c${randomUUID().slice(0, 8)}`;
 	const faux = fauxProvider();
 	const models = createModels();
@@ -71,6 +77,7 @@ async function setup() {
 	const agent = f.defineAgent({
 		name: `support-${channel}`,
 		model: `${faux.provider.id}/${faux.getModel().id}`,
+		tools: tools(channel, (): AgentRef => agent),
 	});
 	const subscription = f.subscribe({
 		name: `channel-${channel}`,
@@ -369,4 +376,36 @@ it("inbox notifies watchers of a Session and prunes admitted input", async () =>
 		watcher.close();
 		await inbox.stop();
 	}
+});
+
+it("a tool sends to another conversation through the same send path", async () => {
+	const t = await setup((channel, self) => [
+		f.defineTool({
+			name: "escalate",
+			description: "Escalate to ops",
+			input: z.object({ summary: z.string() }),
+			async run(input, ctx) {
+				const receipt = await ctx.send("escalate", self(), {
+					session: `ops-${channel}`,
+					input: input.summary,
+					kind: "notification",
+				});
+				return receipt.session;
+			},
+		}),
+	]);
+	t.respond([
+		fauxAssistantMessage(fauxToolCall("escalate", { summary: "billing is down" }), {
+			stopReason: "toolUse",
+		}),
+		fauxAssistantMessage("escalated"),
+		(context) => {
+			expect(text(context.messages)).toContain("billing is down");
+			return fauxAssistantMessage("noted");
+		},
+	]);
+	await t.chat.receive(t.message("m1", "t1"));
+	await t.settle();
+	expect(t.faux.state.callCount).toBe(3);
+	expect(await submitted(`app:ops-${t.channel}`)).toHaveLength(1);
 });

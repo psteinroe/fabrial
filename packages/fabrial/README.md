@@ -302,6 +302,8 @@ await ctx.send("deliver", supportAgent, {
 | `notification` normal | same                                                               | follow-up (next run)                         |
 | `notification` low    | same                                                               | written; seen on the next run, does not wake |
 
+Tools have the same `ctx.send`. A tool's send runs in a managed child execution through the same path, and `replyTo` defaults to the tool call's request.
+
 Agents running sent input get a built-in `reply({ text, request? })` tool. It posts to the request's `replyTo`, by default the latest request in the run. The final answer of a sent run is not posted. Each input's request ID comes from the send's operation ID, so retries and redeliveries are submitted once. Sent input waits in `fabrial.inbox` until the conversation's driver admits it to Pi, then the row is deleted. Drivers wake on Postgres `NOTIFY` and poll every few seconds for missed notifications. A redelivery after the row was pruned is deduplicated by Pi's request ID.
 
 Static subscriptions route a trigger's events into a conversation. They compete for trigger ownership like workflows, but never hold the thread, so every message in the channel or thread is delivered:

@@ -5,17 +5,7 @@ import { boundedTimeout, duration } from "./internal.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { DurableExecution, InvocationMetadata, ThreadIO, WaitBranch } from "./runtime.ts";
 import { parseSchema } from "./schema.ts";
-import {
-	channelSession,
-	customSession,
-	deliveryFor,
-	isChatMessage,
-	renderInput,
-	threadSession,
-	type SendOptions,
-	type SendRequest,
-	type SentRequest,
-} from "./send.ts";
+import { prepareSend } from "./send.ts";
 import type {
 	Awaitable,
 	ChatMessage,
@@ -344,77 +334,6 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 			? parseSchema(registered.definition.input, input, `${workflow.name} input`)
 			: input;
 	};
-	/** Resolve the Session, actor, and reply surface of a send, and render its input. */
-	const prepareSend = async (requestId: string, opts: SendOptions): Promise<SendRequest> => {
-		const kind = opts.kind ?? "message";
-		const priority = opts.priority ?? "normal";
-		const current = (realThread && io ? io.ref : metadata.replyTo) as InvocationMetadata["replyTo"];
-		const option = opts.session ?? "thread";
-		let session: string;
-		if (option === "thread" || option === "channel") {
-			if (!current) throw new Error(`Session "${option}" needs an execution with a chat surface`);
-			if (option === "thread") {
-				if (current.kind !== "thread")
-					throw new Error(
-						"Post to the channel with ctx.thread.post before sending; a channel is not a thread",
-					);
-				session = threadSession(current.provider, current.threadId);
-			} else
-				session = channelSession(
-					current.provider,
-					current.kind === "channel" ? current.channelId : (await getIO()).channelId,
-				);
-		} else session = customSession(option);
-		const replyTo =
-			opts.replyTo === undefined
-				? current
-				: opts.replyTo === null
-					? null
-					: "post" in opts.replyTo
-						? opts.replyTo.ref
-						: opts.replyTo;
-		const message = isChatMessage(opts.input) ? opts.input : undefined;
-		const actor = message
-			? await host.resolvePrincipal(message.author.identity)
-			: metadata.requestedBy;
-		const origin = message
-			? { provider: message.provider, threadId: message.threadId, messageId: message.messageId }
-			: metadata.origin;
-		const context = origin
-			? (
-					await Promise.all(
-						host.plugins.map(async (plugin) => plugin.context?.(origin, host.clients())),
-					)
-				).filter(Boolean)
-			: [];
-		const event = typeof metadata.triggerEvent === "string" ? metadata.triggerEvent : null;
-		const rendered = renderInput({
-			input: opts.input,
-			kind,
-			priority,
-			requestId,
-			from: actor?.name ?? actor?.id,
-			thread: current?.kind === "thread" ? current.threadId : null,
-			source: metadata.origin?.provider ?? event?.split(".")[0],
-			event,
-		});
-		return {
-			session,
-			requestId,
-			content: [...context, rendered].join("\n\n"),
-			delivery: deliveryFor(kind, priority),
-			metadata: {
-				...metadata,
-				requestedBy: actor as InvocationMetadata["requestedBy"],
-				replyTo: replyTo as InvocationMetadata["replyTo"],
-				origin: origin as InvocationMetadata["origin"],
-				ownsThread: false,
-				ownerWorkflow: null,
-				triggerEvent: null,
-				send: { kind, priority } satisfies SentRequest,
-			},
-		};
-	};
 	const childMetadata = (ownsThread: boolean): Partial<InvocationMetadata> => ({
 		...metadata,
 		ownsThread,
@@ -441,8 +360,19 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 		send: async (id, agent, opts) => {
 			if (!agents) throw new Error("Agent integration required");
 			const key = op(id);
-			const request = await execution.step(`fabrial:${key}:send`, () =>
-				prepareSend(`${execution.executionId}:${key}`, opts),
+			const request = await execution.step(`fabrial:${key}:send`, async () =>
+				prepareSend(
+					host,
+					metadata,
+					{
+						current: (realThread && io
+							? io.ref
+							: metadata.replyTo) as InvocationMetadata["replyTo"],
+						channelId: async () => (await getIO()).channelId,
+					},
+					`${execution.executionId}:${key}`,
+					opts,
+				),
 			);
 			return agents.agents.send(execution, key, agent, request);
 		},

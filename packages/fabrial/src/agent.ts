@@ -3,6 +3,7 @@ import type { Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { AgentRef, InvocationMetadata } from "./runtime.ts";
 import type { Schema } from "./schema.ts";
+import type { SendOptions, SendReceipt } from "./send.ts";
 import type { StateDefinition, ToolStateHandle } from "./state.ts";
 import type { ChatMessage, MessageRef, OutboundMessage } from "./thread.ts";
 import type { AnyWorkflow, WorkflowInput, WorkflowOutput } from "./workflow.ts";
@@ -50,6 +51,8 @@ export interface ToolContext<
 		id: string,
 		request: EvaluateRequest<Q>,
 	): Promise<EvaluateResult<Q>>;
+	/** Send input to a conversation and return, as in workflows; `replyTo` defaults to this request's. */
+	send(id: string, agent: AgentRef, options: SendOptions): Promise<SendReceipt>;
 	/** Aborted when the agent run is cancelled or the call is interrupted. */
 	readonly signal: AbortSignal;
 }

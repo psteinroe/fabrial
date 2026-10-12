@@ -12,6 +12,7 @@ it("exposes Fabrial's tool context, not Pi's tool API", () => {
 		| "invoke"
 		| "start"
 		| "evaluate"
+		| "send"
 		| "signal"
 	>();
 });

@@ -8,6 +8,7 @@ import type {
 	ToolExecutionApi,
 	ToolRegistration,
 } from "@earendil-works/pi-durable";
+import type { SendReceipt } from "../send.ts";
 import {
 	parseSchema,
 	type AnyWorkflow,
@@ -159,6 +160,16 @@ export async function fields(
 			if (!api) throw new Error("Prompt sections cannot invoke workflows");
 			const child = await start(id, workflow, input);
 			return (await childResult(child)) as WorkflowOutput<typeof workflow>;
+		},
+		// Sent from a managed child execution, through the same path as workflow `ctx.send`.
+		send: async (id, agent, options) => {
+			if (!api) throw new Error("Prompt sections cannot send");
+			const replyTo =
+				options.replyTo && "post" in options.replyTo ? options.replyTo.ref : options.replyTo;
+			return (await operation(id, "send", [
+				agent.name,
+				cloneJson({ ...options, replyTo }) as unknown as Json,
+			])) as SendReceipt;
 		},
 		evaluate: async (id, request) => {
 			if (!api) throw new Error("Prompt sections cannot evaluate models");
