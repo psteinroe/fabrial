@@ -281,3 +281,37 @@ Limitations:
 ## Current boundaries
 
 Live plugin clients are built once per app, as specified by `FabrialHost.clients`; they must not capture invocation identity. Core does not add a reaction acknowledgement to buffered replies because `ChatPort` has no reaction operation. Thread routing state is a read/write port, not a transaction or CAS: ingress for a given thread must be serialized by the state adapter, including across webhook replicas. The test runtime does not emulate missing Conductor capabilities or schedule cron timers.
+
+## Send and subscriptions
+
+`ctx.agent` **calls** an agent: it submits and waits for the answer. `ctx.send` **sends**: it submits and returns. The conversation is `[session, agent]`. An idle conversation starts a run. A busy one gets the input by kind and priority.
+
+```ts
+await ctx.send("deliver", supportAgent, {
+	session: "channel", // "thread" (default) | "channel" | a custom key such as `ticket:${id}`
+	input: message, // a ChatMessage, a string, or JSON
+	kind: "message", // or "notification" with priority "urgent" | "normal" | "low"
+	replyTo: ctx.thread, // default: this execution's thread; null for none
+});
+```
+
+| Input                 | Rendered as                                                        | Delivery                                     |
+| --------------------- | ------------------------------------------------------------------ | -------------------------------------------- |
+| `message`             | `<message from="Alice" thread="…" request="…">text</message>`      | steers a busy run, or starts one             |
+| `notification` urgent | `<notification source="…" kind="…" priority="urgent" request="…">` | steer                                        |
+| `notification` normal | same                                                               | follow-up (next run)                         |
+| `notification` low    | same                                                               | written; seen on the next run, does not wake |
+
+Agents running sent input get a built-in `reply({ text, request? })` tool. It posts to the request's `replyTo`, by default the latest request in the run. The final answer of a sent run is not posted. Each input's request ID comes from the send's operation ID, so retries and redeliveries are submitted once.
+
+Static subscriptions route a trigger's events into a conversation. They compete for trigger ownership like workflows, but never hold the thread, so every message in the channel or thread is delivered:
+
+```ts
+export const supportChannel = f.subscribe({
+	name: "support-channel",
+	source: slack.message({ channel: "C_SUPPORT" }),
+	agent: supportAgent,
+	session: "channel", // or (event) => `customer:${event.channelId}`
+});
+export const app = f.app({ workflows, subscriptions: [supportChannel] });
+```

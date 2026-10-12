@@ -116,3 +116,7 @@ native subscription: durable event cursors retain pre-registration decisions.
   Conductor step memoization cannot atomically commit an external DB write and
   its runtime receipt. A production repair needs business-level idempotency or
   reconciliation. No extra execution/approval tables are introduced here.
+
+## Support channel subscription
+
+`src/subscriptions.ts` declares `supportChannel`: every message in `#help` (`C_HELP`) goes to `acme-support` in one conversation for the whole channel (`session: "channel"`). The agent answers each asker with its `reply` tool, in the asker's thread. The integration test covers two threads sharing that conversation, targeted replies, no automatic final post, and a restart after ingress.

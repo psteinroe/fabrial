@@ -6,7 +6,7 @@ import { slack } from "@fabrial/slack";
 import type { Adapter } from "chat";
 import postgres, { type Sql } from "postgres";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { workflows } from "../../src/app.ts";
+import { subscriptions, workflows } from "../../src/app.ts";
 import { routingModel } from "../../src/workflows/general-assistant.ts";
 import { f } from "../../src/fabrial.ts";
 import { bob, engineeringTriage, weeklyRotationForTest } from "./rotation.ts";
@@ -128,7 +128,7 @@ afterEach(async () => {
 });
 
 function newApp() {
-	const instance = createIntegrationApp(f, { workflows, models, logger });
+	const instance = createIntegrationApp(f, { workflows, subscriptions, models, logger });
 	const adapter = instance.host.plugins.find((p) => p.id === "linear")!.chat!.adapter() as Adapter;
 	vi.spyOn(adapter, "initialize").mockImplementation(async (sdk) => {
 		Object.assign(adapter, {
@@ -586,4 +586,54 @@ it("read-only query cannot escape its transaction with multiple statements", asy
 		app.host.clients().database.query("org-acme", `COMMIT; ${repair}`),
 	).rejects.toMatchObject({ code: "42601" });
 	expect(await balances()).toEqual([{ balance: 0 }, { balance: 100 }]);
+});
+
+it("support channel: two threads share one conversation, reply posts to the asker, and a restart mid-run resumes", async () => {
+	const answered = (context: { messages: readonly { role: string; toolName?: string }[] }) =>
+		context.messages.filter((m) => m.role === "toolResult" && m.toolName === "reply").length;
+	const step = (context: {
+		messages: readonly { role: string; toolName?: string; content: unknown }[];
+	}) => {
+		const text = JSON.stringify(context.messages);
+		const asks = (text.match(/<message /g) ?? []).length;
+		return answered(context) >= asks
+			? reply.text("final answer, never posted")
+			: reply.toolCall("reply", { text: `Answer ${asks}` });
+	};
+	faux.respond(Array.from({ length: 8 }, () => step));
+	const post = async (user: string, ts: string, text: string, thread?: string) =>
+		expect(
+			(
+				await slackRequest({
+					type: "event_callback",
+					team_id: process.env.SLACK_TEAM_ID,
+					event_id: randomUUID(),
+					event: {
+						type: "message",
+						user,
+						channel: "C_HELP",
+						text,
+						ts,
+						event_ts: ts,
+						...(thread ? { thread_ts: thread } : {}),
+					},
+				})
+			).status,
+		).toBe(200);
+	await post("U_ALICE", "1700000100.000001", "Is billing down?");
+	// Restart right after durable ingress; the subscription and its driver resume after it.
+	await app.stop();
+	app = newApp();
+	await app.start();
+	const replies = () =>
+		calls.filter((c) => c.method === "chat.postMessage" && c.args.channel === "C_HELP");
+	await expect.poll(() => replies().length, poll).toBe(1);
+	expect(replies()[0]!.args.thread_ts).toBe("1700000100.000001");
+	await post("U_BOB", "1700000200.000001", "Same for me");
+	await expect.poll(() => replies().length, poll).toBe(2);
+	expect(replies()[1]!.args.thread_ts).toBe("1700000200.000001");
+	expect(String(replies()[1]!.args.text)).toContain("Answer 2");
+	expect(calls.some((c) => String(c.args.text).includes("never posted"))).toBe(false);
+	const conversations = await sql`SELECT DISTINCT session_key FROM fabrial_pi.inbox`;
+	expect(conversations.map((row) => row.session_key)).toEqual(["slack:channel:C_HELP"]);
 });
