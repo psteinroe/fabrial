@@ -124,7 +124,7 @@ export interface CoreConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[
 export interface App<TClients = Record<string, unknown>> {
 	/** One fetch handler for all plugin routes and chat webhooks. */
 	fetch(request: Request): Promise<Response>;
-	/** Validates (trigger ties, orphaned Pi tasks, …), runs plugin `init`, starts the runtime. */
+	/** Validates (trigger ties, …), aborts orphaned agent work, runs plugin `init`, starts the runtime. */
 	start(): Promise<void>;
 	stop(): Promise<void>;
 	/** Emit an event from application code. */

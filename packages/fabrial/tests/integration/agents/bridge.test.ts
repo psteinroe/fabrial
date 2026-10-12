@@ -27,13 +27,7 @@ import postgres, { type Sql } from "postgres";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { ChildIntents, Invocation, Runs } from "../../../src/agents/documents.ts";
 import { z } from "zod";
-import {
-	abortOrphans,
-	checkOrphans,
-	pi,
-	PostgresStorage,
-	sessionKey,
-} from "../../../src/agents/index.ts";
+import { pi, PostgresStorage, sessionKey } from "../../../src/agents/index.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 const definitions = createFabrial({ plugins: [] });
 const { defineWorkflow } = definitions;
@@ -296,8 +290,9 @@ it("rejects invalid structured answers", async () => {
 	await f.integration.stop();
 });
 
-it("detects missing live task kinds and explicitly aborts their ownership tree", async () => {
-	const storage = await PostgresStorage.open(sql, randomUUID());
+it("aborts live task kinds that are no longer installed at start and logs them", async () => {
+	const session = randomUUID();
+	const storage = await PostgresStorage.open(sql, session);
 	const id = await storage.mintId();
 	await storage.commit(
 		[
@@ -319,13 +314,23 @@ it("detects missing live task kinds and explicitly aborts their ownership tree",
 		BACKGROUND_CONTEXT,
 	);
 	await storage.close(BACKGROUND_CONTEXT);
-	await expect(checkOrphans(sql, ["pi.generation", "pi.tool", "pi.compaction"])).rejects.toThrow(
-		"abortOrphans",
+	const f = fixture();
+	const warn = vi.spyOn(f.host.logger, "warn");
+	await f.integration.start();
+	expect(warn).toHaveBeenCalledWith("Aborted orphaned agent work", {
+		session,
+		kind: "removed.extension",
+		count: 1,
+	});
+	await f.integration.stop();
+	const again = fixture();
+	const warnAgain = vi.spyOn(again.host.logger, "warn");
+	await again.integration.start();
+	expect(warnAgain).not.toHaveBeenCalledWith(
+		"Aborted orphaned agent work",
+		expect.objectContaining({ session }),
 	);
-	expect(await abortOrphans(sql, ["removed.extension"])).toBe(1);
-	await expect(
-		checkOrphans(sql, ["pi.generation", "pi.tool", "pi.compaction"]),
-	).resolves.toBeUndefined();
+	await again.integration.stop();
 });
 
 it.each([[false], [true]])(

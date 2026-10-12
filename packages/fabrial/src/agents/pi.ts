@@ -64,7 +64,7 @@ import {
 } from "./documents.ts";
 import { createEvaluator } from "./evaluate.ts";
 import { LeaseLost, PostgresStorage, SessionBusy } from "./storage.ts";
-import type { AgentIntegration } from "../app.ts";
+import type { AgentIntegration, Logger } from "../app.ts";
 
 const RUN_WORKFLOW = "fabrial.pi.run";
 export function sessionKey(metadata: InvocationMetadata): string {
@@ -782,12 +782,13 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					registry.install(extension);
 				}
 			for (const agent of definedAgents.get(host.definitionScope ?? host) ?? []) install(agent);
-			await checkOrphans(
+			await abortOrphans(
 				options.sql,
 				registry
 					.snapshot()
 					.tasks()
 					.map((task) => task.definition.name),
+				host.logger,
 			);
 			started = true;
 		},
@@ -807,51 +808,62 @@ async function setActive(io: ThreadIO, interactionId: string, agentActive: boole
 	);
 }
 
-export async function checkOrphans(sql: Sql, installedKinds: readonly string[]): Promise<void> {
+/**
+ * Aborts live Pi tasks whose kind is no longer installed (e.g. a removed toolkit), using Pi's abort
+ * cascade. Finds them from the latest task records without taking leases, then acquires only the
+ * affected Sessions; a Session held by another owner is skipped with a warning.
+ */
+export async function abortOrphans(
+	sql: Sql,
+	installedKinds: readonly string[],
+	logger: Logger,
+): Promise<number> {
 	const rows =
 		await sql`SELECT session_key, writes FROM fabrial_pi.commits ORDER BY session_key, seq`;
-	const tasks = new Map<string, { kind: string; state: { status: string } }>();
+	type Task = Extract<import("@earendil-works/pi-durable").StorageWrite, { type: "task" }>["value"];
+	const tasks = new Map<string, Map<Task["id"], Task>>();
 	for (const row of rows)
 		for (const write of JSON.parse(
 			String(row.writes),
 		) as import("@earendil-works/pi-durable").StorageWrite[]) {
-			if (write.type === "task") tasks.set(`${row.session_key}:${write.value.id}`, write.value);
+			if (write.type !== "task") continue;
+			const key = String(row.session_key);
+			const session = tasks.get(key) ?? new Map();
+			session.set(write.value.id, write.value);
+			tasks.set(key, session);
 		}
-	const missing = [
-		...new Set(
-			[...tasks.values()]
-				.filter((task) => task.state.status !== "terminal" && !installedKinds.includes(task.kind))
-				.map((task) => task.kind),
-		),
-	];
-	if (missing.length)
-		throw new Error(
-			`Orphaned Pi task kinds: ${missing.join(", ")}. Keep their toolkit on an agent until they finish, or call abortOrphans(sql, ${JSON.stringify(missing)}) (fabrial pi abort-orphans --kind …).`,
-		);
-}
-
-export async function abortOrphans(sql: Sql, kinds: readonly string[]): Promise<number> {
 	let aborted = 0;
-	const sessions = await sql`SELECT key FROM fabrial_pi.sessions ORDER BY key`;
-	for (const row of sessions) {
-		const storage = await PostgresStorage.open(sql, String(row.key));
-		const { createModels } = await import("@earendil-works/pi-ai/models");
-		const harness = await Harness.open(
-			storage,
-			{ models: createModels(), registry: createRegistry() },
-			BACKGROUND_CONTEXT,
+	for (const [key, session] of tasks) {
+		const orphans = new Map(
+			[...session].filter(
+				([, task]) => task.state.status !== "terminal" && !installedKinds.includes(task.kind),
+			),
 		);
+		if (!orphans.size) continue;
+		const counts = new Map<string, number>();
 		try {
-			const tasks = await harness.inspect(BACKGROUND_CONTEXT);
-			for (const task of tasks.tasks)
-				if (kinds.includes(task.record.kind)) {
-					await harness.abortTask(task.record.id, BACKGROUND_CONTEXT);
-					await harness.waitForTask(task.record.id, BACKGROUND_CONTEXT);
+			const storage = await PostgresStorage.open(sql, key);
+			const { createModels } = await import("@earendil-works/pi-ai/models");
+			const harness = await Harness.open(
+				storage,
+				{ models: createModels(), registry: createRegistry() },
+				BACKGROUND_CONTEXT,
+			);
+			try {
+				for (const [id, task] of orphans) {
+					await harness.abortTask(id, BACKGROUND_CONTEXT);
+					await harness.waitForTask(id, BACKGROUND_CONTEXT);
+					counts.set(task.kind, (counts.get(task.kind) ?? 0) + 1);
 					aborted++;
 				}
-		} finally {
-			await harness.close(BACKGROUND_CONTEXT);
+			} finally {
+				await harness.close(BACKGROUND_CONTEXT);
+			}
+		} catch (error) {
+			logger.warn("Could not abort orphaned agent work", { session: key, error });
 		}
+		for (const [kind, count] of counts)
+			logger.warn("Aborted orphaned agent work", { session: key, kind, count });
 	}
 	return aborted;
 }
