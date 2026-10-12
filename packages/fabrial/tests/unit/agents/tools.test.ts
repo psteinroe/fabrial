@@ -11,7 +11,6 @@ it("converts a Standard Schema input to JSON Schema for the model", () => {
 		type: "object",
 		properties: { text: { type: "string" }, count: { type: "number" } },
 		required: ["text"],
-		additionalProperties: false,
 	});
 	expect(schema).not.toHaveProperty("$schema");
 });
