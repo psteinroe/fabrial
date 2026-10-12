@@ -456,6 +456,7 @@ export function buildApp(config: CoreConfig): App {
 						);
 				}
 			for (const plugin of config.plugins) await plugin.init?.();
+			await config.resources?.open();
 			chat = config.chat?.connect(host);
 			await chat?.start?.();
 			await agents?.start();
@@ -466,6 +467,7 @@ export function buildApp(config: CoreConfig): App {
 			await agents?.stop();
 			await chat?.stop?.();
 			for (const plugin of [...config.plugins].reverse()) await plugin.shutdown?.();
+			await config.resources?.close();
 			liveClients = undefined;
 		},
 		async emit(event, payload, options = {}) {

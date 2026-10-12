@@ -2,9 +2,9 @@
  * Ports between Fabrial core and its runtimes. Core implements the workflow context, approvals, replies,
  * routing, and identity on top of these; adapters implement them:
  *
- * - `DurableRuntime` → `@fabrial/conductor` (PG Conductor), `fabrial/testing` (in memory)
- * - `ChatPort`       → `@fabrial/chat` (Chat SDK)
- * - `AgentPort`, `StatePort`, `Evaluator` → `@fabrial/pi` (Pi Durable, pi-ai)
+ * - `DurableRuntime` → `runtime/conductor` (PG Conductor), `fabrial/testing` (in memory)
+ * - `ChatPort`       → `chat` (Chat SDK)
+ * - `AgentPort`, `StatePort`, `Evaluator` → `agents` (Pi Durable, pi-ai)
  *
  * Method names and shapes mirror PGCONDUCTOR.md so that SHIMs can be deleted as Conductor lands features.
  */
@@ -218,7 +218,7 @@ export type ThreadRoutingState = JsonObject & {
 	cancellationIds?: string[];
 };
 
-/** Port implemented by `@fabrial/chat`. */
+/** Port implemented by the chat module. */
 export interface ChatPort {
 	thread(ref: ThreadRef): Promise<ThreadIO>;
 	/** Resolve a surface to a thread, creating a new thread in a channel lazily. */
@@ -234,11 +234,9 @@ export interface AgentRunOptions {
 	detached?: boolean;
 	/** Standard Schema for a typed structured result. */
 	output?: unknown;
-	/** Native escape hatch, applied to the Pi conversation before submitting. */
-	configure?: (conversation: unknown) => Promise<void> | void;
 }
 
-/** Port implemented by `@fabrial/pi`. Core calls it from `ctx.agent`. */
+/** Port implemented by the agents module. Core calls it from `ctx.agent`. */
 export interface AgentPort {
 	/** Internal workflows the agent bridge needs (e.g. the Session-owning agent run). */
 	workflows(): RuntimeWorkflow[];
@@ -250,13 +248,13 @@ export interface AgentPort {
 	): Promise<Json>;
 }
 
-/** Minimal shape core needs from `defineAgent` (in `@fabrial/pi`). */
+/** Minimal shape core needs from `f.defineAgent`. */
 export interface AgentRef {
 	readonly kind: "fabrial.agent";
 	readonly name: string;
 }
 
-/** Port implemented by `@fabrial/pi` for `ctx.state(S)` in workflow code. Each call is one durable operation. */
+/** Port implemented by the agents module for `ctx.state(S)` in workflow code. Each call is one durable operation. */
 export interface StatePort {
 	get<T extends JsonObject>(
 		execution: DurableExecution,

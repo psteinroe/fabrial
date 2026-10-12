@@ -1,3 +1,12 @@
+import type { AssistantMessage, MutableModels } from "@earendil-works/pi-ai";
+import { createModels as createPiModels } from "@earendil-works/pi-ai/models";
+import {
+	fauxAssistantMessage,
+	fauxProvider,
+	fauxToolCall,
+} from "@earendil-works/pi-ai/providers/faux";
+import { parseModel } from "./agent.ts";
+import { INTERNAL } from "./instance.ts";
 import type { AgentIntegration, ChatIntegration, FabrialHost } from "./app.ts";
 import type { Evaluator } from "./evaluate.ts";
 import type { ExternalIdentity } from "./identity.ts";
@@ -719,10 +728,30 @@ export function createTestRuntime(
 	return new MemoryRuntime(options);
 }
 
+/** Build an app from an instance with explicit test ports (in-memory runtime, fake or real chat, agents). */
+export function testApp<const P extends readonly import("./plugin.ts").AnyPlugin[]>(
+	instance: import("./instance.ts").Fabrial<P>,
+	config: import("./instance.ts").AppConfig & {
+		runtime: DurableRuntime;
+		chat?: ChatIntegration;
+		agents?: AgentIntegration;
+		reservationTimeout?: import("./runtime.ts").DurationInput;
+	},
+): import("./app.ts").App<import("./instance.ts").ClientsOf<P>> {
+	const { workflows, logger, ...overrides } = config;
+	return internal(instance).app({ workflows, logger }, overrides) as never;
+}
+
+function internal(instance: object): import("./instance.ts").InternalInstance {
+	const value = (instance as { [INTERNAL]?: import("./instance.ts").InternalInstance })[INTERNAL];
+	if (!value) throw new Error("Expected an instance from createFabrial()");
+	return value;
+}
+
 /** Build an isolated in-memory app from the same typed catalog as production. */
 export function createTestApp<const P extends readonly import("./plugin.ts").AnyPlugin[]>(
 	instance: import("./instance.ts").Fabrial<P>,
-	config: Omit<import("./instance.ts").FabrialConfig, "runtime" | "chat" | "agents"> & {
+	config: import("./instance.ts").AppConfig & {
 		now?: number | Date;
 		agents?: AgentIntegration;
 	},
@@ -730,11 +759,152 @@ export function createTestApp<const P extends readonly import("./plugin.ts").Any
 	const { now, ...appConfig } = config;
 	const runtime = new MemoryRuntime({ now });
 	const chat = new FakeChat(() => runtime.now());
-	const app = instance.app({
+	const app = testApp(instance, {
 		...appConfig,
 		runtime,
 		chat,
 		agents: config.agents ?? fakeAgents(),
-	} as Parameters<typeof instance.app>[0]);
+	});
 	return { app, runtime, chat };
+}
+
+/** A scripted model reply, built with `reply.text()` or `reply.toolCall()`. */
+export interface ScriptedReply {
+	readonly kind: "fabrial.scripted-reply";
+	readonly message: AssistantMessage;
+}
+export const reply = {
+	text: (text: string): ScriptedReply => ({
+		kind: "fabrial.scripted-reply",
+		message: fauxAssistantMessage(text),
+	}),
+	toolCall: (name: string, input: JsonObject): ScriptedReply => ({
+		kind: "fabrial.scripted-reply",
+		message: fauxAssistantMessage(fauxToolCall(name, input), { stopReason: "toolUse" }),
+	}),
+};
+/** A transcript message as a scripted step sees it. */
+export interface ScriptedMessage {
+	readonly role: string;
+	readonly toolName?: string;
+	readonly content: unknown;
+}
+export type ScriptedStep =
+	| ScriptedReply
+	| ((context: { messages: readonly ScriptedMessage[] }) => ScriptedReply);
+export interface ScriptedModel {
+	/** Replace the remaining replies; each model request consumes the next step. */
+	respond(steps: readonly ScriptedStep[]): void;
+	/** Model requests so far. */
+	readonly calls: number;
+}
+export type ScriptedAnswer =
+	| { probability: number }
+	| { choice: string; probabilities: Record<string, number> }
+	| { score: number; confidence: number };
+export interface ScriptedModels {
+	/** A chat model, `"provider/model"`; one per provider. */
+	model(name: string): ScriptedModel;
+	/** A classifier for `ctx.evaluate`; answers keyed by question. */
+	classifier(name: string, answers: (questions: string[]) => Record<string, ScriptedAnswer>): void;
+}
+
+const scripted = new WeakMap<ScriptedModels, MutableModels>();
+
+/** Scripted models for `createIntegrationApp`, without credentials or network. */
+export function scriptedModels(): ScriptedModels {
+	const models = createPiModels();
+	const handles = new Map<string, { modelId: string; model: ScriptedModel }>();
+	const result: ScriptedModels = {
+		model(name) {
+			const { provider, modelId } = parseModel(name);
+			const existing = handles.get(provider);
+			if (existing) {
+				if (existing.modelId !== modelId)
+					throw new Error(`Scripted provider ${provider} already has model ${existing.modelId}`);
+				return existing.model;
+			}
+			const faux = fauxProvider({ provider, models: [{ id: modelId }] });
+			models.setProvider(faux.provider);
+			const model: ScriptedModel = {
+				respond: (steps) =>
+					faux.setResponses(
+						steps.map((step) =>
+							typeof step === "function"
+								? (context) => step({ messages: context.messages }).message
+								: step.message,
+						),
+					),
+				get calls() {
+					return faux.state.callCount;
+				},
+			};
+			handles.set(provider, { modelId, model });
+			return model;
+		},
+		classifier(name, answers) {
+			const { provider, modelId } = parseModel(name);
+			const faux = fauxProvider({ provider });
+			models.setProvider({
+				...faux.provider,
+				getAllModels: () => [{ ...faux.getModel(), id: modelId, type: "classifier" as const }],
+				classify: async (_model, context) =>
+					({
+						api: faux.api,
+						provider,
+						model: modelId,
+						answers: Object.fromEntries(
+							Object.entries(answers(Object.keys(context.questions))).map(([key, answer]) => [
+								key,
+								"probability" in answer
+									? { type: "bool" as const, probability: answer.probability }
+									: "choice" in answer
+										? { type: "choice" as const, ...answer }
+										: { type: "score" as const, ...answer },
+							]),
+						),
+						stopReason: "stop" as const,
+						timestamp: Date.now(),
+					}) as never,
+			});
+		},
+	};
+	scripted.set(result, models);
+	return result;
+}
+
+/**
+ * Build the real app (Postgres, workflows, agents, chat state on the instance's database) with scripted
+ * models instead of credentials, model retries off, and fast polling.
+ */
+export function createIntegrationApp<const P extends readonly import("./plugin.ts").AnyPlugin[]>(
+	instance: import("./instance.ts").Fabrial<P>,
+	config: import("./instance.ts").AppConfig & {
+		models: ScriptedModels;
+		/** Default false. */
+		modelRetries?: boolean;
+		/** Worker and wait polling interval. Default 20ms. */
+		pollIntervalMs?: number;
+		/** Concurrent workflow executions per worker. Default 8. */
+		concurrency?: number;
+	},
+): import("./app.ts").App<import("./instance.ts").ClientsOf<P>> {
+	const { workflows, logger, models, modelRetries = false } = config;
+	const poll = config.pollIntervalMs ?? 20;
+	return internal(instance).app(
+		{ workflows, logger },
+		{
+			models: scripted.get(models),
+			agentSettings: { retry: { enabled: modelRetries } },
+			conductor: {
+				worker: {
+					concurrency: config.concurrency ?? 8,
+					pollIntervalMs: poll,
+					flushIntervalMs: poll,
+					fetchBatchSize: 10,
+				},
+				pollIntervalMs: poll * 2,
+			},
+		},
+	) as never;
 }

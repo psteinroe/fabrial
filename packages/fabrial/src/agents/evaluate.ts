@@ -1,5 +1,11 @@
 import type { ClassifierQuestion, Models } from "@earendil-works/pi-ai";
-import type { EvaluateQuestion, EvaluateRequest, EvaluateResult, Evaluator, Json } from "../index.ts";
+import type {
+	EvaluateQuestion,
+	EvaluateRequest,
+	EvaluateResult,
+	Evaluator,
+	Json,
+} from "../index.ts";
 
 export function createEvaluator(models: Models): Evaluator {
 	return {

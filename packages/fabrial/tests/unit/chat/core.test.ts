@@ -3,7 +3,7 @@ import { createTestMessage } from "@chat-adapter/tests";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { createFabrial, trigger, type WorkflowContext } from "../../../src/index.ts";
 import { z } from "zod";
-import { MemoryRuntime } from "../../../src/testing.ts";
+import { MemoryRuntime, testApp } from "../../../src/testing.ts";
 import { expect, it, vi } from "vitest";
 import { chat, chatTrigger } from "../../../src/chat/index.ts";
 import { setup } from "../../chat/helper.ts";
@@ -14,7 +14,7 @@ it("dispatches a mention to its owner and all matching observers without duplica
 	const runtime = new MemoryRuntime();
 	const owner = vi.fn(async () => {});
 	const observer = vi.fn(async () => {});
-	const app = createFabrial({ plugins: env.host.plugins }).app({
+	const app = testApp(createFabrial({ plugins: env.host.plugins }), {
 		runtime,
 		chat: chat({ state: createMemoryState() }),
 		workflows: [
@@ -69,7 +69,7 @@ it("rebinds a lazy channel from the durable first-post receipt on replay and chi
 		},
 	});
 	const refs: string[] = [];
-	const app = createFabrial({ plugins: env.host.plugins }).app({
+	const app = testApp(createFabrial({ plugins: env.host.plugins }), {
 		runtime,
 		chat: chat({ state: createMemoryState() }),
 		workflows: [
@@ -110,7 +110,7 @@ it("authorizes native stop actors through core rather than cancelling the handle
 	const env = setup();
 	const state = createMemoryState();
 	const runtime = new MemoryRuntime();
-	const app = createFabrial({ plugins: env.host.plugins }).app({
+	const app = testApp(createFabrial({ plugins: env.host.plugins }), {
 		runtime,
 		chat: chat({ state }),
 		workflows: [

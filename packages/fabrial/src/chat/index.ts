@@ -7,7 +7,8 @@ import {
 	type Message,
 	type Logger,
 } from "chat";
-import type { ChatIntegration, ExternalIdentity, FabrialHost } from "../index.ts";
+import type { ChatIntegration, FabrialHost } from "../app.ts";
+import type { ExternalIdentity } from "../identity.ts";
 import { chatIdentity, normalizeMessage, type ChatPluginCapability } from "./events.ts";
 import { createChatPort, type SDKState } from "./port.ts";
 

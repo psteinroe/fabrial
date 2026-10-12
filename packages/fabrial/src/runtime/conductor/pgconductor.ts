@@ -1,3 +1,5 @@
+// SHIM(conductor#9): include the Bun Timer shim wherever pgconductor-js source is compiled.
+// oxlint-disable-next-line typescript/triple-slash-reference
 /// <reference path="./bun-globals.d.ts" />
 // SHIM(conductor#9): pgconductor-js has no Node build, exports map, or type declarations yet, and its
 // entry point does not export defineTask, TaskSchemas, or EventSchemas. Import its source directly

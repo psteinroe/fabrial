@@ -2,7 +2,13 @@
 import { createTestMessage } from "@chat-adapter/tests";
 import { Chat, type Author } from "chat";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { actionDedupeId, chat, chatEvents, chatTrigger, renderMessage } from "../../../src/chat/index.ts";
+import {
+	actionDedupeId,
+	chat,
+	chatEvents,
+	chatTrigger,
+	renderMessage,
+} from "../../../src/chat/index.ts";
 import { routingState, setup } from "../../chat/helper.ts";
 
 const ref = { kind: "thread" as const, provider: "slack", threadId: "slack:C1:root-1" };

@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import { GitHubAdapter } from "@chat-adapter/github";
 import { createFabrial, type WorkflowContext } from "fabrial";
-import { FakeChat, MemoryRuntime } from "fabrial/testing";
+import { FakeChat, MemoryRuntime, testApp } from "fabrial/testing";
 import { describe, expect, it, vi } from "vitest";
 import { github, pullRequestOpened, issueOpened } from "../../src/index.ts";
 import { alice, options, repository, request } from "../helper.ts";
@@ -37,7 +37,7 @@ describe("GitHub lifecycle webhooks", () => {
 			const observer = vi.fn(async (_input: unknown, ctx: WorkflowContext) => {
 				expect(ctx.thread).toBeUndefined();
 			});
-			const app = createFabrial({ plugins: [plugin] }).app({
+			const app = testApp(createFabrial({ plugins: [plugin] }), {
 				runtime,
 				chat,
 				workflows: [

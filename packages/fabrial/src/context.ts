@@ -363,7 +363,6 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 		actor: metadata.requestedBy,
 		metadata,
 		signal: execution.signal,
-		raw: { execution, chat: host.chat(), agents: agents?.agents },
 		step: (id, fn) => execution.step(op(id), fn),
 		sleep: (id, value) => execution.sleep(op(id), duration(value)),
 		agent: async (id, agent, opts) => {

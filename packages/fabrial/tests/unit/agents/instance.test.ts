@@ -1,59 +1,76 @@
-import { Type } from "typebox";
 import { expect, expectTypeOf, it } from "vitest";
+import { z } from "zod";
 import { createFabrial, definePlugin } from "../../../src/index.ts";
-import { withPi } from "../../../src/agents/index.ts";
 
 const f = createFabrial({
 	plugins: [
 		definePlugin({
 			id: "example",
 			clients: () => ({ example: { read: (): string => "value" } }),
-			extension: () => ({}),
+			toolkit: () => ({ tools: [] }),
 		}),
+		definePlugin({ id: "plain", clients: () => ({}) }),
 	],
 });
-const { defineTool, defineAgent, section } = withPi(f);
 
-const tool = defineTool({
+const tool = f.defineTool({
 	name: "read",
 	description: "Read an example value",
-	parameters: Type.Object({}),
-	async execute(_args, ctx) {
+	input: z.object({ key: z.string() }),
+	async run({ key }, ctx) {
+		expectTypeOf(key).toEqualTypeOf<string>();
 		expectTypeOf(ctx.clients.example.read()).toEqualTypeOf<string>();
 		// @ts-expect-error No open index signature for misspelled client names.
 		void ctx.clients.exmaple;
-		return { content: [{ type: "text", text: ctx.clients.example.read() }] };
+		return ctx.clients.example.read();
 	},
 });
-const prompt = section("example", (_input, ctx) => {
-	expectTypeOf(ctx.clients.example.read()).toEqualTypeOf<string>();
-	// @ts-expect-error Section clients are bound to the instance too.
-	void ctx.clients.exmaple;
-	return ctx.clients.example.read();
+const toolkit = f.defineToolkit({
+	name: "example-toolkit",
+	tools: [tool],
+	instructions: (ctx) => {
+		expectTypeOf(ctx.clients.example.read()).toEqualTypeOf<string>();
+		// @ts-expect-error Instruction clients are bound to the instance too.
+		void ctx.clients.exmaple;
+		return ctx.clients.example.read();
+	},
 });
 
 function invalidDefinitions() {
-	// @ts-expect-error Only this catalog's plugin ids are permitted.
-	defineAgent({ name: "wrong", extensions: ["exmaple"] });
-	const other = withPi(createFabrial({ plugins: [] }));
+	// @ts-expect-error Only this catalog's toolkit plugin ids are permitted.
+	f.defineAgent({ name: "wrong", toolkits: ["exmaple"] });
+	const other = createFabrial({ plugins: [] });
 	// @ts-expect-error Other instances do not inherit this catalog's ids.
-	other.defineAgent({ name: "wrong", extensions: ["example"] });
+	other.defineAgent({ name: "wrong", toolkits: ["example"] });
+	// @ts-expect-error Thinking levels are Fabrial's.
+	other.defineAgent({ name: "wrong", thinking: "xhigh" });
 	other.defineTool({
 		name: "empty",
 		description: "No clients",
-		parameters: Type.Object({}),
-		async execute(_args, ctx) {
+		input: z.object({}),
+		async run(_input, ctx) {
 			// @ts-expect-error Other instances do not inherit this catalog's clients.
 			void ctx.clients.example;
-			return {};
 		},
 	});
 }
 void invalidDefinitions;
 
-it("returns plain native Pi definitions bound to an explicit catalog", () => {
-	const agent = defineAgent({ name: "example", extensions: ["example"], tools: [tool] });
+it("returns plain Fabrial definitions bound to an explicit catalog", () => {
+	const agent = f.defineAgent({
+		name: "example",
+		model: "anthropic/claude-sonnet-5",
+		thinking: "medium",
+		instructions: ["Static", (ctx) => `Requested by ${ctx.actor?.name}`],
+		toolkits: ["example", toolkit],
+		tools: [tool],
+	});
 	expect(agent.definition.tools).toEqual([tool]);
-	expect(agent.definition.extensions).toEqual(["example"]);
-	expect(prompt).toBeDefined();
+	expect(agent.definition.toolkits).toEqual(["example", toolkit]);
+	expect(tool.kind).toBe("fabrial.tool");
+	expect(toolkit.kind).toBe("fabrial.toolkit");
+	expect(() => f.defineAgent({ name: "bad", model: "no-provider" })).toThrow("provider/model");
+	expect(() =>
+		f.defineTool({ name: "bad name", description: "", input: z.object({}), run: () => null }),
+	).toThrow("Invalid tool name");
 });

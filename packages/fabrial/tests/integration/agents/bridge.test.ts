@@ -11,14 +11,10 @@ import {
 	createSession,
 	Harness,
 	LiveDoc,
-	defineExtension,
-	hook,
 	GenerationTask,
 } from "@earendil-works/pi-durable";
-import { Type } from "typebox";
 import {
 	createFabrial,
-	defineState,
 	type DurableExecution,
 	type FabrialHost,
 	type InvocationMetadata,
@@ -34,13 +30,12 @@ import {
 	checkOrphans,
 	pi,
 	PostgresStorage,
-	withPi,
 	sessionKey,
 } from "../../../src/agents/index.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 const definitions = createFabrial({ plugins: [] });
 const { defineWorkflow } = definitions;
-const { defineAgent, defineTool, section } = withPi(definitions);
+const { defineAgent, defineTool, defineToolkit, defineState } = definitions;
 
 let sql: Sql;
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
@@ -108,7 +103,7 @@ it("runs durable structured answers, memoizes submissions, and continues one age
 	const f = fixture();
 	const agent = defineAgent({
 		name: randomUUID(),
-		model: { provider: f.faux.provider.id, modelId: f.faux.getModel().id },
+		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	f.faux.setResponses([fauxAssistantMessage('{"answer":42}'), fauxAssistantMessage("continued")]);
 	const workflow: RuntimeWorkflow = {
@@ -154,26 +149,27 @@ it("binds adapter identity, clients, sections and durable posts; commits tool st
 	const tool = defineTool({
 		name: "record_note",
 		description: "Record a note",
-		parameters: Type.Object({ text: Type.String() }),
-		execute: async ({ text }, ctx) => {
+		input: z.object({ text: z.string() }),
+		idempotent: true,
+		run: async ({ text }, ctx) => {
 			actor = ctx.actor?.id;
 			expect(ctx.clients).toEqual({ example: "client" });
 			await ctx.state(state).update((draft) => {
 				draft.notes.push(text);
 			});
 			await ctx.thread!.post("post", "Recorded");
-			return { content: [{ type: "text", text: "done" }] };
+			return "done";
 		},
 	});
-	const extension = defineExtension({
+	const extension = defineToolkit({
 		name: randomUUID(),
 		tools: [tool],
-		sections: [section("requester", (_input, ctx) => `Requester ${ctx.actor?.name}`)],
+		instructions: (ctx) => `Requester ${ctx.actor?.name}`,
 	});
 	const agent = defineAgent({
 		name: randomUUID(),
-		model: { provider: f.faux.provider.id, modelId: f.faux.getModel().id },
-		extensions: [extension],
+		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
+		toolkits: [extension],
 		state: [state],
 	});
 	f.faux.setResponses([
@@ -230,13 +226,16 @@ it("releases the Session while a workflow tool waits and reconnects with a stabl
 	(f.host.workflows as unknown as (typeof child)[]).push(child);
 	const agent = defineAgent({
 		name: randomUUID(),
-		model: { provider: f.faux.provider.id, modelId: f.faux.getModel().id },
-		tools: [child.asTool()],
+		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
+		tools: [child],
 	});
 	f.faux.setResponses([
-		fauxAssistantMessage(fauxToolCall(child.asTool().name, { value: "ok" }), {
-			stopReason: "toolUse",
-		}),
+		fauxAssistantMessage(
+			fauxToolCall(child.name.replaceAll(/[^a-zA-Z0-9_]/g, "_"), { value: "ok" }),
+			{
+				stopReason: "toolUse",
+			},
+		),
 		fauxAssistantMessage("child finished"),
 	]);
 	const workflow: RuntimeWorkflow = {
@@ -271,11 +270,11 @@ it("releases the Session while a workflow tool waits and reconnects with a stabl
 	await f.integration.stop();
 });
 
-it("rejects call-time configure and invalid structured answers", async () => {
+it("rejects invalid structured answers", async () => {
 	const f = fixture();
 	const agent = defineAgent({
 		name: randomUUID(),
-		model: { provider: f.faux.provider.id, modelId: f.faux.getModel().id },
+		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	f.faux.setResponses([fauxAssistantMessage('{"answer":"not a number"}')]);
 	const workflow: RuntimeWorkflow = {
@@ -327,23 +326,21 @@ it("detects missing live task kinds and explicitly aborts their ownership tree",
 	).resolves.toBeUndefined();
 });
 
-it.each([
-	[false, false],
-	[true, false],
-	[false, true],
-])(
-	"honors agent detached=%s and tool detached=%s when the agent caller is cancelled",
-	async (detached, toolDetached) => {
+it.each([[false], [true]])(
+	"honors agent detached=%s and cancels workflow tools with the agent",
+	async (detached) => {
 		const f = fixture();
 		const child = defineWorkflow({ name: randomUUID(), run: async () => null });
 		(f.host.workflows as unknown as (typeof child)[]).push(child);
 		const agent = defineAgent({
 			name: randomUUID(),
-			model: { provider: f.faux.provider.id, modelId: f.faux.getModel().id },
-			tools: [child.asTool({ detached: toolDetached })],
+			model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
+			tools: [child],
 		});
 		f.faux.setResponses([
-			fauxAssistantMessage(fauxToolCall(child.asTool().name, {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage(fauxToolCall(child.name.replaceAll(/[^a-zA-Z0-9_]/g, "_"), {}), {
+				stopReason: "toolUse",
+			}),
 			fauxAssistantMessage("approved"),
 		]);
 		const workflow: RuntimeWorkflow = {
@@ -380,42 +377,36 @@ it.each([
 				output: "approved",
 			});
 		} else {
-			if (toolDetached) expect(f.runtime.executions(child.name)[0]?.status).toBe("suspended");
-			else expect(f.runtime.executions(child.name)[0]?.result?.status).toBe("cancelled");
+			expect(f.runtime.executions(child.name)[0]?.result?.status).toBe("cancelled");
 			expect(f.runtime.executions("fabrial.pi.run")[0]?.result?.status).toBe("cancelled");
 		}
 		await f.integration.stop();
 	},
 );
 
-it("installs plugin hooks globally but does not select unrequested plugin extensions", async () => {
+it("installs plugin observers globally but does not select unrequested plugin toolkits", async () => {
 	let requests = 0;
 	const f = fixture([
 		{
 			id: "unselected",
-			extension: () =>
-				defineExtension({
-					name: "unselected",
-					sections: [
-						section("hidden", () => {
-							throw new Error("Unselected extension rendered");
-						}),
-					],
-				}),
+			toolkit: () => ({
+				tools: [],
+				instructions: () => {
+					throw new Error("Unselected toolkit rendered");
+				},
+			}),
 			hooks: {
-				agent: [
-					hook(GenerationTask, {
-						beforeRequest: () => {
-							requests++;
-						},
-					}),
-				],
+				agent: {
+					onModelResponse: () => {
+						requests++;
+					},
+				},
 			},
 		},
 	]);
 	const agent = defineAgent({
 		name: randomUUID(),
-		model: { provider: f.faux.provider.id, modelId: f.faux.getModel().id },
+		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	f.faux.setResponses([fauxAssistantMessage("ok")]);
 	const { result } = await execute(f, {
@@ -457,7 +448,7 @@ it("consumes buffered steering replies with stable request ids", async () => {
 	}));
 	const agent = defineAgent({
 		name: randomUUID(),
-		model: { provider: f.faux.provider.id, modelId: f.faux.getModel().id },
+		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	const routing = await io.getState();
 	// Admit steering only after the original input finishes. The driver must still drain it.
@@ -684,7 +675,7 @@ it("stop joins driver routing cleanup after the harness has closed", async () =>
 	const f = fixture();
 	const agent = defineAgent({
 		name: randomUUID(),
-		model: { provider: f.faux.provider.id, modelId: f.faux.getModel().id },
+		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	f.faux.setResponses([fauxAssistantMessage("done")]);
 	const io = await f.chat.thread(f.metadata.replyTo as Parameters<typeof f.chat.thread>[0]);
@@ -742,11 +733,13 @@ it("stop joins driver routing cleanup after the harness has closed", async () =>
 });
 
 it("does not install agents from an unrelated Fabrial catalog", async () => {
-	const unrelated = createFabrial({ plugins: [{ id: "unrelated", extension: () => ({}) }] });
-	withPi(unrelated).defineAgent({ name: randomUUID(), extensions: ["unrelated"] });
+	const unrelated = createFabrial({
+		plugins: [{ id: "unrelated", toolkit: () => ({ tools: [] }) }],
+	});
+	unrelated.defineAgent({ name: randomUUID(), toolkits: ["unrelated"] });
 	const local = createFabrial({ plugins: [] });
 	const f = fixture([], local);
-	// Installing the unrelated agent would fail: this host has no unrelated plugin extension.
+	// Installing the unrelated agent would fail: this host has no unrelated plugin toolkit.
 	await f.integration.start();
 	await f.integration.stop();
 });

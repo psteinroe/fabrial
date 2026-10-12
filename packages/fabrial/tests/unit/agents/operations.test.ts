@@ -16,7 +16,13 @@ import {
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
 import { BridgeKey, fields, type BridgeFrame } from "../../../src/agents/context.ts";
-import { Binding, ChildIntents, ChildResults, Invocation, Runs } from "../../../src/agents/documents.ts";
+import {
+	Binding,
+	ChildIntents,
+	ChildResults,
+	Invocation,
+	Runs,
+} from "../../../src/agents/documents.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
 async function fixture(workflows: FabrialHost["workflows"] = []) {

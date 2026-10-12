@@ -2,7 +2,12 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import postgres from "postgres";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { z } from "zod";
-import { Conductor, Orchestrator, TaskSchemas, defineTask } from "../../../src/runtime/conductor/index.ts";
+import {
+	Conductor,
+	Orchestrator,
+	TaskSchemas,
+	defineTask,
+} from "../../../src/runtime/conductor/index.ts";
 
 // Fabrial runs on Node while Conductor is developed and tested on Bun. This guards the assumption
 // that its source runs unchanged on Node against a real Postgres.

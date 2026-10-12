@@ -19,8 +19,6 @@ export interface WorkflowContext<TClients = Record<string, unknown>> {
 	readonly actor: Principal | null;
 	readonly metadata: InvocationMetadata;
 	readonly signal: AbortSignal;
-	/** Escape hatch to unwrapped runtime handles (Conductor execution, Chat SDK, …). */
-	readonly raw: Record<string, unknown>;
 
 	step<T extends Json | void>(id: string, fn: () => Promise<T> | T): Promise<T>;
 	sleep(id: string, duration: string | number): Promise<void>;
@@ -98,9 +96,9 @@ export interface WorkflowDefinition<
 	TClients = Record<string, unknown>,
 > {
 	name: TName;
-	/** Shown to agents when exposed as a tool. */
+	/** Shown to agents that list this workflow in `tools`. */
 	description?: string;
-	/** Input schema for `invoke`, `handoff`, `start`, and `asTool()`. */
+	/** Input schema for `invoke`, `handoff`, `start`, and agent tool calls. */
 	input?: Schema<TInput>;
 	output?: Schema<TOutput>;
 	triggers?: TTriggers;
@@ -123,16 +121,6 @@ export interface Workflow<
 	readonly kind: "fabrial.workflow";
 	readonly name: TName;
 	readonly definition: WorkflowDefinition<TName, TInput, TOutput, readonly TriggerSpec<any>[]>;
-	/** Expose as an agent tool (interpreted by `@fabrial/pi`). */
-	asTool(options?: { name?: string; description?: string; detached?: boolean }): WorkflowTool;
-}
-
-export interface WorkflowTool {
-	readonly kind: "fabrial.workflow-tool";
-	readonly workflow: Workflow<string, any, any>;
-	readonly name: string;
-	readonly description: string;
-	readonly detached: boolean;
 }
 
 export type AnyWorkflow = Workflow<string, any, any>;
@@ -147,17 +135,9 @@ export function defineWorkflow<
 >(
 	definition: WorkflowDefinition<TName, TInput, TOutput, TTriggers>,
 ): Workflow<TName, TInput, TOutput> {
-	const workflow: Workflow<TName, TInput, TOutput> = {
+	return {
 		kind: "fabrial.workflow",
 		name: definition.name,
 		definition: definition as unknown as Workflow<TName, TInput, TOutput>["definition"],
-		asTool: (options = {}) => ({
-			kind: "fabrial.workflow-tool",
-			workflow,
-			name: options.name ?? definition.name.replaceAll(/[^a-zA-Z0-9_]/g, "_"),
-			description: options.description ?? definition.description ?? definition.name,
-			detached: options.detached ?? false,
-		}),
 	};
-	return workflow;
 }

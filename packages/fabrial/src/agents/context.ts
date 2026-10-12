@@ -1,25 +1,17 @@
 import { LiveDoc } from "@earendil-works/pi-durable";
 import type { Context } from "@earendil-works/chord";
 import { createContextKey, awaitWithContext } from "@earendil-works/chord/context";
-import type {
-	ConversationId,
-	Harness,
-	ToolExecutionApi,
-	PromptInput,
-} from "@earendil-works/pi-durable";
+import type { ConversationId, Harness, ToolExecutionApi } from "@earendil-works/pi-durable";
 import {
 	parseSchema,
 	type AnyWorkflow,
 	type DurableExecution,
-	type EvaluateQuestion,
-	type EvaluateRequest,
 	type EvaluateResult,
 	type Evaluator,
 	type FabrialHost,
 	type InvocationMetadata,
 	type Json,
 	type JsonObject,
-	type Principal,
 	type StateDefinition,
 	type ThreadIO,
 	type ToolStateHandle,
@@ -47,41 +39,8 @@ export interface BridgeFrame {
 	children: Map<number, { executionId: string; detached: boolean }>;
 }
 export const BridgeKey = createContextKey<BridgeFrame>("fabrial.pi.bridge");
-export interface FabrialFields<TClients = Record<string, unknown>> {
-	actor: Principal | null;
-	requestedBy: Principal | null;
-	clients: TClients;
-	interaction: InvocationMetadata;
-	thread:
-		| {
-				post(id: string, message: Parameters<ThreadIO["post"]>[0]): ReturnType<ThreadIO["post"]>;
-				update(
-					id: string,
-					message: Parameters<ThreadIO["update"]>[0],
-					content: Parameters<ThreadIO["update"]>[1],
-				): Promise<void>;
-				history(
-					id: string,
-					options?: Parameters<ThreadIO["history"]>[0],
-				): ReturnType<ThreadIO["history"]>;
-		  }
-		| undefined;
-	state<T extends JsonObject>(definition: StateDefinition<T>): ToolStateHandle<T>;
-	invoke<W extends AnyWorkflow>(
-		id: string,
-		workflow: W,
-		input: WorkflowInput<W>,
-	): Promise<WorkflowOutput<W>>;
-	start<W extends AnyWorkflow>(id: string, workflow: W, input: WorkflowInput<W>): Promise<string>;
-	evaluate<Q extends Record<string, EvaluateQuestion>>(
-		id: string,
-		request: EvaluateRequest<Q>,
-	): Promise<EvaluateResult<Q>>;
-}
-export type ToolContext<TClients = Record<string, unknown>> = import("./bind.ts").BoundToolApi &
-	FabrialFields<TClients>;
-export type SectionContext<TClients = Record<string, unknown>> = PromptInput &
-	FabrialFields<TClients>;
+/** Tool context without the per-call signal. */
+export type FabrialFields = Omit<import("../agent.ts").ToolContext, "signal">;
 export type StagedState = {
 	definition: StateDefinition;
 	interactionId: string;

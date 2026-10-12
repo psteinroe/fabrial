@@ -3,21 +3,22 @@ import {
 	withAbortSignal,
 	withContextValue,
 } from "@earendil-works/chord/context";
-import type { Models } from "@earendil-works/pi-ai";
-import { Type } from "typebox";
+import type { Models, TSchema } from "@earendil-works/pi-ai";
 import {
 	createRegistry,
 	createSession,
 	defineExtension,
 	defineTool as piTool,
+	GenerationTask,
 	Harness,
+	hook,
 	section as piSection,
+	ToolTask,
 	watchEvents,
 	type AgentChange,
 	type ConversationId,
 	type Extension,
 	type HarnessSettings,
-	type HookRegistration,
 	type ToolRegistration,
 	LiveDoc,
 	type Submission,
@@ -25,7 +26,6 @@ import {
 } from "@earendil-works/pi-durable";
 import {
 	parseSchema,
-	type AgentIntegration,
 	type AgentPort,
 	type AgentRef,
 	type DurableExecution,
@@ -37,10 +37,19 @@ import {
 	type Schema,
 	type StatePort,
 	type ThreadIO,
-	type WorkflowTool,
 } from "../index.ts";
+import {
+	definedAgents,
+	isWorkflow,
+	parseModel,
+	type Agent,
+	type AgentObservers,
+	type ThinkingLevel,
+	type Toolkit,
+} from "../agent.ts";
+import type { AnyWorkflow } from "../workflow.ts";
+import { instructionsSection, piToolOf, toJsonSchema } from "./tools.ts";
 import type { Sql } from "postgres";
-import { definedAgents, type DefinedAgent } from "./agent.ts";
 import { BridgeKey, cloneJson, fields, registerChild, type BridgeFrame } from "./context.ts";
 import {
 	applyState,
@@ -55,6 +64,7 @@ import {
 } from "./documents.ts";
 import { createEvaluator } from "./evaluate.ts";
 import { LeaseLost, PostgresStorage, SessionBusy } from "./storage.ts";
+import type { AgentIntegration } from "../app.ts";
 
 const RUN_WORKFLOW = "fabrial.pi.run";
 export function sessionKey(metadata: InvocationMetadata): string {
@@ -79,6 +89,77 @@ async function acquire(sql: Sql, key: string, signal: AbortSignal): Promise<Post
 	}
 }
 
+const THINKING: Record<ThinkingLevel, "off" | "low" | "medium" | "high"> = {
+	off: "off",
+	low: "low",
+	medium: "medium",
+	high: "high",
+};
+
+/** Fabrial observers as Pi hooks on the built-in generation and tool tasks. */
+function observerHooks(
+	observers: AgentObservers[],
+	agentName: (conversationId: number) => string,
+	host: FabrialHost,
+) {
+	const notify = async (run: (observer: AgentObservers) => void | Promise<void> | undefined) => {
+		for (const observer of observers)
+			try {
+				await run(observer);
+			} catch (error) {
+				host.logger.warn("Agent observer failed", { error });
+			}
+	};
+	return [
+		hook(GenerationTask, {
+			async afterResponse(message, api) {
+				await notify((observer) =>
+					observer.onModelResponse?.({
+						agent: agentName(api.conversationId),
+						model: { provider: message.provider, modelId: message.model },
+						text: message.content
+							.flatMap((block) => (block.type === "text" ? [block.text] : []))
+							.join("\n"),
+						toolCalls: message.content.flatMap((block) =>
+							block.type === "toolCall"
+								? [{ id: block.id, name: block.name, arguments: block.arguments as JsonObject }]
+								: [],
+						),
+						stopReason: message.stopReason,
+						...(message.errorMessage ? { error: message.errorMessage } : {}),
+						...(message.usage
+							? {
+									usage: {
+										input: message.usage.input,
+										output: message.usage.output,
+										totalTokens: message.usage.totalTokens,
+									},
+								}
+							: {}),
+					}),
+				);
+			},
+		}),
+		hook(ToolTask, {
+			async afterTool(call, result, api) {
+				await notify((observer) =>
+					observer.onToolCall?.({
+						agent: agentName(api.conversationId),
+						callId: call.id,
+						name: call.name,
+						arguments: call.arguments as JsonObject,
+						result: (result.content ?? [])
+							.flatMap((block) => (block.type === "text" ? [block.text] : []))
+							.join("\n"),
+						isError: !!result.isError,
+					}),
+				);
+				return undefined;
+			},
+		}),
+	];
+}
+
 export interface PiOptions {
 	models: Models;
 	sql: Sql;
@@ -92,87 +173,103 @@ export function pi(options: PiOptions): AgentIntegration {
 function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegration["connect"]> {
 	const registry = createRegistry();
 	const evaluator = createEvaluator(options.models);
-	const agents = new Map<string, DefinedAgent>();
+	const agents = new Map<string, Agent>();
 	const configs = new Map<string, AgentChange>();
 	const active = new Map<BridgeFrame, Promise<void>>();
 	let started = false;
+	const observers = host.plugins.flatMap((plugin) =>
+		plugin.hooks?.agent ? [plugin.hooks.agent] : [],
+	);
 	const internal = defineExtension({
 		name: "fabrial.internal",
-		hooks: host.plugins.flatMap((plugin) => plugin.hooks?.agent ?? []) as HookRegistration[],
+		hooks: observers.length ? observerHooks(observers, agentNameOf, host) : [],
 	});
 	registry.install(internal);
-	const pluginExtensions = new Map<string, Extension>();
-	const workflowTools = new WeakMap<ToolRegistration, WorkflowTool>();
+	const pluginToolkits = new Map<string, Extension>();
+	const appToolkits = new Map<string, { toolkit: Toolkit; extension: Extension }>();
+	const workflowTools = new WeakMap<ToolRegistration, AnyWorkflow>();
+	const conversationAgents = new Map<number, string>();
+	function agentNameOf(conversationId: number): string {
+		return conversationAgents.get(conversationId) ?? "unknown";
+	}
 
-	function install(agent: DefinedAgent): void {
+	function tools(owner: string, list: Toolkit["tools"] = []): ToolRegistration[] {
+		return list.map((tool) => (isWorkflow(tool) ? workflowTool(tool, owner) : piToolOf(tool)));
+	}
+
+	function toolkit(entry: string | Toolkit, agent: string): Extension {
+		if (typeof entry === "string") {
+			const resolved = pluginToolkits.get(entry);
+			if (!resolved)
+				throw new Error(`Agent ${agent} selects plugin ${entry}, which provides no toolkit`);
+			return resolved;
+		}
+		const existing = appToolkits.get(entry.name);
+		if (existing && existing.toolkit !== entry)
+			throw new Error(`Duplicate Fabrial toolkit name: ${entry.name}`);
+		if (existing) return existing.extension;
+		const section = instructionsSection(`toolkit-${entry.name}`, entry.instructions);
+		const extension = defineExtension({
+			name: `fabrial.toolkit.${entry.name}`,
+			tools: tools(`toolkit ${entry.name}`, entry.tools),
+			sections: section ? [section] : [],
+		});
+		appToolkits.set(entry.name, { toolkit: entry, extension });
+		registry.install(extension);
+		return extension;
+	}
+
+	function install(agent: Agent): void {
 		const previous = agents.get(agent.name);
 		if (previous && previous !== agent)
 			throw new Error(`Duplicate Fabrial agent name: ${agent.name}`);
 		agents.set(agent.name, agent);
-		const {
-			name,
-			extensions = [],
-			tools,
-			state = [],
-			configure: _configure,
-			...rest
-		} = agent.definition;
-		const selected = extensions.map((extension) => {
-			if (typeof extension !== "string") return extension;
-			const resolved = pluginExtensions.get(extension);
-			if (!resolved)
-				throw new Error(
-					`Agent ${name} selects plugin ${extension}, which provides no Pi extension`,
-				);
-			return resolved;
-		});
-		for (const extension of selected) registry.install(extension);
-		const nativeTools = tools?.map((tool) =>
-			"kind" in tool && tool.kind === "fabrial.workflow-tool"
-				? workflowTool(tool)
-				: (tool as ToolRegistration),
-		);
+		const { name, model, thinking, instructions, state = [] } = agent.definition;
+		const selected = (agent.definition.toolkits ?? []).map((entry) => toolkit(entry, name));
+		const section = instructionsSection("agent-instructions", instructions);
 		const own = defineExtension({
 			name: `fabrial.agent.${name}`,
-			tools: nativeTools,
-			sections: state
-				.filter((definition) => definition.render)
-				.map((definition) =>
-					piSection(
-						`state-${definition.name.replaceAll(/[^a-z0-9_-]/g, "-")}`,
-						async (input, context) => {
-							const ctx = await fields(context, input.conversationId);
-							return definition.render!(await ctx.state(definition).get());
-						},
+			tools: tools(`agent ${name}`, agent.definition.tools),
+			sections: [
+				...(section ? [section] : []),
+				...state
+					.filter((definition) => definition.render)
+					.map((definition) =>
+						piSection(
+							`state-${definition.name.replaceAll(/[^a-z0-9_-]/g, "-")}`,
+							async (input, context) => {
+								const ctx = await fields(context, input.conversationId);
+								return definition.render!(await ctx.state(definition).get());
+							},
+						),
 					),
-				),
+			],
 		});
 		registry.install(own);
 		configs.set(name, {
-			...rest,
+			model: model ? parseModel(model) : null,
+			thinkingLevel: thinking ? THINKING[thinking] : null,
+			instructions: null,
 			extensions: [internal, ...selected, own],
-			...(nativeTools ? { tools: nativeTools } : {}),
+			tools: null,
 		});
 	}
 
-	function workflowTool(tool: WorkflowTool): ToolRegistration {
-		// Standard Schema cannot generally expose JSON Schema. Validation still runs in Fabrial core.
+	function workflowTool(workflow: AnyWorkflow, owner: string): ToolRegistration {
+		const { input, description } = workflow.definition;
 		const native = piTool({
-			name: tool.name,
-			description: tool.description,
-			parameters: (() => {
-				const schema = host.workflows.find((candidate) => candidate.name === tool.workflow.name)
-					?.definition.input;
-				if (schema && "toJSONSchema" in schema && typeof schema.toJSONSchema === "function")
-					return schema.toJSONSchema() as import("typebox").TSchema;
-				return Type.Object({}, { additionalProperties: true });
-			})(),
+			name: workflow.name.replaceAll(/[^a-zA-Z0-9_]/g, "_"),
+			description: description ?? workflow.name,
+			// Core validates the input again when the workflow starts.
+			parameters: (input
+				? toJsonSchema(input, `Workflow ${workflow.name} (a tool of ${owner})`)
+				: { type: "object", properties: {}, additionalProperties: true }) as unknown as TSchema,
 			replay: "safe",
 			execute: async (input, api, context) => {
 				const frame = context.value(BridgeKey);
 				if (!frame) throw new Error("Workflow tools require a Fabrial bridge");
-				const ctx = await fields(context, api.conversationId, api, undefined, tool.detached);
-				const child = await ctx.start("workflow", tool.workflow, input);
+				const ctx = await fields(context, api.conversationId, api);
+				const child = await ctx.start("workflow", workflow, input as never);
 				const result = (await frame.harness.snapshot(ChildResults, context))?.results[child];
 				if (result)
 					return {
@@ -184,12 +281,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						],
 						isError: result.status !== "completed",
 					};
-				await registerChild(
-					frame,
-					api.taskId,
-					{ executionId: child, detached: tool.detached },
-					context,
-				);
+				await registerChild(frame, api.taskId, { executionId: child, detached: false }, context);
 				return new Promise((_, reject) => {
 					const signal = context.abortSignal;
 					if (signal?.aborted) reject(signal.reason);
@@ -197,7 +289,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				});
 			},
 		});
-		workflowTools.set(native, tool);
+		workflowTools.set(native, workflow);
 		return native;
 	}
 
@@ -276,13 +368,13 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						(await tx.doc(Conversations)).ids[request.agent] = conversationId!;
 					}, context);
 				}
+				conversationAgents.set(conversationId!, request.agent);
 				await conversation.configure(configs.get(request.agent)!, context);
-				await agent.definition.configure?.(conversation);
 				const offered = (await conversation.agent(context)).tools;
 				// Tools are not filtered by who is talking: a conversation can have many participants,
 				// and a tool that needs permission asks its own approvers. Only unregistered workflows drop out.
 				const allowed = offered.map((tool) => {
-					const supplied = workflowTools.get(tool)?.workflow;
+					const supplied = workflowTools.get(tool);
 					return !supplied || host.workflows.some((candidate) => candidate.name === supplied.name);
 				});
 				if (allowed.some((value) => !value))
@@ -609,10 +701,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	const port: AgentPort = {
 		workflows: () => [workflow, effect],
 		async run(execution, id, agent: AgentRef, request) {
-			if (request.configure)
-				throw new Error(
-					"Call-time configure cannot cross a durable execution boundary; move it to defineAgent({ configure })",
-				);
 			// A channel locator is not a durable Session identity. Core rebinds metadata from
 			// the first workflow post receipt; never promote a provisional ThreadIO.ref.
 			const metadata = execution.metadata;
@@ -682,9 +770,15 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		async start() {
 			await PostgresStorage.migrate(options.sql);
 			for (const plugin of host.plugins)
-				if (plugin.extension) {
-					const extension = plugin.extension(host.clients()) as Extension;
-					pluginExtensions.set(plugin.id, extension);
+				if (plugin.toolkit) {
+					const built = plugin.toolkit(host.clients());
+					const section = instructionsSection(`plugin-${plugin.id}`, built.instructions);
+					const extension = defineExtension({
+						name: `fabrial.plugin.${plugin.id}`,
+						tools: tools(`plugin ${plugin.id}`, built.tools),
+						sections: section ? [section] : [],
+					});
+					pluginToolkits.set(plugin.id, extension);
 					registry.install(extension);
 				}
 			for (const agent of definedAgents.get(host.definitionScope ?? host) ?? []) install(agent);
@@ -732,7 +826,7 @@ export async function checkOrphans(sql: Sql, installedKinds: readonly string[]):
 	];
 	if (missing.length)
 		throw new Error(
-			`Orphaned Pi task kinds: ${missing.join(", ")}. Keep their extension installed until they finish, or call abortOrphans(sql, ${JSON.stringify(missing)}) (fabrial pi abort-orphans --kind …).`,
+			`Orphaned Pi task kinds: ${missing.join(", ")}. Keep their toolkit on an agent until they finish, or call abortOrphans(sql, ${JSON.stringify(missing)}) (fabrial pi abort-orphans --kind …).`,
 		);
 }
 

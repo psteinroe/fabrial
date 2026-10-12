@@ -5,7 +5,6 @@ import {
 	defineEvent,
 	defineGroup,
 	definePlugin,
-	defineState,
 	defineUser,
 	trigger,
 	weeklyRotation,
@@ -20,7 +19,8 @@ import type {
 	JsonObject,
 	WorkflowContext,
 } from "../../src/index.ts";
-import { FakeChat, fakeAgents, MemoryRuntime } from "fabrial/testing";
+import { FakeChat, fakeAgents, MemoryRuntime, testApp } from "fabrial/testing";
+const { defineState } = createFabrial({ plugins: [] });
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
 const identity = (subjectId: string): ExternalIdentity => ({
@@ -70,7 +70,7 @@ function setup(
 		...extra,
 	};
 	const { plugins, identity: identities, logger, ...appConfig } = config;
-	const app = createFabrial({ plugins, identity: identities, logger }).app(appConfig);
+	const app = testApp(createFabrial({ plugins, identity: identities }), { ...appConfig, logger });
 	return { runtime, chat, app };
 }
 const workflow = (
@@ -885,46 +885,49 @@ describe("lazy channel threads and cancellation ingress", () => {
 		const runtime = new MemoryRuntime();
 		const chat = new FakeChat(() => runtime.now());
 		const agents = fakeAgents();
-		const app = createFabrial({
-			plugins: [
-				definePlugin({
-					id: "lifecycle",
-					init: () => {
-						calls.push("init");
-					},
-					shutdown: () => {
-						calls.push("shutdown");
-					},
-				}),
-			],
-		}).app({
-			runtime,
-			workflows: [],
-			chat: {
-				kind: "fabrial.chat",
-				connect: (host) => ({
-					...chat.connect(host),
-					start: async () => {
-						calls.push("chat:start");
-					},
-					stop: async () => {
-						calls.push("chat:stop");
-					},
-				}),
+		const app = testApp(
+			createFabrial({
+				plugins: [
+					definePlugin({
+						id: "lifecycle",
+						init: () => {
+							calls.push("init");
+						},
+						shutdown: () => {
+							calls.push("shutdown");
+						},
+					}),
+				],
+			}),
+			{
+				runtime,
+				workflows: [],
+				chat: {
+					kind: "fabrial.chat",
+					connect: (host) => ({
+						...chat.connect(host),
+						start: async () => {
+							calls.push("chat:start");
+						},
+						stop: async () => {
+							calls.push("chat:stop");
+						},
+					}),
+				},
+				agents: {
+					kind: "fabrial.agents",
+					connect: (host) => ({
+						...agents.connect(host),
+						start: async () => {
+							calls.push("agents:start");
+						},
+						stop: async () => {
+							calls.push("agents:stop");
+						},
+					}),
+				},
 			},
-			agents: {
-				kind: "fabrial.agents",
-				connect: (host) => ({
-					...agents.connect(host),
-					start: async () => {
-						calls.push("agents:start");
-					},
-					stop: async () => {
-						calls.push("agents:stop");
-					},
-				}),
-			},
-		});
+		);
 		await app.start();
 		await app.stop();
 		expect(calls).toEqual([

@@ -16,7 +16,7 @@ import {
 	type WaitBranch,
 	type EventCursor,
 } from "../../../src/index.ts";
-import { FakeChat } from "../../../src/testing.ts";
+import { FakeChat, testApp } from "../../../src/testing.ts";
 import { z } from "zod";
 import {
 	conductor,
@@ -1454,8 +1454,8 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 			});
 			await ctx.thread!.post("ack", "working");
 			const output = await ctx.invoke("child", child, input.key);
-			// Core exposes native runtime operations through its documented raw escape hatch.
-			const execution = ctx.raw.execution as ConductorExecution;
+			// Native runtime operations are internal; this test captures them from the runtime port.
+			const execution = executions.get(ctx.executionId) as ConductorExecution;
 			expect(execution.raw).toBeDefined();
 			const event = await execution.waitForEvent("reply", {
 				event: "test.reply",
@@ -1465,7 +1465,20 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 			return { output, event };
 		},
 	});
-	const app = createFabrial({ plugins: [plugin] }).app({
+	const executions = new Map<string, import("../../../src/index.ts").DurableExecution>();
+	const register = runtime.register.bind(runtime);
+	runtime.register = (definition) =>
+		register({
+			...definition,
+			workflows: definition.workflows.map((workflow) => ({
+				...workflow,
+				handler: (input, execution) => {
+					executions.set(execution.executionId, execution);
+					return workflow.handler(input, execution);
+				},
+			})),
+		});
+	const app = testApp(createFabrial({ plugins: [plugin] }), {
 		runtime,
 		chat,
 		workflows: [parent, child],
@@ -1609,7 +1622,7 @@ test("core approval accepts an authenticated click during card delivery, before 
 			return decision;
 		},
 	});
-	const app = createFabrial({ plugins: [plugin], identity: [alice] }).app({
+	const app = testApp(createFabrial({ plugins: [plugin], identity: [alice] }), {
 		runtime,
 		chat,
 		workflows: [parent],

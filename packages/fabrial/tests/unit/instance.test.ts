@@ -1,6 +1,6 @@
 import { expect, expectTypeOf, it, vi } from "vitest";
 import { createFabrial, definePlugin, defineUser } from "../../src/index.ts";
-import { createTestApp, MemoryRuntime } from "fabrial/testing";
+import { createTestApp, MemoryRuntime, testApp } from "fabrial/testing";
 
 const database = definePlugin((value: string) => ({
 	id: "database",
@@ -103,7 +103,7 @@ it("does not connect chat adapters until startup", async () => {
 	const instance = createFabrial({
 		plugins: [{ id: "chat", chat: { installationId: "", adapter: vi.fn() } }],
 	});
-	const app = instance.app({
+	const app = testApp(instance, {
 		runtime: new MemoryRuntime(),
 		workflows: [],
 		chat: { kind: "fabrial.chat", connect },

@@ -14,7 +14,7 @@ export interface Logger {
 	error(message: string, data?: Record<string, unknown>): void;
 }
 
-/** What core exposes to adapter packages (`@fabrial/chat`, `@fabrial/pi`). Not for app code. */
+/** What core exposes to its runtime modules and to tests (`app.host`). */
 export interface FabrialHost<TClients = Record<string, unknown>> {
 	/** Definition catalog identity, used by adapters to isolate instance-local definitions. */
 	readonly definitionScope?: object;
@@ -25,7 +25,7 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 	readonly logger: Logger;
 	/** Live clients of all plugins (built once per app; plugin `clients()` must be cheap and stateless). */
 	clients(): TClients;
-	/** Chat port, after app.start() connects `@fabrial/chat`. */
+	/** Chat port, after app.start() connects chat. */
 	chat(): ChatPort | undefined;
 
 	/**
@@ -76,7 +76,7 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 	resolvePrincipal(identity: ExternalIdentity): Promise<Principal>;
 }
 
-/** An adapter that plugs into the host (`chat(...)`, `pi(...)`). */
+/** A runtime module that plugs into the host (chat, agents). Internal. */
 export interface HostIntegration<T> {
 	readonly kind: string;
 	connect(host: FabrialHost): T;
@@ -104,12 +104,14 @@ export interface AgentIntegration extends HostIntegration<{
 
 export interface CoreConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[]> {
 	definitionScope?: object;
-	/** Durable workflow runtime, e.g. `conductor({ sql })` from `@fabrial/conductor`. */
+	/** Durable workflow runtime (Conductor, or in memory for tests). */
 	runtime: DurableRuntime;
-	/** Chat SDK integration from `@fabrial/chat`. Required when any plugin has a `chat` capability. */
+	/** Chat SDK integration. Required when any plugin has a `chat` capability. */
 	chat?: ChatIntegration;
-	/** Pi Durable integration from `@fabrial/pi`. Required for `ctx.agent`, `ctx.state`, `ctx.evaluate`. */
+	/** Agents, state, and evaluation. Required for `ctx.agent`, `ctx.state`, `ctx.evaluate`. */
 	agents?: AgentIntegration;
+	/** Owned resources (database pools): opened after plugin `init`, closed last on stop. */
+	resources?: { open(): Promise<void> | void; close(): Promise<void> };
 	plugins: P;
 	workflows: readonly AnyWorkflow[];
 	/** Known users only; groups are resolved directly by reference in access/approval options. */

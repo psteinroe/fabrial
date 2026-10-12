@@ -1,5 +1,7 @@
 import type { EmitOptions, EventDefinition, InferEventPayload, Origin } from "./events.ts";
 import type { ExternalIdentity } from "./identity.ts";
+import type { Adapter } from "chat";
+import type { AgentObservers, Instructions, ToolDefinition } from "./agent.ts";
 import type { WorkflowMiddleware } from "./workflow.ts";
 
 /** Context passed to a plugin's HTTP route handlers. */
@@ -18,12 +20,12 @@ export type RouteHandler<TEvents extends Record<string, EventDefinition<any>>, T
 	ctx: RouteContext<TEvents, TClients>,
 ) => Promise<Response> | Response;
 
-/** Chat SDK capability, interpreted by `@fabrial/chat`. Kept opaque here so core has no Chat SDK dependency. */
+/** Chat SDK capability: the one runtime type plugin authors see. */
 export interface ChatCapability {
 	/** Trusted provider installation namespace, never inferred from message display data. */
 	installationId: string;
 	/** Creates the Chat SDK platform adapter (e.g. `createSlackAdapter(...)`). */
-	adapter: () => unknown;
+	adapter: () => Adapter;
 	/** Default model-context history loading for threads of this provider. */
 	history?: { mode: "thread" | "since-last-reply"; limit?: number };
 }
@@ -51,21 +53,26 @@ export interface PluginDefinition<
 	chat?: ChatCapability;
 	/** Canonical live clients, exposed as `ctx.clients.*` and rebuilt on every run/resume. */
 	clients?: (deps: { chat?: unknown }) => TClients;
-	/** Pi extension for agents that select this plugin by id (built by `@fabrial/pi`). */
-	extension?: (clients: TClients) => unknown;
+	/** Tools and instructions for agents that list this plugin's id in `toolkits`. */
+	toolkit?: (clients: TClients) => PluginToolkit<TClients>;
 	/** Model context for a trigger's origin, loaded durably when an agent starts from it. */
 	context?: (origin: Origin, clients: TClients) => Promise<string | undefined>;
 	hooks?: {
 		/** Middleware around every workflow run/resume. */
 		workflow?: WorkflowMiddleware[];
-		/** Native Pi hooks installed on every harness (interpreted by `@fabrial/pi`). */
-		agent?: unknown[];
+		/** Observers on every agent. */
+		agent?: AgentObservers;
 	};
 	identity?: IdentityCapability<TClients>;
 	/** Validate definition-time options and acquire owned resources at app.start(), never in the factory. */
 	init?: () => Promise<void> | void;
 	/** Release owned resources at app.stop(). */
 	shutdown?: () => Promise<void> | void;
+}
+
+export interface PluginToolkit<TClients = Record<string, unknown>> {
+	tools: readonly ToolDefinition<any, TClients>[];
+	instructions?: Instructions<TClients> | readonly Instructions<TClients>[];
 }
 
 export type AnyPlugin = PluginDefinition<string, any, any>;
