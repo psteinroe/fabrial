@@ -313,7 +313,7 @@ describe("durability and context", () => {
 						draft.count++;
 					});
 					await ctx.evaluate("evaluate", {
-						model: { provider: "test", modelId: "test" },
+						model: "test/test",
 						state: {},
 						questions: {},
 					});

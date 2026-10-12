@@ -9,15 +9,10 @@ export type EvaluateQuestion =
 export interface EvaluateRequest<
 	Q extends Record<string, EvaluateQuestion> = Record<string, EvaluateQuestion>,
 > {
-	/** A classifier model reference, resolved by the configured evaluator (Pi AI models). */
-	model: ModelRef;
+	/** A classifier, `"provider/model"`, resolved from the instance's `models`. */
+	model: string;
 	state: Json;
 	questions: Q;
-}
-
-export interface ModelRef {
-	provider: string;
-	modelId: string;
 }
 
 export type EvaluateAnswer<Q extends EvaluateQuestion> = Q extends {
@@ -46,11 +41,12 @@ export interface EvaluateResult<Q extends Record<string, EvaluateQuestion>> {
 	stopReason: "stop" | "error";
 	error?: string;
 	answers: { [K in keyof Q]?: EvaluateAnswer<Q[K]> };
-	model: ModelRef;
+	/** The requested classifier, `"provider/model"`. */
+	model: string;
 	usage?: Json;
 }
 
-/** Port: runs a classification. Implemented by `@fabrial/pi` on `pi-ai` `models.classify()`. */
+/** Port: runs a classification. Implemented on Pi AI's `models.classify()`. */
 export interface Evaluator {
 	evaluate<Q extends Record<string, EvaluateQuestion>>(
 		request: EvaluateRequest<Q>,

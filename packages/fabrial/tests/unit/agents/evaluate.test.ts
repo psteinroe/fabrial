@@ -3,7 +3,7 @@ import type { ClassifierContext, ClassifierModel } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { createEvaluator } from "../../../src/agents/index.ts";
 
-const ref = { provider: "test", modelId: "classifier" };
+const ref = "test/classifier";
 function fixture() {
 	const models = createModels();
 	let received: ClassifierContext | undefined;
@@ -88,6 +88,7 @@ describe("Pi classifier adapter", () => {
 			new AbortController().signal,
 		);
 		expect(result.stopReason).toBe("error");
-		expect(result.error).toContain("Unknown classifier");
+		expect(result.error).toBe("Unknown classifier test/classifier");
+		expect(result.model).toBe("test/classifier");
 	});
 });

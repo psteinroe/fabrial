@@ -277,7 +277,7 @@ The shape follows Vercel AI SDK's experimental `evaluate`. It is implemented on 
 
 ```ts
 const result = await ctx.evaluate("route", {
-	model: jev,
+	model: "typesafe/jev-latest",
 	state: { message: message.text, channel: ctx.thread.channel },
 	questions: {
 		intent: {
@@ -560,7 +560,7 @@ export const generalAssistant = f.defineWorkflow({
 		}
 
 		const result = await ctx.evaluate("route", {
-			model: jev,
+			model: "typesafe/jev-latest",
 			state: { message: message.text, channel: ctx.thread.channel },
 			questions: routingQuestions,
 		});

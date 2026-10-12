@@ -11,7 +11,7 @@ it.skipIf(!process.env.TYPESAFE_API_KEY)(
 		const model = models.getModelsOfType("classifier", "typesafe")[0]!;
 		const result = await createEvaluator(models).evaluate(
 			{
-				model: { provider: model.provider, modelId: model.id },
+				model: `${model.provider}/${model.id}`,
 				state: { statement: "Two plus two equals four." },
 				questions: { correct: { type: "boolean", instructions: "Is the statement correct?" } },
 			},

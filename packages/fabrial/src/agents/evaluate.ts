@@ -6,6 +6,7 @@ import type {
 	Evaluator,
 	Json,
 } from "../index.ts";
+import { parseModel } from "../agent.ts";
 
 export function createEvaluator(models: Models): Evaluator {
 	return {
@@ -14,13 +15,9 @@ export function createEvaluator(models: Models): Evaluator {
 			signal: AbortSignal,
 		): Promise<EvaluateResult<Q>> {
 			try {
-				const model = models.getModelOfType(
-					"classifier",
-					request.model.provider,
-					request.model.modelId,
-				);
-				if (!model)
-					throw new Error(`Unknown classifier ${request.model.provider}/${request.model.modelId}`);
+				const ref = parseModel(request.model);
+				const model = models.getModelOfType("classifier", ref.provider, ref.modelId);
+				if (!model) throw new Error(`Unknown classifier ${request.model}`);
 				const questions: Record<string, ClassifierQuestion> = {};
 				const scoreKeys: Record<string, string[]> = {};
 				for (const [key, question] of Object.entries(request.questions)) {

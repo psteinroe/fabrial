@@ -3,7 +3,7 @@ import { slack } from "@fabrial/slack";
 import { supportAgent } from "../agents/support.ts";
 import { bugIntake } from "./bug-intake.ts";
 export const channels = { support: "C_SUPPORT", bugs: "C_BUGS" };
-export const routingModel = { provider: "jev", modelId: "route" };
+export const routingModel = "jev/route";
 export const generalAssistant = f.defineWorkflow({
 	name: "general-assistant",
 	triggers: [slack.mentioned()],
