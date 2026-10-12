@@ -30,24 +30,27 @@ The name comes from Brandon Sanderson's _Stormlight Archive_: a fabrial is a dev
 | [Chat SDK](https://chat-sdk.dev)                     | Platform adapters: webhooks, threads, messages, cards, modals, streaming, native clients (`WebClient`, `octokit`, `linearClient`). |
 | [Executor](https://v2.executor.sh)                   | Not foundational. May become a tool/client plugin later.                                                                           |
 
+These are implementation details. App authors install `fabrial` and provider plugins, configure a database and model credentials, and never import or configure the runtimes (see [Ownership](#ownership)).
+
 Reference for chat UX: Vercel [Eve](https://github.com/vercel/eve). Its persisted thread bindings, thread-handle reconstruction on resume, bounded/attributed history loading, and default status rendering are the patterns to borrow.
 
 ## Ownership
 
-> Native runtimes own execution; Fabrial carries context across them.
+> Fabrial owns the API. The runtimes are implementation details.
 
-| Concern                                                         | Owner                                    |
-| --------------------------------------------------------------- | ---------------------------------------- |
-| Event-driven and scheduled workflows, steps, retries, waits     | PG Conductor (via `defineWorkflow`)      |
-| Agent conversations, model execution, agent tasks               | Pi Durable (native)                      |
-| Session/conversation state                                      | Pi documents (native `defineDoc`)        |
-| Agent capability bundles                                        | Pi extensions (native `defineExtension`) |
-| Platform messages, threads, cards, clients                      | Chat SDK (native)                        |
-| Provider events → triggers, context reconstruction, clients     | Fabrial plugins                          |
-| Workflow ↔ agent bridges, approvals, response context, identity | Fabrial core                             |
-| Users and groups                                                | Fabrial identity definitions/providers   |
+App authors see one programming model: workflows, agents, tools, toolkits, state, groups, and plugins, all defined on the Fabrial instance. Conductor, Pi, and Chat SDK run underneath and never appear in app code: no runtime packages to install or wire, no runtime types in signatures, and no escape hatch to native handles. While Fabrial ships preview releases, a missing capability becomes a Fabrial field, not a pass-through.
 
-Fabrial owns no tables. Its per-resource routing state (subscriptions, active interaction, current handler, response message refs) lives in Chat SDK state, keyed by thread or resource. Everything else is Conductor step results, events, and metadata, or Pi documents.
+| Concern                                                         | Public API                               | Implemented with                  |
+| --------------------------------------------------------------- | ---------------------------------------- | --------------------------------- |
+| Event-driven and scheduled workflows, steps, retries, waits     | `f.defineWorkflow`, `ctx.step`, triggers | PG Conductor                      |
+| Agent conversations, model execution                            | `f.defineAgent`, `ctx.agent`, `ctx.send` | Pi Durable, Pi AI                 |
+| Tools and tool bundles                                          | `f.defineTool`, `f.defineToolkit`        | Pi tools and extensions           |
+| Session/conversation state                                      | `f.defineState`                          | Pi documents                      |
+| Platform messages, threads, cards                               | `ctx.thread`, `Card`, `ChatMessage`      | Chat SDK, inside the chat plugins |
+| Provider events → triggers, context reconstruction, clients     | Plugins (`definePlugin`)                 | Fabrial                           |
+| Workflow ↔ agent bridges, approvals, response context, identity | `ctx.*`, `f.defineGroup`                 | Fabrial                           |
+
+Fabrial owns no tables of its own. Everything lives in the one configured Postgres database, in the runtimes' schemas: Conductor step results, events, and metadata; Pi Sessions and documents; and Chat SDK state, which holds the per-resource routing state (subscriptions, active interaction, current handler, response message refs).
 
 ## Public API
 
@@ -55,13 +58,18 @@ All code below is the proposed Fabrial API.
 
 ### The instance: `createFabrial`
 
-Like PG Conductor (`Conductor.create({ context })` → `conductor.createTask`, wired later by `Orchestrator.create`), a Fabrial instance carries the plugin types, so definitions get typed `ctx.clients` without global type augmentation. The instance holds plugins (with their configuration) and users only, never workflows, so definition files can import it without cycles. Runtime wiring happens separately in `f.app()`.
+A Fabrial instance carries the plugin types, so definitions get typed `ctx.clients` without global type augmentation. It holds configuration (database, model credentials, plugins, users) and never workflows, so definition files can import it without cycles. `f.app()` only lists the workflows to run.
 
-Plugins carry their values at definition, read from env when the module loads (the Better Auth / Inngest style). Plugin factories are side-effect free: nothing connects or validates credentials until `app.start()`, so unset env at import time is fine. Tests configure the same way, through env set in a test `globalSetup`.
+Configuration is read from env when the module loads (the Better Auth / Inngest style). Plugin factories are side-effect free: nothing connects or validates credentials until `app.start()`, so unset env at import time is fine. Tests configure the same way, through env set in a test `globalSetup`.
+
+- `database`: one Postgres connection string. Workflows, agent sessions, and chat state share it, each in its own schema. Fabrial owns the pool and closes it on `app.stop()`.
+- `models`: credentials per model provider. Agents name models as `"provider/model"` strings (`"anthropic/claude-sonnet-5"`), the AI SDK / Mastra convention. Tests pass scripted models from `fabrial/testing` instead of credentials.
 
 ```ts
 // fabrial.ts
 export const f = createFabrial({
+	database: env.DATABASE_URL,
+	models: { anthropic: { apiKey: env.ANTHROPIC_API_KEY } },
 	plugins: [
 		slack({ botToken: env.SLACK_BOT_TOKEN, signingSecret: env.SLACK_SIGNING_SECRET, workspace: "acme" }),
 		github({ ... }),
@@ -70,26 +78,22 @@ export const f = createFabrial({
 	],
 	identity: [alice, bob], // users; groups are referenced where they're used
 });
-export const { defineTool, defineAgent, section } = withPi(f); // from @fabrial/pi
 
-// workflows, tools, agents, groups use f (or the bound Pi helpers): ctx.clients is typed from f's plugins
+// every definition hangs off f: ctx.clients is typed from f's plugins
 export const runSql = f.defineWorkflow({ name: "run-sql", async run(input, ctx) { /* ctx.clients.database */ } });
+export const supportAgent = f.defineAgent({ name: "support", model: "anthropic/claude-sonnet-5", tools: [runSql] });
 export const linearTriage = f.defineGroup({ id: "linear-triage", resolve: (ctx) => ctx.clients.linear.triageResponsibility({ team: "ENG" }) });
 
-// app.ts: runtime wiring only
-export const app = f.app({
-	runtime: conductor({ connectionString: env.DATABASE_URL }),
-	chat: chat({ state }),
-	agents: pi({ models, sql }),
-	workflows: [generalAssistant, runSql],
-});
+// app.ts
+export const app = f.app({ workflows: [generalAssistant, runSql] });
+export default { fetch: app.fetch };
 ```
 
-Definitions are plain data, so any app built from `f` can register them. Reusable tools shipped inside plugin packages don't use `f`; they get typed clients through the plugin's own `extension: (clients) => …` closure.
+Definitions are plain data, so any app built from `f` can register them. Reusable tools shipped inside plugin packages don't use `f`; they get typed clients through the plugin's own `toolkit: (clients) => …` closure.
 
 ### `f.defineWorkflow`
 
-The main abstraction. It registers a Conductor task, turns plugin triggers into Conductor subscriptions, and rebuilds the invocation context on every start or resume. Conductor execution options (concurrency, retries, …) are passed through.
+The main abstraction. It registers a durable task, turns plugin triggers into subscriptions, and rebuilds the invocation context on every start or resume. Execution options are Fabrial fields: `concurrency`, `retries`.
 
 ```ts
 export const repairCustomer = f.defineWorkflow({
@@ -127,11 +131,10 @@ Workflow context:
 
 | API                                               | Behavior                                                                                                       |
 | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `ctx.thread`                                      | Chat SDK thread rebuilt from the trigger's persisted references. Survives restarts and multi-day waits.        |
+| `ctx.thread`                                      | Thread rebuilt from the trigger's persisted references. Survives restarts and multi-day waits.                 |
 | `ctx.clients.*`                                   | Native provider clients from plugins, recreated on resume and never serialized.                                |
-| `ctx.raw.*`                                       | Escape hatch to unwrapped native clients and Conductor/Pi handles.                                             |
 | `ctx.thread.post(id, message)`                    | Durable post into the bound thread. Other thread operations follow the same `(id, …)` shape.                   |
-| `ctx.agent(id, agent, opts)`                      | Runs a Pi conversation; durable submission and result bridge.                                                  |
+| `ctx.agent(id, agent, opts)`                      | Runs an agent conversation; durable submission and result bridge.                                              |
 | `ctx.state(S).get(id)` / `.update(id, fn)`        | Shared state (`defineState`), durable.                                                                         |
 | `ctx.evaluate(id, { model, state, questions })`   | Structured judgment (Jev), durably recorded.                                                                   |
 | `ctx.waitForApproval(id, opts)`                   | Complete approval protocol over Conductor `waitForEvent`. Sugar for `requestApproval` + awaiting the decision. |
@@ -142,8 +145,7 @@ Workflow context:
 | `ctx.race(id, { a, b, … })`                       | Durably waits for the first of several awaitables (decision, reply, timer) and returns which one won.          |
 | `ctx.invoke(id, workflow, input)`                 | Calls another workflow as a child and returns its result.                                                      |
 | `ctx.handoff(id, workflow, input)`                | Transfers responsibility for the interaction to another workflow.                                              |
-| `ctx.step(name, fn)`                              | Native Conductor step for arbitrary code.                                                                      |
-| `workflow.asTool()`                               | Generates a native Pi tool that starts or reconnects to the workflow.                                          |
+| `ctx.step(name, fn)`                              | Durable, memoized step for arbitrary code.                                                                     |
 
 ### Automatic durability
 
@@ -166,65 +168,65 @@ Intentional framework operations are wrapped in durable operations automatically
 
 Step memoization does not give exactly-once external effects. Integration operations use provider idempotency keys or reconciliation where possible. Fabrial does not promise exactly-once in general.
 
-### Agents (Pi)
+### Agents
 
-Agents run on Pi Durable. App authors write agents (`defineAgent`), tools (`defineTool`, or `workflow.asTool()` for anything durable or long-running), and shared state (`defineState`). `defineAgent`, `defineTool`, and `section` come from `withPi(f)`, so their `ctx.clients` and plugin extension ids are typed from the instance. Pi tasks and raw Pi documents are Pi's internal machinery and an advanced escape hatch only; app authors don't need them.
-
-`defineAgent` is a thin wrapper over Pi's per-conversation agent config (`conversation.configure()`). It adds a stable `name` (used for the continuation key, tracing, and progress labels), plugin extensions referenced by plugin `id` (they are built at runtime from live clients), and the `state` the agent can see. Every other field passes through, and unset fields follow host defaults as in Pi:
+App authors write agents (`f.defineAgent`), tools (`f.defineTool`), toolkits (`f.defineToolkit`), and shared state (`f.defineState`). Everything durable or long-running is a workflow, and a workflow is a tool: pass it in `tools` and agents call it by its `name` and `description`.
 
 ```ts
-export const bugInvestigator = defineAgent({
+export const bugInvestigator = f.defineAgent({
 	name: "bug-investigator",
-	model: { provider: "anthropic", modelId: "claude-sonnet-5" },
-	thinkingLevel: "medium",
-	instructions: "Investigate bug reports. Find root cause and affected customers.",
-	extensions: ["github", "linear", Investigation], // plugin ids (typed) + native Pi extensions
-	tools: [readOnlyQuery, addFinding, runSql.asTool()], // Pi tools, incl. workflows as tools
+	model: "anthropic/claude-sonnet-5",
+	thinking: "medium", // "off" | "low" | "medium" | "high"
+	instructions: [
+		"Investigate bug reports. Find root cause and affected customers.",
+		(ctx) => `Requested by ${ctx.actor.name}.`, // dynamic, rendered per run
+	],
+	tools: [readOnlyQuery, addFinding, runSql], // tools and workflows
+	toolkits: ["github", "linear", Investigation], // plugin ids (typed) and app toolkits
 	state: [Findings], // rendered into the prompt via their `render`
 });
 
 const analysis = await ctx.agent("investigate", bugInvestigator, { input });
 const plan = await ctx.agent("plan", cleanupPlanner, { input, output: CleanupPlan }); // typed structured result
-// native escape hatch: `configure` lives on defineAgent, because the agent runs in its own execution
-export const repoAgent = defineAgent({
-	name: "repo-agent",
-	configure: (conversation) => conversation.configure({ cwd: "/work/repo" }),
-});
 ```
 
-Tools and sections use thin `@fabrial/pi` adapters that return **native Pi objects**. Their handlers receive `ctx` = Pi's `api` plus Fabrial context:
+- `name` is stable: it is the continuation key, and labels traces and progress.
+- `ctx.agent` options are `input`, `output` (a Standard Schema; the answer is validated JSON), and `detached`.
+- Unset fields follow instance defaults. There is no pass-through to the runtime's agent config; new capabilities (working directory, compaction, …) become fields.
+
+Tools take a Standard Schema `input`, like workflows, and return a string or any JSON value:
 
 ```ts
-import { defineTool, section } from "./fabrial.ts"; // = withPi(f)
-import { defineExtension } from "@earendil-works/pi-durable";
-
-export const addFinding = defineTool({
+export const addFinding = f.defineTool({
 	name: "add_finding",
 	description: "Record a finding about this customer issue",
-	parameters: Type.Object({ text: Type.String() }),
-	execute: async ({ text }, ctx) => {
+	input: z.object({ text: z.string() }),
+	async run({ text }, ctx) {
 		ctx.actor; // who sent the message this run answers
 		await ctx.state(Findings).update((s) => {
 			s.notes.push(text);
 		}); // committed with the tool result
-		return { content: [{ type: "text", text: "recorded" }] };
+		return "recorded";
 	},
 });
 
-export const Investigation = defineExtension({
-	// native
+export const Investigation = f.defineToolkit({
 	name: "investigation",
 	tools: [addFinding, lookupCustomer],
-	sections: [section("requester", (input, ctx) => `Requested by ${ctx.actor.name}.`)],
+	instructions: (ctx) => `Requested by ${ctx.actor.name}.`,
 });
 ```
+
+- The input schema is converted to JSON Schema for the model and validated before `run`.
+- `idempotent: true` lets a call interrupted by a crash run again; otherwise the model sees an interrupted result and decides.
+- Tool `ctx` is Fabrial's: `actor`, `requestedBy`, `clients`, `thread`, `state`, `invoke`, `start`, `evaluate`, `interaction`, `signal`.
 
 ### State: `defineState`
 
 State that agents see and change and that outlives a single step. One concept and one API in workflows and tools, backed by Pi documents in the thread's Session:
 
 ```ts
-export const Findings = defineState({
+export const Findings = f.defineState({
 	name: "findings",
 	scope: "thread", // "interaction" | "thread" | "agent"
 	schema: z.object({ customerId: z.string().optional(), notes: z.array(z.string()) }),
@@ -261,14 +263,13 @@ await ctx.state(Findings).update((s) => {
 | Direction                                           | Behavior                                                                                                                                                              |
 | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Workflow → agent (`ctx.agent`)                      | Create/find conversation, submit with a stable request ID, persist the reference, suspend, resume with the result.                                                    |
-| Agent → workflow (`workflow.asTool()`)              | Start/reconnect to the Conductor execution with a stable invocation key and return its result as the tool result. No access check; the tool's own approval guards it. |
+| Agent → workflow (workflow in `tools`)              | Start/reconnect to the Conductor execution with a stable invocation key and return its result as the tool result. No access check; the tool's own approval guards it. |
 | Workflow → workflow                                 | Native Conductor child invocation.                                                                                                                                    |
-| Pi task → Pi task / document                        | Native Pi.                                                                                                                                                            |
 | Managed external ops inside Pi (e.g. `thread.post`) | Routed through the Conductor bridge, keyed by Pi task ID + operation ID, so external effects have one durability implementation.                                      |
 
 A workflow called by an agent must not synchronously query that same busy conversation, because that would deadlock. It starts a separate conversation instead.
 
-Approvals are always Conductor-backed. A Pi tool that needs approval is a workflow exposed with `asTool()`.
+Approvals are always workflow-backed. A tool that needs approval is a workflow in the agent's `tools`.
 
 ### `ctx.evaluate` (Jev)
 
@@ -409,8 +410,8 @@ export const sentry = definePlugin(
 		// canonical client: ctx.clients.sentry, rebuilt on every run/resume
 		clients: () => ({ sentry: new SentryClient({ token: options.authToken, org: options.org }) }),
 
-		// Pi tools for agents that select this extension, built on the same client
-		extension: ({ sentry }) => defineExtension({ name: "sentry", tools: [getIssueTool(sentry)] }),
+		// tools for agents that list this plugin in `toolkits`, built on the same client
+		toolkit: ({ sentry }) => ({ tools: [getIssueTool(sentry)] }),
 
 		// model context about the origin, loaded durably when an agent starts from this trigger
 		context: async (origin, { sentry }) => formatIssue(await sentry.getIssue(origin.issueId)),
@@ -444,7 +445,7 @@ export const langfuse = definePlugin((options: LangfuseOptions) => {
 				async (execution, ctx, next) =>
 					next({ ...ctx, trace: client.trace({ id: execution.rootId }) }),
 			],
-			agent: [hook(GenerationTask, { afterGeneration: (gen) => client.generation(gen) })],
+			agent: { onModelResponse: (response) => client.generation(response) },
 		},
 		shutdown: () => client.flushAsync(),
 	};
@@ -471,16 +472,11 @@ export const f = createFabrial({
 	identity: [alice, bob],
 });
 
-// app.ts: runtime wiring
-export const app = f.app({
-	runtime: conductor({ sql }),
-	chat: chat({ state }),
-	agents: pi({ models, sql }),
-	workflows: [generalAssistant, bugIntake, runSql],
-});
+// app.ts
+export const app = f.app({ workflows: [generalAssistant, bugIntake, runSql] });
 
 export default { fetch: app.fetch }; // one handler for /slack/events, /sentry/webhook, …
-await app.start(); // Conductor workers + Pi bridge
+await app.start(); // workers and agent runtime
 ```
 
 A workflow using both providers:
@@ -509,19 +505,19 @@ Capabilities (all optional except `id`):
 | Key                 | Purpose                                                                                                                               |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `id`                | Unique name. Prefixes events (`sentry.issueCreated`). A second installation is a second instance with its own `id`.                   |
-| `events`            | Typed event definitions, registered as Conductor events.                                                                              |
+| `events`            | Typed event definitions, registered with the workflow runtime.                                                                        |
 | `routes`            | Webhook ingress, served by `app.fetch` (mountable in Hono, Next.js, Bun.serve, …).                                                    |
-| `chat`              | Chat SDK adapter. Supplies routes, typed message events, `ctx.thread`, cards, status rendering, and history loading.                  |
+| `chat`              | Chat SDK adapter (the one runtime type plugin authors see). Supplies routes, message events, `ctx.thread`, cards, and history.        |
 | `clients`           | Canonical live clients exposed as `ctx.clients.*` and rebuilt on every run/resume. Workflow code and agent tools use the same client. |
-| `extension`         | Pi extension (tools, sections, hooks) for agents that select it.                                                                      |
+| `toolkit`           | Tools and instructions for agents that list this plugin's id in `toolkits`.                                                           |
 | `context`           | Model context for a trigger's origin.                                                                                                 |
-| `hooks.workflow`    | Conductor middleware for **every** workflow run/resume.                                                                               |
-| `hooks.agent`       | Native Pi hooks installed on **every** harness. Hooks scoped to particular agents go in `extension`.                                  |
+| `hooks.workflow`    | Middleware around **every** workflow run/resume.                                                                                      |
+| `hooks.agent`       | Observers on **every** agent: `onModelResponse`, `onToolCall`.                                                                        |
 | `identity`          | External identity → principal.                                                                                                        |
 | `init` / `shutdown` | Lifecycle. Factories must have no side effects.                                                                                       |
 
 - Credentials are plugin options. There is no provider/account split, accounts table, or secret store yet.
-- Triggers are real Conductor triggers. Plugins translate provider events into typed Conductor events, and Conductor owns matching and starting.
+- Triggers are durable subscriptions in the workflow runtime. Plugins translate provider events into typed events, and the runtime owns matching and starting.
 - A non-chat trigger has no thread of its own. `replyTo` says where `ctx.thread` points, and the thread is created lazily on the first post. Without a `replyTo`, `ctx.thread` is absent from the type.
 - Polling sources (APIs without webhooks) ship a cron workflow that emits the same events.
 - Executions persist only references (installation, thread, message, actor IDs) and event data. Live clients are rebuilt on resume.
@@ -581,7 +577,7 @@ export const generalAssistant = f.defineWorkflow({
 
 		const answer = await ctx.agent("assistant", assistantAgent, {
 			input: message,
-			tools: [investigateCustomer.asTool(), explainDeployment.asTool()],
+			tools: [investigateCustomer, explainDeployment],
 		});
 		await ctx.thread.post("answer", answer);
 	},
@@ -590,7 +586,7 @@ export const generalAssistant = f.defineWorkflow({
 
 - Overlapping triggers on one workflow are merged, so a mention in `#bugs` produces one execution. Ingress deduplicates provider redeliveries.
 - Across workflows, the most specific matching trigger owns the thread (e.g. `deployBot` on `slack.mentioned({ channel: "C_DEPLOYS" })` beats `generalAssistant` on `slack.mentioned()`). Ties are a startup error, and `observe: true` triggers run alongside without owning the thread.
-- **Call** vs **handoff**: calling a workflow (`asTool`, child invoke) returns a result and posts no final answer. A handoff transfers responsibility for the interaction and its final response, and the router ends.
+- **Call** vs **handoff**: calling a workflow (as a tool, child invoke) returns a result and posts no final answer. A handoff transfers responsibility for the interaction and its final response, and the router ends.
 - Thread replies during an active interaction go to that interaction (clarification, steering), not through trigger matching again. The routing state `{ interactionId, handlerExecutionId, response }` lives in Chat SDK thread state. After completion, a new mention starts a new interaction and gets the thread history as context.
 - Agent conversation continuation key: `[installationId, threadId, agentName]`, so two agents in one thread never share a conversation. This is the default; [Sessions, conversations, and subscriptions](#sessions-conversations-and-subscriptions) lets an app choose other keys.
 
@@ -677,7 +673,7 @@ Subagents are Pi-native owned conversations in the same Session: no Conductor ro
 | `fork`  | the parent's transcript so far         | `conversation.fork(entryId)`                  |
 
 ```ts
-export const lead = defineAgent({
+export const lead = f.defineAgent({
 	name: "lead",
 	subagents: {
 		researcher: { agent: researcher, mode: "brief" },
@@ -686,7 +682,7 @@ export const lead = defineAgent({
 });
 ```
 
-This generates a `subagent` tool. Foreground calls return the child's answer as the tool result (Pi example 22). Background subagents are persistent and named: the tool spawns, messages, stops, and lists them, and each answer comes back to the lead as a `followUp` input (Pi example 23). Subagents get no chat binding, so only the lead speaks in the thread; their progress feeds the lead's response context. Work that waits for days, such as an approval, is still a workflow behind `asTool()`.
+This generates a `subagent` tool. Foreground calls return the child's answer as the tool result (Pi example 22). Background subagents are persistent and named: the tool spawns, messages, stops, and lists them, and each answer comes back to the lead as a `followUp` input (Pi example 23). Subagents get no chat binding, so only the lead speaks in the thread; their progress feeds the lead's response context. Work that waits for days, such as an approval, is still a workflow in `tools`.
 
 `brief` and `fork` avoid a third meaning of "handoff", which already names `ctx.handoff` (a workflow transfers an interaction) and Pi's reset with a note.
 
@@ -725,20 +721,17 @@ fabrial/
 ├── justfile  .oxlintrc.json  .oxfmtrc.jsonc  cliff.toml  LICENSE
 ├── PLAN.md
 ├── packages/
-│   ├── fabrial/  conductor/  pi/  chat/
+│   ├── fabrial/          # core + runtimes (conductor, pi, chat as internal modules)
 │   └── slack/  github/  linear/
 └── examples/
     └── acme/         # v1 reference app
 ```
 
-| Package                                                | Contents                                                                                                                                              |
-| ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `fabrial`                                              | Core: `createFabrial` (`f.defineWorkflow`, `f.app`), plugin lifecycle, invocation-context contract, identity, approvals, response context.            |
-| `@fabrial/conductor`                                   | Event registration, context enrichment, durable dispatch helpers.                                                                                     |
-| `@fabrial/pi`                                          | Pi Postgres storage, Conductor ↔ Pi bridges, `withPi(f)` (`defineAgent`, `defineTool`/`section` adapters), `defineState` storage, progress rendering. |
-| `@fabrial/chat`                                        | Chat SDK ingestion, thread reconstruction, default renderers.                                                                                         |
-| `@fabrial/slack`, `@fabrial/github`, `@fabrial/linear` | Provider events, clients, auth, context loaders, identities.                                                                                          |
-| `@fabrial/sentry`, `@fabrial/langfuse`                 | After v1.                                                                                                                                             |
+| Package                                                | Contents                                                                                                                                                                                                                   |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fabrial`                                              | The whole framework: `createFabrial` and every `f.define*`, `f.app`, plugin lifecycle, identity, approvals, response context, and the runtimes as internal modules (Conductor, Pi, Chat SDK). `fabrial/testing` for tests. |
+| `@fabrial/slack`, `@fabrial/github`, `@fabrial/linear` | Provider events, clients, auth, context loaders, identities.                                                                                                                                                               |
+| `@fabrial/sentry`, `@fabrial/langfuse`                 | After v1.                                                                                                                                                                                                                  |
 
 These are packages, not services. They can all run in one process.
 
@@ -751,25 +744,25 @@ Recorded as open questions are resolved.
 - **Pi Session per thread by default, in Postgres, opened on demand.** Apps can choose other Session keys through subscriptions and `ctx.send` (see [Sessions, conversations, and subscriptions](#sessions-conversations-and-subscriptions)). `@fabrial/pi` ships a Postgres storage backend (validated with Pi's `registerStorageConformance`) that holds one logical Session per key: `slack:<installationId>:<threadId>` for chat, or the interaction ID for non-chat triggers. Agents in the same thread are separate conversations in that Session, chosen by `[installationId, threadId, agentName]`.
   - `ctx.agent` drives the harness inside a Conductor execution grouped by Session ID under a strict limit of 1 (Conductor issue 4), so only one worker owns a Session at a time. That execution opens the harness, submits with a stable request ID, runs Pi's scheduler until idle or a result arrives, then closes the harness and releases the worker.
   - **Fencing**: each open takes a lease epoch, and every commit checks it, so a stale worker can't commit after a takeover.
-  - Long tool calls (e.g. `workflow.asTool()` waiting days for approval) close the harness. When the child completes, a Conductor execution reopens the Session, and the `pi.tool` task reconnects through its invocation key.
+  - Long tool calls (e.g. a workflow tool waiting days for approval) close the harness. When the child completes, a Conductor execution reopens the Session, and the `pi.tool` task reconnects through its invocation key.
 - **Explicit IDs for every durable operation (Inngest model).** `ctx.thread.post("ack", …)`, `ctx.agent("investigate", …)`, `ctx.evaluate("route", …)`, `ctx.waitForApproval("approve-repair", …)`, and so on. Repeated IDs get automatic suffixes. Deploys are tolerated by ID: new IDs run and missing ones are ignored. There is no call-order determinism or version pinning. This is the most robust option across deploys, at the cost of some verbosity.
-- **Cancellation is structured by default, with a per-call `detached` opt-out.** Cancelling an execution cancels every call it made: `ctx.agent` (Pi conversation abort), `ctx.invoke`, and `asTool()` workflows, recursively. A pending `waitForApproval` updates its card to "Cancelled" and rejects later clicks. Opt out per call with `{ detached: true }`, or per tool with `workflow.asTool({ detached: true })`. Handoffs are always independent, because the receiver owns the interaction. Cancellation is cooperative: a running step finishes and its result is recorded, and cancellation takes effect at the next durable operation. A "stop" in a thread cancels the interaction's current handler.
-- **`run(input, ctx)`, matching Conductor's handler shape.** For triggered runs, `input` is the typed trigger event (a union for multiple triggers). For `ctx.invoke`, `ctx.handoff`, and `asTool()` it is the workflow's typed input.
-- **Plugins: `definePlugin(factory | object)`** with the capability set in [Plugins](#plugins). Chat SDK is just the optional `chat` capability, so non-chat sources like Sentry or internal webhooks are first-class (`events` + `routes`). The shape follows Better Auth and Executor: an option factory, a declarative object, and inferred types. Global hooks are `hooks: { workflow, agent }` in native Conductor-middleware and Pi-hook shapes. Agent-scoped hooks live in `extension`. Trigger helpers are static exports.
-- **Typed clients come from a Conductor-style instance, not global type augmentation.** `createFabrial({ plugins, identity })` returns `f`; `f.defineWorkflow`, `f.defineGroup`, and `withPi(f)`'s `defineTool`/`defineAgent`/`section` get `ctx.clients` and plugin extension ids typed from `f`'s plugins, and a misspelled client is a type error. The instance holds no workflows (no import cycles); `f.app({ runtime, chat, agents, workflows })` does the runtime wiring. `identity` lists users only; groups are referenced where they're used. There are no free `defineWorkflow`/`fabrial()` functions and no `declare module` registration. Most backend frameworks do it this way (Conductor, Inngest, tRPC, Hono); global `Register` augmentation is a frontend-library pattern and felt like magic.
+- **Cancellation is structured by default, with a per-call `detached` opt-out.** Cancelling an execution cancels every call it made: `ctx.agent` (Pi conversation abort), `ctx.invoke`, and workflows called as tools, recursively. A pending `waitForApproval` updates its card to "Cancelled" and rejects later clicks. Opt out per call with `{ detached: true }`. Handoffs are always independent, because the receiver owns the interaction. Cancellation is cooperative: a running step finishes and its result is recorded, and cancellation takes effect at the next durable operation. A "stop" in a thread cancels the interaction's current handler.
+- **`run(input, ctx)` for workflows and tools.** For triggered runs, `input` is the typed trigger event (a union for multiple triggers). For `ctx.invoke`, `ctx.handoff`, and tool calls it is the workflow's typed input.
+- **Plugins: `definePlugin(factory | object)`** with the capability set in [Plugins](#plugins). Chat SDK is just the optional `chat` capability, so non-chat sources like Sentry or internal webhooks are first-class (`events` + `routes`). The shape follows Better Auth and Executor: an option factory, a declarative object, and inferred types. Global hooks are `hooks: { workflow, agent }` in Fabrial shapes: workflow middleware and agent observers. Plugin tools live in `toolkit`. Trigger helpers are static exports.
+- **Typed clients come from an instance, not global type augmentation.** `createFabrial({ database, models, plugins, identity })` returns `f`; every `f.define*` gets `ctx.clients` and plugin toolkit ids typed from `f`'s plugins, and a misspelled client is a type error. The instance holds no workflows (no import cycles); `f.app({ workflows })` lists what runs. `identity` lists users only; groups are referenced where they're used. There are no free `defineWorkflow`/`fabrial()` functions and no `declare module` registration. Most backend frameworks do it this way (Conductor, Inngest, tRPC, Hono); global `Register` augmentation is a frontend-library pattern and felt like magic.
 - **Plugin values at definition, from env (the Better Auth / Inngest style).** Plugins get their options when passed to `createFabrial`, typically read from env when the module loads. Factories are side-effect free and nothing connects until `app.start()`. Tests set env in a `globalSetup` (e.g. testcontainers URLs, test secrets) before importing the app, and use spies on `app.host.clients()` for fake clients. There is one way to configure plugins: no `f.app()` overrides and no type/value split (the NestJS / Effect style was considered and rejected as heavier).
 - **Credentials are plugin options.** Executor's provider/account split (an accounts table, secret storage, slots) is deferred until several accounts per provider or per-person credentials are needed. A second installation is a second plugin instance with its own `id`.
-- **Thin `defineAgent`.** It holds `name`, plus plugin extensions by `id`. Everything else (`model`, `thinkingLevel`, `instructions`, `extensions`, `tools`, …) passes through to Pi's `configure()`. `ctx.agent` options are `input`, `output` (typed structured result, validated from a JSON answer), and `detached`. The native `configure` escape hatch is a `defineAgent` field, since a function can't cross into the agent's own execution. No Fabrial-owned agent features such as memory or per-agent permissions.
+- **`f.defineAgent` with Fabrial fields only.** `name`, `model` (a `"provider/model"` string), `thinking`, `instructions` (strings and per-run functions), `tools` (tools and workflows), `toolkits` (plugin ids and app toolkits), and `state`. There is no pass-through to the runtime's agent config and no `configure` escape hatch: a missing capability becomes a field. `ctx.agent` options are `input`, `output` (typed structured result, validated from a JSON answer), and `detached`. No Fabrial-owned agent features such as memory or per-agent permissions.
 - **v1 scope: Slack + the SQL approval flow + GitHub and Linear.**
-  - Packages: `fabrial`, `@fabrial/conductor`, `@fabrial/pi`, `@fabrial/chat`, `@fabrial/slack`, `@fabrial/github`, `@fabrial/linear`.
-  - Reference flow: a `generalAssistant` workflow (Slack mention) → a support agent → a `runSql.asTool()` workflow with triage approval in a Slack DM → resume → final reply in the thread. It must survive rejection, expiry, duplicate clicks, a deploy during approval, and a crash right after the DB write.
+  - Packages: `fabrial`, `@fabrial/slack`, `@fabrial/github`, `@fabrial/linear`.
+  - Reference flow: a `generalAssistant` workflow (Slack mention) → a support agent → a `runSql` workflow tool with triage approval in a Slack DM → resume → final reply in the thread. It must survive rejection, expiry, duplicate clicks, a deploy during approval, and a crash right after the DB write.
   - GitHub and Linear prove that plugins, triggers, and `ctx.thread` generalize beyond Slack (PR/issue comments as threads, non-mention events such as PR opened or issue created), with at least one workflow each.
   - Not in v1: Sentry, Executor, coding-agent providers. Next up: Sentry bug intake.
 - **Identity in v1: users in code; groups either in code or from Slack user groups.** `defineUser` maps Slack, GitHub, and Linear identities. Groups come in two kinds, both shipped:
   - Code-defined: `defineGroup({ members })` or `defineGroup({ resolve })`, with helpers such as `weeklyRotation([...], { start })`. Versioned in git, but a swap needs a deploy.
   - Slack-backed: `slack.userGroup({ id, handle: "triage" })` resolves the current members of a Slack user group. Rotation happens in Slack (or via an on-call tool that syncs the group) with no deploy.
   - `defineGroup({ resolve })` remains the escape hatch for anything else (Linear triage, PagerDuty, …). No email auto-matching.
-- **Package naming: unscoped `fabrial` core + `@fabrial/*` for everything else** (`@fabrial/slack`, `@fabrial/github`, `@fabrial/conductor`, …). `fabrial` on npm was unpublished in 2020 and should be claimable. Confirm the npm scope `@fabrial` before the first publish.
+- **Package naming: unscoped `fabrial` for the framework + `@fabrial/*` for plugins** (`@fabrial/slack`, `@fabrial/github`, …). `fabrial` on npm was unpublished in 2020 and should be claimable. Confirm the npm scope `@fabrial` before the first publish.
 - **Repo and tooling follow postgres-conductor's conventions, with Node instead of Bun.** pnpm workspaces with a catalog, vitest (+ testcontainers Postgres for integration tests), oxlint (type-aware) + oxfmt, a `justfile` (`just ready | lint | format | test`), git-cliff, and the MIT license. Node only (≥ 22), plain ESM.
 - **Per-thread routing state lives in Chat SDK thread state** (Postgres state adapter), the same approach Eve takes. Fabrial owns no routing table. Ingress reads `thread.state` on every inbound message. If an interaction is active, the message becomes a correlated reply to it. Otherwise it goes through trigger matching as new work.
   ```ts
@@ -809,10 +802,10 @@ Recorded as open questions are resolved.
   	},
   });
   ```
-- **Pi code gets Fabrial context through thin `@fabrial/pi` adapters.** `defineTool` and `section` return **native Pi objects** (usable in native `defineExtension`, next to plain Pi tools, with hooks and `wrapTool`). The only change is that handlers receive `ctx` = Pi's `api` **plus** Fabrial fields (`actor`, `requestedBy`, `clients`, `thread`, `state`, `invoke`, `start`, `evaluate`, `interaction`), with Pi's chord `Context` bound automatically. Every other Pi field passes through unchanged. Fabrial's names are reserved and disjoint from Pi's, and a type test fails the build on a collision. Per-request context comes from a `fabrial.invocation` document that `ctx.agent` commits right before `submit()`, keyed by request ID (Pi's `submit()` isn't available on `Tx`, so it can't share the submission's commit). Hooks stay native.
-- **State is `defineState`, and app authors don't write Pi tasks.** `defineState({ name, scope, schema, initial, render })` with scopes `interaction` (one request across handoffs), `thread`, and `agent`, backed by Pi documents. `ctx.state(S).get/update` works in workflows (durable ops with IDs) and in tools (committed with the tool result). Agents see the states listed in `defineAgent.state` through `render`. Durable or long-running tool work is a workflow exposed with `asTool()`. Pi tasks and raw documents stay internal / advanced, with no `defineTask` adapter. This replaces exposing raw Pi (`ctx.pi`) and `ctx.agent` document options, both of which made the DX convoluted.
-- **The Pi registry is derived, and nothing is selected by default.** There is no app-level extensions list. Installed = Fabrial's internal extension + every plugin's `extension` + every extension referenced by a `defineAgent` reachable from the registered workflows. Harness `settings.extensions` selects only Fabrial's internal extension, so each agent gets exactly what its `defineAgent.extensions` lists. Documents need no registration (`defineDoc` is used directly), so the plugin `docs` key is dropped. On startup, `@fabrial/pi` checks all Sessions for pending or waiting Pi tasks whose kind no installed extension provides, and **fails the deploy** with a fix-it message: keep the extension on an agent until those tasks finish, or run `fabrial pi abort-orphans --kind …`.
-- **Approval is explicit code only.** A tool that needs approval is a workflow that calls `ctx.waitForApproval`, exposed to agents with `asTool()`. The approval sits next to the logic, so previews, conditions, and multiple approvals are plain code. Not for now: a declarative `approval` option on `defineWorkflow`, or a `requireApproval` hook for native Pi tools. Add them later if needed.
+- **Runtimes are hidden behind Fabrial's API** (replaces thin adapters returning native Pi objects). App authors install one `fabrial` package and configure a database and model credentials; Conductor, Pi, and Chat SDK are internal modules. Tools use a Standard Schema `input` (converted to JSON Schema for the model) and return a string or JSON; toolkits replace Pi extensions and sections; hooks are Fabrial observers. There is no escape hatch (`ctx.raw`, `configure`) while Fabrial is in preview: what apps need becomes API. Plugin authors writing a chat provider still hand over a Chat SDK adapter, the one runtime type they see. Internally, per-request context still comes from a `fabrial.invocation` document that `ctx.agent` commits right before `submit()`, keyed by request ID.
+- **State is `defineState`, and app authors don't write Pi tasks.** `defineState({ name, scope, schema, initial, render })` with scopes `interaction` (one request across handoffs), `thread`, and `agent`, backed by Pi documents. `ctx.state(S).get/update` works in workflows (durable ops with IDs) and in tools (committed with the tool result). Agents see the states listed in `defineAgent.state` through `render`. Durable or long-running tool work is a workflow in `tools`. Pi tasks and raw documents stay internal / advanced, with no `defineTask` adapter. This replaces exposing raw Pi (`ctx.pi`) and `ctx.agent` document options, both of which made the DX convoluted.
+- **The agent registry is derived, and nothing is selected by default.** There is no app-level toolkit list. Installed = Fabrial's internal toolkit + every plugin's `toolkit` + every toolkit referenced by an agent reachable from the registered workflows. Each agent gets exactly what its `toolkits` and `tools` list. On startup, Fabrial checks all Sessions for pending agent work whose toolkit is no longer installed, and **fails the deploy** with a fix-it message: keep the toolkit on an agent until that work finishes, or abort it with the CLI.
+- **Approval is explicit code only.** A tool that needs approval is a workflow that calls `ctx.waitForApproval`, listed in an agent's `tools`. The approval sits next to the logic, so previews, conditions, and multiple approvals are plain code. Not for now: a declarative `approval` option on `defineWorkflow`, or a `requireApproval` option on `f.defineTool`. Add them later if needed.
 - **Conversations are addressable; subscriptions route events into them.** Sessions get app-chosen keys (default per thread), `ctx.send` complements `ctx.agent`, inputs carry a kind and priority that choose Pi's `steer`/`followUp`/`write`, and subscriptions (static or created at runtime, durable, many per conversation) generalize thread routing state. Subagents are Pi-native with `brief` and `fork` modes. See [Sessions, conversations, and subscriptions](#sessions-conversations-and-subscriptions).
 - **Permissions only on tools.** Agents are offered every tool their definition lists, regardless of who is talking. `access.invoke` is not checked for agent tools; a tool that needs permission asks its fixed approvers. This keeps shared conversations unambiguous: participants shape proposals, approvers authorize actions.
 
@@ -826,7 +819,7 @@ Conductor behaviors Fabrial relies on, checked against Conductor `main` @ `33228
 4. **Strict per-key mutual exclusion** (P1). `groupConcurrency` is soft, but a Pi Session needs exactly one owner. Expose the claim token for fencing.
 5. **Cancellation** (P1). Per-call opt-out (`cancelWithParent: false`) and a terminal status distinct from failure.
 6. **Wait for any** (P1). Race events, child results, and timers (`ctx.race`).
-7. **Start without waiting** (P1). Durable, deduped `ctx.start` for handoffs and `asTool()`.
+7. **Start without waiting** (P1). Durable, deduped `ctx.start` for handoffs and workflow tools.
 8. **Idempotent `emit` with options** (P0). Dedup ID and metadata, for webhook redelivery.
 9. **Node-compatible package** (P0). Today's build is Bun-only, with no exports or types. Fabrial vendors Conductor as a pinned submodule until this ships.
 10. **Terminal-state hooks** (P1). Notify on completion, failure, and cancellation in every state. The adapter polls for settled executions meanwhile.
