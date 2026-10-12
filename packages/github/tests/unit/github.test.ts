@@ -15,6 +15,14 @@ describe("GitHub provider", () => {
 			"dm",
 			"pullRequestOpened",
 			"issueOpened",
+			"pullRequestClosed",
+			"pullRequestReopened",
+			"pullRequestLabeled",
+			"pullRequestSynchronized",
+			"pullRequestReviewed",
+			"pullRequestCommented",
+			"checkSuiteCompleted",
+			"checkRunCompleted",
 		]);
 		expect(plugin.clients!({}).github).toBe((plugin.chat!.adapter() as GitHubAdapter).octokit);
 		expect(github.mentioned).toBe(mentioned);
