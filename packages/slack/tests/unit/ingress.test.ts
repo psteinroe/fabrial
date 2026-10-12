@@ -1,10 +1,10 @@
 // oxlint-disable typescript/unbound-method -- Host methods are Vitest mocks.
 import { createHmac } from "node:crypto";
 import { SlackAdapter } from "@chat-adapter/slack";
-import { chat } from "@fabrial/chat";
+import { chat } from "../../../fabrial/src/chat/index.ts";
 import type { WebClient } from "@slack/web-api";
 import { afterEach, expect, it, vi } from "vitest";
-import { setup } from "../../../chat/tests/helper.ts";
+import { setup } from "../../../fabrial/tests/chat/helper.ts";
 import { slack } from "../../src/index.ts";
 
 afterEach(() => vi.restoreAllMocks());

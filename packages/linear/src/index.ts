@@ -4,7 +4,7 @@ import {
 	type LinearAdapterAPIKeyConfig,
 	type LinearAdapterOAuthConfig,
 } from "@chat-adapter/linear";
-import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "@fabrial/chat";
+import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "fabrial";
 import {
 	defineEvent,
 	defineGroup,

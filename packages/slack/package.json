@@ -30,7 +30,6 @@
 	},
 	"dependencies": {
 		"@chat-adapter/slack": "catalog:",
-		"@fabrial/chat": "workspace:*",
 		"@slack/web-api": "catalog:",
 		"fabrial": "workspace:*"
 	},

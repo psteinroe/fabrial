@@ -122,46 +122,25 @@ importers:
 
   examples/acme:
     dependencies:
-      '@earendil-works/pi-ai':
-        specifier: 'catalog:'
-        version: 1.0.0(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.11.2)(ws@8.22.0)(zod@4.6.5)
-      '@fabrial/chat':
-        specifier: workspace:*
-        version: link:../../packages/chat
-      '@fabrial/conductor':
-        specifier: workspace:*
-        version: link:../../packages/conductor
       '@fabrial/github':
         specifier: workspace:*
         version: link:../../packages/github
       '@fabrial/linear':
         specifier: workspace:*
         version: link:../../packages/linear
-      '@fabrial/pi':
-        specifier: workspace:*
-        version: link:../../packages/pi
       '@fabrial/slack':
         specifier: workspace:*
         version: link:../../packages/slack
-      chat:
-        specifier: 'catalog:'
-        version: 4.41.1(zod@4.6.5)
       fabrial:
         specifier: workspace:*
         version: link:../../packages/fabrial
       postgres:
         specifier: 'catalog:'
         version: 3.4.7
-      typebox:
-        specifier: 'catalog:'
-        version: 1.3.27
       zod:
         specifier: 'catalog:'
         version: 4.6.5
     devDependencies:
-      '@chat-adapter/state-pg':
-        specifier: 'catalog:'
-        version: 4.41.1(zod@4.6.5)
       '@chat-adapter/tests':
         specifier: 'catalog:'
         version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1)))
@@ -174,6 +153,9 @@ importers:
       '@types/node':
         specifier: 'catalog:'
         version: 26.6.4
+      chat:
+        specifier: 'catalog:'
+        version: 4.41.1(zod@4.6.5)
       typescript:
         specifier: 'catalog:'
         version: 7.0.2
@@ -181,17 +163,35 @@ importers:
         specifier: 'catalog:'
         version: 4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1))
 
-  packages/chat:
+  packages/fabrial:
     dependencies:
       '@chat-adapter/state-pg':
         specifier: 'catalog:'
         version: 4.41.1(zod@4.6.5)
+      '@earendil-works/chord':
+        specifier: 'catalog:'
+        version: 1.0.0
+      '@earendil-works/pi-ai':
+        specifier: 'catalog:'
+        version: 1.0.0(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.11.2)(ws@8.22.0)(zod@4.6.5)
+      '@earendil-works/pi-durable':
+        specifier: 'catalog:'
+        version: 1.0.0(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.11.2)(ws@8.22.0)(zod@4.6.5)
+      '@standard-schema/spec':
+        specifier: 'catalog:'
+        version: 1.0.0
       chat:
         specifier: 'catalog:'
         version: 4.41.1(zod@4.6.5)
-      fabrial:
+      pgconductor-js:
         specifier: workspace:*
-        version: link:../fabrial
+        version: link:../../vendor/postgres-conductor/packages/pgconductor-js
+      postgres:
+        specifier: 'catalog:'
+        version: 3.4.7
+      typebox:
+        specifier: 'catalog:'
+        version: 1.3.27
     devDependencies:
       '@chat-adapter/slack':
         specifier: 'catalog:'
@@ -202,35 +202,9 @@ importers:
       '@chat-adapter/tests':
         specifier: 'catalog:'
         version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1)))
-      zod:
-        specifier: 'catalog:'
-        version: 4.6.5
-
-  packages/conductor:
-    dependencies:
-      fabrial:
-        specifier: workspace:*
-        version: link:../fabrial
-      pgconductor-js:
-        specifier: workspace:*
-        version: link:../../vendor/postgres-conductor/packages/pgconductor-js
-      postgres:
-        specifier: 'catalog:'
-        version: 3.4.7
-    devDependencies:
       '@testcontainers/postgresql':
         specifier: 'catalog:'
         version: 12.2.0
-      zod:
-        specifier: 'catalog:'
-        version: 4.6.5
-
-  packages/fabrial:
-    dependencies:
-      '@standard-schema/spec':
-        specifier: 'catalog:'
-        version: 1.0.0
-    devDependencies:
       zod:
         specifier: 'catalog:'
         version: 4.6.5
@@ -240,9 +214,6 @@ importers:
       '@chat-adapter/github':
         specifier: 'catalog:'
         version: 4.41.1(zod@4.6.5)
-      '@fabrial/chat':
-        specifier: workspace:*
-        version: link:../chat
       fabrial:
         specifier: workspace:*
         version: link:../fabrial
@@ -262,9 +233,6 @@ importers:
       '@chat-adapter/linear':
         specifier: 'catalog:'
         version: 4.41.1(graphql@17.0.2)(zod@4.6.5)
-      '@fabrial/chat':
-        specifier: workspace:*
-        version: link:../chat
       fabrial:
         specifier: workspace:*
         version: link:../fabrial
@@ -279,45 +247,11 @@ importers:
         specifier: 'catalog:'
         version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1)))
 
-  packages/pi:
-    dependencies:
-      '@earendil-works/chord':
-        specifier: 'catalog:'
-        version: 1.0.0
-      '@earendil-works/pi-ai':
-        specifier: 'catalog:'
-        version: 1.0.0(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.11.2)(ws@8.22.0)(zod@4.6.5)
-      '@earendil-works/pi-durable':
-        specifier: 'catalog:'
-        version: 1.0.0(@aws-sdk/credential-provider-node@3.972.84)(@smithy/signature-v4@5.7.4)(undici@8.11.2)(ws@8.22.0)(zod@4.6.5)
-      fabrial:
-        specifier: workspace:*
-        version: link:../fabrial
-      postgres:
-        specifier: 'catalog:'
-        version: 3.4.7
-      typebox:
-        specifier: 'catalog:'
-        version: 1.3.27
-    devDependencies:
-      '@fabrial/conductor':
-        specifier: workspace:*
-        version: link:../conductor
-      '@testcontainers/postgresql':
-        specifier: 'catalog:'
-        version: 12.2.0
-      zod:
-        specifier: 'catalog:'
-        version: 4.6.5
-
   packages/slack:
     dependencies:
       '@chat-adapter/slack':
         specifier: 'catalog:'
         version: 4.41.1(debug@4.4.3)(zod@4.6.5)
-      '@fabrial/chat':
-        specifier: workspace:*
-        version: link:../chat
       '@slack/web-api':
         specifier: 'catalog:'
         version: 8.2.0

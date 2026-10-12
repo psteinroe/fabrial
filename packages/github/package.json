@@ -30,7 +30,6 @@
 	},
 	"dependencies": {
 		"@chat-adapter/github": "catalog:",
-		"@fabrial/chat": "workspace:*",
 		"fabrial": "workspace:*",
 		"zod": "catalog:"
 	},

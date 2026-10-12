@@ -1,5 +1,5 @@
 import { SlackAdapter } from "@chat-adapter/slack";
-import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "@fabrial/chat";
+import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "fabrial";
 import { WebClient } from "@slack/web-api";
 import {
 	defineGroup,

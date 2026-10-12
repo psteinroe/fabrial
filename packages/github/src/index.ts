@@ -4,7 +4,7 @@ import {
 	type GitHubAdapterPATConfig,
 	type GitHubAdapterAppConfig,
 } from "@chat-adapter/github";
-import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "@fabrial/chat";
+import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "fabrial";
 import {
 	defineEvent,
 	definePlugin,

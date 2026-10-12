@@ -18,6 +18,15 @@ export * from "./schema.ts";
 export * from "./state.ts";
 export type * from "./thread.ts";
 export * from "./trigger.ts";
+export {
+	chatCapability,
+	chatEvents,
+	chatIdentity,
+	chatTrigger,
+	type ChatPluginCapability,
+	type ChatEventPayload,
+	type ChatEventName,
+} from "./chat/events.ts";
 export type {
 	WorkflowContext,
 	RaceResult,
