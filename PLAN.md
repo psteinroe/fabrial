@@ -47,7 +47,7 @@ Reference for chat UX: Vercel [Eve](https://github.com/vercel/eve). Its persiste
 | Workflow ↔ agent bridges, approvals, response context, identity | Fabrial core                             |
 | Users and groups                                                | Fabrial identity definitions/providers   |
 
-Fabrial owns no tables. Its per-thread routing state (active interaction, current handler, response message refs) lives in Chat SDK thread state. Everything else is Conductor step results, events, and metadata, or Pi documents.
+Fabrial owns no tables. Its per-resource routing state (subscriptions, active interaction, current handler, response message refs) lives in Chat SDK state, keyed by thread or resource. Everything else is Conductor step results, events, and metadata, or Pi documents.
 
 ## Public API
 
@@ -258,13 +258,13 @@ await ctx.state(Findings).update((s) => {
 
 ### Runtime bridges
 
-| Direction                                           | Behavior                                                                                                                               |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Workflow → agent (`ctx.agent`)                      | Create/find conversation, submit with a stable request ID, persist the reference, suspend, resume with the result.                     |
-| Agent → workflow (`workflow.asTool()`)              | Start/reconnect to the Conductor execution with a stable invocation key and return its result as the tool result. Access checks apply. |
-| Workflow → workflow                                 | Native Conductor child invocation.                                                                                                     |
-| Pi task → Pi task / document                        | Native Pi.                                                                                                                             |
-| Managed external ops inside Pi (e.g. `thread.post`) | Routed through the Conductor bridge, keyed by Pi task ID + operation ID, so external effects have one durability implementation.       |
+| Direction                                           | Behavior                                                                                                                                                              |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Workflow → agent (`ctx.agent`)                      | Create/find conversation, submit with a stable request ID, persist the reference, suspend, resume with the result.                                                    |
+| Agent → workflow (`workflow.asTool()`)              | Start/reconnect to the Conductor execution with a stable invocation key and return its result as the tool result. No access check; the tool's own approval guards it. |
+| Workflow → workflow                                 | Native Conductor child invocation.                                                                                                                                    |
+| Pi task → Pi task / document                        | Native Pi.                                                                                                                                                            |
+| Managed external ops inside Pi (e.g. `thread.post`) | Routed through the Conductor bridge, keyed by Pi task ID + operation ID, so external effects have one durability implementation.                                      |
 
 A workflow called by an agent must not synchronously query that same busy conversation, because that would deadlock. It starts a separate conversation instead.
 
@@ -367,8 +367,7 @@ export const linearTriage = f.defineGroup({
 ```
 
 - Every invocation has its own identity context: `requestedBy`, `executedBy`, and approval `decidedBy`. There is no mutable conversation-wide "current user", because a thread can have many participants.
-- Permissions are separate: discovering a workflow (as a tool), invoking it (`access.invoke`), and approving its actions (`approvers`). Channel context can help routing but never grants authority.
-- Tools exposed to agents are filtered by the requester's permissions.
+- Permissions live on tools. An agent is offered every tool its definition lists, regardless of who is talking to it; a tool that needs permission asks its fixed approvers (see [Permissions](#permissions)). `access.invoke` only guards workflow-to-workflow calls (`ctx.invoke`, `ctx.handoff`). Channel context can help routing but never grants authority.
 
 ### Plugins
 
@@ -593,7 +592,126 @@ export const generalAssistant = f.defineWorkflow({
 - Across workflows, the most specific matching trigger owns the thread (e.g. `deployBot` on `slack.mentioned({ channel: "C_DEPLOYS" })` beats `generalAssistant` on `slack.mentioned()`). Ties are a startup error, and `observe: true` triggers run alongside without owning the thread.
 - **Call** vs **handoff**: calling a workflow (`asTool`, child invoke) returns a result and posts no final answer. A handoff transfers responsibility for the interaction and its final response, and the router ends.
 - Thread replies during an active interaction go to that interaction (clarification, steering), not through trigger matching again. The routing state `{ interactionId, handlerExecutionId, response }` lives in Chat SDK thread state. After completion, a new mention starts a new interaction and gets the thread history as context.
-- Agent conversation continuation key: `[installationId, threadId, agentName]`, so two agents in one thread never share a conversation.
+- Agent conversation continuation key: `[installationId, threadId, agentName]`, so two agents in one thread never share a conversation. This is the default; [Sessions, conversations, and subscriptions](#sessions-conversations-and-subscriptions) lets an app choose other keys.
+
+### Sessions, conversations, and subscriptions
+
+> Conversations are addressable. Subscriptions route outside events into them. Tools hold the permissions.
+
+The model above ties an agent to one chat thread and reaches it only through a workflow execution. Three use cases need more:
+
+1. One conversation for every message in a Slack channel, steered by whoever writes there.
+2. That conversation's agent starting subagents, either with a brief or as a fork of its own context.
+3. A conversation started in Slack that follows the PR its agent opened: reviews requesting changes, new labels, CI results.
+
+| Concept          | What it is                                                                                      | Backed by                                             |
+| ---------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| **Session**      | The durability and lock unit. Its key is chosen by the app; the default stays per thread.       | Pi Session in Postgres, with lease epochs and fencing |
+| **Conversation** | One agent's transcript and inbox. The thing that is addressed.                                  | Pi conversation                                       |
+| **Input**        | Something delivered to a conversation: a kind, a priority, and what happens if it is busy.      | Pi `submit` (`steer`, `followUp`, `write`)            |
+| **Subscription** | A resource (Slack channel or thread, GitHub PR, Linear issue) routed to a conversation.         | Per-resource routing state (generalized thread state) |
+| **Request**      | One input's reply destination, actor, and progress. Today's interaction, without a thread lock. | `fabrial.invocation` document, keyed by request ID    |
+
+#### Call and send
+
+There are two ways to talk to an agent:
+
+- **Call** (`ctx.agent`, unchanged): submit and wait for the answer. The caller decides what to do with it.
+- **Send** (`ctx.send`): submit and return. The agent's output goes out through the subscription's reply surface or its own tools.
+
+```ts
+await ctx.send("deliver", supportAgent, {
+	session: `slack:${msg.channelId}`, // app-chosen; default is the thread
+	input: msg, // attributed: <user name="…" thread="…">
+	kind: "message",
+	replyTo: slack.thread(msg),
+});
+```
+
+#### Inputs
+
+Every input has a **kind** and a **priority**, which choose the Pi delivery:
+
+| Kind           | Rendered as                                | Default delivery                                                                                              |
+| -------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `message`      | attributed user input                      | `steer` when busy, starts a run when idle                                                                     |
+| `notification` | `<notification source="github" …>` context | by priority: `urgent` → `steer`, `normal` → `followUp`, `low` → `write` (seen on the next run, does not wake) |
+
+Inputs carry a request ID derived from the source event (Slack event ID, GitHub delivery ID), so redeliveries are dropped by Pi's request-ID dedup. Batching low-priority notifications into summaries and an inbox tool can come later.
+
+#### Subscriptions
+
+A subscription routes a resource's events into a conversation. It replaces Chat SDK thread routing state as the general mechanism: a Slack thread bound to its interaction is one kind of subscription.
+
+- **Static** subscriptions are declared like triggers and cover always-on surfaces such as a channel.
+- **Dynamic** subscriptions are created at runtime, from a workflow (`ctx.subscribe`) or by an agent through a tool its plugin provides (`github.subscribePullRequest`). Both write the same record.
+- Records are durable and looked up by resource key (`github:acme/app#123`), so they live in the per-resource routing state, not in a Session's Pi documents. A conversation can have many.
+- Plugins ship **presets** for event sets (e.g. GitHub `review`: new commits, review state, comments; `working`: also CI and conflicts) and an **end condition** (merged, closed).
+- An **event filter** decides which events count. It is not a permission: it keeps untrusted input out, e.g. PR comments only from users with write access, so an outside commenter cannot steer the agent.
+- Subscriptions deliver input; they never take thread ownership from a trigger.
+
+```ts
+// static: one conversation for the whole channel
+export const supportChannel = f.subscribe(slack.channel("C_SUPPORT"), {
+	session: (msg) => `slack:${msg.channelId}`,
+	agent: supportAgent,
+});
+
+// dynamic: after opening a PR, follow it from the calling agent's conversation
+await ctx.subscribe("watch-pr", github.pullRequest({ repo, number: pr.number }), {
+	preset: "review",
+	priority: (event) => (event.review?.state === "changes_requested" ? "urgent" : "normal"),
+	until: "merged-or-closed",
+});
+```
+
+When the agent is idle, a notification wakes it and its reply goes to the subscription's reply surface, here the Slack thread the conversation started in.
+
+#### Subagents
+
+Subagents are Pi-native owned conversations in the same Session: no Conductor round trip, aborts and idle waits propagate, and restarts resume them.
+
+| Mode    | Child starts with                      | Pi mechanism                                  |
+| ------- | -------------------------------------- | --------------------------------------------- |
+| `brief` | its own instructions and the task only | task-owned `createConversation` + `configure` |
+| `fork`  | the parent's transcript so far         | `conversation.fork(entryId)`                  |
+
+```ts
+export const lead = defineAgent({
+	name: "lead",
+	subagents: {
+		researcher: { agent: researcher, mode: "brief" },
+		explorer: { agent: lead, mode: "fork" },
+	},
+});
+```
+
+This generates a `subagent` tool. Foreground calls return the child's answer as the tool result (Pi example 22). Background subagents are persistent and named: the tool spawns, messages, stops, and lists them, and each answer comes back to the lead as a `followUp` input (Pi example 23). Subagents get no chat binding, so only the lead speaks in the thread; their progress feeds the lead's response context. Work that waits for days, such as an approval, is still a workflow behind `asTool()`.
+
+`brief` and `fork` avoid a third meaning of "handoff", which already names `ctx.handoff` (a workflow transfers an interaction) and Pi's reset with a note.
+
+#### Requests
+
+A request is one input's reply destination, actor, and progress. It replaces the interaction's role as a per-thread lock: routing goes through subscriptions, and several requests can be folded into one run when inputs steer it. Agents in shared conversations answer through an explicit reply tool that targets a request, rather than having the final answer posted automatically.
+
+#### Permissions
+
+Permissions live only on tools. An agent is offered every tool its definition lists, whoever is talking to it, because a conversation can have many participants. A tool that needs permission is a workflow that calls `ctx.waitForApproval` with fixed approvers (`run-sql` always asks `engineeringTriage`), so participants shape what the agent proposes and only the assigned approvers let it act. The approval card shows the exact arguments and the inputs that led to the call, including their source, so the approver can spot a request steered in from a PR comment.
+
+#### Compared with Mastra
+
+Mastra's [signals](https://mastra.ai/docs/harness/signals), [signal providers](https://mastra.ai/docs/harness/signal-providers), and [AgentController](https://mastra.ai/docs/harness/agent-controller) split the problem the same way:
+
+| Fabrial                     | Mastra                                                     | Difference                                                                                 |
+| --------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Conversation                | Thread                                                     | Same.                                                                                      |
+| Session                     | AgentController Session                                    | Mastra's is live state (mode, model, grants, pending approvals) and is lost on restart.    |
+| Input kinds and delivery    | `sendMessage`, `queueMessage`, `sendSignal`, notifications | Mastra's notification inbox (priority, coalescing, summaries) is richer; borrowed in part. |
+| Static subscription         | Channels (one chat thread → one session)                   | Mastra cannot address a whole channel either.                                              |
+| Dynamic subscription        | Signal providers + `github_subscribe_pr`                   | Mastra's registry is in memory, GitHub allows one PR per thread and polls.                 |
+| Subagents (`brief`, `fork`) | Subagent definitions, `forked: true`                       | Same modes. Pi adds persistent background subagents.                                       |
+| Tool approvals as workflows | Permission policies with `ask`                             | Mastra's approvals live in memory and go stale on restart.                                 |
+| Session lease in Postgres   | Leases over pub/sub (Redis Streams across instances)       | No extra infrastructure.                                                                   |
 
 ### Coding agents (after v1)
 
@@ -630,7 +748,7 @@ Recorded as open questions are resolved.
 
 - **Conductor gaps are tracked, not worked around up front.** Fabrial assumes the Conductor behavior it needs. Gaps go in [Conductor issues](#conductor-issues) and get fixed in Conductor later, if they still exist by then.
 - **Context via execution metadata + middleware (the Temporal/Hatchet/Inngest/Trigger.dev pattern).** Fabrial stores its serializable invocation context (`replyTo`, `origin`, `requestedBy`, `interactionId`) as Conductor execution metadata, which propagates event → run → child automatically. Fabrial middleware rebuilds `ctx.thread`, `ctx.clients`, and `ctx.actor` from that metadata on every start and resume. Payloads stay clean, with no Fabrial envelope.
-- **Pi Session per thread, in Postgres, opened on demand.** `@fabrial/pi` ships a Postgres storage backend (validated with Pi's `registerStorageConformance`) that holds one logical Session per key: `slack:<installationId>:<threadId>` for chat, or the interaction ID for non-chat triggers. Agents in the same thread are separate conversations in that Session, chosen by `[installationId, threadId, agentName]`.
+- **Pi Session per thread by default, in Postgres, opened on demand.** Apps can choose other Session keys through subscriptions and `ctx.send` (see [Sessions, conversations, and subscriptions](#sessions-conversations-and-subscriptions)). `@fabrial/pi` ships a Postgres storage backend (validated with Pi's `registerStorageConformance`) that holds one logical Session per key: `slack:<installationId>:<threadId>` for chat, or the interaction ID for non-chat triggers. Agents in the same thread are separate conversations in that Session, chosen by `[installationId, threadId, agentName]`.
   - `ctx.agent` drives the harness inside a Conductor execution grouped by Session ID under a strict limit of 1 (Conductor issue 4), so only one worker owns a Session at a time. That execution opens the harness, submits with a stable request ID, runs Pi's scheduler until idle or a result arrives, then closes the harness and releases the worker.
   - **Fencing**: each open takes a lease epoch, and every commit checks it, so a stale worker can't commit after a takeover.
   - Long tool calls (e.g. `workflow.asTool()` waiting days for approval) close the harness. When the child completes, a Conductor execution reopens the Session, and the `pi.tool` task reconnects through its invocation key.
@@ -695,6 +813,8 @@ Recorded as open questions are resolved.
 - **State is `defineState`, and app authors don't write Pi tasks.** `defineState({ name, scope, schema, initial, render })` with scopes `interaction` (one request across handoffs), `thread`, and `agent`, backed by Pi documents. `ctx.state(S).get/update` works in workflows (durable ops with IDs) and in tools (committed with the tool result). Agents see the states listed in `defineAgent.state` through `render`. Durable or long-running tool work is a workflow exposed with `asTool()`. Pi tasks and raw documents stay internal / advanced, with no `defineTask` adapter. This replaces exposing raw Pi (`ctx.pi`) and `ctx.agent` document options, both of which made the DX convoluted.
 - **The Pi registry is derived, and nothing is selected by default.** There is no app-level extensions list. Installed = Fabrial's internal extension + every plugin's `extension` + every extension referenced by a `defineAgent` reachable from the registered workflows. Harness `settings.extensions` selects only Fabrial's internal extension, so each agent gets exactly what its `defineAgent.extensions` lists. Documents need no registration (`defineDoc` is used directly), so the plugin `docs` key is dropped. On startup, `@fabrial/pi` checks all Sessions for pending or waiting Pi tasks whose kind no installed extension provides, and **fails the deploy** with a fix-it message: keep the extension on an agent until those tasks finish, or run `fabrial pi abort-orphans --kind …`.
 - **Approval is explicit code only.** A tool that needs approval is a workflow that calls `ctx.waitForApproval`, exposed to agents with `asTool()`. The approval sits next to the logic, so previews, conditions, and multiple approvals are plain code. Not for now: a declarative `approval` option on `defineWorkflow`, or a `requireApproval` hook for native Pi tools. Add them later if needed.
+- **Conversations are addressable; subscriptions route events into them.** Sessions get app-chosen keys (default per thread), `ctx.send` complements `ctx.agent`, inputs carry a kind and priority that choose Pi's `steer`/`followUp`/`write`, and subscriptions (static or created at runtime, durable, many per conversation) generalize thread routing state. Subagents are Pi-native with `brief` and `fork` modes. See [Sessions, conversations, and subscriptions](#sessions-conversations-and-subscriptions).
+- **Permissions only on tools.** Agents are offered every tool their definition lists, regardless of who is talking. `access.invoke` is not checked for agent tools; a tool that needs permission asks its fixed approvers. This keeps shared conversations unambiguous: participants shape proposals, approvers authorize actions.
 
 ## Conductor issues
 
@@ -714,4 +834,8 @@ Conductor behaviors Fabrial relies on, checked against Conductor `main` @ `33228
 
 ## Open questions
 
-None right now. Add new ones here as they come up.
+- **Does `access.invoke` stay at all?** It now only guards `ctx.invoke` and `ctx.handoff`. Triggers do not check it. Either enforce it on triggers too ("who may start this from Slack") or drop it in favor of approvals.
+- **Reply target in shared conversations.** When steering folds several requests into one run, which request does the final answer go to? The proposal is an explicit reply tool; confirm with the channel example.
+- **Pi `write` visibility.** Low-priority notifications rely on a written entry reaching the model on the next run. Verify that a `write` entry with model content is shown to the model.
+- **Subscription API names.** `f.subscribe`, `ctx.subscribe`, and `ctx.send` are placeholders.
+- **Session lock granularity.** One Session per channel serializes the channel. Fine for steering; check whether busy channels need per-thread Sessions with a shared `thread`-scoped state instead.
