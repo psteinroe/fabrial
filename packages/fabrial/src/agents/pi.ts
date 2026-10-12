@@ -50,7 +50,15 @@ import {
 import type { AnyWorkflow } from "../workflow.ts";
 import { instructionsSection, piToolOf, toJsonSchema } from "./tools.ts";
 import type { Sql } from "postgres";
-import { BridgeKey, cloneJson, fields, registerChild, type BridgeFrame } from "./context.ts";
+import {
+	BridgeKey,
+	cloneJson,
+	fields,
+	registerChild,
+	replyTool,
+	type BridgeFrame,
+} from "./context.ts";
+import { threadSession, type Delivery } from "../send.ts";
 import {
 	applyState,
 	Binding,
@@ -69,7 +77,7 @@ import type { AgentIntegration, Logger } from "../app.ts";
 const RUN_WORKFLOW = "fabrial.pi.run";
 export function sessionKey(metadata: InvocationMetadata): string {
 	const surface = metadata.replyTo;
-	if (surface?.kind === "thread") return `${surface.provider}:${surface.threadId}`;
+	if (surface?.kind === "thread") return threadSession(surface.provider, surface.threadId);
 	if (surface?.kind === "channel")
 		throw new Error(
 			"Post to the channel with ctx.thread.post before using Pi; a channel is not a Session key",
@@ -180,8 +188,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	const observers = host.plugins.flatMap((plugin) =>
 		plugin.hooks?.agent ? [plugin.hooks.agent] : [],
 	);
+	const reply = replyTool();
 	const internal = defineExtension({
 		name: "fabrial.internal",
+		tools: [reply],
 		hooks: observers.length ? observerHooks(observers, agentNameOf, host) : [],
 	});
 	registry.install(internal);
@@ -301,13 +311,16 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 
 	async function drive(input: Json, execution: DurableExecution): Promise<Json> {
 		if (!started) throw new Error("Start the Pi integration before running agents");
+		// A call drives its own request; a send drains the conversation's inbox. Both drain sent input.
 		const request = input as {
 			agent: string;
-			requestId: string;
-			input: Json;
-			structured: boolean;
 			session: string;
+			mode?: "call" | "send";
+			requestId?: string;
+			input?: Json;
+			structured?: boolean;
 		};
+		const sending = request.mode === "send";
 		const agent = agents.get(request.agent);
 		if (!agent)
 			throw new Error(
@@ -323,6 +336,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				execution,
 				evaluator,
 				harness: undefined as unknown as Harness,
+				session: request.session,
 				thread: io,
 				children: new Map(),
 			};
@@ -372,18 +386,26 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				await conversation.configure(configs.get(request.agent)!, context);
 				const offered = (await conversation.agent(context)).tools;
 				// Tools are not filtered by who is talking: a conversation can have many participants,
-				// and a tool that needs permission asks its own approvers. Only unregistered workflows drop out.
-				const allowed = offered.map((tool) => {
-					const supplied = workflowTools.get(tool);
-					return !supplied || host.workflows.some((candidate) => candidate.name === supplied.name);
-				});
-				if (allowed.some((value) => !value))
-					await conversation.configure(
+				// and a tool that needs permission asks its own approvers. Only unregistered workflows drop
+				// out, and `reply` is offered only to runs that answer sent input.
+				let replying = false;
+				const offer = async (withReply: boolean) => {
+					replying = withReply;
+					const allowed = offered.map((tool) => {
+						if (tool === reply) return withReply;
+						const supplied = workflowTools.get(tool);
+						return (
+							!supplied || host.workflows.some((candidate) => candidate.name === supplied.name)
+						);
+					});
+					await conversation!.configure(
 						{ tools: offered.filter((_tool, index) => allowed[index]) },
 						context,
 					);
+				};
+				await offer(sending);
 				const originContext = await execution.step("fabrial:pi:origin", async () => {
-					if (!execution.metadata.origin) return "";
+					if (sending || !execution.metadata.origin) return "";
 					const sections = await Promise.all(
 						host.plugins.map(async (plugin) =>
 							plugin.context?.(execution.metadata.origin!, host.clients()),
@@ -392,8 +414,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					return sections.filter(Boolean).join("\n\n");
 				});
 				await frame.harness.commit(async (tx) => {
-					await tx.doc(Invocation, request.requestId, cloneJson(execution.metadata));
-					(await tx.doc(Binding, conversationId!)).requestId = request.requestId;
+					if (request.requestId) {
+						await tx.doc(Invocation, request.requestId, cloneJson(execution.metadata));
+						(await tx.doc(Binding, conversationId!)).requestId = request.requestId;
+					}
 					const runs = await tx.doc(Runs);
 					runs.runs[execution.executionId] ??= { conversationId: conversationId!, children: {} };
 				}, context);
@@ -418,7 +442,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				}
 				const content = [
 					originContext,
-					typeof request.input === "string" ? request.input : JSON.stringify(request.input),
+					typeof request.input === "string" ? request.input : JSON.stringify(request.input ?? null),
 					request.structured
 						? "Return your final answer as a single JSON value, without Markdown fences or surrounding prose."
 						: "",
@@ -426,27 +450,53 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					.filter(Boolean)
 					.join("\n\n");
 				// Persist admission intents before submit; re-opening drains the same durable request set.
-				const admit = async (requestId: string, content: string, metadata: InvocationMetadata) => {
+				const admit = async (
+					requestId: string,
+					content: string,
+					metadata: InvocationMetadata,
+					delivery: Delivery = "steer",
+				) => {
 					await frame.harness.commit(async (tx) => {
 						await tx.doc(Invocation, requestId, cloneJson(metadata));
+						(await tx.doc(Binding, conversationId!)).requestId ??= requestId;
 						const run = (await tx.doc(Runs)).runs[execution.executionId]!;
 						run.requests ??= {};
-						run.requests[requestId] ??= { content, submissionId: null };
+						run.requests[requestId] ??= { content, submissionId: null, delivery };
 					}, context);
 				};
-				await admit(request.requestId, content, execution.metadata);
+				if (request.requestId) await admit(request.requestId, content, execution.metadata);
 				const submissions = new Map<string, Submission>();
 				const submitPending = async () => {
 					const run = (await frame.harness.snapshot(Runs, context))!.runs[execution.executionId]!;
 					for (const [requestId, pending] of Object.entries(run.requests ?? {})) {
 						if (submissions.has(requestId)) continue;
+						// Pi dedupes by request id, so a request re-admitted after a crash is submitted once.
 						const submission =
-							pending.submissionId === null
-								? await conversation!.submit(
-										{ type: "input", content: pending.content, requestId, whenBusy: "steer" },
-										context,
-									)
-								: await frame.harness.submission(pending.submissionId as SubmissionId, context);
+							pending.submissionId !== null
+								? await frame.harness.submission(pending.submissionId as SubmissionId, context)
+								: pending.delivery === "write"
+									? await conversation!.submit(
+											{
+												type: "write",
+												requestId,
+												entry: {
+													kind: "fabrial.notification",
+													model: [
+														{ role: "user", content: pending.content, timestamp: Date.now() },
+													],
+												},
+											},
+											context,
+										)
+									: await conversation!.submit(
+											{
+												type: "input",
+												content: pending.content,
+												requestId,
+												whenBusy: pending.delivery ?? "steer",
+											},
+											context,
+										);
 						if (!submission) throw new Error(`Missing Pi submission ${requestId}`);
 						submissions.set(requestId, submission);
 						await frame.harness.commit(async (tx) => {
@@ -455,11 +505,33 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						}, context);
 					}
 				};
+				// Sent input for this conversation, admitted durably before it is marked as taken.
+				const drain = async () => {
+					const rows = await options.sql<
+						{
+							request_id: string;
+							content: string;
+							delivery: Delivery;
+							metadata: InvocationMetadata;
+						}[]
+					>`SELECT request_id, content, delivery, metadata FROM fabrial_pi.inbox
+						WHERE session_key = ${request.session} AND agent = ${request.agent} AND NOT admitted
+						ORDER BY seq`;
+					if (!rows.length) return;
+					if (!replying) await offer(true);
+					for (const row of rows)
+						await admit(row.request_id, row.content, row.metadata, row.delivery);
+					await submitPending();
+					await options.sql`UPDATE fabrial_pi.inbox SET admitted = true
+						WHERE request_id IN ${options.sql(rows.map((row) => row.request_id))}`;
+				};
 				await submitPending();
+				await drain();
 				frame.harness.resume();
 				while (outcome === undefined) {
 					execution.signal.throwIfAborted();
 					if (storage.lost.signal.aborted) throw new LeaseLost("Pi Session ownership lost");
+					await drain();
 					if (io && execution.metadata.ownsThread) {
 						const routing = await io.getState();
 						if (
@@ -534,7 +606,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						}
 					}
 					if (complete) {
-						outcome = answer ?? "";
+						// A sent run answers through `reply`; nothing is returned to post.
+						outcome = sending ? null : (answer ?? "");
 						break;
 					}
 					const inspection = await frame.harness.inspect(context);
@@ -654,7 +727,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			if (result.status !== "cancelled") return;
 			const storage = await acquire(
 				options.sql,
-				sessionKey(metadata),
+				typeof metadata.piSession === "string" ? metadata.piSession : sessionKey(metadata),
 				new AbortController().signal,
 			);
 			const harness = await Harness.open(
@@ -700,6 +773,33 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	};
 	const port: AgentPort = {
 		workflows: () => [workflow, effect],
+		async send(execution, id, agent, request) {
+			await execution.step(`fabrial:pi:enqueue:${id}`, async () => {
+				await options.sql`INSERT INTO fabrial_pi.inbox
+					(request_id, session_key, agent, content, delivery, metadata)
+					VALUES (${request.requestId}, ${request.session}, ${agent.name}, ${request.content},
+						${request.delivery}, ${options.sql.json(request.metadata as never)})
+					ON CONFLICT (request_id) DO NOTHING`;
+			});
+			// Every send ensures a driver; one queued behind a busy Session finds its input already taken.
+			await execution.start(
+				`fabrial:pi:deliver:${id}`,
+				RUN_WORKFLOW,
+				{ agent: agent.name, session: request.session, mode: "send" },
+				{
+					metadata: {
+						...execution.metadata,
+						ownsThread: false,
+						ownerWorkflow: null,
+						triggerEvent: null,
+						piSession: request.session,
+					},
+					dedupeKey: JSON.stringify(["fabrial.pi.send", request.requestId]),
+					mutex: request.session,
+				},
+			);
+			return { requestId: request.requestId, session: request.session };
+		},
 		async run(execution, id, agent: AgentRef, request) {
 			// A channel locator is not a durable Session identity. Core rebinds metadata from
 			// the first workflow post receipt; never promote a provisional ThreadIO.ref.
@@ -710,12 +810,13 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				RUN_WORKFLOW,
 				{
 					agent: agent.name,
+					mode: "call",
 					requestId: `${execution.executionId}:${id}`,
 					input: request.input,
 					structured: !!request.output,
 					session: key,
 				},
-				{ mutex: key, metadata, detached: request.detached },
+				{ mutex: key, metadata: { ...metadata, piSession: key }, detached: request.detached },
 			);
 			if (!request.output) return answer;
 			return execution.step(`fabrial:pi:output:${id}`, async () =>

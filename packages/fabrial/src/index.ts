@@ -34,6 +34,19 @@ export type * from "./json.ts";
 export * from "./plugin.ts";
 export * from "./runtime.ts";
 export * from "./schema.ts";
+export {
+	renderInput,
+	deliveryFor,
+	type Delivery,
+	type InputKind,
+	type InputPriority,
+	type SendOptions,
+	type SendReceipt,
+	type SendRequest,
+	type SentRequest,
+	type SessionOption,
+} from "./send.ts";
+export type { Subscription, SubscriptionDefinition } from "./subscription.ts";
 export type * from "./state.ts";
 export type * from "./thread.ts";
 export * from "./trigger.ts";

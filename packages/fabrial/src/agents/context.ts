@@ -1,7 +1,13 @@
-import { LiveDoc } from "@earendil-works/pi-durable";
+import { defineTool as piTool, LiveDoc } from "@earendil-works/pi-durable";
+import type { TSchema } from "@earendil-works/pi-ai";
 import type { Context } from "@earendil-works/chord";
 import { createContextKey, awaitWithContext } from "@earendil-works/chord/context";
-import type { ConversationId, Harness, ToolExecutionApi } from "@earendil-works/pi-durable";
+import type {
+	ConversationId,
+	Harness,
+	ToolExecutionApi,
+	ToolRegistration,
+} from "@earendil-works/pi-durable";
 import {
 	parseSchema,
 	type AnyWorkflow,
@@ -35,6 +41,8 @@ export interface BridgeFrame {
 	execution: DurableExecution;
 	evaluator: Evaluator;
 	harness: Harness;
+	/** The Pi Session key this driver holds. */
+	session: string;
 	thread?: ThreadIO;
 	children: Map<number, { executionId: string; detached: boolean }>;
 }
@@ -212,11 +220,7 @@ export async function startChild(
 	detached: boolean,
 	context: Context,
 ): Promise<string> {
-	const session =
-		metadata.replyTo?.kind === "thread"
-			? `${metadata.replyTo.provider}:${metadata.replyTo.threadId}`
-			: metadata.interactionId;
-	const dedupeKey = JSON.stringify(["fabrial.pi.child", session, key]);
+	const dedupeKey = JSON.stringify(["fabrial.pi.child", bridge.session, key]);
 	const intent = await bridge.harness.commit(async (tx) => {
 		const saved = await tx.doc(ChildIntents, key, {
 			workflow,
@@ -280,4 +284,70 @@ export async function commitStaged(
 				);
 		await change(tx);
 	}, context);
+}
+
+/**
+ * The built-in `reply` tool of runs that answer sent input: posts to a request's `replyTo` through the
+ * managed effect workflow, so a replayed call reconnects to the same post.
+ */
+export function replyTool(): ToolRegistration {
+	return piTool({
+		name: "reply",
+		description:
+			"Post a message to the person or thread a request came from. Without `request`, replies to the latest request in this run. Your final answer is not posted; use this tool to answer.",
+		parameters: {
+			type: "object",
+			properties: {
+				text: { type: "string", description: "Message to post (Markdown)" },
+				request: { type: "string", description: "The `request` attribute of the input to answer" },
+			},
+			required: ["text"],
+			additionalProperties: false,
+		} as unknown as TSchema,
+		replay: "safe",
+		execute: async (input, api, context) => {
+			const bridge = frame(context);
+			const { text, request } = input as { text: string; request?: string };
+			const sent = async (id: string | undefined) => {
+				const invocation = id
+					? ((await bridge.harness.snapshot(Invocation, id, context)) as
+							| InvocationMetadata
+							| undefined)
+					: undefined;
+				return invocation?.send ? invocation : undefined;
+			};
+			let target = request ? await sent(request) : undefined;
+			if (!request) {
+				const live = await bridge.harness.snapshot(LiveDoc, api.conversationId, context);
+				for (const id of [...(live?.run?.inputs ?? [])].reverse()) {
+					const submission = await bridge.harness.submission(id, context);
+					target = await sent((await submission?.status(context))?.requestId);
+					if (target) break;
+				}
+			}
+			const error = (message: string) => ({
+				content: [{ type: "text" as const, text: message }],
+				isError: true,
+			});
+			if (!target) return error(request ? `Unknown request ${request}` : "No request to reply to");
+			if (!target.replyTo) return error("This request has no reply destination");
+			const key = `fabrial:pi:${api.conversationId}:${api.taskId}:reply`;
+			const child = await startChild(
+				bridge,
+				key,
+				EFFECT_WORKFLOW,
+				{ method: "post", args: [text] },
+				target,
+				false,
+				context,
+			);
+			const result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
+			if (result)
+				return result.status === "completed"
+					? { content: [{ type: "text" as const, text: "Posted." }] }
+					: error(JSON.stringify(result.error ?? result.reason ?? result.status));
+			await registerChild(bridge, api.taskId, { executionId: child, detached: false }, context);
+			return awaitWithContext(new Promise<never>(() => {}), context);
+		},
+	});
 }

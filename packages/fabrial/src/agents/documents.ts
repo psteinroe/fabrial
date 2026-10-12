@@ -75,7 +75,14 @@ export const Runs = defineDoc({
 				conversationId: number;
 				children: Record<string, { executionId: string; detached: boolean }>;
 				intents?: string[];
-				requests?: Record<string, { content: string; submissionId: number | null }>;
+				requests?: Record<
+					string,
+					{
+						content: string;
+						submissionId: number | null;
+						delivery?: import("../send.ts").Delivery;
+					}
+				>;
 			}
 		>;
 	} => ({ runs: {} }),

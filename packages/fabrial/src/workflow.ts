@@ -4,6 +4,7 @@ import type { GroupDefinition, Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { AgentRef, AgentRunOptions, InvocationMetadata } from "./runtime.ts";
 import type { Schema } from "./schema.ts";
+import type { SendOptions, SendReceipt } from "./send.ts";
 import type { JsonObject as StateValue } from "./json.ts";
 import type { StateDefinition, WorkflowStateHandle } from "./state.ts";
 import type { Awaitable, Thread } from "./thread.ts";
@@ -23,7 +24,13 @@ export interface WorkflowContext<TClients = Record<string, unknown>> {
 	step<T extends Json | void>(id: string, fn: () => Promise<T> | T): Promise<T>;
 	sleep(id: string, duration: string | number): Promise<void>;
 
+	/** Call: submit to the agent and wait for its answer. */
 	agent<T extends Json = Json>(id: string, agent: AgentRef, options: AgentRunOptions): Promise<T>;
+	/**
+	 * Send: deliver input to the conversation `[session, agent]` and return. An idle conversation starts a
+	 * run; a busy one gets it by kind and priority. The agent answers with its `reply` tool.
+	 */
+	send(id: string, agent: AgentRef, options: SendOptions): Promise<SendReceipt>;
 	evaluate<Q extends Record<string, EvaluateQuestion>>(
 		id: string,
 		request: EvaluateRequest<Q>,
@@ -112,6 +119,8 @@ export interface Workflow<
 	readonly kind: "fabrial.workflow";
 	readonly name: TName;
 	readonly definition: WorkflowDefinition<TName, TInput, TOutput, readonly TriggerSpec<any>[]>;
+	/** @internal Compiled from `f.subscribe`: delivers input and never holds the thread's routing slot. */
+	readonly subscription?: true;
 }
 
 export type AnyWorkflow = Workflow<string, any, any>;

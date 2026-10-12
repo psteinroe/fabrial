@@ -40,6 +40,14 @@ export class PostgresStorage extends MemoryStorage {
 			session_key text NOT NULL REFERENCES fabrial_pi.sessions(key),
 			seq bigint NOT NULL, writes text NOT NULL, PRIMARY KEY (session_key, seq)
 		)`;
+			// Sent input waiting for its conversation's driver; the request id dedupes redeliveries.
+			await sql`CREATE TABLE IF NOT EXISTS fabrial_pi.inbox (
+			request_id text PRIMARY KEY, session_key text NOT NULL, agent text NOT NULL,
+			seq bigserial, content text NOT NULL, delivery text NOT NULL, metadata jsonb NOT NULL,
+			admitted boolean NOT NULL DEFAULT false, created_at timestamptz NOT NULL DEFAULT now()
+		)`;
+			await sql`CREATE INDEX IF NOT EXISTS inbox_pending
+			ON fabrial_pi.inbox (session_key, agent, seq) WHERE NOT admitted`;
 		});
 	}
 

@@ -19,6 +19,7 @@ import { production, type ProductionOverrides } from "./production.ts";
 import { defineState, type StateDefinition, type StateScope } from "./state.ts";
 import type { Schema } from "./schema.ts";
 import type { TriggerSpec } from "./trigger.ts";
+import { subscribe, type Subscription, type SubscriptionDefinition } from "./subscription.ts";
 import {
 	defineWorkflow,
 	type AnyWorkflow,
@@ -56,6 +57,8 @@ export interface FabrialConfig<P extends readonly AnyPlugin[] = readonly AnyPlug
 
 export interface AppConfig {
 	workflows: readonly AnyWorkflow[];
+	/** Static subscriptions from `f.subscribe`. */
+	subscriptions?: readonly Subscription[];
 	logger?: Logger;
 }
 
@@ -85,6 +88,11 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 			migrate?: (old: unknown, fromVersion: number) => T;
 		},
 	): StateDefinition<T>;
+	/** Route a trigger's events into an agent conversation with `ctx.send`. */
+	subscribe<const TTrigger extends TriggerSpec<any>>(
+		this: void,
+		definition: SubscriptionDefinition<TTrigger>,
+	): Subscription;
 	defineGroup(
 		this: void,
 		definition: Parameters<typeof defineGroup<ClientsOf<P>>>[0],
@@ -114,7 +122,10 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 			...integrations,
 			plugins,
 			identity: config.identity,
-			workflows: appConfig.workflows,
+			workflows: [
+				...appConfig.workflows,
+				...(appConfig.subscriptions ?? []).map((subscription) => subscription.workflow),
+			],
 			logger: appConfig.logger,
 			reservationTimeout,
 			definitionScope: instance,
@@ -129,6 +140,7 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 		defineToolkit,
 		defineState,
 		defineGroup,
+		subscribe,
 		app: (appConfig) => build(appConfig) as App<ClientsOf<P>>,
 		[INTERNAL]: { app: build },
 	};

@@ -83,7 +83,7 @@ export function buildApp(config: CoreConfig): App {
 							options.requestedBy,
 						)) as InvocationMetadata["requestedBy"])
 					: null,
-				ownsThread: !!selected,
+				ownsThread: !!selected && !selected.workflow.subscription,
 				ownerWorkflow: selected?.workflow.name ?? null,
 				triggerEvent: event,
 			};
@@ -144,8 +144,10 @@ export function buildApp(config: CoreConfig): App {
 				decision.route = "new";
 				decision.selected = select(events, message).selected;
 				const idle = clearInteraction(state);
+				// A subscription delivers the message and returns at once; it never holds the routing slot,
+				// so the next message in this thread matches its trigger again instead of being buffered.
 				return rememberIngress(
-					decision.selected
+					decision.selected && !decision.selected.workflow.subscription
 						? {
 								...idle,
 								interactionId,
@@ -194,7 +196,7 @@ export function buildApp(config: CoreConfig): App {
 				origin: { provider: message.provider, messageId: message.messageId },
 				replyTo: ref as InvocationMetadata["replyTo"],
 				requestedBy: actor as InvocationMetadata["requestedBy"],
-				ownsThread: !!selected,
+				ownsThread: !!selected && !selected.workflow.subscription,
 				ownerWorkflow: selected?.workflow.name ?? null,
 				triggerEvent: selected?.spec.event ?? events[0]!,
 				initialMessageId: message.messageId,

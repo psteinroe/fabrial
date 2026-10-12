@@ -23,6 +23,7 @@ export interface InvocationMetadata extends JsonObject {
 	requestedBy: (Principal & JsonObject) | null;
 	/** True when this execution owns the interaction's thread (renders progress, receives replies). */
 	ownsThread: boolean;
+	// Requests delivered by `ctx.send` also carry `send: SentRequest` (kind and priority).
 }
 
 export type DurationInput = string | number;
@@ -246,6 +247,13 @@ export interface AgentPort {
 		agent: AgentRef,
 		options: AgentRunOptions,
 	): Promise<Json>;
+	/** Deliver a rendered input to the conversation `[request.session, agent]` without waiting. */
+	send(
+		execution: DurableExecution,
+		id: string,
+		agent: AgentRef,
+		request: import("./send.ts").SendRequest,
+	): Promise<import("./send.ts").SendReceipt>;
 }
 
 /** Minimal shape core needs from `f.defineAgent`. */

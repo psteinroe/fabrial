@@ -72,7 +72,10 @@ export class MemoryRuntime implements DurableRuntime {
 	private nextId = 1;
 	private flushing?: Promise<void>;
 	private active = false;
-	constructor(options: { now?: number | Date } = {}) {
+	private readonly idPrefix: string;
+	/** `idPrefix` keeps execution ids unique across runtimes that share a database. */
+	constructor(options: { now?: number | Date; idPrefix?: string } = {}) {
+		this.idPrefix = options.idPrefix ?? "execution";
 		this.clock =
 			options.now instanceof Date
 				? options.now.getTime()
@@ -165,7 +168,7 @@ export class MemoryRuntime implements DurableRuntime {
 			return this.invocationKeys.get(invocationKey)!;
 		const definition = this.workflows.get(workflow);
 		if (!definition) throw new Error(`Unknown workflow: ${workflow}`);
-		const id = `execution-${this.nextId++}`;
+		const id = `${this.idPrefix}-${this.nextId++}`;
 		const run: Run = {
 			id,
 			workflow: definition,
@@ -675,12 +678,18 @@ export class FakeChat implements ChatPort, ChatIntegration {
 export function fakeAgents(
 	options: {
 		run?: AgentPort["run"];
+		send?: AgentPort["send"];
 		evaluate?: Evaluator["evaluate"];
 		state?: StatePort;
 		workflows?: RuntimeWorkflow[];
 	} = {},
-): AgentIntegration & { values: Map<string, JsonObject> } {
+): AgentIntegration & {
+	values: Map<string, JsonObject>;
+	/** Inputs delivered with `ctx.send`, in order (default `send` only). */
+	sent: (import("./send.ts").SendRequest & { agent: string })[];
+} {
 	const values = new Map<string, JsonObject>();
+	const sent: (import("./send.ts").SendRequest & { agent: string })[] = [];
 	const key = (execution: DurableExecution, state: { name: string; scope: string }) =>
 		`${state.scope}:${state.scope === "thread" ? (execution.metadata.replyTo?.kind === "thread" ? execution.metadata.replyTo.threadId : execution.metadata.interactionId) : state.scope === "agent" ? execution.executionId : execution.metadata.interactionId}:${state.name}`;
 	const state: StatePort = {
@@ -704,10 +713,18 @@ export function fakeAgents(
 	return {
 		kind: "fabrial.agents",
 		values,
+		sent,
 		connect: () => ({
 			agents: {
 				workflows: () => options.workflows ?? [],
 				run: options.run ?? ((execution, id, _agent, opts) => execution.step(id, () => opts.input)),
+				send:
+					options.send ??
+					((execution, id, agent, request) =>
+						execution.step(`fabrial:fake:send:${id}`, () => {
+							sent.push({ ...request, agent: agent.name });
+							return { requestId: request.requestId, session: request.session };
+						})),
 			},
 			state: options.state ?? state,
 			evaluator: {
@@ -738,8 +755,8 @@ export function testApp<const P extends readonly import("./plugin.ts").AnyPlugin
 		reservationTimeout?: import("./runtime.ts").DurationInput;
 	},
 ): import("./app.ts").App<import("./instance.ts").ClientsOf<P>> {
-	const { workflows, logger, ...overrides } = config;
-	return internal(instance).app({ workflows, logger }, overrides) as never;
+	const { workflows, subscriptions, logger, ...overrides } = config;
+	return internal(instance).app({ workflows, subscriptions, logger }, overrides) as never;
 }
 
 function internal(instance: object): import("./instance.ts").InternalInstance {
@@ -889,10 +906,10 @@ export function createIntegrationApp<const P extends readonly import("./plugin.t
 		concurrency?: number;
 	},
 ): import("./app.ts").App<import("./instance.ts").ClientsOf<P>> {
-	const { workflows, logger, models, modelRetries = false } = config;
+	const { workflows, subscriptions, logger, models, modelRetries = false } = config;
 	const poll = config.pollIntervalMs ?? 20;
 	return internal(instance).app(
-		{ workflows, logger },
+		{ workflows, subscriptions, logger },
 		{
 			models: scripted.get(models),
 			agentSettings: { retry: { enabled: modelRetries } },
