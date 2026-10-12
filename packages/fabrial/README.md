@@ -317,3 +317,32 @@ export const supportChannel = f.subscribe({
 });
 export const app = f.app({ workflows, subscriptions: [supportChannel] });
 ```
+
+### Dynamic subscriptions
+
+`ctx.subscribe` routes a resource's events into a conversation at runtime, from a workflow or a tool. Plugins describe their resources; GitHub provides `github.pullRequest({ repo, number })`:
+
+```ts
+const prPolicy = f.defineSubscriptionPolicy({
+	name: "pr-review",
+	priority: (event) =>
+		event.kind === "review" && event.attributes.state === "changes_requested"
+			? "urgent"
+			: undefined,
+});
+
+await ctx.subscribe("watch-pr", github.pullRequest({ repo: "acme/app", number: pr.number }), {
+	preset: "review", // the resource kind's presets; default: its first
+	until: "merged-or-closed", // the event that meets it is delivered, then the record is removed
+	policy: prPolicy, // app filter and priority functions
+	priority: { label: "low" }, // declarative: one priority, or one per notification kind
+});
+await ctx.unsubscribe("unwatch-pr", github.pullRequest({ repo: "acme/app", number: pr.number }));
+```
+
+- **Target.** From a tool, or a workflow an agent tool started, the default is the calling agent's conversation, and `reply` goes where the current request replies (e.g. the Slack thread). From other workflows, pass `to: { agent, session }`. `replyTo` overrides the reply surface. Re-subscribing the same resource from the same conversation updates the record.
+- **Storage.** Records live in `fabrial.subscriptions` (resource key such as `github:acme/app#123`, Session, agent, reply surface, preset, end condition, priority, policy name), created at `app.start()`.
+- **Policies.** Functions can't be stored, so `filter` and `priority` functions live in `f.defineSubscriptionPolicy` objects defined at module level. Subscriptions store the policy name. If a deploy removes a policy, delivery logs a warning and uses the plugin's defaults.
+- **Delivery.** An internal observer workflow runs on every resource event. It finds the records for the event's resources, then filters: the preset selects notification kinds, the plugin's filter keeps untrusted input out, and the policy filter applies after that. It sends each match as a `notification` through the `ctx.send` path. Priority comes from the policy first, then the declared priority, then the plugin's default, then `normal`. Request ids are `${event id}:${subscription id}`, and ingress dedupes provider redeliveries, so a redelivered webhook is not delivered twice. Subscriptions never own threads, so triggers on the same events still run.
+- **Plugin SPI.** A plugin adds `resources: { [kind]: { events, key(ref), match(event), notify(event), presets, until?, filter? } }` and a helper built on `resource(pluginId, kind, ref)`.
+- **Testing.** `testApp` uses an in-memory store by default (`subscriptionStore` overrides it). `MemorySubscriptions` is exported from `fabrial/testing`.

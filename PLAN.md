@@ -672,10 +672,17 @@ export const app = f.app({ workflows, subscriptions: [supportChannel] });
 **Dynamic** subscriptions are created at runtime from a workflow or tool with `ctx.subscribe`, or by an agent through a tool its plugin's toolkit provides (`github_subscribe_pull_request`). By default they target the calling agent's conversation and reply to the request that created them:
 
 ```ts
+// Functions can't be stored: subscriptions reference a policy defined at module level by name.
+const prPolicy = f.defineSubscriptionPolicy({
+	name: "pr-review",
+	priority: (event) =>
+		event.kind === "review" && event.attributes.state === "changes_requested"
+			? "urgent"
+			: undefined,
+});
 await ctx.subscribe("watch-pr", github.pullRequest({ repo: "acme/app", number: pr.number }), {
 	preset: "review",
-	priority: (event) =>
-		event.kind === "review" && event.state === "changes_requested" ? "urgent" : "normal",
+	policy: prPolicy, // or declarative: priority: "urgent" | { review: "urgent" }
 	until: "merged-or-closed",
 });
 await ctx.unsubscribe("unwatch-pr", github.pullRequest({ repo: "acme/app", number: pr.number }));
@@ -683,7 +690,7 @@ await ctx.unsubscribe("unwatch-pr", github.pullRequest({ repo: "acme/app", numbe
 
 - Records live in `fabrial.subscriptions`: resource key (`github:acme/app#123`), target Session and agent, reply surface, preset, filter, end condition. A conversation can have many; one resource can feed many conversations. Re-subscribing the same resource from the same conversation updates the record.
 - Plugins describe their resources: a key, the events that belong to it, how each event renders as a notification, **presets** (GitHub `review`: new commits, reviews, authorized comments, merge/close; `working`: also labels and CI), and **end conditions** (`merged-or-closed`). When an event ends a subscription, it is delivered and the record is removed.
-- An **event filter** decides which events count. It is not a permission: it keeps untrusted input out. GitHub presets only accept comments and reviews from users with write access (author association `OWNER`, `MEMBER`, `COLLABORATOR`), so an outside commenter cannot steer the agent. Apps can add `filter: (event) => boolean`.
+- An **event filter** decides which events count. It is not a permission: it keeps untrusted input out. GitHub presets only accept comments and reviews from users with write access (author association `OWNER`, `MEMBER`, `COLLABORATOR`), so an outside commenter cannot steer the agent. Apps add `filter: (event) => boolean` through a subscription policy.
 - When the agent is idle, a notification wakes it, and its `reply` goes to the subscription's reply surface, e.g. the Slack thread the conversation started in.
 
 #### Subagents
@@ -831,6 +838,7 @@ Recorded as open questions are resolved.
 - **Approval is explicit code only.** A tool that needs approval is a workflow that calls `ctx.waitForApproval`, listed in an agent's `tools`. The approval sits next to the logic, so previews, conditions, and multiple approvals are plain code. Not for now: a declarative `approval` option on `defineWorkflow`, or a `requireApproval` option on `f.defineTool`. Add them later if needed.
 - **Conversations are addressable; subscriptions route events into them.** Sessions get app-chosen keys (default per thread), `ctx.send` complements `ctx.agent`, inputs carry a kind and priority that choose Pi's `steer`/`followUp`/`write`, and subscriptions (static or created at runtime, durable, many per conversation) generalize thread routing state. Subagents are Pi-native with `brief` and `fork` modes. See [Sessions, conversations, and subscriptions](#sessions-conversations-and-subscriptions).
 - **Subscriptions and send (resolved open questions).** Names are `f.subscribe` (static, a trigger as source), `ctx.subscribe`/`ctx.unsubscribe` (dynamic), and `ctx.send` next to `ctx.agent`. Sessions are chosen per send or subscription: `"thread"` (default), `"channel"`, or a custom key. Sent runs answer through a built-in `reply` tool that targets a request; nothing is posted automatically. Subscriptions are stored in a Fabrial-owned `fabrial.subscriptions` table, because no runtime owns this state and it is looked up by resource. Sent input waits in `fabrial.inbox`, the other Fabrial-owned table: a busy Session's driver may run in another process, so `ctx.send` queues the input and notifies (`LISTEN`/`NOTIFY`, with a slow fallback poll). The driver deletes a row once Pi has admitted it; a later redelivery is dropped by Pi's request-ID dedup. Low-priority notifications use Pi `write` as planned: verified that the written entry does not wake the agent and is seen by the model on the next run.
+- **Dynamic subscriptions store references, never functions.** `ctx.subscribe` stores a record in `fabrial.subscriptions`; `filter` and `priority` functions live in `f.defineSubscriptionPolicy` objects referenced by name (a removed policy falls back to plugin defaults with a warning). Delivery is an internal observer workflow on every resource event, so ingress stays a fast insert and redeliveries dedupe at ingress; each delivery is a `ctx.send` with request ID `${event id}:${subscription id}`. Tools and the workflows they start carry their conversation in metadata, which is the default target.
 - **Orphaned agent work is aborted at startup.** When a deploy removes a toolkit that pending agent work still needs, `app.start()` aborts that work and logs it instead of failing the deploy.
 - **Webhooks wait for durable ingress.** Chat and plugin routes respond only after the event is stored. There is no `waitUntil`: ingress is a fast insert, and acknowledging earlier risks losing events.
 - **Permissions only on tools.** Agents are offered every tool their definition lists, regardless of who is talking. There are no access lists on workflows, triggers, or tools (`access.invoke` is removed); a tool that needs permission asks its fixed approvers. This keeps shared conversations unambiguous: participants shape proposals, approvers authorize actions.

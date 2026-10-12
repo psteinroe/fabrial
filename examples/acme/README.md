@@ -120,3 +120,7 @@ native subscription: durable event cursors retain pre-registration decisions.
 ## Support channel subscription
 
 `src/subscriptions.ts` declares `supportChannel`: every message in `#help` (`C_HELP`) goes to `acme-support` in one conversation for the whole channel (`session: "channel"`). The agent answers each asker with its `reply` tool, in the asker's thread. The integration test covers two threads sharing that conversation, targeted replies, no automatic final post, and a restart after ingress.
+
+## Following a pull request from Slack
+
+`src/agents/developer.ts` defines `acme-developer`. `devThreads` in `src/subscriptions.ts` sends every `#dev` (`C_DEV`) thread to it, one conversation per thread. Its `open_pull_request` tool opens a PR with `ctx.clients.github` and calls `ctx.subscribe` with the `review` preset, `until: "merged-or-closed"`, and the `acme-pr-review` policy, which makes changes-requested reviews `urgent`. The e2e test runs the whole flow: Slack message, PR opened, signed review webhook (delivered twice), the agent's `reply` in the original Slack thread, and the merge webhook removing the subscription.
