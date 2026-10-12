@@ -536,3 +536,80 @@ it.each(["notification", "message"] as const)(
 		expect(await sql`SELECT 1 FROM fabrial.inbox WHERE session_key = ${session}`).toHaveLength(0);
 	},
 );
+
+it("an urgent notification during a tool call steers the running run and is answered in it", async () => {
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => (release = resolve));
+	let busy!: () => void;
+	const started = new Promise<void>((resolve) => (busy = resolve));
+	const t = await setup(() => [
+		f.defineTool({
+			name: "deploy",
+			description: "Deploy",
+			input: z.object({}),
+			async run() {
+				busy();
+				await gate;
+				return "deployed";
+			},
+		}),
+	]);
+	const other = await t.launch();
+	let steered = "";
+	t.respond([
+		fauxAssistantMessage(fauxToolCall("deploy", {}), { stopReason: "toolUse" }),
+		(context) => {
+			steered = text(context.messages);
+			return fauxAssistantMessage(fauxToolCall("reply", { text: "Rolled back" }), {
+				stopReason: "toolUse",
+			});
+		},
+		fauxAssistantMessage("done"),
+	]);
+	const notify = (text: string, priority: "urgent" | "normal", runtime = t.runtime) =>
+		runtime.invoke(
+			t.notify.name,
+			{ text, priority },
+			{
+				metadata: {
+					interactionId: randomUUID(),
+					origin: { provider: "github" },
+					replyTo: { kind: "thread", provider: "chat", threadId: `chat:${t.channel}:t1` },
+					requestedBy: null,
+					ownsThread: false,
+				},
+			},
+		);
+	await notify("deploy please", "normal");
+	const flushing = t.runtime.flush();
+	const session = `app:ops-${t.channel}`;
+	try {
+		await started;
+		await notify("error rate is up", "urgent", other.runtime);
+		void other.runtime.flush();
+		await expect.poll(async () => (await submitted(session)).length, { timeout: 10_000 }).toBe(2);
+	} finally {
+		release();
+	}
+	await flushing;
+	await t.settle();
+	await other.settle();
+	expect(steered).toContain("deployed");
+	expect(steered).toContain("error rate is up");
+	expect(steered).toContain('priority=\\"urgent\\"');
+	expect(t.faux.state.callCount).toBe(3);
+	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Rolled back"]);
+	// Both inputs settled with the same answer: one run.
+	const answers = await t.read(session, async (s, storage) => {
+		const runs = await s.snapshot(Runs, BACKGROUND_CONTEXT);
+		const requests = Object.values(runs!.runs).flatMap((run) => Object.values(run.requests ?? {}));
+		return Promise.all(
+			requests.map(async (request) => {
+				const record = await storage.submission(request.submissionId as never, BACKGROUND_CONTEXT);
+				return record?.status === "done" ? record.answer : record?.status;
+			}),
+		);
+	});
+	expect(answers).toHaveLength(2);
+	expect(new Set(answers).size).toBe(1);
+});
