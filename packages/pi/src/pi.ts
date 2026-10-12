@@ -279,24 +279,12 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				await conversation.configure(configs.get(request.agent)!, context);
 				await agent.definition.configure?.(conversation);
 				const offered = (await conversation.agent(context)).tools;
-				const allowed = await Promise.all(
-					offered.map(async (tool) => {
-						const supplied = workflowTools.get(tool)?.workflow;
-						const workflow =
-							supplied && host.workflows.find((candidate) => candidate.name === supplied.name);
-						if (supplied && !workflow) return false;
-						const groups = workflow?.definition.access?.invoke;
-						if (!groups) return true;
-						if (!execution.metadata.requestedBy) return false;
-						return (
-							await Promise.all(
-								(Array.isArray(groups) ? groups : [groups]).map((group) =>
-									host.directory.isMember(execution.metadata.requestedBy!, group),
-								),
-							)
-						).some(Boolean);
-					}),
-				);
+				// Tools are not filtered by who is talking: a conversation can have many participants,
+				// and a tool that needs permission asks its own approvers. Only unregistered workflows drop out.
+				const allowed = offered.map((tool) => {
+					const supplied = workflowTools.get(tool)?.workflow;
+					return !supplied || host.workflows.some((candidate) => candidate.name === supplied.name);
+				});
 				if (allowed.some((value) => !value))
 					await conversation.configure(
 						{ tools: offered.filter((_tool, index) => allowed[index]) },

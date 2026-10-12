@@ -28,7 +28,7 @@ export const generalAssistant = f.defineWorkflow({
 				message: { text: message.text, channelId: message.channelId },
 			});
 		}
-		// Explicit safe fallback on classifier error: the support agent still has deterministic access checks.
+		// Explicit safe fallback on classifier error: the support agent's writes still need human approval.
 		const answer = await ctx.agent<string>("assistant", supportAgent, { input: message.text });
 		await ctx.thread!.post("answer", answer);
 		return { status: "answered" };

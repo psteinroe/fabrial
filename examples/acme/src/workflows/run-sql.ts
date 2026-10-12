@@ -1,6 +1,6 @@
 import { f } from "../fabrial.ts";
 import { z } from "zod";
-import { engineeringTriage, support } from "../groups.ts";
+import { engineeringTriage } from "../groups.ts";
 
 export const runSql = f.defineWorkflow({
 	name: "run-sql",
@@ -10,7 +10,6 @@ export const runSql = f.defineWorkflow({
 		sql: z.string().min(1),
 		reason: z.string().min(1),
 	}),
-	access: { invoke: support },
 	async run(input, ctx) {
 		const preview = await ctx.step("preview", () =>
 			ctx.clients.database.preview(input.organisationId, input.sql),

@@ -61,8 +61,8 @@ Endpoints:
 - `/linear/events`: comments; `/linear/webhook`: issue lifecycle events.
 
 The SQL tool's schema includes organisation, exact SQL and reason. Its preview is
-an `EXPLAIN` in a read-only transaction. Approval binds to that proposal; only
-support can invoke it. Bob and Alice rotate weekly from 2026-01-05. Alternatively,
+an `EXPLAIN` in a read-only transaction. Approval binds to that proposal, and the
+approval is the only permission check: anyone in the thread can ask for it. Bob and Alice rotate weekly from 2026-01-05. Alternatively,
 replace `engineeringTriage` with `slackEngineeringTriage` for live `@triage`
 membership. Rejection/cancellation return a declined tool result without executing
 SQL. The support agent records read-only query findings in rendered thread state.

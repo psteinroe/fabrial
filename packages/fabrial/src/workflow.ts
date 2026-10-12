@@ -83,7 +83,10 @@ export type WorkflowMiddleware = (
 ) => Promise<Json | void>;
 
 export interface WorkflowAccess {
-	/** Who may invoke this workflow (directly or as a tool). */
+	/**
+	 * Who may invoke this workflow from another workflow (`ctx.invoke`, `ctx.handoff`). Not checked when
+	 * an agent calls it as a tool: tools carry their own approvals.
+	 */
 	invoke?: GroupDefinition | readonly GroupDefinition[];
 }
 
