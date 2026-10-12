@@ -44,6 +44,43 @@ describe("GitHub provider", () => {
 		});
 		expect(issueOpened()).toMatchObject({ event: "github.issueOpened", specificity: 0 });
 	});
+	it.each([
+		[
+			github.pullRequestClosed({ repo: "acme/app", merged: true }),
+			"pullRequestClosed",
+			{ repo: ["acme/app"], merged: [true] },
+		],
+		[github.pullRequestReopened({ number: [1, 2] }), "pullRequestReopened", { number: [1, 2] }],
+		[github.pullRequestLabeled({ label: "bug" }), "pullRequestLabeled", { label: ["bug"] }],
+		[
+			github.pullRequestSynchronized({ repo: "acme/app", number: 3 }),
+			"pullRequestSynchronized",
+			{ repo: ["acme/app"], number: [3] },
+		],
+		[
+			github.pullRequestReviewed({ state: "changes_requested" }),
+			"pullRequestReviewed",
+			{ state: ["changes_requested"] },
+		],
+		[
+			github.pullRequestCommented({ repo: "acme/app" }),
+			"pullRequestCommented",
+			{ repo: ["acme/app"] },
+		],
+		[
+			github.checkSuiteCompleted({ conclusion: ["failure", "timed_out"] }),
+			"checkSuiteCompleted",
+			{ conclusion: ["failure", "timed_out"] },
+		],
+		[github.checkRunCompleted(), "checkRunCompleted", {}],
+	])("builds a %#: %s trigger with its filter as specificity", (built, event, filter) => {
+		expect(built).toMatchObject({
+			event: `github.${event}`,
+			filter,
+			specificity: Object.keys(filter).length,
+		});
+		expect(Object.keys(built.filter ?? {})).toEqual(Object.keys(filter));
+	});
 	it("creates installation-scoped numeric and login identities", () => {
 		expect(identity({ userId: 1 })).toEqual({
 			provider: "github",

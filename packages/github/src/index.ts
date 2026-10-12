@@ -11,8 +11,10 @@ import {
 	resource,
 	trigger,
 	type EmitOptions,
+	type EventFilter,
 	type ExternalIdentity,
 	type InputPriority,
+	type JsonObject,
 	type PluginEvent,
 	type ResourceEvent,
 	type ResourceKind,
@@ -679,6 +681,58 @@ export function pullRequestOpened(filter: Pick<GitHubFilter, "repo" | "observe">
 export function issueOpened(filter: Pick<GitHubFilter, "repo" | "observe"> = {}) {
 	return openedTrigger("issueOpened", filter);
 }
+type Many<T> = T | readonly T[];
+interface PullRequestFilter {
+	repo?: Many<string>;
+	number?: Many<number>;
+	observe?: boolean;
+}
+/** A trigger on a lifecycle event; each set filter field narrows it and adds specificity. */
+function eventTrigger<T extends JsonObject>(
+	event: keyof typeof events,
+	{
+		observe,
+		...fields
+	}: Record<string, Many<string | number | boolean> | undefined> & {
+		observe?: boolean;
+	},
+) {
+	const filter = Object.fromEntries(
+		Object.entries(fields).flatMap(([key, value]) =>
+			value === undefined ? [] : [[key, Array.isArray(value) ? [...value] : [value]]],
+		),
+	);
+	return trigger<T>({
+		event: `github.${event}`,
+		// Each event declares these fields filterable; keys are checked by the helpers' signatures.
+		filter: filter as EventFilter<T>,
+		observe,
+		specificity: Object.keys(filter).length,
+	});
+}
+export const pullRequestClosed = (filter: PullRequestFilter & { merged?: boolean } = {}) =>
+	eventTrigger<GitHubPullRequestClosed>("pullRequestClosed", { ...filter });
+export const pullRequestReopened = (filter: PullRequestFilter = {}) =>
+	eventTrigger<GitHubPullRequestEvent>("pullRequestReopened", { ...filter });
+export const pullRequestLabeled = (filter: PullRequestFilter & { label?: Many<string> } = {}) =>
+	eventTrigger<GitHubPullRequestLabeled>("pullRequestLabeled", { ...filter });
+export const pullRequestSynchronized = (filter: PullRequestFilter = {}) =>
+	eventTrigger<GitHubPullRequestSynchronized>("pullRequestSynchronized", { ...filter });
+/** `state`: `approved`, `changes_requested`, or `commented`. */
+export const pullRequestReviewed = (filter: PullRequestFilter & { state?: Many<string> } = {}) =>
+	eventTrigger<GitHubPullRequestReviewed>("pullRequestReviewed", { ...filter });
+export const pullRequestCommented = (filter: PullRequestFilter = {}) =>
+	eventTrigger<GitHubPullRequestCommented>("pullRequestCommented", { ...filter });
+interface CheckFilter {
+	repo?: Many<string>;
+	/** `success`, `failure`, `cancelled`, `timed_out`, … */
+	conclusion?: Many<string>;
+	observe?: boolean;
+}
+export const checkSuiteCompleted = (filter: CheckFilter = {}) =>
+	eventTrigger<GitHubCheckCompleted>("checkSuiteCompleted", { ...filter });
+export const checkRunCompleted = (filter: CheckFilter = {}) =>
+	eventTrigger<GitHubCheckCompleted>("checkRunCompleted", { ...filter });
 export function identity(
 	options: { installationId?: string | number } & (
 		| { login: string; userId?: never }
@@ -695,6 +749,14 @@ export const github = Object.assign(createPlugin, {
 	mentioned,
 	pullRequestOpened,
 	issueOpened,
+	pullRequestClosed,
+	pullRequestReopened,
+	pullRequestLabeled,
+	pullRequestSynchronized,
+	pullRequestReviewed,
+	pullRequestCommented,
+	checkSuiteCompleted,
+	checkRunCompleted,
 	identity,
 	pullRequest,
 });
