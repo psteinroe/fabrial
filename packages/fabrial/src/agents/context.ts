@@ -10,6 +10,12 @@ import type {
 } from "@earendil-works/pi-durable";
 import type { SendReceipt } from "../send.ts";
 import {
+	storedOptions,
+	type ConversationRef,
+	type SubscriptionReceipt,
+	type UnsubscribeReceipt,
+} from "../subscriptions.ts";
+import {
 	parseSchema,
 	type AnyWorkflow,
 	type DurableExecution,
@@ -44,6 +50,8 @@ export interface BridgeFrame {
 	harness: Harness;
 	/** The Pi Session key this driver holds. */
 	session: string;
+	/** The agent whose conversation this driver runs. */
+	agent: string;
 	thread?: ThreadIO;
 	children: Map<number, { executionId: string; detached: boolean }>;
 }
@@ -82,7 +90,11 @@ export async function fields(
 	const requestId = (await submission?.status(context))?.requestId ?? binding.requestId;
 	const invocation = await bridge.harness.snapshot(Invocation, requestId, context);
 	if (!invocation) throw new Error(`Missing Fabrial invocation ${binding.requestId}`);
-	const metadata = invocation as InvocationMetadata;
+	// Tools, and the workflows they start, subscribe this conversation by default.
+	const metadata: InvocationMetadata = {
+		...(invocation as InvocationMetadata),
+		conversation: { session: bridge.session, agent: bridge.agent } satisfies ConversationRef,
+	};
 	const prefix = `fabrial:pi:${conversationId}:${api?.taskId ?? "section"}`;
 	const ids = new Map<string, number>();
 	const operationId = (id: string) => {
@@ -170,6 +182,20 @@ export async function fields(
 				agent.name,
 				cloneJson({ ...options, replyTo }) as unknown as Json,
 			])) as SendReceipt;
+		},
+		subscribe: async (id, resource, options) => {
+			if (!api) throw new Error("Prompt sections cannot subscribe");
+			return (await operation(id, "subscribe", [
+				cloneJson(resource) as unknown as Json,
+				storedOptions(options),
+			])) as SubscriptionReceipt;
+		},
+		unsubscribe: async (id, resource, options) => {
+			if (!api) throw new Error("Prompt sections cannot unsubscribe");
+			return (await operation(id, "unsubscribe", [
+				cloneJson(resource) as unknown as Json,
+				storedOptions(options),
+			])) as UnsubscribeReceipt;
 		},
 		evaluate: async (id, request) => {
 			if (!api) throw new Error("Prompt sections cannot evaluate models");

@@ -21,6 +21,11 @@ import type { Schema } from "./schema.ts";
 import type { TriggerSpec } from "./trigger.ts";
 import { subscribe, type Subscription, type SubscriptionDefinition } from "./subscription.ts";
 import {
+	defineSubscriptionPolicy,
+	type SubscriptionPolicy,
+	type SubscriptionPolicyDefinition,
+} from "./subscriptions.ts";
+import {
 	defineWorkflow,
 	type AnyWorkflow,
 	type Workflow,
@@ -93,6 +98,14 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 		this: void,
 		definition: SubscriptionDefinition<TTrigger>,
 	): Subscription;
+	/**
+	 * Filter and priority functions for `ctx.subscribe({ policy })`. Subscriptions store the name, so
+	 * define policies at module level, like agents.
+	 */
+	defineSubscriptionPolicy(
+		this: void,
+		definition: SubscriptionPolicyDefinition,
+	): SubscriptionPolicy;
 	defineGroup(
 		this: void,
 		definition: Parameters<typeof defineGroup<ClientsOf<P>>>[0],
@@ -103,7 +116,9 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 /** Internal app construction for `fabrial/testing`. Not part of the public API. */
 export const INTERNAL = Symbol.for("fabrial.internal");
 export type InternalOverrides = ProductionOverrides &
-	Partial<Pick<CoreConfig, "runtime" | "chat" | "agents" | "reservationTimeout">>;
+	Partial<
+		Pick<CoreConfig, "runtime" | "chat" | "agents" | "reservationTimeout" | "subscriptionStore">
+	>;
 export interface InternalInstance {
 	app(config: AppConfig, overrides: InternalOverrides): App;
 }
@@ -114,9 +129,9 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 ): Fabrial<P> {
 	const plugins = Object.freeze([...config.plugins]) as unknown as P;
 	const build = (appConfig: AppConfig, overrides: InternalOverrides = {}): App => {
-		const { runtime, chat, agents, reservationTimeout, ...settings } = overrides;
+		const { runtime, chat, agents, reservationTimeout, subscriptionStore, ...settings } = overrides;
 		const integrations = runtime
-			? { runtime, chat, agents }
+			? { runtime, chat, agents, subscriptionStore }
 			: production({ database: config.database, models: config.models ?? {} }, settings);
 		return buildApp({
 			...integrations,
@@ -141,6 +156,7 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 		defineState,
 		defineGroup,
 		subscribe,
+		defineSubscriptionPolicy: (definition) => defineSubscriptionPolicy(definition, instance),
 		app: (appConfig) => build(appConfig) as App<ClientsOf<P>>,
 		[INTERNAL]: { app: build },
 	};

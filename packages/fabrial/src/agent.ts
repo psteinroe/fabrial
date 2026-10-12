@@ -4,6 +4,8 @@ import type { Json, JsonObject } from "./json.ts";
 import type { AgentRef, InvocationMetadata } from "./runtime.ts";
 import type { Schema } from "./schema.ts";
 import type { SendOptions, SendReceipt } from "./send.ts";
+import type { ResourceRef } from "./plugin.ts";
+import type { SubscribeOptions, SubscriptionReceipt, UnsubscribeReceipt } from "./subscriptions.ts";
 import type { StateDefinition, ToolStateHandle } from "./state.ts";
 import type { ChatMessage, MessageRef, OutboundMessage } from "./thread.ts";
 import type { AnyWorkflow, WorkflowInput, WorkflowOutput } from "./workflow.ts";
@@ -53,6 +55,17 @@ export interface ToolContext<
 	): Promise<EvaluateResult<Q>>;
 	/** Send input to a conversation and return, as in workflows; `replyTo` defaults to this request's. */
 	send(id: string, agent: AgentRef, options: SendOptions): Promise<SendReceipt>;
+	/** Subscribe a conversation to a resource, as in workflows; default: this agent's conversation. */
+	subscribe(
+		id: string,
+		resource: ResourceRef<any>,
+		options?: SubscribeOptions,
+	): Promise<SubscriptionReceipt>;
+	unsubscribe(
+		id: string,
+		resource: ResourceRef<any>,
+		options?: Pick<SubscribeOptions, "to">,
+	): Promise<UnsubscribeReceipt>;
 	/** Aborted when the agent run is cancelled or the call is interrupted. */
 	readonly signal: AbortSignal;
 }

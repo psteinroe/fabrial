@@ -97,6 +97,8 @@ export function renderInput(options: {
 	thread?: string | null;
 	source?: string | null;
 	event?: string | null;
+	/** Extra notification attributes, e.g. the resource and the event's details. */
+	attributes?: Record<string, string | number | boolean | null>;
 }): string {
 	const { input, kind, requestId } = options;
 	if (kind === "message") {
@@ -112,7 +114,42 @@ export function renderInput(options: {
 		kind: options.event,
 		priority: options.priority ?? "normal",
 		request: requestId,
+		...Object.fromEntries(
+			Object.entries(options.attributes ?? {})
+				.filter(([key]) => !["source", "kind", "priority", "request"].includes(key))
+				.map(([key, value]) => [key, value === null ? null : String(value)]),
+		),
 	})}>${escapeXml(text(input))}</notification>`;
+}
+
+/** The Session key of a session option, relative to the caller's chat surface. */
+export async function resolveSession(
+	option: SessionOption,
+	surface: { current: InvocationMetadata["replyTo"]; channelId: () => Promise<string> },
+): Promise<string> {
+	if (option !== "thread" && option !== "channel") return customSession(option);
+	const current = surface.current;
+	if (!current) throw new Error(`Session "${option}" needs an execution with a chat surface`);
+	if (option === "channel")
+		return channelSession(
+			current.provider,
+			current.kind === "channel" ? current.channelId : await surface.channelId(),
+		);
+	if (current.kind !== "thread")
+		throw new Error(
+			"Post to the channel with ctx.thread.post before sending; a channel is not a thread",
+		);
+	return threadSession(current.provider, current.threadId);
+}
+
+/** A reply surface option (`Thread`, `Surface`, or `null`) as stored metadata. */
+export function replySurface(
+	option: Thread | Surface | null | undefined,
+	current: InvocationMetadata["replyTo"],
+): InvocationMetadata["replyTo"] {
+	if (option === undefined) return current;
+	if (option === null) return null;
+	return ("post" in option ? option.ref : option) as InvocationMetadata["replyTo"];
 }
 
 /**
@@ -129,30 +166,8 @@ export async function prepareSend(
 	const kind = opts.kind ?? "message";
 	const priority = opts.priority ?? "normal";
 	const current = surface.current;
-	const option = opts.session ?? "thread";
-	let session: string;
-	if (option === "thread" || option === "channel") {
-		if (!current) throw new Error(`Session "${option}" needs an execution with a chat surface`);
-		if (option === "thread") {
-			if (current.kind !== "thread")
-				throw new Error(
-					"Post to the channel with ctx.thread.post before sending; a channel is not a thread",
-				);
-			session = threadSession(current.provider, current.threadId);
-		} else
-			session = channelSession(
-				current.provider,
-				current.kind === "channel" ? current.channelId : await surface.channelId(),
-			);
-	} else session = customSession(option);
-	const replyTo =
-		opts.replyTo === undefined
-			? current
-			: opts.replyTo === null
-				? null
-				: "post" in opts.replyTo
-					? opts.replyTo.ref
-					: opts.replyTo;
+	const session = await resolveSession(opts.session ?? "thread", surface);
+	const replyTo = replySurface(opts.replyTo, current);
 	const message = isChatMessage(opts.input) ? opts.input : undefined;
 	const actor = message
 		? await host.resolvePrincipal(message.author.identity)
@@ -186,7 +201,7 @@ export async function prepareSend(
 		metadata: {
 			...metadata,
 			requestedBy: actor as InvocationMetadata["requestedBy"],
-			replyTo: replyTo as InvocationMetadata["replyTo"],
+			replyTo,
 			origin: origin as InvocationMetadata["origin"],
 			ownsThread: false,
 			ownerWorkflow: null,

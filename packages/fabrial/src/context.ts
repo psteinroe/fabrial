@@ -6,6 +6,13 @@ import type { Json, JsonObject } from "./json.ts";
 import type { DurableExecution, InvocationMetadata, ThreadIO, WaitBranch } from "./runtime.ts";
 import { parseSchema } from "./schema.ts";
 import { prepareSend } from "./send.ts";
+import {
+	prepareSubscribe,
+	prepareUnsubscribe,
+	storedOptions,
+	type SubscriptionReceipt,
+	type UnsubscribeReceipt,
+} from "./subscriptions.ts";
 import type {
 	Awaitable,
 	ChatMessage,
@@ -343,6 +350,10 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 			? (io?.ref ?? metadata.replyTo)
 			: metadata.replyTo) as InvocationMetadata["replyTo"],
 	});
+	const surfaces = () => ({
+		current: (realThread && io ? io.ref : metadata.replyTo) as InvocationMetadata["replyTo"],
+		channelId: async () => (await getIO()).channelId,
+	});
 	const ctx: WorkflowContext = {
 		executionId: execution.executionId,
 		interactionId: metadata.interactionId,
@@ -361,20 +372,46 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 			if (!agents) throw new Error("Agent integration required");
 			const key = op(id);
 			const request = await execution.step(`fabrial:${key}:send`, async () =>
-				prepareSend(
-					host,
-					metadata,
-					{
-						current: (realThread && io
-							? io.ref
-							: metadata.replyTo) as InvocationMetadata["replyTo"],
-						channelId: async () => (await getIO()).channelId,
-					},
-					`${execution.executionId}:${key}`,
-					opts,
-				),
+				prepareSend(host, metadata, surfaces(), `${execution.executionId}:${key}`, opts),
 			);
 			return agents.agents.send(execution, key, agent, request);
+		},
+		subscribe: async (id, resource, opts) => {
+			const store = host.subscriptions;
+			if (!store) throw new Error("Subscriptions need a subscription store");
+			const key = op(id);
+			return execution.step(key, async (): Promise<SubscriptionReceipt> => {
+				const saved = await store.upsert(
+					await prepareSubscribe(
+						host,
+						metadata,
+						surfaces(),
+						`${execution.executionId}:${key}`,
+						resource,
+						storedOptions(opts),
+					),
+				);
+				return {
+					subscriptionId: saved.id,
+					resource: saved.resource,
+					session: saved.session,
+					agent: saved.agent,
+				};
+			});
+		},
+		unsubscribe: async (id, resource, opts) => {
+			const store = host.subscriptions;
+			if (!store) throw new Error("Subscriptions need a subscription store");
+			return execution.step(op(id), async (): Promise<UnsubscribeReceipt> => {
+				const target = await prepareUnsubscribe(
+					host,
+					metadata,
+					surfaces(),
+					resource,
+					storedOptions(opts),
+				);
+				return { removed: await store.remove(target), ...target };
+			});
 		},
 		evaluate: async (id, request) => {
 			if (!agents) throw new Error("Agent integration required");

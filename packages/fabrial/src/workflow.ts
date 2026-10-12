@@ -5,6 +5,8 @@ import type { Json, JsonObject } from "./json.ts";
 import type { AgentRef, AgentRunOptions, InvocationMetadata } from "./runtime.ts";
 import type { Schema } from "./schema.ts";
 import type { SendOptions, SendReceipt } from "./send.ts";
+import type { ResourceRef } from "./plugin.ts";
+import type { SubscribeOptions, SubscriptionReceipt, UnsubscribeReceipt } from "./subscriptions.ts";
 import type { JsonObject as StateValue } from "./json.ts";
 import type { StateDefinition, WorkflowStateHandle } from "./state.ts";
 import type { Awaitable, Thread } from "./thread.ts";
@@ -31,6 +33,21 @@ export interface WorkflowContext<TClients = Record<string, unknown>> {
 	 * run; a busy one gets it by kind and priority. The agent answers with its `reply` tool.
 	 */
 	send(id: string, agent: AgentRef, options: SendOptions): Promise<SendReceipt>;
+	/**
+	 * Route a resource's events (e.g. `github.pullRequest({ repo, number })`) into a conversation: by
+	 * default the calling agent's, replying where the current request replies. Re-subscribing updates it.
+	 */
+	subscribe(
+		id: string,
+		resource: ResourceRef<any>,
+		options?: SubscribeOptions,
+	): Promise<SubscriptionReceipt>;
+	/** Remove the subscription of a resource for a conversation (default: the calling agent's). */
+	unsubscribe(
+		id: string,
+		resource: ResourceRef<any>,
+		options?: Pick<SubscribeOptions, "to">,
+	): Promise<UnsubscribeReceipt>;
 	evaluate<Q extends Record<string, EvaluateQuestion>>(
 		id: string,
 		request: EvaluateRequest<Q>,

@@ -3,6 +3,8 @@ import type { ExternalIdentity } from "./identity.ts";
 import type { Adapter } from "chat";
 import type { AgentObservers, Instructions, ToolDefinition } from "./agent.ts";
 import type { WorkflowMiddleware } from "./workflow.ts";
+import type { Json, JsonObject } from "./json.ts";
+import type { InputPriority } from "./send.ts";
 
 /** Context passed to a plugin's HTTP route handlers. */
 export interface RouteContext<TEvents extends Record<string, EventDefinition<any>>, TClients> {
@@ -64,6 +66,8 @@ export interface PluginDefinition<
 		agent?: AgentObservers;
 	};
 	identity?: IdentityCapability<TClients>;
+	/** Resource kinds apps can subscribe conversations to (`ctx.subscribe`), keyed by kind name. */
+	resources?: Record<string, ResourceKind<any>>;
 	/** Validate definition-time options and acquire owned resources at app.start(), never in the factory. */
 	init?: () => Promise<void> | void;
 	/** Release owned resources at app.stop(). */
@@ -132,3 +136,84 @@ export function definePlugin<
 export function definePlugin(pluginOrFactory: unknown): unknown {
 	return pluginOrFactory;
 }
+
+/** An event of a plugin, as resource kinds see it. `name` is the plugin-local key (`pullRequestReviewed`). */
+export interface PluginEvent {
+	name: string;
+	payload: JsonObject;
+}
+
+/** Scalar details of a notification: rendered as attributes and seen by filters and priority functions. */
+export type NotificationAttributes = Record<string, string | number | boolean | null>;
+
+/** How a resource event reads to an agent. */
+export interface ResourceNotification {
+	/** What happened, in the plugin's vocabulary (`review`, `comment`, `merged`); presets select kinds. */
+	kind: string;
+	/** Text the agent sees. */
+	summary: string;
+	/** Default priority; an app's subscription priority wins. */
+	priority?: InputPriority;
+	attributes?: NotificationAttributes;
+}
+
+/** A rendered resource event, as filters, priority functions, and end conditions see it. */
+export interface ResourceEvent extends ResourceNotification {
+	/** Full event name, e.g. `github.pullRequestReviewed`. */
+	event: string;
+	/** Resource key, e.g. `github:acme/app#123`. */
+	resource: string;
+	payload: JsonObject;
+	attributes: NotificationAttributes;
+}
+
+/**
+ * A kind of resource a conversation can follow (a GitHub pull request, a Linear issue). Fabrial stores
+ * subscriptions by resource key and asks the kind which events belong to which resources.
+ */
+export interface ResourceKind<TRef extends JsonObject = JsonObject> {
+	/** Event keys of this plugin that can belong to resources of this kind. */
+	events: readonly string[];
+	/** Key of a resource, unique within the plugin; Fabrial prefixes the plugin id (`github:acme/app#123`). */
+	key(ref: TRef): string;
+	/** Keys of the resources an event belongs to, unprefixed like `key`. */
+	match(event: PluginEvent): readonly string[];
+	/** Render an event as a notification; `undefined` delivers nothing. */
+	notify(event: PluginEvent): ResourceNotification | undefined;
+	/** Named sets of notification kinds a subscription receives. The first is the default. */
+	presets: Record<string, readonly string[]>;
+	/** Named end conditions: a matching event is delivered, then the subscription is removed. */
+	until?: Record<string, (event: ResourceEvent) => boolean>;
+	/**
+	 * Which events count before the app's own filter, e.g. comments only from collaborators. Not a
+	 * permission: it keeps untrusted input out of the conversation.
+	 */
+	filter?: (event: ResourceEvent) => boolean;
+}
+
+/** A serializable reference to one resource, built by a plugin helper such as `github.pullRequest()`. */
+export interface ResourceRef<TRef extends JsonObject = JsonObject> {
+	readonly kind: "fabrial.resource";
+	/** Plugin id. */
+	readonly provider: string;
+	/** Resource kind name in the plugin's `resources`. */
+	readonly type: string;
+	readonly ref: TRef;
+}
+
+/** Build a resource reference. Plugins wrap this in typed helpers, e.g. `github.pullRequest({ repo, number })`. */
+export function resource<TRef extends JsonObject>(
+	provider: string,
+	type: string,
+	ref: TRef,
+): ResourceRef<TRef> {
+	return { kind: "fabrial.resource", provider, type, ref };
+}
+
+/** @internal JSON form of a resource reference, for durable operations. */
+export type ResourceRefJson = {
+	kind: "fabrial.resource";
+	provider: string;
+	type: string;
+	ref: Json;
+};

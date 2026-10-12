@@ -6,6 +6,7 @@ import { createModels, type ModelCredentials } from "./agents/models.ts";
 import type { ChatIntegration, CoreConfig } from "./app.ts";
 import { chat } from "./chat/index.ts";
 import { conductor, type ConductorConfig } from "./runtime/conductor/index.ts";
+import { PostgresSubscriptions } from "./subscriptions.ts";
 
 /** Settings only `fabrial/testing` may change. */
 export interface ProductionOverrides {
@@ -44,7 +45,7 @@ function lazyPool(url: string | undefined) {
 export function production(
 	config: { database: string | undefined; models: ModelCredentials },
 	overrides: ProductionOverrides = {},
-): Pick<CoreConfig, "runtime" | "chat" | "agents" | "resources"> {
+): Pick<CoreConfig, "runtime" | "chat" | "agents" | "resources" | "subscriptionStore"> {
 	const pool = lazyPool(config.database);
 	const credentials = createModels(config.models);
 	let state: ReturnType<typeof createPostgresState> | undefined;
@@ -57,6 +58,7 @@ export function production(
 	};
 	return {
 		runtime: conductor({ sql: pool.sql }, overrides.conductor),
+		subscriptionStore: new PostgresSubscriptions(pool.sql),
 		chat: chatIntegration,
 		agents: pi({
 			models: overrides.models ?? credentials.models,

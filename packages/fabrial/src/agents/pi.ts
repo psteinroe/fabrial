@@ -59,6 +59,12 @@ import {
 	type BridgeFrame,
 } from "./context.ts";
 import { prepareSend, threadSession, type Delivery, type SendOptions } from "../send.ts";
+import {
+	prepareSubscribe,
+	prepareUnsubscribe,
+	type StoredSubscribeOptions,
+} from "../subscriptions.ts";
+import type { ResourceRefJson } from "../plugin.ts";
 import { Inbox } from "./inbox.ts";
 import {
 	applyState,
@@ -339,6 +345,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				evaluator,
 				harness: undefined as unknown as Harness,
 				session: request.session,
+				agent: request.agent,
 				thread: io,
 				children: new Map(),
 			};
@@ -748,6 +755,47 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		triggers: [],
 		handler: async (input, execution) => {
 			const { method, args } = input as { method: string; args: Json[] };
+			if (method === "subscribe" || method === "unsubscribe") {
+				const store = host.subscriptions;
+				if (!store) throw new Error("Subscriptions need a subscription store");
+				const [resource, options] = args as [ResourceRefJson, StoredSubscribeOptions];
+				const surface = {
+					current: execution.metadata.replyTo,
+					channelId: async () => {
+						const io = await thread(execution);
+						if (!io) throw new Error("Managed Pi subscribe has no chat surface");
+						return io.channelId;
+					},
+				};
+				return execution.step(`fabrial:pi:${method}`, async (): Promise<JsonObject> => {
+					if (method === "unsubscribe") {
+						const target = await prepareUnsubscribe(
+							host,
+							execution.metadata,
+							surface,
+							resource,
+							options,
+						);
+						return { removed: await store.remove(target), ...target };
+					}
+					const saved = await store.upsert(
+						await prepareSubscribe(
+							host,
+							execution.metadata,
+							surface,
+							`${execution.executionId}:subscribe`,
+							resource,
+							options,
+						),
+					);
+					return {
+						subscriptionId: saved.id,
+						resource: saved.resource,
+						session: saved.session,
+						agent: saved.agent,
+					};
+				});
+			}
 			if (method === "send") {
 				const [agent, options] = args as [string, SendOptions];
 				const request = await execution.step("fabrial:pi:send", () =>

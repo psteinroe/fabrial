@@ -23,7 +23,8 @@ export interface InvocationMetadata extends JsonObject {
 	requestedBy: (Principal & JsonObject) | null;
 	/** True when this execution owns the interaction's thread (renders progress, receives replies). */
 	ownsThread: boolean;
-	// Requests delivered by `ctx.send` also carry `send: SentRequest` (kind and priority).
+	// Requests delivered by `ctx.send` also carry `send: SentRequest` (kind and priority). Tools and the
+	// workflows they start carry `conversation: ConversationRef`, the agent conversation they belong to.
 }
 
 export type DurationInput = string | number;

@@ -8,6 +8,7 @@ import type { ExecutionResult, InvocationMetadata, RuntimeWorkflow } from "./run
 import { createContext } from "./context.ts";
 import { APPROVAL_CLOSED_EVENT, CLEANUP_WORKFLOW, PRESENTATION_EVENT, cleanup } from "./cleanup.ts";
 import type { TriggerSpec } from "./trigger.ts";
+import { deliveryWorkflow } from "./subscriptions.ts";
 
 const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -65,6 +66,7 @@ export function buildApp(config: CoreConfig): App {
 		directory,
 		logger: config.logger ?? silentLogger,
 		clients,
+		subscriptions: config.subscriptionStore,
 		chat: () => chat?.port,
 		resolvePrincipal: (identity) => directory.resolveIdentity(identity),
 		async ingest(event, payload, options) {
@@ -365,6 +367,8 @@ export function buildApp(config: CoreConfig): App {
 	}));
 	const extraWorkflows = new Map((agents?.agents.workflows() ?? []).map((w) => [w.name, w]));
 	for (const workflow of agents?.workflows ?? []) extraWorkflows.set(workflow.name, workflow);
+	const delivery = deliveryWorkflow(host, () => agents?.agents);
+	if (delivery) extraWorkflows.set(delivery.name, delivery);
 	extraWorkflows.set(CLEANUP_WORKFLOW, {
 		name: CLEANUP_WORKFLOW,
 		triggers: [],
@@ -459,6 +463,7 @@ export function buildApp(config: CoreConfig): App {
 				}
 			for (const plugin of config.plugins) await plugin.init?.();
 			await config.resources?.open();
+			await config.subscriptionStore?.start?.();
 			chat = config.chat?.connect(host);
 			await chat?.start?.();
 			await agents?.start();
