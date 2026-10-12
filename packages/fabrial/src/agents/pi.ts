@@ -465,21 +465,31 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					content: string,
 					metadata: InvocationMetadata,
 					delivery: Delivery = "steer",
+					sent = false,
 				) => {
 					await frame.harness.commit(async (tx) => {
 						await tx.doc(Invocation, requestId, cloneJson(metadata));
 						(await tx.doc(Binding, conversationId!)).requestId ??= requestId;
 						const run = (await tx.doc(Runs)).runs[execution.executionId]!;
 						run.requests ??= {};
-						run.requests[requestId] ??= { content, submissionId: null, delivery };
+						run.requests[requestId] ??= {
+							content,
+							submissionId: null,
+							delivery,
+							...(sent ? { sent } : {}),
+						};
 					}, context);
 				};
 				if (request.requestId) await admit(request.requestId, content, execution.metadata);
 				const submissions = new Map<string, Submission>();
+				// Requests from the inbox, answered through `reply`; the rest are this call's own.
+				const sent = new Set<string>();
+				const unanswered = new Set<string>();
 				const submitPending = async () => {
 					const run = (await frame.harness.snapshot(Runs, context))!.runs[execution.executionId]!;
 					for (const [requestId, pending] of Object.entries(run.requests ?? {})) {
 						if (submissions.has(requestId)) continue;
+						if (pending.sent) sent.add(requestId);
 						// Pi dedupes by request id, so a request re-admitted after a crash is submitted once.
 						const submission =
 							pending.submissionId !== null
@@ -516,15 +526,16 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					}
 				};
 				// Sent input for this conversation, admitted durably before its inbox row is pruned.
-				const drain = async () => {
-					if (!watcher?.due()) return;
+				const drain = async (force = false) => {
+					if (!watcher?.due() && !force) return false;
 					const rows = await inbox.pending(request.session, request.agent);
-					if (!rows.length) return;
+					if (!rows.length) return false;
 					if (!replying) await offer(true);
 					for (const row of rows)
-						await admit(row.request_id, row.content, row.metadata, row.delivery);
+						await admit(row.request_id, row.content, row.metadata, row.delivery, true);
 					await submitPending();
 					await inbox.remove(rows.map((row) => row.request_id));
+					return true;
 				};
 				watcher = inbox.watch(request.session);
 				await submitPending();
@@ -584,16 +595,27 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						}
 					}
 					let complete = true;
+					let queued = false;
+					let failed: string | undefined;
 					let answer: Json | undefined;
-					for (const submission of submissions.values()) {
+					for (const [requestId, submission] of submissions) {
 						const status = await submission.status(context);
-						if (status.status === "unanswered")
-							throw new Error(`Pi run unanswered: ${status.reason}`);
-						if (status.status !== "done") {
-							complete = false;
+						// A failed run leaves the input queued behind it in Pi's inbox: keep driving that.
+						if (status.status === "unanswered") {
+							if (!sent.has(requestId)) failed ??= status.reason;
+							else if (!unanswered.has(requestId)) {
+								unanswered.add(requestId);
+								host.logger.warn("Sent input unanswered", { requestId, reason: status.reason });
+							}
 							continue;
 						}
-						if (status.type === "input") {
+						if (status.status !== "done") {
+							complete = false;
+							queued ||= status.status === "queued";
+							continue;
+						}
+						// Sent input is answered through `reply`; a call returns its own answer.
+						if (status.type === "input" && !sent.has(requestId)) {
 							const entry = await conversation.commit((tx) => tx.entry(status.answer), context);
 							answer =
 								entry?.model
@@ -608,10 +630,17 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						}
 					}
 					if (complete) {
+						// Input sent while this run ended is ours to answer; its own driver may already be done.
+						if (await drain(true)) continue;
+						if (failed) throw new Error(`Pi run unanswered: ${failed}`);
 						// A sent run answers through `reply`; nothing is returned to post.
 						outcome = sending ? null : (answer ?? "");
 						break;
 					}
+					// Pi places queued input only at a boundary of a run or with the next submission. After a
+					// failed run nothing is running, so an invisible write places what is still queued.
+					if (queued && !(await frame.harness.snapshot(LiveDoc, conversationId!, context))?.run)
+						await conversation.submit({ type: "write", entry: { kind: "fabrial.wake" } }, context);
 					const inspection = await frame.harness.inspect(context);
 					const live = inspection.tasks.filter((task) => !task.record.background);
 					const runners = live.filter((task) => task.state.kind === "running");

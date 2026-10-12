@@ -681,9 +681,8 @@ it("dev thread: the agent opens a PR, follows it, answers a review in the Slack 
 	await expect
 		.poll(async () => (await sql`SELECT resource_key FROM fabrial.subscriptions`).length, poll)
 		.toBe(1);
-	// Review once the first run has finished, so the notification wakes an idle conversation.
+	// The review arrives while the first run ends; the driver answers it whenever it lands.
 	await expect.poll(() => faux.calls, poll).toBe(3);
-	await new Promise((resolve) => setTimeout(resolve, 500));
 
 	const pr = {
 		id: 42,

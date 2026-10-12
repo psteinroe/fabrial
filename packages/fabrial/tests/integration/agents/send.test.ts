@@ -409,3 +409,130 @@ it("a tool sends to another conversation through the same send path", async () =
 	expect(t.faux.state.callCount).toBe(3);
 	expect(await submitted(`app:ops-${t.channel}`)).toHaveLength(1);
 });
+
+it.each(["notification", "message"] as const)(
+	"a %s steered while the final answer completes is answered by the next run",
+	async (kind) => {
+		const t = await setup();
+		const other = await t.launch();
+		const session = kind === "message" ? `chat:channel:${t.channel}` : `app:ops-${t.channel}`;
+		const seen: string[] = [];
+		t.respond([
+			fauxAssistantMessage(fauxToolCall("reply", { text: "first" }), { stopReason: "toolUse" }),
+			async () => {
+				// Steer while this final answer is in flight; answer only once the driver admitted it.
+				if (kind === "message")
+					expect(await other.chat.receive(t.message("m2", "t2", "late steer"))).toBe("new");
+				else
+					await other.runtime.invoke(
+						t.notify.name,
+						{ text: "late steer", priority: "urgent" },
+						{
+							metadata: {
+								interactionId: randomUUID(),
+								origin: { provider: "github" },
+								replyTo: null,
+								requestedBy: null,
+								ownsThread: false,
+							},
+						},
+					);
+				void other.runtime.flush();
+				await expect
+					.poll(async () => (await submitted(session)).length, { timeout: 10_000 })
+					.toBe(2);
+				return fauxAssistantMessage("done");
+			},
+			(context) => {
+				seen.push(text(context.messages));
+				return fauxAssistantMessage(fauxToolCall("reply", { text: "second" }), {
+					stopReason: "toolUse",
+				});
+			},
+			fauxAssistantMessage("done"),
+		]);
+		if (kind === "message") await t.chat.receive(t.message("m1", "t1"));
+		else
+			await t.runtime.invoke(
+				t.notify.name,
+				{ text: "first", priority: "normal" },
+				{
+					metadata: {
+						interactionId: randomUUID(),
+						origin: { provider: "github" },
+						replyTo: null,
+						requestedBy: null,
+						ownsThread: false,
+					},
+				},
+			);
+		await t.settle();
+		await other.settle();
+		await t.settle();
+		expect(seen).toHaveLength(1);
+		expect(seen[0]).toContain("late steer");
+		expect(t.faux.state.callCount).toBe(4);
+		expect(await sql`SELECT 1 FROM fabrial.inbox WHERE session_key = ${session}`).toHaveLength(0);
+	},
+);
+
+it.each(["notification", "message"] as const)(
+	"a %s queued behind a failed run is still answered",
+	async (kind) => {
+		const t = await setup();
+		const other = await t.launch();
+		const session = kind === "message" ? `chat:channel:${t.channel}` : `app:ops-${t.channel}`;
+		const seen: string[] = [];
+		t.respond([
+			async () => {
+				// The steer queues behind this generation, which then fails: Pi leaves it in its inbox.
+				if (kind === "message")
+					expect(await other.chat.receive(t.message("m2", "t2", "queued steer"))).toBe("new");
+				else
+					await other.runtime.invoke(
+						t.notify.name,
+						{ text: "queued steer", priority: "urgent" },
+						{
+							metadata: {
+								interactionId: randomUUID(),
+								origin: { provider: "github" },
+								replyTo: null,
+								requestedBy: null,
+								ownsThread: false,
+							},
+						},
+					);
+				void other.runtime.flush();
+				await expect
+					.poll(async () => (await submitted(session)).length, { timeout: 10_000 })
+					.toBe(2);
+				return fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded" });
+			},
+			(context) => {
+				seen.push(text(context.messages));
+				return fauxAssistantMessage("answered");
+			},
+		]);
+		if (kind === "message") await t.chat.receive(t.message("m1", "t1"));
+		else
+			await t.runtime.invoke(
+				t.notify.name,
+				{ text: "first", priority: "normal" },
+				{
+					metadata: {
+						interactionId: randomUUID(),
+						origin: { provider: "github" },
+						replyTo: null,
+						requestedBy: null,
+						ownsThread: false,
+					},
+				},
+			);
+		await t.settle();
+		await other.settle();
+		expect(seen).toHaveLength(1);
+		expect(seen[0]).toContain("queued steer");
+		expect(t.faux.state.callCount).toBe(2);
+		expect(await sql`SELECT 1 FROM fabrial.inbox WHERE session_key = ${session}`).toHaveLength(0);
+	},
+);

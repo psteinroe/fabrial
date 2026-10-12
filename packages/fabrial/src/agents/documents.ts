@@ -81,6 +81,8 @@ export const Runs = defineDoc({
 						content: string;
 						submissionId: number | null;
 						delivery?: import("../send.ts").Delivery;
+						/** Sent through the inbox, so answered through `reply`. */
+						sent?: boolean;
 					}
 				>;
 			}
