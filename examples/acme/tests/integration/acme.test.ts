@@ -639,3 +639,109 @@ it("support channel: two threads share one conversation, reply posts to the aske
 	expect(sessions.map((row) => row.key)).toEqual(["slack:channel:C_HELP"]);
 	expect(await sql`SELECT 1 FROM fabrial.inbox`).toHaveLength(0);
 });
+
+it("dev thread: the agent opens a PR, follows it, answers a review in the Slack thread, and stops at merge", async () => {
+	vi.spyOn(app.host.clients().github, "request").mockResolvedValue({
+		data: { id: 1, name: "Alice", login: "alice" },
+	} as never);
+	const create = vi.spyOn(app.host.clients().github.rest.pulls, "create").mockResolvedValue({
+		data: { number: 42, html_url: "https://github.com/acme/app/pull/42" },
+	} as never);
+	let notification = "";
+	faux.respond([
+		reply.toolCall("open_pull_request", { title: "Fix flaky test", head: "fix-flaky" }),
+		reply.toolCall("reply", { text: "Opened acme/app#42." }),
+		reply.text("done"),
+		(context) => {
+			notification = JSON.stringify(context.messages);
+			return reply.toolCall("reply", { text: "Addressing the requested changes." });
+		},
+		reply.text("done"),
+		reply.text("merged"),
+	]);
+	const ts = "1700000300.000001";
+	const response = await slackRequest({
+		type: "event_callback",
+		team_id: process.env.SLACK_TEAM_ID,
+		event_id: randomUUID(),
+		event: {
+			type: "message",
+			user: "U_ALICE",
+			channel: "C_DEV",
+			text: "Please fix the flaky test",
+			ts,
+			event_ts: ts,
+		},
+	});
+	expect(response.status).toBe(200);
+	const replies = () =>
+		calls.filter((c) => c.method === "chat.postMessage" && c.args.channel === "C_DEV");
+	await expect.poll(() => replies().length, poll).toBe(1);
+	expect(create).toHaveBeenCalledOnce();
+	await expect
+		.poll(async () => (await sql`SELECT resource_key FROM fabrial.subscriptions`).length, poll)
+		.toBe(1);
+	// Review once the first run has finished, so the notification wakes an idle conversation.
+	await expect.poll(() => faux.calls, poll).toBe(3);
+	await new Promise((resolve) => setTimeout(resolve, 500));
+
+	const pr = {
+		id: 42,
+		number: 42,
+		title: "Fix flaky test",
+		body: null,
+		html_url: "https://github.com/acme/app/pull/42",
+		user: { id: 99, login: "fabrial[bot]", type: "Bot" },
+	};
+	const repository = { full_name: "acme/app", owner: { login: process.env.GITHUB_OWNER } };
+	const installation = { id: Number(process.env.GITHUB_INSTALLATION_ID) };
+	const webhook = async (event: string, delivery: string, payload: Record<string, unknown>) => {
+		const body = JSON.stringify({ installation, repository, pull_request: pr, ...payload });
+		const signature = createHmac("sha256", process.env.GITHUB_WEBHOOK_SECRET!)
+			.update(body)
+			.digest("hex");
+		const result = await app.fetch(
+			new Request("https://acme.test/github/webhook", {
+				method: "POST",
+				body,
+				headers: {
+					"x-github-event": event,
+					"x-github-delivery": delivery,
+					"x-hub-signature-256": `sha256=${signature}`,
+				},
+			}),
+		);
+		expect(result.status).toBe(200);
+	};
+	const alice = { id: 1, login: "alice", type: "User" };
+	const review = {
+		action: "submitted",
+		sender: alice,
+		review: {
+			id: 7,
+			state: "CHANGES_REQUESTED",
+			body: "Please add a regression test",
+			user: alice,
+			author_association: "MEMBER",
+		},
+	};
+	await webhook("pull_request_review", "review-42", review);
+	await webhook("pull_request_review", "review-42", review);
+	await expect.poll(() => replies().length, poll).toBe(2);
+	expect(replies()[1]!.args).toMatchObject({
+		thread_ts: ts,
+		text: expect.stringContaining("Addressing the requested changes."),
+	});
+	expect(notification).toContain('priority=\\"urgent\\"');
+	expect(notification).toContain("Please add a regression test");
+
+	await webhook("pull_request", "merge-42", {
+		action: "closed",
+		sender: alice,
+		pull_request: { ...pr, merged: true },
+	});
+	await expect
+		.poll(async () => (await sql`SELECT 1 FROM fabrial.subscriptions`).length, poll)
+		.toBe(0);
+	expect(replies()).toHaveLength(2);
+});
