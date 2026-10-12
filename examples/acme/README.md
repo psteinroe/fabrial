@@ -21,6 +21,7 @@ Configure these environment variables:
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
 | `DATABASE_URL`           | Fabrial's Postgres database: workflows, agent sessions, and chat state.                                          |
 | `ANTHROPIC_API_KEY`      | Model credentials for the support agent.                                                                         |
+| `TYPESAFE_API_KEY`       | Model credentials for the routing classifier.                                                                    |
 | `APP_DATABASE_URL`       | Separate least-privilege business database; the database plugin creates its pool at start and closes it at stop. |
 | `SLACK_BOT_TOKEN`        | Slack bot token.                                                                                                 |
 | `SLACK_SIGNING_SECRET`   | Slack webhook signing secret.                                                                                    |
@@ -46,8 +47,7 @@ await app.start(); // migrates Postgres, validates credentials, starts workers
 Load `schema.sql` in `APP_DATABASE_URL`. Replace the sample external user IDs,
 channel IDs, team keys, and model references in source with your own.
 `supportAgent` uses `"anthropic/claude-sonnet-4-5"`; routing calls
-`ctx.evaluate` with the classifier `"jev/route"`. Point it at a classifier you
-have credentials for in `models` (e.g. `"typesafe/jev-latest"`). A missing or erroring
+`ctx.evaluate` with the classifier `"typesafe/jev-latest"`. A missing or erroring
 classifier explicitly falls back to support; `#bugs` always hands off. Define
 agents before `app.start()`.
 

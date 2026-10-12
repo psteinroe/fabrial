@@ -10,7 +10,10 @@ const env = process.env;
 // Values at definition; factories do not connect or validate credentials at import time.
 export const f = createFabrial({
 	database: env.DATABASE_URL,
-	models: { anthropic: { apiKey: env.ANTHROPIC_API_KEY } },
+	models: {
+		anthropic: { apiKey: env.ANTHROPIC_API_KEY },
+		typesafe: { apiKey: env.TYPESAFE_API_KEY },
+	},
 	plugins: [
 		slack({
 			workspace: env.SLACK_WORKSPACE!,

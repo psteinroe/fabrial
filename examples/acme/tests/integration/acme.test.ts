@@ -7,6 +7,7 @@ import type { Adapter } from "chat";
 import postgres, { type Sql } from "postgres";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { workflows } from "../../src/app.ts";
+import { routingModel } from "../../src/workflows/general-assistant.ts";
 import { f } from "../../src/fabrial.ts";
 import { bob, engineeringTriage, weeklyRotationForTest } from "./rotation.ts";
 import { supportModel } from "../../src/agents/support.ts";
@@ -114,7 +115,7 @@ beforeEach(async () => {
 	vi.spyOn(WebClient.prototype, "apiCall").mockImplementation(apiCall);
 	models = scriptedModels();
 	faux = models.model(supportModel);
-	models.classifier("jev/route", () => ({ bug: { probability: 0.01 } }));
+	models.classifier(routingModel, () => ({ bug: { probability: 0.01 } }));
 	app = newApp();
 	// No Linear API calls are needed in these Slack/GitHub tests. Skip only Linear's startup profile lookup.
 	await app.start();
