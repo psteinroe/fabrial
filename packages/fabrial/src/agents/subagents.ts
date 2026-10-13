@@ -74,10 +74,19 @@ function failure(
 	return `The subagent stopped without an answer (error id ${errorId}). You may retry or continue without it.`;
 }
 
+/** A slot whose child answered: it no longer counts, though its holder task may still be finishing. */
+const FREED = "";
+
+/** Frees `holder`'s slot in the commit that settles its child's answer. */
+async function free(tx: Tx, lead: number, holder: number): Promise<void> {
+	const slots = (await tx.doc(SubagentWork)).slots[lead];
+	if (slots?.[holder] !== undefined) slots[holder] = FREED;
+}
+
 /**
  * Takes a slot of the lead's `limits.concurrent` for `holder`, or only checks for one without a holder. Slots are
- * durable and held by a task, so they count background children across driver cycles and free themselves when the
- * holder ends. Returns the number running when the limit is reached.
+ * durable and held by a task, so they count background children across driver cycles. A slot frees with the
+ * commit that settles its child's answer, or when its holder ends without one. Returns the number running when the limit is reached.
  */
 async function admit(
 	tx: Tx,
@@ -96,7 +105,8 @@ async function admit(
 		const task = await tx.task(Number(id) as TaskId);
 		if (!task || task.state.status === "terminal") delete slots[id];
 	}
-	const running = new Set(Object.values(slots));
+	// A freed slot keeps its holder, so a rerun of a call whose child already answered is still admitted.
+	const running = new Set(Object.values(slots).filter((child) => child !== FREED));
 	if (!running.has(child) && running.size >= limit) return running.size;
 	if (holder !== undefined) slots[holder] = child;
 	return undefined;
@@ -446,6 +456,7 @@ const reporterTask = (deps: SubagentDeps) =>
 				} finally {
 					await stop?.();
 				}
+				await bridge?.clearStatus?.(agent);
 				const errorId = newErrorId();
 				const failed =
 					settled.status === "unanswered" && settled.reason !== "aborted"
@@ -458,6 +469,7 @@ const reporterTask = (deps: SubagentDeps) =>
 						: undefined;
 				// One commit decides the report and records the answer as reported, so a restart does not decide again.
 				await runtime.commit(async (tx) => {
+					await free(tx, reporter.input.lead, reporter.id);
 					const next = (report?: string) =>
 						({
 							status: "running",
@@ -671,9 +683,15 @@ async function run(
 		bridge.waiting.delete(api.taskId);
 		await stop();
 	}
+	await bridge.clearStatus?.(subagent.agent.name);
 	const details = { conversationId: child, name };
-	if (settled.status === "done" && settled.type === "input") {
-		const entry = await api.commit((tx) => tx.entry(settled.answer), context);
+	const answered =
+		settled.status === "done" && settled.type === "input" ? settled.answer : undefined;
+	const entry = await api.commit(async (tx) => {
+		await free(tx, api.conversationId, api.taskId);
+		return answered === undefined ? undefined : tx.entry(answered);
+	}, context);
+	if (answered !== undefined) {
 		return {
 			content: [{ type: "text", text: subagentResult(name, "done", answerText(entry)) }],
 			details,

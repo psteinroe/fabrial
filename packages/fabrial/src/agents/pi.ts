@@ -529,6 +529,15 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					childStatus = text;
 					await showStatus(text);
 				};
+				// A child that answered gives the status back to the lead: its own activity, or none when idle.
+				frame.clearStatus = async (label) => {
+					if (!childStatus?.startsWith(`${label}: `)) return;
+					childStatus = undefined;
+					if (waiting) return;
+					if ((await frame.harness.snapshot(LiveDoc, conversationId!, context))?.run)
+						await thinking();
+					else await progress?.setStatus(null).catch(() => {});
+				};
 				if (sending || (execution.metadata.ownsThread && io)) {
 					events = await watchEvents(frame.harness, conversationId!, context);
 					waiting = !!events.snapshot.generation?.retry;

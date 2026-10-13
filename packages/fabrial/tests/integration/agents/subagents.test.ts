@@ -8,7 +8,7 @@ import {
 	fauxToolCall,
 	type FauxResponseStep,
 } from "@earendil-works/pi-ai/providers/faux";
-import type { StorageWrite } from "@earendil-works/pi-durable";
+import { createSession, type StorageWrite } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import postgres, { type Sql } from "postgres";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
@@ -23,6 +23,7 @@ import {
 } from "../../../src/index.ts";
 import { toolName } from "../../../src/agent.ts";
 import { pi, PostgresStorage, sessionKey } from "../../../src/agents/index.ts";
+import { SubagentWork } from "../../../src/agents/documents.ts";
 import { FakeChat, MemoryRuntime, testApp } from "../../../src/testing.ts";
 
 const definitions = createFabrial({ plugins: [] });
@@ -1141,4 +1142,47 @@ it("a background child waiting for approval releases the Session: a new message 
 	} finally {
 		await app.stop();
 	}
+});
+
+it("a child's answer frees its concurrency slot as it settles, and its status line gives way to the lead's", async () => {
+	const f = fixture();
+	const researcher = researcherOf(f);
+	const lead = leadOf(f, researcher, { concurrent: 1 });
+	const tool = toolName(researcher.name);
+	route(f, (text) => {
+		if (text.includes("Go")) return use(tool, { task: "First" });
+		if (text === "First") return say("one");
+		if (text.startsWith(`<subagent name="${tool}-1"`))
+			return use(tool, { task: "Second", background: true });
+		if (text === "Second") return say("two");
+		if (text.startsWith("Started")) return say("Waiting.");
+		if (text.startsWith(`<subagent name="${tool}-2"`)) return say("Final");
+		return say(`unexpected: ${text}`);
+	});
+	const { settled } = await f.call(lead, "Go");
+	expect(await settled).toEqual({ status: "completed", output: "Final" });
+	const storage = await PostgresStorage.open(sql, sessionKey(f.metadata));
+	const session = createSession(storage);
+	try {
+		// Holders stay recorded, so a rerun is admitted, but none counts against the limit.
+		const slots = Object.values((await session.snapshot(SubagentWork, BACKGROUND_CONTEXT))!.slots);
+		const values = slots.flatMap((each) => Object.values(each));
+		expect(values.length).toBeGreaterThan(0);
+		expect(new Set(values)).toEqual(new Set([""]));
+	} finally {
+		await session.close(BACKGROUND_CONTEXT);
+	}
+	// Each child's activity is followed by the lead's own status, not left showing until the driver ends.
+	const statuses = (await f.chat.thread(f.metadata.replyTo as Parameters<typeof f.chat.thread>[0]))
+		.statuses;
+	const child = statuses.flatMap((status, index) =>
+		status?.startsWith(`${researcher.name}: `) ? [index] : [],
+	);
+	expect(child.length).toBeGreaterThan(0);
+	for (const index of child)
+		expect(
+			// Before the status the driver clears as it ends.
+			statuses.slice(index + 1, -1).find((status) => !status?.startsWith(`${researcher.name}: `)),
+		).not.toBeUndefined();
+	await f.integration.stop();
 });
