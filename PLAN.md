@@ -745,7 +745,8 @@ Each entry is an agent, `"self"` (a copy of the lead), or `{ agent, context?, ba
 - Only the lead speaks in chat. Children have no chat binding; their activity shows in the lead's status ("researcher: searching docs…").
 - Children act under the lead's request context: workflow tools they call (approvals included) see the same actor, thread, and approvers.
 - Child output is data: it is escaped inside the `<subagent>` tag. A failed child reports `status="failed"` with a generic message; provider errors go to logs, as in [Errors in sent runs](#decisions).
-- Limits: with `depth: 1` (default) children get no subagent tools; reaching `concurrent` returns a tool error the model can act on.
+- Limits: with `depth: 1` (default) children get no subagent tools; reaching `concurrent` returns a tool error the model can act on. A slot frees in the commit that settles the child's answer.
+- Lease: a driver keeps the Session while background children work, but releases it whenever every live task (the lead's or a child's) waits on a workflow, and resumes when any of them completes; other input to the Session is processed meanwhile.
 - Work that waits for days, such as an approval, is still a workflow in `tools`. Orchestration from code is `ctx.agent`; there is no separate API.
 - Background children run while a driver holds the Session: a sent run's driver keeps the Session until every reporter has reported and the lead is idle, so a later `ctx.agent` call on the same Session queues behind it. Cancelling a run's workflow aborts the background children that run started or continued; aborting only the lead's Pi run does not. A stopped child reports nothing. Continuing a background child keeps it in the background, even without `background: true`.
 
