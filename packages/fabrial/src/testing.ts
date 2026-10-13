@@ -905,8 +905,8 @@ export function createIntegrationApp<const P extends readonly import("./plugin.t
 	instance: import("./instance.ts").Fabrial<P>,
 	config: import("./instance.ts").AppConfig & {
 		models: ScriptedModels;
-		/** Default false. */
-		modelRetries?: boolean;
+		/** Durable model retries: off by default; `true` for production's policy, or a policy override (e.g. tiny delays). */
+		modelRetries?: boolean | Partial<import("@earendil-works/pi-durable").ConversationRetryPolicy>;
 		/** Worker and wait polling interval. Default 20ms. */
 		pollIntervalMs?: number;
 		/** Concurrent workflow executions per worker. Default 8. */
@@ -919,7 +919,12 @@ export function createIntegrationApp<const P extends readonly import("./plugin.t
 		{ workflows, subscriptions, logger },
 		{
 			models: scripted.get(models),
-			agentSettings: { retry: { enabled: modelRetries } },
+			agentSettings: {
+				retry:
+					typeof modelRetries === "boolean"
+						? { enabled: modelRetries }
+						: { enabled: true, ...modelRetries },
+			},
 			conductor: {
 				worker: {
 					concurrency: config.concurrency ?? 8,

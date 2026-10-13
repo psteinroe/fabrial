@@ -91,6 +91,8 @@ export const Runs = defineDoc({
 						delivery?: import("../send.ts").Delivery;
 						/** Sent through the inbox, so answered through `reply`. */
 						sent?: boolean;
+						/** Id of the error reply of sent input that ended unanswered, assigned once. */
+						errorId?: string;
 					}
 				>;
 			}

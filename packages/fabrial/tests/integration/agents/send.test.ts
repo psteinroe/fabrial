@@ -7,7 +7,11 @@ import {
 	fauxProvider,
 	fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
-import { createSession, type StorageWrite } from "@earendil-works/pi-durable";
+import {
+	createSession,
+	type ConversationRetryPolicy,
+	type StorageWrite,
+} from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import postgres, { type Sql } from "postgres";
 import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
@@ -24,6 +28,8 @@ import {
 } from "../../../src/index.ts";
 import { Inbox, pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { Conversations, Invocation, Runs } from "../../../src/agents/documents.ts";
+import { WAITING_STATUS } from "../../../src/agents/errors.ts";
+import type { Logger } from "../../../src/app.ts";
 import { FakeChat, MemoryRuntime, testApp } from "../../../src/testing.ts";
 
 let sql: Sql;
@@ -69,6 +75,7 @@ async function setup(
 		channel: string,
 		self: () => AgentRef,
 	) => Parameters<typeof f.defineAgent>[0]["tools"] = () => [],
+	options: { retry?: Partial<ConversationRetryPolicy>; logger?: Logger } = {},
 ) {
 	const channel = `c${randomUUID().slice(0, 8)}`;
 	const faux = fauxProvider();
@@ -106,7 +113,8 @@ async function setup(
 			subscriptions: [subscription],
 			runtime,
 			chat,
-			agents: pi({ models, sql, settings: { retry: { enabled: false } } }),
+			agents: pi({ models, sql, settings: { retry: options.retry ?? { enabled: false } } }),
+			...(options.logger ? { logger: options.logger } : {}),
 		});
 		await app.start();
 		stops.push(() => app.stop());
@@ -619,4 +627,150 @@ it("an urgent notification during a tool call steers the running run and is answ
 	});
 	expect(answers).toHaveLength(2);
 	expect(new Set(answers).size).toBe(1);
+});
+
+const UNREACHABLE =
+	/^I couldn't reach the model provider while handling your request\. Please try again in a few minutes\.\n\n_Error id: `[0-9a-f]{12}`_$/;
+const FAILED =
+	/^I hit an error while handling your request\. Please try again, rephrase, or reach out if it keeps failing\.\n\n_Error id: `[0-9a-f]{12}`_$/;
+const statuses = async (t: Awaited<ReturnType<typeof setup>>, thread: string) =>
+	(
+		await t.chat.thread({
+			kind: "thread",
+			provider: "chat",
+			threadId: `chat:${t.channel}:${thread}`,
+		})
+	).statuses;
+
+it("a non-retryable model error posts one error reply with an error id; the conversation answers the next message", async () => {
+	const errors: Record<string, unknown>[] = [];
+	const logger: Logger = {
+		debug() {},
+		info() {},
+		warn() {},
+		error: (_m, data) => errors.push(data!),
+	};
+	const t = await setup(undefined, { logger });
+	t.respond([
+		fauxAssistantMessage("", {
+			stopReason: "error",
+			errorMessage: "invalid_request_error: tools.0.input_schema is invalid",
+		}),
+		fauxAssistantMessage(fauxToolCall("reply", { text: "Answer two" }), { stopReason: "toolUse" }),
+		fauxAssistantMessage("done"),
+	]);
+	await t.chat.receive(t.message("m1", "t1"));
+	await t.settle();
+	const [failure] = (await t.posts("t1")).map((post) => post.content as string);
+	expect(failure).toMatch(FAILED);
+	// The provider's text is logged under the error id, not posted.
+	expect(failure).not.toContain("invalid_request_error");
+	expect(errors).toEqual([
+		expect.objectContaining({
+			reason: "model_error",
+			error: "invalid_request_error: tools.0.input_schema is invalid",
+			errorId: /`([0-9a-f]{12})`/.exec(failure!)![1],
+		}),
+	]);
+	expect((await statuses(t, "t1")).at(-1)).toBeNull();
+	await t.chat.receive(t.message("m2", "t1", "again"));
+	await t.settle();
+	expect((await t.posts("t1")).map((post) => post.content)).toEqual([failure, "Answer two"]);
+	expect(t.faux.state.callCount).toBe(3);
+});
+
+it("a transient model error retried durably shows the waiting status and posts no error reply", async () => {
+	const t = await setup(undefined, {
+		retry: { enabled: true, maxRetries: 2, baseDelayMs: 300, maxAgentDelayMs: 300 },
+	});
+	t.respond([
+		fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 overloaded" }),
+		fauxAssistantMessage(fauxToolCall("reply", { text: "Answer one" }), { stopReason: "toolUse" }),
+		fauxAssistantMessage("done"),
+	]);
+	await t.chat.receive(t.message("m1", "t1"));
+	await t.settle();
+	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Answer one"]);
+	const shown = await statuses(t, "t1");
+	expect(shown).toContain(WAITING_STATUS);
+	expect(shown.slice(shown.indexOf(WAITING_STATUS))).toContain("Thinking…");
+	expect(shown.at(-1)).toBeNull();
+	expect(t.faux.state.callCount).toBe(3);
+});
+
+it("a transient model error that exhausts its retries posts the couldn't-reach reply", async () => {
+	const t = await setup(undefined, {
+		retry: { enabled: true, maxRetries: 1, baseDelayMs: 5, maxAgentDelayMs: 5 },
+	});
+	const overloaded = () =>
+		fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error: Overloaded" });
+	t.respond([overloaded(), overloaded()]);
+	await t.chat.receive(t.message("m1", "t1"));
+	await t.settle();
+	const posts = (await t.posts("t1")).map((post) => post.content as string);
+	expect(posts).toHaveLength(1);
+	expect(posts[0]).toMatch(UNREACHABLE);
+	expect(t.faux.state.callCount).toBe(2);
+});
+
+it("an aborted sent run posts no reply and the conversation stays usable", async () => {
+	let started!: () => void;
+	const blocking = new Promise<void>((resolve) => (started = resolve));
+	const t = await setup(() => [
+		f.defineTool({
+			name: "slow",
+			description: "Slow work",
+			input: z.object({}),
+			run: (_input, ctx) => {
+				started();
+				return new Promise<never>((_resolve, reject) =>
+					ctx.signal.addEventListener("abort", () => reject(ctx.signal.reason), { once: true }),
+				);
+			},
+		}),
+	]);
+	t.respond([
+		fauxAssistantMessage(fauxToolCall("slow", {}), { stopReason: "toolUse" }),
+		fauxAssistantMessage(fauxToolCall("reply", { text: "Answer two" }), { stopReason: "toolUse" }),
+		fauxAssistantMessage("done"),
+	]);
+	await t.chat.receive(t.message("m1", "t1"));
+	void t.runtime.flush();
+	await blocking;
+	for (const driver of t.runtime.executions("fabrial.pi.run"))
+		if (driver.status !== "settled") await t.runtime.cancel(driver.executionId, "Stopped");
+	await t.settle();
+	expect(await t.posts("t1")).toEqual([]);
+	await t.chat.receive(t.message("m2", "t1", "again"));
+	await t.settle();
+	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Answer two"]);
+});
+
+it("a driver redelivered after starting the error reply does not post it twice", async () => {
+	let crashed = false;
+	const logger: Logger = {
+		debug() {},
+		info() {},
+		warn() {},
+		error: (message) => {
+			// Crash once right after the error reply's durable intent started.
+			if (message === "Sent input failed" && !crashed) {
+				crashed = true;
+				throw new Error("driver crashed");
+			}
+		},
+	};
+	const t = await setup(undefined, { logger });
+	const driver = t.runtime.workflows.get("fabrial.pi.run")!;
+	driver.retries = { maxAttempts: 2 };
+	t.respond([fauxAssistantMessage("", { stopReason: "error", errorMessage: "no such model" })]);
+	await t.chat.receive(t.message("m1", "t1"));
+	await t.settle();
+	expect(crashed).toBe(true);
+	const posts = (await t.posts("t1")).map((post) => post.content as string);
+	expect(posts).toHaveLength(1);
+	expect(posts[0]).toMatch(FAILED);
+	expect(t.runtime.executions("fabrial.pi.run").map((e) => e.result?.status)).toEqual([
+		"completed",
+	]);
 });

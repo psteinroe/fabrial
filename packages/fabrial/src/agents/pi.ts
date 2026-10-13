@@ -56,12 +56,14 @@ import {
 	fields,
 	registerChild,
 	replyTool,
+	startChild,
 	type BridgeFrame,
 } from "./context.ts";
 import {
+	claimRequestAlias,
 	prepareSend,
-	shortRequestId,
 	threadSession,
+	withRequestAlias,
 	type Delivery,
 	type SendOptions,
 } from "../send.ts";
@@ -84,6 +86,7 @@ import {
 	ChildIntents,
 	EFFECT_WORKFLOW,
 } from "./documents.ts";
+import { newErrorId, sentErrorReply, WAITING_STATUS } from "./errors.ts";
 import { createEvaluator } from "./evaluate.ts";
 import { LeaseLost, PostgresStorage, SessionBusy } from "./storage.ts";
 import type { AgentIntegration, Logger } from "../app.ts";
@@ -444,16 +447,29 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				let lastStatus = 0;
 				// Progress shows on the owned thread, or on the reply thread of the latest sent request.
 				let progress = execution.metadata.ownsThread ? io : undefined;
+				let progressRequest: string | undefined;
+				// A generation backing off before a durable retry, from Pi's `pi.live` generation.
+				let waiting = false;
 				const showStatus = async (text: string) => {
 					if (!progress) return;
 					shown.add(progress);
 					lastStatus = Date.now();
 					await progress.setStatus(text).catch(() => {});
 				};
+				const thinking = () => showStatus(waiting ? WAITING_STATUS : "Thinking…");
 				if (sending || (execution.metadata.ownsThread && io)) {
 					events = await watchEvents(frame.harness, conversationId!, context);
+					waiting = !!events.snapshot.generation?.retry;
 					events.start(async (batch) => {
-						if (!progress || Date.now() - lastStatus < 750) return;
+						const retry = batch.findLast(
+							(event) => event.type === "auto_retry_start" || event.type === "auto_retry_end",
+						);
+						if (retry) {
+							waiting = retry.type === "auto_retry_start";
+							await thinking();
+							return;
+						}
+						if (waiting || !progress || Date.now() - lastStatus < 750) return;
 						const tool = batch.find((event) => event.type === "tool_execution_start");
 						const text =
 							tool?.type === "tool_execution_start"
@@ -463,7 +479,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 								: "Thinking…";
 						await showStatus(text);
 					});
-					await showStatus("Thinking…");
+					await thinking();
 				}
 				const content = [
 					originContext,
@@ -484,12 +500,15 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				) => {
 					await frame.harness.commit(async (tx) => {
 						await tx.doc(Invocation, requestId, cloneJson(metadata));
-						await tx.doc(RequestAlias, shortRequestId(requestId), requestId);
+						const alias = await claimRequestAlias(
+							requestId,
+							async (alias) => (await tx.doc(RequestAlias, alias, requestId)).requestId,
+						);
 						(await tx.doc(Binding, conversationId!)).requestId ??= requestId;
 						const run = (await tx.doc(Runs)).runs[execution.executionId]!;
 						run.requests ??= {};
 						run.requests[requestId] ??= {
-							content,
+							content: withRequestAlias(content, requestId, alias),
 							submissionId: null,
 							delivery,
 							...(sent ? { sent } : {}),
@@ -511,7 +530,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 								?.replyTo;
 							if (replyTo?.kind === "thread" && host.chat()) {
 								progress = await host.chat()!.resolve(replyTo);
-								await showStatus("Thinking…");
+								progressRequest = requestId;
+								await thinking();
 							}
 						}
 						// Pi dedupes by request id, so a request re-admitted after a crash is submitted once.
@@ -548,6 +568,44 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 								submission.id;
 						}, context);
 					}
+				};
+				// Sent input Pi gave up on: one error reply for a model error or no model, keyed by request id.
+				const settleUnanswered = async (requestId: string, reason: string, detail: Json) => {
+					if (progressRequest === requestId) {
+						await progress?.setStatus(null).catch(() => {});
+						progress = undefined;
+					}
+					const error =
+						typeof detail === "string"
+							? detail
+							: detail === null
+								? undefined
+								: JSON.stringify(detail);
+					if (!sentErrorReply(reason, error, "")) {
+						host.logger.info("Sent input unanswered", { requestId, reason });
+						return;
+					}
+					const fresh = newErrorId();
+					const errorId = await frame.harness.commit(async (tx) => {
+						const pending = (await tx.doc(Runs)).runs[execution.executionId]!.requests![requestId]!;
+						return (pending.errorId ??= fresh);
+					}, context);
+					const invocation = (await frame.harness.snapshot(Invocation, requestId, context)) as
+						| InvocationMetadata
+						| undefined;
+					// A stable intent and global dedupe key: a redelivered or restarted driver posts once.
+					if (invocation?.replyTo)
+						await startChild(
+							frame,
+							`fabrial:pi:error:${requestId}`,
+							EFFECT_WORKFLOW,
+							{ method: "post", args: [sentErrorReply(reason, error, errorId)!] },
+							invocation,
+							true,
+							context,
+						);
+					if (errorId === fresh)
+						host.logger.error("Sent input failed", { requestId, reason, errorId, error });
 				};
 				// Sent input for this conversation, admitted durably before its inbox row is pruned.
 				const drain = async (force = false) => {
@@ -629,7 +687,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 							if (!sent.has(requestId)) failed ??= status.reason;
 							else if (!unanswered.has(requestId)) {
 								unanswered.add(requestId);
-								host.logger.warn("Sent input unanswered", { requestId, reason: status.reason });
+								await settleUnanswered(requestId, status.reason, (status.detail ?? null) as Json);
 							}
 							continue;
 						}
