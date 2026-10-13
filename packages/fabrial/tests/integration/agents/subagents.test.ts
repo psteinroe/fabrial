@@ -918,3 +918,227 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 		await app.stop();
 	}
 });
+
+it.each([
+	["the lead's", ["lead", "child"]],
+	["the child's", ["child", "lead"]],
+] as const)(
+	"%s workflow completing first resumes the task waiting on it while the other still waits",
+	async (_label, order) => {
+		const f = fixture();
+		const waiter = (who: string) => {
+			const workflow = defineWorkflow({
+				name: `wait-${who}-${short()}`,
+				description: `Waits for ${who}`,
+				input: z.object({}),
+				run: async () => "unused",
+			});
+			(f.host.workflows as unknown as (typeof workflow)[]).push(workflow);
+			const runtime: RuntimeWorkflow = {
+				name: workflow.name,
+				triggers: [],
+				handler: async (_input, execution) => {
+					await execution.waitForEvent("wait", { event: `go-${workflow.name}` });
+					return `${who} went`;
+				},
+			};
+			return {
+				workflow,
+				runtime,
+				go: async () => {
+					await f.runtime.emit(`go-${workflow.name}`, {}, { metadata: f.metadata });
+					void f.runtime.flush();
+				},
+			};
+		};
+		const lead = waiter("lead");
+		const child = waiter("child");
+		const researcher = researcherOf(f, [child.workflow]);
+		const agent = defineAgent({
+			name: `lead-${short()}`,
+			description: "Answers support questions.",
+			model: f.model,
+			tools: [lead.workflow],
+			subagents: [researcher],
+		});
+		const tool = toolName(researcher.name);
+		const parked = { lead: gate(), child: gate() };
+		route(f, (text) => {
+			if (text.includes("Go")) return use(tool, { task: "Wait", background: true });
+			if (text === "Wait") {
+				parked.child.open();
+				return use(toolName(child.workflow.name), {});
+			}
+			if (text.startsWith("Started")) {
+				parked.lead.open();
+				return use(toolName(lead.workflow.name), {});
+			}
+			if (text === '"lead went"') return say("Waiting for the researcher.");
+			if (text === '"child went"') return say("child done");
+			if (text.startsWith("<subagent")) return say(`Final: ${text}`);
+			return say(`unexpected: ${text}`);
+		});
+		const { id } = await f.call(agent, "Go", [lead.runtime, child.runtime]);
+		await Promise.all([parked.lead.opened, parked.child.opened]);
+		const settle = async () => {
+			await f.runtime.flush();
+			return f.runtime.result(id);
+		};
+		await expect.poll(settle).toBeUndefined();
+		const waiters = { lead, child };
+		await waiters[order[0]].go();
+		await expect
+			.poll(() => f.contexts.map(lastText), { timeout: 10_000 })
+			.toContain(order[0] === "lead" ? '"lead went"' : '"child went"');
+		await waiters[order[1]].go();
+		await expect.poll(settle, { timeout: 10_000 }).toEqual({
+			status: "completed",
+			output: `Final: <subagent name="${tool}-1" status="done">child done</subagent>`,
+		});
+		await f.integration.stop();
+	},
+);
+
+it("a background child waiting for approval releases the Session: a new message is answered meanwhile, and the click resumes the child", async () => {
+	const alice = defineUser({
+		id: `alice-${short()}`,
+		name: "Alice",
+		identities: [{ provider: "slack-test", installationId: "w", subjectId: `A${short()}` }],
+	});
+	const g = createFabrial({ plugins: [], identity: [alice] });
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const model = `${faux.provider.id}/${faux.getModel().id}`;
+	const runSql = g.defineWorkflow({
+		name: `run-sql-${short()}`,
+		description: "Runs SQL after approval",
+		input: z.object({ sql: z.string() }),
+		async run(input, ctx) {
+			const approval = await ctx.waitForApproval("approve", {
+				title: "Run SQL?",
+				details: input.sql,
+				approvers: alice,
+			});
+			return approval.status === "approved" ? "ran" : "declined";
+		},
+	});
+	const researcher = g.defineAgent({
+		name: `researcher-${short()}`,
+		description: "Fixes rows.",
+		model,
+		tools: [runSql],
+	});
+	const lead = g.defineAgent({
+		name: `lead-${short()}`,
+		description: "Leads.",
+		model,
+		subagents: [researcher],
+	});
+	const tool = toolName(researcher.name);
+	const session = `ticket-${short()}`;
+	const thread = { kind: "thread", provider: "slack-test", threadId: randomUUID() } as const;
+	const ask = g.defineWorkflow({
+		name: `ask-${short()}`,
+		input: z.object({ text: z.string() }),
+		run: async (input, ctx) => {
+			await ctx.send("ask", lead, { session, input: input.text, replyTo: thread });
+		},
+	});
+	faux.setResponses(
+		Array.from({ length: 20 }, () => (context: TranscriptContext) => {
+			const text = lastText(context);
+			if (text === "Fix it") return use(toolName(runSql.name), { sql: "update x" });
+			if (text === '"ran"') return say("Fixed after approval.");
+			if (text.includes("Fix the row")) return use(tool, { task: "Fix it", background: true });
+			if (text.startsWith("Started")) return use("reply", { text: "On it." });
+			if (text.includes("Status?")) return use("reply", { text: "Still waiting for approval." });
+			if (text.startsWith("<subagent")) return use("reply", { text: `Done: ${text}` });
+			if (text === "Posted.") return say("ok");
+			return say(`unexpected: ${text}`);
+		}),
+	);
+	const runtime = new MemoryRuntime();
+	const chat = new FakeChat();
+	const dm = await chat.openDM(alice.identities[0]!);
+	const post = dm.post.bind(dm);
+	let approve: (() => Promise<void>) | undefined;
+	dm.post = async (content) => {
+		const ref = await post(content);
+		const action =
+			typeof content === "object" && "card" in content
+				? content.card.actions?.find((each) => each.id.startsWith("fabrial.approval.approve:"))
+				: undefined;
+		if (action) approve = () => chat.click(ref, action.id, alice.identities[0]!);
+		return ref;
+	};
+	const app = testApp(g, {
+		workflows: [runSql, ask],
+		runtime,
+		chat,
+		agents: pi({ models, sql, settings: { retry: { enabled: false } } }),
+	});
+	await app.start();
+	const send = (text: string) =>
+		runtime.invoke(
+			ask.name,
+			{ text },
+			{
+				metadata: {
+					interactionId: randomUUID(),
+					origin: null,
+					replyTo: null,
+					requestedBy: { id: alice.id, known: true, identities: [], name: "Alice" },
+					ownsThread: false,
+					ownerWorkflow: null,
+					triggerEvent: null,
+				},
+			},
+		);
+	const posts = async () => {
+		await runtime.flush();
+		// Replies only; the approval status card is posted here too.
+		return (await chat.thread(thread)).posts.flatMap((each) =>
+			typeof each.content === "string" ? [each.content] : [],
+		);
+	};
+	try {
+		await send("Fix the row");
+		await expect.poll(posts, { timeout: 10_000 }).toEqual(["On it."]);
+		await expect
+			.poll(async () => (await runtime.flush(), !!approve), { timeout: 10_000 })
+			.toBe(true);
+		// Every live task waits on the approval: no driver runs and the Session lease is free.
+		await expect
+			.poll(async () => {
+				await runtime.flush();
+				return runtime
+					.executions()
+					.filter((each) => each.workflow === "fabrial.pi.run" && each.status !== "suspended")
+					.map((each) => each.status);
+			})
+			.toEqual([]);
+		const storage = await PostgresStorage.open(sql, session);
+		await storage.close(BACKGROUND_CONTEXT);
+		await send("Status?");
+		await expect
+			.poll(posts, { timeout: 10_000 })
+			.toEqual(["On it.", "Still waiting for approval."]);
+		await approve!();
+		await expect
+			.poll(posts, { timeout: 10_000 })
+			.toEqual([
+				"On it.",
+				"Still waiting for approval.",
+				`Done: <subagent name="${tool}-1" status="done">Fixed after approval.</subagent>`,
+			]);
+		await expect
+			.poll(async () => {
+				await runtime.flush();
+				return runtime.executions().every((each) => each.status === "settled");
+			})
+			.toBe(true);
+	} finally {
+		await app.stop();
+	}
+});
