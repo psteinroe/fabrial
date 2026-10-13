@@ -29,6 +29,8 @@ Helpers are named exports and properties on `github`:
 
 - `mentioned({ repo?, thread?, observe? })`: global < repository < thread specificity.
 - `pullRequestOpened({ repo?, observe? })`, `issueOpened({ repo?, observe? })`: global < repository specificity.
+- `pullRequestClosed({ repo?, number?, merged? })`, `pullRequestReopened({ repo?, number? })`, `pullRequestLabeled({ repo?, number?, label? })`, `pullRequestSynchronized({ repo?, number? })`, `pullRequestReviewed({ repo?, number?, state? })`, `pullRequestCommented({ repo?, number? })`: pull request lifecycle triggers; each set filter field narrows the trigger and adds specificity. All take `observe?`.
+- `checkSuiteCompleted({ repo?, conclusion? })`, `checkRunCompleted({ repo?, conclusion? })`: check lifecycle triggers, with the same specificity rules and `observe?`.
 - `identity({ userId, installationId? })` or `identity({ login, installationId? })`.
 
 Inbound identities use stable numeric GitHub user IDs, including lifecycle authors. Login identities support profile lookup, but **are not automatically equated to numeric identities by core**. Use `userId` in `defineUser` for inbound principal/approval matching. Login alias canonicalization needs an identity-directory contract extension.
