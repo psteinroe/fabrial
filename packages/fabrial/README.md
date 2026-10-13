@@ -24,6 +24,7 @@ export const lookup = f.defineTool({
 });
 export const support = f.defineAgent({
 	name: "support",
+	description: "Answers support questions.",
 	model: "anthropic/claude-sonnet-5",
 	instructions: "Answer support questions. Return your answer without posting it.",
 	tools: [lookup, refundWorkflow], // workflows are tools too
@@ -58,13 +59,39 @@ Durable operations require explicit, nonempty IDs. Repeated IDs are suffixed det
 
 ## Agents and tools
 
-- `f.defineAgent({ name, model, thinking?, instructions?, tools?, toolkits?, state? })`. `name` is stable: it is the conversation's continuation key. `instructions` are strings or functions rendered per run with a read-only context (`actor`, `requestedBy`, `clients`, `interaction`, `state(definition).get()`). Define agents before `app.start()`.
+- `f.defineAgent({ name, description, model, thinking?, instructions?, tools?, toolkits?, state?, subagents?, limits? })`. `name` is stable: it is the conversation's continuation key. `description` is required: it says what the agent does and when to use it, and is the tool description when the agent is a subagent. `instructions` are strings or functions rendered per run with a read-only context (`actor`, `requestedBy`, `clients`, `interaction`, `state(definition).get()`). Define agents before `app.start()`.
 - `tools` lists tools and workflows. A workflow tool starts the workflow as a child of the agent run and returns its output; approvals are always workflow-backed.
 - `f.defineTool({ name, description, input, idempotent?, run })`. `input` is a Standard Schema with Standard JSON Schema support (e.g. zod ≥ 4.2); the model sees its JSON Schema, and the app fails to start if a schema cannot be converted. Input is validated before `run`: invalid input never reaches `run` and goes back to the model as an error result. `run` returns a string (sent as is) or any JSON value (serialized). Tool `ctx` has `actor`, `requestedBy`, `clients`, `interaction`, `thread` (durable `post`/`update`/`history`, each with an id), `state`, `invoke`, `start`, `evaluate`, and `signal`.
 - `idempotent: true` tools run again after a crash interrupts them; other tools give the model an interrupted result instead.
 - `f.defineToolkit({ name, tools, instructions })` groups tools and instructions. Agents list app toolkits and plugin ids in `toolkits`.
 - `f.defineState({ name, scope, schema, initial, render? })` is state agents see and change. Tools change it with `ctx.state(def).update(fn)`; the changes commit atomically with the tool result. Workflows use `ctx.state(def).get(id)` / `.update(id, fn)`. Agents listing a state in `state` see its `render` output in the prompt.
 - `ctx.agent(id, agent, { input, output?, detached? })` runs the agent durably and returns its final answer; it never posts automatically. With `output`, the agent is asked for a single JSON value, which is parsed and validated against the schema in a durable step. Invalid answers fail explicitly; there is no silent coercion or repair loop. `detached: true` keeps the agent run alive when the caller is cancelled.
+
+### Subagents
+
+```ts
+export const researcher = f.defineAgent({
+	name: "researcher",
+	description: "Investigates a question and returns findings with sources.",
+	model: "anthropic/claude-haiku-4-5",
+	tools: [search, readDocs],
+});
+
+export const lead = f.defineAgent({
+	name: "lead",
+	description: "Answers support questions in #help.",
+	model: "anthropic/claude-sonnet-5",
+	subagents: [researcher, { agent: "self", context: "fork" }],
+	limits: { depth: 1, concurrent: 5 }, // defaults
+});
+```
+
+- Entries are an agent, `"self"` (a copy of the lead), or `{ agent, context?: "fresh" | "fork", background?: "allow" | "always" | "never" }`. Names that collide with another subagent, a tool, a workflow, or `reply` are rejected at definition (plugin toolkit tools when the app starts).
+- The model gets one tool per subagent, named after the agent like workflow tools (`researcher`, `bug-researcher` → `bug_researcher`) and described by its `description`: `researcher({ task, name?, background? })`. A call runs a child conversation in the lead's Session, configured from the subagent's definition (model, instructions, tools, toolkits, state); unset `model` and `thinking` follow the lead. Fresh children see only their task; `context: "fork"` children see the lead's transcript up to the delegating response.
+- The call waits and returns the answer as data: `<subagent name="researcher-1" status="done">…escaped…</subagent>`. Pass `name: "researcher-1"` to continue that child with its history. A child that ends without an answer returns `status="failed"` with a generic message and an error id; the provider's error is logged with that id.
+- The child is owned by the lead's tool call (Pi ownership): cancelling the lead aborts it, and a restart resumes it without submitting the task twice. Children have no chat binding and no `reply` tool; their tools and workflows (approvals included) act for the lead's current request: the same actor, thread, and approvers. Their activity shows on the lead's status (`researcher: Thinking…`).
+- With `depth: 1` children get no subagent tools; a deeper `depth` passes the remaining levels down. More than `concurrent` children running at once in one conversation is a tool error the model can act on.
+- Background children are not available yet: `background: true` (or an `"always"` entry) returns a tool error.
 
 ### `ctx.evaluate`
 

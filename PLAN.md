@@ -731,13 +731,13 @@ Each entry is an agent, `"self"` (a copy of the lead), or `{ agent, context?, ba
 
 **How it maps to Pi.**
 
-| Fabrial           | Pi                                                                                                   |
-| ----------------- | ---------------------------------------------------------------------------------------------------- |
-| Foreground call   | Child conversation owned by the tool call (Pi example 22): aborting the lead aborts it               |
-| Background child  | Child owned by a background anchor task, so the lead's Esc and idle waits stop there (Pi example 23) |
-| Background answer | Reporter task that submits the answer to the lead as a `followUp`, with a request ID                 |
-| `context: "fork"` | `conversation.fork(entryId)`, owned the same way                                                     |
-| Continue, stop    | `submit` to the child (`steer` if busy, otherwise a new run); `abort()`                              |
+| Fabrial           | Pi                                                                                                                                                                 |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Foreground call   | Child conversation owned by the tool call (Pi example 22): aborting the lead aborts it                                                                             |
+| Background child  | Child owned by a background anchor task, so the lead's Esc and idle waits stop there (Pi example 23)                                                               |
+| Background answer | Reporter task that submits the answer to the lead as a `followUp`, with a request ID                                                                               |
+| `context: "fork"` | `conversation.fork(entryId)`, owned the same way                                                                                                                   |
+| Continue, stop    | A running child: `submit` (`steer` if busy). An idle child: `fork()` at its newest entry, owned by the new call, so aborts still flow through ownership; `abort()` |
 
 **Rules.**
 
