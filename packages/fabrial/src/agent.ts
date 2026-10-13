@@ -107,6 +107,8 @@ export interface AgentDefinition<
 > {
 	/** Stable: the continuation key; labels traces and progress. */
 	name: string;
+	/** What the agent does and when to use it: the tool description when it is a subagent. */
+	description: string;
 	/** `"provider/model"`, e.g. `"anthropic/claude-sonnet-5"`. */
 	model?: string;
 	thinking?: ThinkingLevel;
@@ -116,6 +118,36 @@ export interface AgentDefinition<
 	toolkits?: readonly (TPluginId | Toolkit)[];
 	/** States rendered into the prompt via their `render`. */
 	state?: readonly StateDefinition<any>[];
+	/** Agents this one delegates to, one tool each: an agent, `"self"` (a copy of this one), or options. */
+	subagents?: readonly SubagentEntry[];
+	limits?: SubagentLimits;
+}
+
+/** A subagent with options. */
+export interface SubagentOptions {
+	agent: Agent | "self";
+	/** `"fresh"` (default): the child sees only its task. `"fork"`: it inherits the lead's transcript so far. */
+	context?: "fresh" | "fork";
+	/** Whether the model may (`"allow"`, default), must, or must not run the child in the background. */
+	background?: "allow" | "always" | "never";
+}
+
+export type SubagentEntry = Agent | "self" | SubagentOptions;
+
+export interface SubagentLimits {
+	/** Levels of subagents below this agent; with 1 (default) children get no subagent tools. */
+	depth?: number;
+	/** Children running at once per lead conversation (default 5). */
+	concurrent?: number;
+}
+
+/** A subagent entry resolved against its lead: `"self"` is the lead, options are filled in. */
+export interface ResolvedSubagent {
+	/** The tool name the model calls. */
+	readonly tool: string;
+	readonly agent: Agent;
+	readonly context: "fresh" | "fork";
+	readonly background: "allow" | "always" | "never";
 }
 
 export interface Agent extends AgentRef {
@@ -154,12 +186,75 @@ export const definedAgents = new WeakMap<object, Set<Agent>>();
 
 export function defineAgent(definition: AgentDefinition<string, any>, scope: object): Agent {
 	if (!definition.name) throw new Error("Agent name must not be empty");
+	if (typeof definition.description !== "string" || !definition.description.trim())
+		throw new Error(`Agent ${definition.name} needs a description`);
 	if (definition.model !== undefined) parseModel(definition.model);
 	const agent: Agent = { kind: "fabrial.agent", name: definition.name, definition };
+	validateSubagents(agent);
 	let agents = definedAgents.get(scope);
 	if (!agents) definedAgents.set(scope, (agents = new Set()));
 	agents.add(agent);
 	return agent;
+}
+
+/** The name the model calls a workflow or subagent by: letters, digits, and `_`. */
+export const toolName = (name: string) => name.replaceAll(/[^a-zA-Z0-9_]/g, "_");
+
+export const SUBAGENT_DEFAULTS = { depth: 1, concurrent: 5 } as const;
+
+export function resolveSubagents(lead: Agent): ResolvedSubagent[] {
+	return (lead.definition.subagents ?? []).map((entry) => {
+		const options: SubagentOptions =
+			entry === "self" || (typeof entry === "object" && "kind" in entry) ? { agent: entry } : entry;
+		const agent = options.agent === "self" ? lead : options.agent;
+		return {
+			tool: toolName(agent.name),
+			agent,
+			context: options.context ?? "fresh",
+			background: options.background ?? "allow",
+		};
+	});
+}
+
+/** Tool names of an agent's own tools and app toolkits; plugin toolkits are checked when the app starts. */
+export function ownToolNames(definition: AgentDefinition<string, any>): string[] {
+	const name = (tool: AgentTool) => (isWorkflow(tool) ? toolName(tool.name) : tool.name);
+	return [
+		"reply",
+		...(definition.tools ?? []).map(name),
+		...(definition.toolkits ?? []).flatMap((entry) =>
+			typeof entry === "string" ? [] : (entry.tools ?? []).map(name),
+		),
+	];
+}
+
+function validateSubagents(lead: Agent): void {
+	const { name, subagents = [], limits = {} } = lead.definition;
+	for (const [key, value] of Object.entries(limits))
+		if (value !== undefined && (!Number.isInteger(value) || value < 1))
+			throw new Error(`Agent ${name}: limits.${key} must be a positive integer`);
+	for (const entry of subagents) {
+		const options =
+			typeof entry === "object" && !("kind" in entry) ? (entry as SubagentOptions) : undefined;
+		const agent: unknown = options ? options.agent : entry;
+		if (agent !== "self" && (agent as Agent | undefined)?.kind !== "fabrial.agent")
+			throw new Error(`Agent ${name}: a subagent must be an agent, "self", or { agent }`);
+		if (options?.context !== undefined && !["fresh", "fork"].includes(options.context))
+			throw new Error(`Agent ${name}: subagent context must be "fresh" or "fork"`);
+		if (
+			options?.background !== undefined &&
+			!["allow", "always", "never"].includes(options.background)
+		)
+			throw new Error(`Agent ${name}: subagent background must be "allow", "always", or "never"`);
+	}
+	const taken = new Set(ownToolNames(lead.definition));
+	for (const subagent of resolveSubagents(lead)) {
+		if (taken.has(subagent.tool))
+			throw new Error(
+				`Agent ${name}: subagent ${subagent.agent.name} is called ${subagent.tool}, which another tool or subagent already uses`,
+			);
+		taken.add(subagent.tool);
+	}
 }
 
 export function defineTool<TInput>(definition: ToolDefinition<TInput, any>): Tool<TInput> {

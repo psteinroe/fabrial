@@ -55,6 +55,7 @@ const models = createModels();
 models.setProvider(faux.provider);
 const developer = f.defineAgent({
 	name: "developer",
+	description: "Answers test questions.",
 	model: `${faux.provider.id}/${faux.getModel().id}`,
 	toolkits: ["github"],
 });

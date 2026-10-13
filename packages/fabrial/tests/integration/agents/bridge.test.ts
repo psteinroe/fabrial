@@ -99,6 +99,7 @@ it("runs durable structured answers, memoizes submissions, and continues one age
 	const f = fixture();
 	const agent = defineAgent({
 		name: randomUUID(),
+		description: "Answers test questions.",
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	f.faux.setResponses([fauxAssistantMessage('{"answer":42}'), fauxAssistantMessage("continued")]);
@@ -164,6 +165,7 @@ it("binds adapter identity, clients, sections and durable posts; commits tool st
 	});
 	const agent = defineAgent({
 		name: randomUUID(),
+		description: "Answers test questions.",
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 		toolkits: [extension],
 		state: [state],
@@ -222,6 +224,7 @@ it("releases the Session while a workflow tool waits and reconnects with a stabl
 	(f.host.workflows as unknown as (typeof child)[]).push(child);
 	const agent = defineAgent({
 		name: randomUUID(),
+		description: "Answers test questions.",
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 		tools: [child],
 	});
@@ -270,6 +273,7 @@ it("rejects invalid structured answers", async () => {
 	const f = fixture();
 	const agent = defineAgent({
 		name: randomUUID(),
+		description: "Answers test questions.",
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	f.faux.setResponses([fauxAssistantMessage('{"answer":"not a number"}')]);
@@ -341,6 +345,7 @@ it.each([[false], [true]])(
 		(f.host.workflows as unknown as (typeof child)[]).push(child);
 		const agent = defineAgent({
 			name: randomUUID(),
+			description: "Answers test questions.",
 			model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 			tools: [child],
 		});
@@ -413,6 +418,7 @@ it("installs plugin observers globally but does not select unrequested plugin to
 	]);
 	const agent = defineAgent({
 		name: randomUUID(),
+		description: "Answers test questions.",
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	f.faux.setResponses([fauxAssistantMessage("ok")]);
@@ -441,6 +447,7 @@ it("notifies onToolCall after a tool settles and logs observers that throw", asy
 	const warn = vi.spyOn(f.host.logger, "warn");
 	const agent = defineAgent({
 		name: randomUUID(),
+		description: "Answers test questions.",
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 		tools: [
 			defineTool({
@@ -481,6 +488,7 @@ it("returns input that fails the tool schema to the model without running the to
 	let runs = 0;
 	const agent = defineAgent({
 		name: randomUUID(),
+		description: "Answers test questions.",
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 		tools: [
 			defineTool({
@@ -527,6 +535,7 @@ it("sends a non-string tool result to the model as serialized JSON", async () =>
 	const f = fixture();
 	const agent = defineAgent({
 		name: randomUUID(),
+		description: "Answers test questions.",
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 		tools: [
 			defineTool({
@@ -590,6 +599,7 @@ it("consumes buffered steering replies with stable request ids", async () => {
 	}));
 	const agent = defineAgent({
 		name: randomUUID(),
+		description: "Answers test questions.",
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	const routing = await io.getState();
@@ -817,6 +827,7 @@ it("stop joins driver routing cleanup after the harness has closed", async () =>
 	const f = fixture();
 	const agent = defineAgent({
 		name: randomUUID(),
+		description: "Answers test questions.",
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	f.faux.setResponses([fauxAssistantMessage("done")]);
@@ -878,7 +889,11 @@ it("does not install agents from an unrelated Fabrial catalog", async () => {
 	const unrelated = createFabrial({
 		plugins: [{ id: "unrelated", toolkit: () => ({ tools: [] }) }],
 	});
-	unrelated.defineAgent({ name: randomUUID(), toolkits: ["unrelated"] });
+	unrelated.defineAgent({
+		name: randomUUID(),
+		description: "Answers test questions.",
+		toolkits: ["unrelated"],
+	});
 	const local = createFabrial({ plugins: [] });
 	const f = fixture([], local);
 	// Installing the unrelated agent would fail: this host has no unrelated plugin toolkit.

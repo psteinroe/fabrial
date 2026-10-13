@@ -83,6 +83,7 @@ async function setup(
 	models.setProvider(faux.provider);
 	const agent = f.defineAgent({
 		name: `support-${channel}`,
+		description: "Answers test questions.",
 		model: `${faux.provider.id}/${faux.getModel().id}`,
 		tools: tools(channel, (): AgentRef => agent),
 	});

@@ -112,7 +112,7 @@ describe("static subscriptions", () => {
 		},
 	});
 	const f = createFabrial({ plugins: [plugin] });
-	const agent = f.defineAgent({ name: "support" });
+	const agent = f.defineAgent({ name: "support", description: "Answers test questions." });
 
 	it("sends every message without holding the thread, keyed by channel or a computed key", async () => {
 		const channel = f.subscribe({

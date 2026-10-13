@@ -194,7 +194,7 @@ describe("pull request resources", () => {
 describe("dynamic subscriptions in an app", () => {
 	async function setup() {
 		const f = createFabrial({ plugins: [plugin()] });
-		const agent = f.defineAgent({ name: "dev" });
+		const agent = f.defineAgent({ name: "dev", description: "Answers test questions." });
 		const policy = f.defineSubscriptionPolicy({
 			name: "changes-urgent",
 			priority: (event) =>

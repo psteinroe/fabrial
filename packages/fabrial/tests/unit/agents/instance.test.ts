@@ -43,17 +43,25 @@ const toolkit = f.defineToolkit({
 
 function invalidDefinitions() {
 	// @ts-expect-error Only this catalog's toolkit plugin ids are permitted.
-	f.defineAgent({ name: "wrong", toolkits: ["exmaple"] });
+	f.defineAgent({ name: "wrong", description: "Answers test questions.", toolkits: ["exmaple"] });
 	// @ts-expect-error Plugins without a toolkit cannot be selected.
-	f.defineAgent({ name: "wrong", toolkits: ["plain"] });
-	// @ts-expect-error Plugin factories record a missing toolkit too.
-	f.defineAgent({ name: "wrong", toolkits: ["plain-factory"] });
-	f.defineAgent({ name: "factory", toolkits: ["factory"] });
+	f.defineAgent({ name: "wrong", description: "Answers test questions.", toolkits: ["plain"] });
+	f.defineAgent({
+		name: "wrong",
+		description: "Answers test questions.",
+		// @ts-expect-error Plugin factories record a missing toolkit too.
+		toolkits: ["plain-factory"],
+	});
+	f.defineAgent({ name: "factory", description: "Answers test questions.", toolkits: ["factory"] });
 	const other = createFabrial({ plugins: [] });
-	// @ts-expect-error Other instances do not inherit this catalog's ids.
-	other.defineAgent({ name: "wrong", toolkits: ["example"] });
+	other.defineAgent({
+		name: "wrong",
+		description: "Answers test questions.",
+		// @ts-expect-error Other instances do not inherit this catalog's ids.
+		toolkits: ["example"],
+	});
 	// @ts-expect-error Thinking levels are Fabrial's.
-	other.defineAgent({ name: "wrong", thinking: "xhigh" });
+	other.defineAgent({ name: "wrong", description: "Answers test questions.", thinking: "xhigh" });
 	other.defineTool({
 		name: "empty",
 		description: "No clients",
@@ -69,6 +77,7 @@ void invalidDefinitions;
 it("returns plain Fabrial definitions bound to an explicit catalog", () => {
 	const agent = f.defineAgent({
 		name: "example",
+		description: "Answers test questions.",
 		model: "anthropic/claude-sonnet-5",
 		thinking: "medium",
 		instructions: ["Static", (ctx) => `Requested by ${ctx.actor?.name}`],
@@ -79,7 +88,9 @@ it("returns plain Fabrial definitions bound to an explicit catalog", () => {
 	expect(agent.definition.toolkits).toEqual(["example", toolkit]);
 	expect(tool.kind).toBe("fabrial.tool");
 	expect(toolkit.kind).toBe("fabrial.toolkit");
-	expect(() => f.defineAgent({ name: "bad", model: "no-provider" })).toThrow("provider/model");
+	expect(() =>
+		f.defineAgent({ name: "bad", description: "Answers test questions.", model: "no-provider" }),
+	).toThrow("provider/model");
 	expect(() =>
 		f.defineTool({ name: "bad name", description: "", input: z.object({}), run: () => null }),
 	).toThrow("Invalid tool name");

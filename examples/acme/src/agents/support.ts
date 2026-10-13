@@ -25,6 +25,7 @@ export const readOnlyQuery = f.defineTool({
 export const supportModel = "anthropic/claude-sonnet-4-5";
 export const supportAgent = f.defineAgent({
 	name: "acme-support",
+	description: "Investigates customer issues with read-only queries and proposes approved repairs.",
 	model: supportModel,
 	instructions:
 		"Help support investigate customer issues. Read before proposing repairs. Use run_sql for writes; never bypass its human approval. Report declined or cancelled requests honestly. Return your answer without posting it.",

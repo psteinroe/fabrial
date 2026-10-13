@@ -37,6 +37,7 @@ export const openPullRequest = f.defineTool({
 
 export const developerAgent = f.defineAgent({
 	name: "acme-developer",
+	description: "Makes code changes, opens pull requests, and follows their reviews.",
 	model: supportModel,
 	instructions:
 		"You make code changes for the team. Answer with the reply tool. When a pull request you follow gets a review, address it and say what you changed.",
