@@ -75,17 +75,22 @@ async function setup(
 		channel: string,
 		self: () => AgentRef,
 	) => Parameters<typeof f.defineAgent>[0]["tools"] = () => [],
-	options: { retry?: Partial<ConversationRetryPolicy>; logger?: Logger } = {},
+	options: { retry?: Partial<ConversationRetryPolicy>; logger?: Logger; researcher?: boolean } = {},
 ) {
 	const channel = `c${randomUUID().slice(0, 8)}`;
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
+	const model = `${faux.provider.id}/${faux.getModel().id}`;
+	const researcher = options.researcher
+		? f.defineAgent({ name: `researcher-${channel}`, description: "Researches.", model })
+		: undefined;
 	const agent = f.defineAgent({
 		name: `support-${channel}`,
 		description: "Answers test questions.",
-		model: `${faux.provider.id}/${faux.getModel().id}`,
+		model,
 		tools: tools(channel, (): AgentRef => agent),
+		...(researcher ? { subagents: [researcher] } : {}),
 	});
 	const subscription = f.subscribe({
 		name: `channel-${channel}`,
@@ -774,4 +779,43 @@ it("a driver redelivered after starting the error reply does not post it twice",
 	expect(t.runtime.executions("fabrial.pi.run").map((e) => e.result?.status)).toEqual([
 		"completed",
 	]);
+});
+
+it("a sent run's background child reports as a follow-up and the lead replies again", async () => {
+	const t = await setup(undefined, { researcher: true });
+	const tool = `researcher_${t.channel}`;
+	const last = (messages: readonly Message[]) => {
+		const message = messages.findLast((each) => (each.role as string) !== "system")!;
+		return typeof message.content === "string" ? message.content : text([message]);
+	};
+	t.respond(
+		Array.from({ length: 12 }, () => (context: { messages: Message[] }) => {
+			const latest = last(context.messages);
+			if (latest === "Find the cause") return fauxAssistantMessage("It is DNS");
+			if (latest.includes("subagent name=") && latest.includes("It is DNS"))
+				return fauxAssistantMessage(fauxToolCall("reply", { text: "Found: DNS" }), {
+					stopReason: "toolUse",
+				});
+			if (latest.includes("Started"))
+				return fauxAssistantMessage(fauxToolCall("reply", { text: "Looking into it" }), {
+					stopReason: "toolUse",
+				});
+			if (latest.includes("Posted.")) return fauxAssistantMessage("done");
+			return fauxAssistantMessage(
+				fauxToolCall(tool, { task: "Find the cause", background: true }),
+				{ stopReason: "toolUse" },
+			);
+		}),
+	);
+	await t.chat.receive(t.message("m1", "t1", "Why is it down?"));
+	await t.settle();
+	expect((await t.posts("t1")).map((post) => post.content)).toEqual([
+		"Looking into it",
+		"Found: DNS",
+	]);
+	expect(
+		(await submitted(`chat:channel:${t.channel}`)).filter((id) =>
+			id.startsWith("fabrial.subagent-report:"),
+		),
+	).toHaveLength(1);
 });

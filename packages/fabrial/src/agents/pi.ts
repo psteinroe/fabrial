@@ -52,7 +52,16 @@ import {
 } from "../agent.ts";
 import type { AnyWorkflow } from "../workflow.ts";
 import { instructionsSection, piToolOf, toJsonSchema } from "./tools.ts";
-import { subagentTool, type SubagentDeps } from "./subagents.ts";
+import {
+	abortBackground,
+	backgroundPending,
+	reportedAnswer,
+	stopTool,
+	subagentsSection,
+	subagentTasks,
+	subagentTool,
+	type SubagentDeps,
+} from "./subagents.ts";
 import type { Sql } from "postgres";
 import {
 	BridgeKey,
@@ -211,9 +220,17 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	);
 	const reply = replyTool();
 	const inbox = new Inbox(options.sql);
+	const subagentDeps: SubagentDeps = {
+		childAgent,
+		named: (conversationId, agent) => conversationAgents.set(conversationId, agent),
+		logger: host.logger,
+		busy: new Map(),
+	};
 	const internal = defineExtension({
 		name: "fabrial.internal",
 		tools: [reply],
+		// Background subagent tasks resume after a restart wherever a Session is opened.
+		tasks: subagentTasks(subagentDeps),
 		hooks: observers.length ? observerHooks(observers, agentNameOf, host) : [],
 	});
 	registry.install(internal);
@@ -226,13 +243,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	}
 	/** Each agent's extensions without, and its subagent tools as, an extension. */
 	const extensionsOf = new Map<string, { base: Extension[]; subagents?: Extension }>();
-	const subagentDeps: SubagentDeps = {
-		childAgent,
-		named: (conversationId, agent) => conversationAgents.set(conversationId, agent),
-		logger: host.logger,
-		running: new Map(),
-		busy: new Map(),
-	};
 	/** Workflow tools drop out until their workflow is registered. */
 	const registered = (tool: ToolRegistration) => {
 		const supplied = workflowTools.get(tool);
@@ -325,7 +335,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		const delegates = subagents.length
 			? defineExtension({
 					name: `fabrial.subagents.${name}`,
-					tools: subagents.map((subagent) => subagentTool(agent, subagent, subagentDeps)),
+					tools: [
+						...subagents.map((subagent) => subagentTool(agent, subagent, subagentDeps)),
+						stopTool(),
+					],
+					sections: [subagentsSection],
 				})
 			: undefined;
 		if (delegates) registry.install(delegates);
@@ -771,10 +785,26 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 									.join("\n") ?? "";
 						}
 					}
+					// Background children keep the driver: their reports arrive as follow-ups the lead answers, and
+					// a call settles only once the lead has answered the last of them.
+					if (
+						complete &&
+						!failed &&
+						((await backgroundPending(frame.harness, context)) ||
+							(await frame.harness.snapshot(LiveDoc, conversationId!, context))?.run)
+					)
+						complete = false;
 					if (complete) {
 						// Input sent while this run ended is ours to answer; its own driver may already be done.
 						if (await drain(true)) continue;
 						if (failed) throw new Error(`Pi run unanswered: ${failed}`);
+						answer =
+							(await reportedAnswer(
+								frame.harness,
+								execution.executionId,
+								conversationId!,
+								context,
+							)) ?? answer;
 						// A sent run answers through `reply`; nothing is returned to post.
 						outcome = sending ? null : (answer ?? "");
 						break;
@@ -882,6 +912,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		}
 		for (const child of Object.values(run.children))
 			if (!child.detached) await host.runtime.cancel(child.executionId, reason);
+		// Cancelling the interaction reaches past the background boundary to the children this run started.
+		await abortBackground(harness, executionId, context);
 		const inspection = await harness.inspect(context);
 		const requests = new Set(Object.keys(run.requests ?? {}));
 		const ids = new Set<number>();

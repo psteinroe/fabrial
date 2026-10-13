@@ -2,12 +2,7 @@ import { expect, it } from "vitest";
 import { z } from "zod";
 import { createFabrial } from "../../../src/index.ts";
 import { resolveSubagents } from "../../../src/agent.ts";
-import {
-	BACKGROUND_UNAVAILABLE,
-	subagentResult,
-	subagentTool,
-	type SubagentDeps,
-} from "../../../src/agents/subagents.ts";
+import { subagentResult, subagentTool, type SubagentDeps } from "../../../src/agents/subagents.ts";
 
 const f = createFabrial({ plugins: [] });
 const researcher = f.defineAgent({
@@ -77,7 +72,6 @@ const deps = (): SubagentDeps => ({
 	childAgent: () => ({}),
 	named: () => {},
 	logger: { warn() {}, error() {}, debug() {}, info() {} },
-	running: new Map(),
 	busy: new Map(),
 });
 
@@ -106,21 +100,14 @@ it("generates one replay-safe tool per subagent, described by the agent's descri
 	]);
 });
 
-it("returns background calls as tool errors until background children land", async () => {
+it("refuses background calls to a subagent that never runs in the background", async () => {
 	const lead = f.defineAgent({
 		name: "lead",
 		description: "Leads.",
-		subagents: [
-			{ agent: researcher, background: "always" },
-			{ agent: reviewer, background: "never" },
-		],
+		subagents: [{ agent: reviewer, background: "never" }],
 	});
-	const [always, never] = resolveSubagents(lead).map((entry) => subagentTool(lead, entry, deps()));
+	const [never] = resolveSubagents(lead).map((entry) => subagentTool(lead, entry, deps()));
 	const bridge = { value: () => ({}) } as never;
-	expect(await always!.execute({ task: "x" } as never, {} as never, bridge)).toEqual({
-		content: [{ type: "text", text: BACKGROUND_UNAVAILABLE }],
-		isError: true,
-	});
 	expect(
 		await never!.execute({ task: "x", background: true } as never, {} as never, bridge),
 	).toMatchObject({ isError: true, content: [{ text: expect.stringContaining("cannot run") }] });

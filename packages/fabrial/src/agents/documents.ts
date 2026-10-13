@@ -64,10 +64,29 @@ export const SubagentNames = defineDoc({
 			string,
 			{
 				next: Record<string, number>;
-				children: Record<string, { agent: string; conversationId: number }>;
+				children: Record<string, { agent: string; conversationId: number; background?: boolean }>;
 			}
 		>;
 	} => ({ leads: {} }),
+});
+/**
+ * Subagent work that outlives a driver cycle. `slots` count running children per lead for `limits.concurrent`: one per
+ * holder task (a foreground call or a background reporter), released when the holder ends. `calls` make a rerun of a
+ * background call find its reporter; `reported` keeps several inputs that end in one answer from reporting it twice.
+ */
+export const SubagentWork = defineDoc({
+	kind: "fabrial.subagent-work",
+	scope: "session",
+	version: 1,
+	initial: (): {
+		slots: Record<string, Record<string, string>>;
+		calls: Record<string, number>;
+		reporters: Record<
+			string,
+			{ lead: number; child: number; name: string; run: string; report: number | null }
+		>;
+		reported: Record<string, number[]>;
+	} => ({ slots: {}, calls: {}, reporters: {}, reported: {} }),
 });
 export const ChildResults = defineDoc({
 	kind: "fabrial.children",

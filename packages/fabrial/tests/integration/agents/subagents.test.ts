@@ -15,6 +15,7 @@ import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
 	createFabrial,
+	defineUser,
 	type Agent,
 	type FabrialHost,
 	type InvocationMetadata,
@@ -22,7 +23,7 @@ import {
 } from "../../../src/index.ts";
 import { toolName } from "../../../src/agent.ts";
 import { pi, PostgresStorage, sessionKey } from "../../../src/agents/index.ts";
-import { FakeChat, MemoryRuntime } from "../../../src/testing.ts";
+import { FakeChat, MemoryRuntime, testApp } from "../../../src/testing.ts";
 
 const definitions = createFabrial({ plugins: [] });
 const { defineAgent, defineTool, defineWorkflow } = definitions;
@@ -250,14 +251,15 @@ it("depth 2 passes one level down: a self copy gets the subagent tool, its child
 	]);
 	const { settled } = await f.call(lead, "Go deep");
 	expect(await settled).toMatchObject({ status: "completed", output: "top" });
-	expect(f.contexts.map(toolNames)).toEqual([[tool], [tool], [], [tool], [tool]]);
+	const offered = [tool, "subagent_stop"];
+	expect(f.contexts.map(toolNames)).toEqual([offered, offered, [], offered, offered]);
 	expect(toolResults(f.contexts[3]!)).toEqual([
 		`<subagent name="${tool}-1" status="done">deepest</subagent>`,
 	]);
 	await f.integration.stop();
 });
 
-it("continuing a named child keeps its history; unknown names and background calls are tool errors", async () => {
+it("continuing a named child keeps its history; unknown names are tool errors", async () => {
 	const f = fixture();
 	const researcher = researcherOf(f);
 	const lead = defineAgent({
@@ -274,7 +276,6 @@ it("continuing a named child keeps its history; unknown names and background cal
 			[
 				fauxToolCall(tool, { task: "What number?", name: `${tool}-1` }),
 				fauxToolCall(tool, { task: "x", name: "nobody" }),
-				fauxToolCall(tool, { task: "x", background: true }),
 			],
 			{ stopReason: "toolUse" },
 		),
@@ -290,7 +291,6 @@ it("continuing a named child keeps its history; unknown names and background cal
 		`<subagent name="${tool}-1" status="done">Remembered.</subagent>`,
 		`<subagent name="${tool}-1" status="done">7</subagent>`,
 		`There is no ${tool} child called nobody. Call ${tool} without a name to start one.`,
-		"background subagents are not available yet",
 	]);
 	await f.integration.stop();
 });
@@ -475,4 +475,446 @@ it("a child that fails returns a generic failed result and logs the provider err
 		expect.objectContaining({ errorId, reason: "model_error" }),
 	);
 	await f.integration.stop();
+});
+
+/** The text of the newest message a request answers: a user input or a tool result. */
+const lastText = (context: TranscriptContext) => {
+	const last = context.messages.findLast((message) => (message.role as string) !== "system")!;
+	const content =
+		typeof last.content === "string" ? [{ type: "text", text: last.content }] : last.content;
+	return content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
+};
+type Reply = ReturnType<typeof fauxAssistantMessage>;
+/** Answers every request from its newest message: lead and children run concurrently, so order is not fixed. */
+const route = (f: Fixture, answer: (text: string) => Reply | Promise<Reply>) =>
+	f.respond(
+		Array.from({ length: 40 }, () => (context: TranscriptContext) => answer(lastText(context))),
+	);
+const use = (tool: string, args: object) =>
+	fauxAssistantMessage(fauxToolCall(tool, args as never), { stopReason: "toolUse" });
+const say = (text: string) => fauxAssistantMessage(text);
+/** Request ids of submissions in the fixture's Session that start with `prefix`. */
+const requests = async (f: Fixture, prefix: string) => [
+	...new Set(
+		(await f.writes()).flatMap((write) =>
+			write.type === "submission" && write.value.requestId?.startsWith(prefix)
+				? [write.value.requestId]
+				: [],
+		),
+	),
+];
+const latestTasks = async (f: Fixture) => [
+	...new Map(
+		(await f.writes()).flatMap((write) =>
+			write.type === "task" ? [[write.value.id, write.value] as const] : [],
+		),
+	).values(),
+];
+function gate() {
+	let open!: () => void;
+	const opened = new Promise<void>((resolve) => (open = resolve));
+	return { open, opened };
+}
+function leadOf(f: Fixture, researcher: Agent, limits?: { concurrent?: number }) {
+	return defineAgent({
+		name: `lead-${short()}`,
+		description: "Answers support questions.",
+		model: f.model,
+		subagents: [researcher],
+		...(limits ? { limits } : {}),
+	});
+}
+
+it("a background child returns its name at once; a call settles after the lead answered its report", async () => {
+	const f = fixture();
+	const researcher = researcherOf(f);
+	const lead = leadOf(f, researcher);
+	const tool = toolName(researcher.name);
+	route(f, (text) => {
+		if (text.includes("Why is the site down?"))
+			return use(tool, { task: "Find the root cause", background: true });
+		if (text.startsWith("Started")) return say("I asked a researcher.");
+		if (text === "Find the root cause") return say("It is <DNS>");
+		if (text.startsWith("<subagent")) return say("Final: DNS");
+		return say(`unexpected: ${text}`);
+	});
+	const { settled } = await f.call(lead, "Why is the site down?");
+	expect(await settled).toEqual({ status: "completed", output: "Final: DNS" });
+	const started = f.contexts.find((context) => lastText(context).startsWith("Started"))!;
+	expect(lastText(started)).toBe(
+		`Started ${tool}-1 in the background. Its answer arrives later as input <subagent name="${tool}-1">; continue meanwhile.`,
+	);
+	const report = f.contexts.find((context) => lastText(context).startsWith("<subagent"))!;
+	expect(lastText(report)).toBe(
+		`<subagent name="${tool}-1" status="done">It is &lt;DNS&gt;</subagent>`,
+	);
+	// The status section lists children from durable state, only once there are some.
+	expect(prompt(f.contexts[0]!)).not.toContain("Your subagents");
+	expect(prompt(report)).toMatch(
+		new RegExp(`- ${tool}-1 \\(${researcher.name}, background\\): (working|idle)`),
+	);
+	expect(await requests(f, "fabrial.subagent-report:")).toHaveLength(1);
+	const statuses = (await f.chat.thread(f.metadata.replyTo as Parameters<typeof f.chat.thread>[0]))
+		.statuses;
+	expect(statuses).toContain(`${researcher.name}: Thinking…`);
+	await f.integration.stop();
+});
+
+it("continuing a busy background child steers it; an idle one gets new input; each answer is reported once", async () => {
+	const f = fixture();
+	const held = gate();
+	const wait = defineTool({
+		name: "wait",
+		description: "Waits",
+		input: z.object({}),
+		run: async () => {
+			await held.opened;
+			return "waited";
+		},
+	});
+	const researcher = researcherOf(f, [wait]);
+	const lead = leadOf(f, researcher);
+	const tool = toolName(researcher.name);
+	const name = `${tool}-1`;
+	const childTexts: string[][] = [];
+	f.respond(
+		Array.from({ length: 40 }, () => (context: TranscriptContext) => {
+			const text = lastText(context);
+			if (text.includes("Go")) return use(tool, { task: "Count to three", background: true });
+			if (text.startsWith("Started")) return use(tool, { task: "Also count to four", name });
+			if (text.startsWith("Sent the task")) {
+				held.open();
+				return say("Waiting.");
+			}
+			if (text === "Count to three") return use("wait", {});
+			// The steer is placed after the tool result, so it is the newest message.
+			if (text === "waited" || text === "Also count to four") {
+				childTexts.push(userTexts(context));
+				return say(userTexts(context).includes("Also count to four") ? "1 2 3 4" : "1 2 3");
+			}
+			if (text.includes("1 2 3 4</subagent>")) return use(tool, { task: "Now five", name });
+			if (text === "Now five") {
+				childTexts.push(userTexts(context));
+				return say("5");
+			}
+			if (text.startsWith("<subagent") && text.includes(">5<")) return say("Final");
+			return say("ok");
+		}),
+	);
+	const { settled } = await f.call(lead, "Go");
+	expect(await settled).toEqual({ status: "completed", output: "Final" });
+	const reports = f.contexts.map(lastText).filter((text) => text.startsWith("<subagent"));
+	expect(reports).toEqual([
+		`<subagent name="${name}" status="done">1 2 3 4</subagent>`,
+		`<subagent name="${name}" status="done">5</subagent>`,
+	]);
+	// One conversation keeps the whole history: the steer reached it mid-run, the next task after it.
+	expect(childTexts.at(-1)).toEqual(["Count to three", "Also count to four", "Now five"]);
+	const conversations = (await f.writes()).filter((write) => write.type === "conversation");
+	expect(new Set(conversations.map((write) => write.value.id)).size).toBe(2);
+	await f.integration.stop();
+});
+
+it("subagent_stop aborts a background child's work; it reports nothing and the call settles", async () => {
+	const f = fixture();
+	const started = gate();
+	let aborted = false;
+	const slow = defineTool({
+		name: "slow",
+		description: "Slow work",
+		input: z.object({}),
+		run: (_input, ctx) => {
+			started.open();
+			return new Promise<never>((_resolve, reject) =>
+				ctx.signal.addEventListener(
+					"abort",
+					() => {
+						aborted = true;
+						reject(ctx.signal.reason);
+					},
+					{ once: true },
+				),
+			);
+		},
+	});
+	const researcher = researcherOf(f, [slow]);
+	const lead = leadOf(f, researcher);
+	const tool = toolName(researcher.name);
+	route(f, async (text) => {
+		if (text.includes("Go")) return use(tool, { task: "Work slowly", background: true });
+		if (text.startsWith("Started")) {
+			await started.opened;
+			return use("subagent_stop", { name: `${tool}-1` });
+		}
+		if (text.startsWith("Stopped")) return say("Stopped it.");
+		if (text === "Work slowly") return use("slow", {});
+		return say(`unexpected: ${text}`);
+	});
+	const { settled } = await f.call(lead, "Go");
+	expect(await settled).toEqual({ status: "completed", output: "Stopped it." });
+	expect(aborted).toBe(true);
+	expect(f.contexts.map(lastText)).toContain(`Stopped ${tool}-1. It can be continued by name.`);
+	expect(await requests(f, "fabrial.subagent-report:")).toEqual([]);
+	await f.integration.stop();
+});
+
+it("a background child's report survives the Session being released and the driver crashing, and arrives once", async () => {
+	const f = fixture();
+	const approve = defineWorkflow({
+		name: `approve-${short()}`,
+		description: "Run SQL after approval",
+		input: z.object({ sql: z.string() }),
+		run: async () => "unused",
+	});
+	let crashes = 0;
+	const flaky = defineTool({
+		name: "flaky",
+		description: "Flaky",
+		input: z.object({}),
+		run: async () => {
+			// The first run replaces the Session owner, so the driver loses its lease and is redelivered.
+			if (!crashes++)
+				await sql`UPDATE fabrial_pi.sessions SET epoch = epoch + 1, owner = NULL, lease_until = NULL
+					WHERE key = ${sessionKey(f.metadata)}`;
+			return "flaked";
+		},
+	});
+	const researcher = researcherOf(f, [approve, flaky]);
+	const lead = leadOf(f, researcher);
+	const tool = toolName(researcher.name);
+	route(f, (text) => {
+		if (text.includes("Go")) return use(tool, { task: "Fix the row", background: true });
+		if (text.startsWith("Started")) return say("Working on it.");
+		if (text === "Fix the row") return use(toolName(approve.name), { sql: "update x" });
+		if (text === '"approved and ran"' || text.includes("flaky was interrupted"))
+			return use("flaky", {});
+		if (text === "flaked") return say("fixed");
+		if (text.startsWith("<subagent")) return say("Final");
+		return say(`unexpected: ${text}`);
+	});
+	(f.host.workflows as unknown as (typeof approve)[]).push(approve);
+	f.integration.workflows.find((workflow) => workflow.name === "fabrial.pi.run")!.retries = {
+		maxAttempts: 3,
+	};
+	let released = false;
+	const { settled } = await f.call(lead, "Go", [
+		{
+			name: approve.name,
+			triggers: [],
+			handler: async () => {
+				// The driver released the Session while the background child waits on this workflow.
+				const storage = await PostgresStorage.open(sql, sessionKey(f.metadata));
+				await storage.close(BACKGROUND_CONTEXT);
+				released = true;
+				return "approved and ran";
+			},
+		},
+	]);
+	expect(await settled).toEqual({ status: "completed", output: "Final" });
+	expect(released).toBe(true);
+	expect(crashes).toBeGreaterThanOrEqual(1);
+	expect(await requests(f, "fabrial.subagent-report:")).toHaveLength(1);
+	expect(f.contexts.map(lastText).filter((text) => text.startsWith("<subagent"))).toEqual([
+		`<subagent name="${tool}-1" status="done">fixed</subagent>`,
+	]);
+	await f.integration.stop();
+});
+
+it("limits.concurrent counts a running background child durably across driver attempts", async () => {
+	const f = fixture();
+	const held = gate();
+	const crashed = gate();
+	let runs = 0;
+	const hold = defineTool({
+		name: "hold",
+		description: "Holds",
+		input: z.object({}),
+		run: async (_input, ctx) => {
+			// The first run replaces the Session owner: the driver loses its lease and is redelivered.
+			if (!runs++) {
+				await sql`UPDATE fabrial_pi.sessions SET epoch = epoch + 1, owner = NULL, lease_until = NULL
+					WHERE key = ${sessionKey(f.metadata)}`;
+				crashed.open();
+			}
+			await Promise.race([
+				held.opened,
+				new Promise((_resolve, reject) =>
+					ctx.signal.addEventListener("abort", () => reject(ctx.signal.reason), { once: true }),
+				),
+			]);
+			return "held";
+		},
+	});
+	const researcher = researcherOf(f, [hold]);
+	const lead = leadOf(f, researcher, { concurrent: 1 });
+	const tool = toolName(researcher.name);
+	route(f, async (text) => {
+		if (text.includes("Go")) return use(tool, { task: "Hold on", background: true });
+		if (text.startsWith("Started")) {
+			// Ask for a second child only from the redelivered driver, which has no memory of the first.
+			await crashed.opened;
+			return use(tool, { task: "Another", background: true });
+		}
+		if (text.includes("already running")) {
+			held.open();
+			return say("Waiting for the first.");
+		}
+		if (text === "Hold on" || text.includes("hold was interrupted")) return use("hold", {});
+		if (text === "held") return say("held");
+		if (text.startsWith("<subagent")) return say("Final");
+		return say(`unexpected: ${text}`);
+	});
+	f.integration.workflows.find((workflow) => workflow.name === "fabrial.pi.run")!.retries = {
+		maxAttempts: 3,
+	};
+	const { settled } = await f.call(lead, "Go");
+	expect(await settled).toEqual({ status: "completed", output: "Final" });
+	expect(f.contexts.map(lastText)).toContain(
+		`1 subagents are already running, the limit for this conversation. Wait for one of them to answer, then call ${tool} again.`,
+	);
+	expect(await requests(f, "fabrial.subagent-report:")).toHaveLength(1);
+	await f.integration.stop();
+});
+
+it("cancelling the interaction aborts its background children", async () => {
+	const f = fixture();
+	const started = gate();
+	const slow = defineTool({
+		name: "slow",
+		description: "Slow work",
+		input: z.object({}),
+		run: (_input, ctx) => {
+			started.open();
+			return new Promise<never>((_resolve, reject) =>
+				ctx.signal.addEventListener("abort", () => reject(ctx.signal.reason), { once: true }),
+			);
+		},
+	});
+	const researcher = researcherOf(f, [slow]);
+	const lead = leadOf(f, researcher);
+	const tool = toolName(researcher.name);
+	route(f, (text) => {
+		if (text.includes("Go")) return use(tool, { task: "Work slowly", background: true });
+		if (text.startsWith("Started")) return say("Waiting.");
+		if (text === "Work slowly") return use("slow", {});
+		return say(`unexpected: ${text}`);
+	});
+	const { id, settled } = await f.call(lead, "Go");
+	await started.opened;
+	await f.runtime.cancel(id, "Stopped");
+	expect(await settled).toMatchObject({ status: "cancelled" });
+	const tasks = await latestTasks(f);
+	const reporter = tasks.find((task) => task.kind === "fabrial.subagent-reporter")!;
+	expect(reporter.abortRequested || reporter.state.status === "terminal").toBe(true);
+	// The child's work is marked for abort through the background boundary.
+	const child = tasks.filter(
+		(task) => task.conversationId !== reporter.conversationId && task.state.status !== "terminal",
+	);
+	expect(child.length).toBeGreaterThan(0);
+	expect(child.every((task) => task.abortRequested)).toBe(true);
+	await f.integration.stop();
+});
+
+it("a child's workflow tool waits for approval: the approver's click resumes it and the answer reaches the lead", async () => {
+	const alice = defineUser({
+		id: `alice-${short()}`,
+		name: "Alice",
+		identities: [{ provider: "slack-test", installationId: "w", subjectId: `A${short()}` }],
+	});
+	const g = createFabrial({ plugins: [], identity: [alice] });
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const model = `${faux.provider.id}/${faux.getModel().id}`;
+	const runSql = g.defineWorkflow({
+		name: `run-sql-${short()}`,
+		description: "Runs SQL after approval",
+		input: z.object({ sql: z.string() }),
+		async run(input, ctx) {
+			const approval = await ctx.waitForApproval("approve", {
+				title: "Run SQL?",
+				details: input.sql,
+				approvers: alice,
+			});
+			return approval.status === "approved" ? "ran" : "declined";
+		},
+	});
+	const researcher = g.defineAgent({
+		name: `researcher-${short()}`,
+		description: "Fixes rows.",
+		model,
+		tools: [runSql],
+	});
+	const lead = g.defineAgent({
+		name: `lead-${short()}`,
+		description: "Leads.",
+		model,
+		subagents: [researcher],
+	});
+	const entry = g.defineWorkflow({
+		name: `entry-${short()}`,
+		run: (_input, ctx) => ctx.agent<string>("lead", lead, { input: "Fix the row" }),
+	});
+	faux.setResponses(
+		Array.from({ length: 10 }, () => (context: TranscriptContext) => {
+			const text = lastText(context);
+			if (text === "Fix it") return use(toolName(runSql.name), { sql: "update x" });
+			if (text.includes("Fix the row")) return use(toolName(researcher.name), { task: "Fix it" });
+			if (text === '"ran"') return say("Fixed after approval.");
+			if (text.startsWith("<subagent")) return say(`Lead: ${text}`);
+			return say(`unexpected: ${text}`);
+		}),
+	);
+	const runtime = new MemoryRuntime();
+	const chat = new FakeChat();
+	const dm = await chat.openDM(alice.identities[0]!);
+	const post = dm.post.bind(dm);
+	let cards = 0;
+	dm.post = async (content) => {
+		const ref = await post(content);
+		const action =
+			typeof content === "object" && "card" in content
+				? content.card.actions?.find((each) => each.id.startsWith("fabrial.approval.approve:"))
+				: undefined;
+		if (action) {
+			cards++;
+			await chat.click(ref, action.id, alice.identities[0]!);
+		}
+		return ref;
+	};
+	const app = testApp(g, {
+		workflows: [runSql, entry],
+		runtime,
+		chat,
+		agents: pi({ models, sql, settings: { retry: { enabled: false } } }),
+	});
+	await app.start();
+	try {
+		const id = await runtime.invoke(entry.name, null, {
+			metadata: {
+				interactionId: randomUUID(),
+				origin: null,
+				replyTo: null,
+				requestedBy: { id: alice.id, known: true, identities: [], name: "Alice" },
+				ownsThread: false,
+				ownerWorkflow: null,
+				triggerEvent: null,
+			},
+		});
+		await expect
+			.poll(
+				async () => {
+					await runtime.flush();
+					return runtime.result(id);
+				},
+				{ timeout: 10_000 },
+			)
+			.toMatchObject({
+				status: "completed",
+				output: `Lead: <subagent name="${toolName(researcher.name)}-1" status="done">Fixed after approval.</subagent>`,
+			});
+		expect(cards).toBe(1);
+	} finally {
+		await app.stop();
+	}
 });
