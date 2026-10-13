@@ -744,3 +744,62 @@ it("dev thread: the agent opens a PR, follows it, answers a review in the Slack 
 		.toBe(0);
 	expect(replies()).toHaveLength(2);
 });
+
+it("dev thread: the developer asks its researcher in the foreground and the background, and replies with both", async () => {
+	const search = vi.spyOn(app.host.clients().github.rest.search, "code").mockResolvedValue({
+		data: { items: [{ path: "tests/flaky.test.ts" }] },
+	} as never);
+	type Message = { role: string; content: string | readonly { type: string; text?: string }[] };
+	const last = (context: { messages: readonly Message[] }) => {
+		const message = context.messages.findLast((each) => each.role !== "system")!;
+		return typeof message.content === "string"
+			? message.content
+			: message.content.map((block) => block.text ?? "").join("");
+	};
+	faux.respond(
+		Array.from({ length: 12 }, () => (context: { messages: readonly Message[] }) => {
+			const text = last(context);
+			// The researcher.
+			if (text === "Find the flaky test") return reply.toolCall("search_code", { query: "flaky" });
+			if (text === "tests/flaky.test.ts") return reply.text("It is tests/flaky.test.ts.");
+			if (text === "Check its CI history") return reply.text("It failed 3 of the last 10 runs.");
+			// The developer.
+			if (text.includes("Where is the flaky test?"))
+				return reply.toolCall("acme_researcher", { task: "Find the flaky test" });
+			if (text.includes("It is tests/flaky.test.ts."))
+				return reply.toolCall("acme_researcher", {
+					task: "Check its CI history",
+					background: true,
+				});
+			if (text.startsWith("Started"))
+				return reply.toolCall("reply", { text: "It is tests/flaky.test.ts; checking CI." });
+			if (text.includes("3 of the last 10"))
+				return reply.toolCall("reply", { text: "CI: it failed 3 of the last 10 runs." });
+			return reply.text("done");
+		}),
+	);
+	const ts = "1700000400.000001";
+	const response = await slackRequest({
+		type: "event_callback",
+		team_id: process.env.SLACK_TEAM_ID,
+		event_id: randomUUID(),
+		event: {
+			type: "message",
+			user: "U_ALICE",
+			channel: "C_DEV",
+			text: "Where is the flaky test?",
+			ts,
+			event_ts: ts,
+		},
+	});
+	expect(response.status).toBe(200);
+	const replies = () =>
+		calls
+			.filter((c) => c.method === "chat.postMessage" && c.args.channel === "C_DEV")
+			.map((c) => [c.args.thread_ts, c.args.text]);
+	await expect.poll(replies, poll).toEqual([
+		[ts, "It is tests/flaky.test.ts; checking CI."],
+		[ts, "CI: it failed 3 of the last 10 runs."],
+	]);
+	expect(search).toHaveBeenCalledOnce();
+});

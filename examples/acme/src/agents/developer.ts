@@ -35,6 +35,26 @@ export const openPullRequest = f.defineTool({
 	},
 });
 
+/** A read-only code search; the researcher's only tool. */
+export const searchCode = f.defineTool({
+	name: "search_code",
+	description: "Search acme/app's code for a query and return matching paths.",
+	input: z.object({ query: z.string() }),
+	async run({ query }, ctx) {
+		const { data } = await ctx.clients.github.rest.search.code({ q: `${query} repo:acme/app` });
+		return data.items.map((item) => item.path).join("\n") || "No matches.";
+	},
+});
+
+/** Investigates for the developer without changing anything: it has only read-only tools. */
+export const researcherAgent = f.defineAgent({
+	name: "acme-researcher",
+	description: "Investigates a code question in acme/app and returns findings with file paths.",
+	model: supportModel,
+	instructions: "You investigate code questions. Answer with what you found and where.",
+	tools: [searchCode],
+});
+
 export const developerAgent = f.defineAgent({
 	name: "acme-developer",
 	description: "Makes code changes, opens pull requests, and follows their reviews.",
@@ -43,4 +63,6 @@ export const developerAgent = f.defineAgent({
 		"You make code changes for the team. Answer with the reply tool. When a pull request you follow gets a review, address it and say what you changed.",
 	tools: [openPullRequest],
 	toolkits: ["github"],
+	// The `acme_researcher` tool: in the foreground for a quick lookup, in the background for longer digging.
+	subagents: [researcherAgent],
 });
