@@ -1,6 +1,12 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { createMockLogger } from "@chat-adapter/tests";
-import { createIntegrationApp, reply, scriptedModels, type ScriptedModel } from "fabrial/testing";
+import {
+	createIntegrationApp,
+	reply,
+	scriptedModels,
+	type ScriptedMessage,
+	type ScriptedModel,
+} from "fabrial/testing";
 import { WebClient } from "@slack/web-api";
 import { slack } from "@fabrial/slack";
 import type { Adapter } from "chat";
@@ -749,15 +755,14 @@ it("dev thread: the developer asks its researcher in the foreground and the back
 	const search = vi.spyOn(app.host.clients().github.rest.search, "code").mockResolvedValue({
 		data: { items: [{ path: "tests/flaky.test.ts" }] },
 	} as never);
-	type Message = { role: string; content: string | readonly { type: string; text?: string }[] };
-	const last = (context: { messages: readonly Message[] }) => {
+	const last = (context: { messages: readonly ScriptedMessage[] }) => {
 		const message = context.messages.findLast((each) => each.role !== "system")!;
 		return typeof message.content === "string"
 			? message.content
-			: message.content.map((block) => block.text ?? "").join("");
+			: (message.content as readonly { text?: string }[]).map((block) => block.text ?? "").join("");
 	};
 	faux.respond(
-		Array.from({ length: 12 }, () => (context: { messages: readonly Message[] }) => {
+		Array.from({ length: 12 }, () => (context: { messages: readonly ScriptedMessage[] }) => {
 			const text = last(context);
 			// The researcher.
 			if (text === "Find the flaky test") return reply.toolCall("search_code", { query: "flaky" });
