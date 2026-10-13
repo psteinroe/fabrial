@@ -55,6 +55,10 @@ export interface BridgeFrame {
 	agent: string;
 	thread?: ThreadIO;
 	children: Map<number, { executionId: string; detached: boolean }>;
+	/** Subagent calls waiting for their child's answer; they do not keep the driver from releasing the Session. */
+	waiting: Set<number>;
+	/** Shows a status on the lead's progress surface, if it has one. */
+	status?: (text: string) => Promise<void>;
 }
 export const BridgeKey = createContextKey<BridgeFrame>("fabrial.pi.bridge");
 /** Tool context without the per-call signal. */
@@ -81,16 +85,8 @@ export async function fields(
 	detached = false,
 ): Promise<FabrialFields> {
 	const bridge = frame(context);
-	const binding = await bridge.harness.snapshot(Binding, conversationId, context);
-	if (!binding?.requestId)
-		throw new Error("This conversation has no Fabrial invocation/chat binding (forks are unbound)");
-	// The bridge commits this request's identity before submission and never serializes live clients.
-	const live = await bridge.harness.snapshot(LiveDoc, conversationId, context);
-	const inputId = live?.run?.inputs[0];
-	const submission = inputId ? await bridge.harness.submission(inputId, context) : undefined;
-	const requestId = (await submission?.status(context))?.requestId ?? binding.requestId;
-	const invocation = await bridge.harness.snapshot(Invocation, requestId, context);
-	if (!invocation) throw new Error(`Missing Fabrial invocation ${binding.requestId}`);
+	const requestId = await currentRequest(bridge, conversationId, context);
+	const invocation = (await bridge.harness.snapshot(Invocation, requestId, context))!;
 	// Tools, and the workflows they start, subscribe this conversation by default.
 	const metadata: InvocationMetadata = {
 		...(invocation as InvocationMetadata),
@@ -246,6 +242,30 @@ export async function fields(
 			};
 		},
 	};
+}
+
+/**
+ * The request a conversation's current run acts for: the request of its first input, or its binding. A subagent's
+ * input has no invocation of its own, so it acts for the lead request bound when it was called.
+ */
+export async function currentRequest(
+	bridge: BridgeFrame,
+	conversationId: ConversationId,
+	context: Context,
+): Promise<string> {
+	const binding = await bridge.harness.snapshot(Binding, conversationId, context);
+	if (!binding?.requestId)
+		throw new Error("This conversation has no Fabrial invocation/chat binding (forks are unbound)");
+	// The bridge commits this request's identity before submission and never serializes live clients.
+	const live = await bridge.harness.snapshot(LiveDoc, conversationId, context);
+	const inputId = live?.run?.inputs[0];
+	const submission = inputId ? await bridge.harness.submission(inputId, context) : undefined;
+	const requestId = (await submission?.status(context))?.requestId;
+	if (requestId && (await bridge.harness.snapshot(Invocation, requestId, context)))
+		return requestId;
+	if (!(await bridge.harness.snapshot(Invocation, binding.requestId, context)))
+		throw new Error(`Missing Fabrial invocation ${binding.requestId}`);
+	return binding.requestId;
 }
 
 /** Persist the cancellation relationship BEFORE starting. A lost start receipt reconciles by global key. */

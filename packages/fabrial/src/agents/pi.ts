@@ -41,7 +41,10 @@ import {
 import {
 	definedAgents,
 	isWorkflow,
+	ownToolNames,
 	parseModel,
+	resolveSubagents,
+	toolName,
 	type Agent,
 	type AgentObservers,
 	type ThinkingLevel,
@@ -49,6 +52,7 @@ import {
 } from "../agent.ts";
 import type { AnyWorkflow } from "../workflow.ts";
 import { instructionsSection, piToolOf, toJsonSchema } from "./tools.ts";
+import { subagentTool, type SubagentDeps } from "./subagents.ts";
 import type { Sql } from "postgres";
 import {
 	BridgeKey,
@@ -220,6 +224,38 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	function agentNameOf(conversationId: number): string {
 		return conversationAgents.get(conversationId) ?? "unknown";
 	}
+	/** Each agent's extensions without, and its subagent tools as, an extension. */
+	const extensionsOf = new Map<string, { base: Extension[]; subagents?: Extension }>();
+	const subagentDeps: SubagentDeps = {
+		childAgent,
+		named: (conversationId, agent) => conversationAgents.set(conversationId, agent),
+		logger: host.logger,
+		running: new Map(),
+		busy: new Map(),
+	};
+	/** Workflow tools drop out until their workflow is registered. */
+	const registered = (tool: ToolRegistration) => {
+		const supplied = workflowTools.get(tool);
+		return !supplied || host.workflows.some((candidate) => candidate.name === supplied.name);
+	};
+
+	/** A child's agent: its own definition, subagent tools only with levels left, and never `reply`. */
+	function childAgent(agent: Agent, depth: number): AgentChange {
+		const { model, thinking } = agent.definition;
+		const parts = extensionsOf.get(agent.name)!;
+		const extensions = [...parts.base, ...(depth > 0 && parts.subagents ? [parts.subagents] : [])];
+		const tools = new Map<string, ToolRegistration>();
+		for (const extension of extensions)
+			for (const tool of extension.tools ?? []) tools.set(tool.name, tool);
+		return {
+			// Unset fields keep the copy of the lead's agent the child starts with.
+			...(model ? { model: parseModel(model) } : {}),
+			...(thinking ? { thinkingLevel: THINKING[thinking] } : {}),
+			instructions: null,
+			extensions,
+			tools: [...tools.values()].filter((tool) => tool !== reply && registered(tool)),
+		};
+	}
 
 	function tools(owner: string, list: Toolkit["tools"] = []): ToolRegistration[] {
 		return list.map((tool) => (isWorkflow(tool) ? workflowTool(tool, owner) : piToolOf(tool)));
@@ -254,6 +290,18 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		agents.set(agent.name, agent);
 		const { name, model, thinking, instructions, state = [] } = agent.definition;
 		const selected = (agent.definition.toolkits ?? []).map((entry) => toolkit(entry, name));
+		const subagents = resolveSubagents(agent);
+		const taken = new Set([
+			...ownToolNames(agent.definition),
+			...selected.flatMap((extension) => (extension.tools ?? []).map((tool) => tool.name)),
+		]);
+		for (const subagent of subagents) {
+			if (taken.has(subagent.tool))
+				throw new Error(
+					`Agent ${name}: subagent ${subagent.agent.name} is called ${subagent.tool}, which a toolkit tool already uses`,
+				);
+			if (subagent.agent !== agent) install(subagent.agent);
+		}
 		const section = instructionsSection("agent-instructions", instructions);
 		const own = defineExtension({
 			name: `fabrial.agent.${name}`,
@@ -274,11 +322,19 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			],
 		});
 		registry.install(own);
+		const delegates = subagents.length
+			? defineExtension({
+					name: `fabrial.subagents.${name}`,
+					tools: subagents.map((subagent) => subagentTool(agent, subagent, subagentDeps)),
+				})
+			: undefined;
+		if (delegates) registry.install(delegates);
+		extensionsOf.set(name, { base: [internal, ...selected, own], subagents: delegates });
 		configs.set(name, {
 			model: model ? parseModel(model) : null,
 			thinkingLevel: thinking ? THINKING[thinking] : null,
 			instructions: null,
-			extensions: [internal, ...selected, own],
+			extensions: [internal, ...selected, own, ...(delegates ? [delegates] : [])],
 			tools: null,
 		});
 	}
@@ -286,7 +342,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	function workflowTool(workflow: AnyWorkflow, owner: string): ToolRegistration {
 		const { input, description } = workflow.definition;
 		const native = piTool({
-			name: workflow.name.replaceAll(/[^a-zA-Z0-9_]/g, "_"),
+			name: toolName(workflow.name),
 			description: description ?? workflow.name,
 			// Core validates the input again when the workflow starts.
 			parameters: (input
@@ -358,6 +414,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				agent: request.agent,
 				thread: io,
 				children: new Map(),
+				waiting: new Set(),
 			};
 			const context = withContextValue(
 				BridgeKey,
@@ -412,13 +469,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				let replying = false;
 				const offer = async (withReply: boolean) => {
 					replying = withReply;
-					const allowed = offered.map((tool) => {
-						if (tool === reply) return withReply;
-						const supplied = workflowTools.get(tool);
-						return (
-							!supplied || host.workflows.some((candidate) => candidate.name === supplied.name)
-						);
-					});
+					const allowed = offered.map((tool) => (tool === reply ? withReply : registered(tool)));
 					await conversation!.configure(
 						{ tools: offered.filter((_tool, index) => allowed[index]) },
 						context,
@@ -457,6 +508,13 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					await progress.setStatus(text).catch(() => {});
 				};
 				const thinking = () => showStatus(waiting ? WAITING_STATUS : "Thinking…");
+				// Subagents show their activity on the lead's status ("researcher: Thinking…").
+				let childStatus: string | undefined;
+				frame.status = async (text) => {
+					if (waiting || text === childStatus) return;
+					childStatus = text;
+					await showStatus(text);
+				};
 				if (sending || (execution.metadata.ownsThread && io)) {
 					events = await watchEvents(frame.harness, conversationId!, context);
 					waiting = !!events.snapshot.generation?.retry;
@@ -470,6 +528,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 							return;
 						}
 						if (waiting || !progress || Date.now() - lastStatus < 750) return;
+						// A subagent call's details update; the child shows its own activity.
+						if (batch.every((event) => event.type === "tool_execution_update")) return;
 						const tool = batch.find((event) => event.type === "tool_execution_start");
 						const text =
 							tool?.type === "tool_execution_start"
@@ -726,17 +786,18 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					const inspection = await frame.harness.inspect(context);
 					const live = inspection.tasks.filter((task) => !task.record.background);
 					const runners = live.filter((task) => task.state.kind === "running");
+					// Release the Session while every running task waits on a workflow, or on a subagent that does.
+					const parked = (id: number) => frame.children.has(id) || frame.waiting.has(id);
 					if (
-						runners.length &&
-						runners.every((task) => frame.children.has(task.record.id)) &&
+						runners.some((task) => frame.children.has(task.record.id)) &&
 						live.every(
 							(task) =>
 								task.state.kind === "waiting" ||
 								task.state.kind === "completing" ||
-								(task.state.kind === "running" && frame.children.has(task.record.id)),
+								(task.state.kind === "running" && parked(task.record.id)),
 						)
 					) {
-						children = runners.map((task) => frame.children.get(task.record.id)!);
+						children = runners.flatMap((task) => frame.children.get(task.record.id) ?? []);
 						break;
 					}
 					await new Promise<void>((resolve) => setTimeout(resolve, 25));

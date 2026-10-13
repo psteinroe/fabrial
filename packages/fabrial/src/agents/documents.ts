@@ -41,6 +41,34 @@ export const Binding = defineDoc({
 	version: 1,
 	initial: (): { requestId: string | null } => ({ requestId: null }),
 });
+/** A subagent's identity and the subagent levels left below it; initial on a lead conversation. */
+export const Subagent = defineDoc({
+	kind: "fabrial.subagent",
+	scope: "conversation",
+	history: "latest",
+	fork: "initial",
+	version: 1,
+	initial: (): { agent: string | null; name: string | null; depth: number | null } => ({
+		agent: null,
+		name: null,
+		depth: null,
+	}),
+});
+/** Named children per calling conversation: a continued child is forked, so a name moves to its newest conversation. */
+export const SubagentNames = defineDoc({
+	kind: "fabrial.subagent-names",
+	scope: "session",
+	version: 1,
+	initial: (): {
+		leads: Record<
+			string,
+			{
+				next: Record<string, number>;
+				children: Record<string, { agent: string; conversationId: number }>;
+			}
+		>;
+	} => ({ leads: {} }),
+});
 export const ChildResults = defineDoc({
 	kind: "fabrial.children",
 	scope: "session",
