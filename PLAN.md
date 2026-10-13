@@ -747,6 +747,7 @@ Each entry is an agent, `"self"` (a copy of the lead), or `{ agent, context?, ba
 - Child output is data: it is escaped inside the `<subagent>` tag. A failed child reports `status="failed"` with a generic message; provider errors go to logs, as in [Errors in sent runs](#decisions).
 - Limits: with `depth: 1` (default) children get no subagent tools; reaching `concurrent` returns a tool error the model can act on.
 - Work that waits for days, such as an approval, is still a workflow in `tools`. Orchestration from code is `ctx.agent`; there is no separate API.
+- Background children run while a driver holds the Session: a sent run's driver keeps the Session until every reporter has reported and the lead is idle, so a later `ctx.agent` call on the same Session queues behind it. Cancelling a run's workflow aborts the background children that run started or continued; aborting only the lead's Pi run does not. A stopped child reports nothing. Continuing a background child keeps it in the background, even without `background: true`.
 
 Compared with others: one tool per subagent routed by `description` follows Mastra and Eve; fresh context by default with an opt-in fork follows Claude's Agent SDK and Eve (Mastra forwards the full parent conversation by default); continuing a named child and background reports come from Pi; the call-waits-for-children rule comes from Eve's "a turn can't end while tasks are working".
 
