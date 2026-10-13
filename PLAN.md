@@ -175,6 +175,7 @@ App authors write agents (`f.defineAgent`), tools (`f.defineTool`), toolkits (`f
 ```ts
 export const bugInvestigator = f.defineAgent({
 	name: "bug-investigator",
+	description: "Investigates bug reports and finds the root cause and affected customers.",
 	model: "anthropic/claude-sonnet-5",
 	thinking: "medium", // "off" | "low" | "medium" | "high"
 	instructions: [
@@ -191,6 +192,7 @@ const plan = await ctx.agent("plan", cleanupPlanner, { input, output: CleanupPla
 ```
 
 - `name` is stable: it is the continuation key, and labels traces and progress.
+- `description` is required on every agent. It says what the agent does and when to use it: it is the tool description when the agent is a subagent, and it labels the agent in traces and listings.
 - `ctx.agent` options are `input`, `output` (a Standard Schema; the answer is validated JSON), and `detached`.
 - Unset fields follow instance defaults. There is no pass-through to the runtime's agent config; new capabilities (working directory, compaction, …) become fields.
 
@@ -597,7 +599,7 @@ export const generalAssistant = f.defineWorkflow({
 The model above ties an agent to one chat thread and reaches it only through a workflow execution. Three use cases need more:
 
 1. One conversation for every message in a Slack channel, steered by whoever writes there.
-2. That conversation's agent starting subagents, either with a brief or as a fork of its own context.
+2. That conversation's agent starting subagents, either fresh with a task or as a fork of its own context.
 3. A conversation started in Slack that follows the PR its agent opened: reviews requesting changes, new labels, CI results.
 
 | Concept          | What it is                                                                                      | Backed by                                             |
@@ -699,26 +701,54 @@ await ctx.unsubscribe("unwatch-pr", github.pullRequest({ repo: "acme/app", numbe
 
 #### Subagents
 
-Subagents are Pi-native owned conversations in the same Session: no Conductor round trip, aborts and idle waits propagate, and restarts resume them.
-
-| Mode    | Child starts with                      | Pi mechanism                                  |
-| ------- | -------------------------------------- | --------------------------------------------- |
-| `brief` | its own instructions and the task only | task-owned `createConversation` + `configure` |
-| `fork`  | the parent's transcript so far         | `conversation.fork(entryId)`                  |
+A subagent is another agent the lead delegates to. It runs as a child conversation in the lead's Session, using Pi's ownership model: no Conductor round trip, aborts and idle waits propagate through ownership, and restarts resume children.
 
 ```ts
+export const researcher = f.defineAgent({
+	name: "researcher",
+	description: "Investigates a question and returns findings with sources.",
+	model: "anthropic/claude-haiku-4-5",
+	tools: [search, readDocs],
+});
+
 export const lead = f.defineAgent({
 	name: "lead",
-	subagents: {
-		researcher: { agent: researcher, mode: "brief" },
-		explorer: { agent: lead, mode: "fork" },
-	},
+	description: "Answers support questions in #help.",
+	model: "anthropic/claude-sonnet-5",
+	subagents: [researcher, reviewer, { agent: "self", context: "fork" }],
+	limits: { depth: 1, concurrent: 5 }, // defaults
 });
 ```
 
-This generates a `subagent` tool. Foreground calls return the child's answer as the tool result (Pi example 22). Background subagents are persistent and named: the tool spawns, messages, stops, and lists them, and each answer comes back to the lead as a `followUp` input (Pi example 23). Subagents get no chat binding, so only the lead speaks in the thread; their progress feeds the lead's response context. Work that waits for days, such as an approval, is still a workflow in `tools`.
+Each entry is an agent, `"self"` (a copy of the lead), or `{ agent, context?, background? }`:
 
-`brief` and `fork` avoid a third meaning of "handoff", which already names `ctx.handoff` (a workflow transfers an interaction) and Pi's reset with a note.
+| Option       | Values                                     | Meaning                                                                                     |
+| ------------ | ------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `context`    | `"fresh"` (default), `"fork"`              | Fresh: the child sees only its task. Fork: the child inherits the lead's transcript so far. |
+| `background` | `"allow"` (default), `"always"`, `"never"` | Whether the model may, must, or must not run the child in the background.                   |
+
+**What the model sees.** One tool per subagent, named after the agent and described by its `description`: `researcher({ task, background?, name? })`. A foreground call waits and returns the child's answer as the tool result. A background call returns a name at once (`researcher-1`); the answer arrives later as an input to the lead, `<subagent name="researcher-1" status="done">…</subagent>`. Calling with the `name` of a running child continues it (steering it if busy). `subagent_stop({ name })` stops a child. A short section lists running children and their status.
+
+**How it maps to Pi.**
+
+| Fabrial           | Pi                                                                                                   |
+| ----------------- | ---------------------------------------------------------------------------------------------------- |
+| Foreground call   | Child conversation owned by the tool call (Pi example 22): aborting the lead aborts it               |
+| Background child  | Child owned by a background anchor task, so the lead's Esc and idle waits stop there (Pi example 23) |
+| Background answer | Reporter task that submits the answer to the lead as a `followUp`, with a request ID                 |
+| `context: "fork"` | `conversation.fork(entryId)`, owned the same way                                                     |
+| Continue, stop    | `submit` to the child (`steer` if busy, otherwise a new run); `abort()`                              |
+
+**Rules.**
+
+- When the lead's run ends depends on how it was started. Under `ctx.agent` (call), the call settles only after its background children have reported, so a waiting workflow never gets an answer while work is still running. Under `ctx.send` or a subscription, reports arrive as follow-ups and the lead can `reply` again.
+- Only the lead speaks in chat. Children have no chat binding; their activity shows in the lead's status ("researcher: searching docs…").
+- Children act under the lead's request context: workflow tools they call (approvals included) see the same actor, thread, and approvers.
+- Child output is data: it is escaped inside the `<subagent>` tag. A failed child reports `status="failed"` with a generic message; provider errors go to logs, as in [Errors in sent runs](#decisions).
+- Limits: with `depth: 1` (default) children get no subagent tools; reaching `concurrent` returns a tool error the model can act on.
+- Work that waits for days, such as an approval, is still a workflow in `tools`. Orchestration from code is `ctx.agent`; there is no separate API.
+
+Compared with others: one tool per subagent routed by `description` follows Mastra and Eve; fresh context by default with an opt-in fork follows Claude's Agent SDK and Eve (Mastra forwards the full parent conversation by default); continuing a named child and background reports come from Pi; the call-waits-for-children rule comes from Eve's "a turn can't end while tasks are working".
 
 #### Requests
 
@@ -739,7 +769,7 @@ Mastra's [signals](https://mastra.ai/docs/harness/signals), [signal providers](h
 | Input kinds and delivery    | `sendMessage`, `queueMessage`, `sendSignal`, notifications | Mastra's notification inbox (priority, coalescing, summaries) is richer; borrowed in part. |
 | Static subscription         | Channels (one chat thread → one session)                   | Mastra cannot address a whole channel either.                                              |
 | Dynamic subscription        | Signal providers + `github_subscribe_pr`                   | Mastra's registry is in memory, GitHub allows one PR per thread and polls.                 |
-| Subagents (`brief`, `fork`) | Subagent definitions, `forked: true`                       | Same modes. Pi adds persistent background subagents.                                       |
+| Subagents (fresh, `fork`)   | Subagent definitions, `forked: true`                       | Same modes. Pi adds persistent background subagents.                                       |
 | Tool approvals as workflows | Permission policies with `ask`                             | Mastra's approvals live in memory and go stale on restart.                                 |
 | Session lease in Postgres   | Leases over pub/sub (Redis Streams across instances)       | No extra infrastructure.                                                                   |
 
@@ -786,7 +816,7 @@ Recorded as open questions are resolved.
 - **Typed clients come from an instance, not global type augmentation.** `createFabrial({ database, models, plugins, identity })` returns `f`; every `f.define*` gets `ctx.clients` and plugin toolkit ids typed from `f`'s plugins, and a misspelled client is a type error. The instance holds no workflows (no import cycles); `f.app({ workflows })` lists what runs. `identity` lists users only; groups are referenced where they're used. There are no free `defineWorkflow`/`fabrial()` functions and no `declare module` registration. Most backend frameworks do it this way (Conductor, Inngest, tRPC, Hono); global `Register` augmentation is a frontend-library pattern and felt like magic.
 - **Plugin values at definition, from env (the Better Auth / Inngest style).** Plugins get their options when passed to `createFabrial`, typically read from env when the module loads. Factories are side-effect free and nothing connects until `app.start()`. Tests set env in a `globalSetup` (e.g. testcontainers URLs, test secrets) before importing the app, and use spies on `app.host.clients()` for fake clients. There is one way to configure plugins: no `f.app()` overrides and no type/value split (the NestJS / Effect style was considered and rejected as heavier).
 - **Credentials are plugin options.** Executor's provider/account split (an accounts table, secret storage, slots) is deferred until several accounts per provider or per-person credentials are needed. A second installation is a second plugin instance with its own `id`.
-- **`f.defineAgent` with Fabrial fields only.** `name`, `model` (a `"provider/model"` string), `thinking`, `instructions` (strings and per-run functions), `tools` (tools and workflows), `toolkits` (plugin ids and app toolkits), and `state`. There is no pass-through to the runtime's agent config and no `configure` escape hatch: a missing capability becomes a field. `ctx.agent` options are `input`, `output` (typed structured result, validated from a JSON answer), and `detached`. No Fabrial-owned agent features such as memory or per-agent permissions.
+- **`f.defineAgent` with Fabrial fields only.** `name`, `description` (required), `model` (a `"provider/model"` string), `thinking`, `instructions` (strings and per-run functions), `tools` (tools and workflows), `toolkits` (plugin ids and app toolkits), `state`, `subagents`, and `limits`. There is no pass-through to the runtime's agent config and no `configure` escape hatch: a missing capability becomes a field. `ctx.agent` options are `input`, `output` (typed structured result, validated from a JSON answer), and `detached`. No Fabrial-owned agent features such as memory or per-agent permissions.
 - **v1 scope: Slack + the SQL approval flow + GitHub and Linear.**
   - Packages: `fabrial`, `@fabrial/slack`, `@fabrial/github`, `@fabrial/linear`.
   - Reference flow: a `generalAssistant` workflow (Slack mention) → a support agent → a `runSql` workflow tool with triage approval in a Slack DM → resume → final reply in the thread. It must survive rejection, expiry, duplicate clicks, a deploy during approval, and a crash right after the DB write.
@@ -840,7 +870,7 @@ Recorded as open questions are resolved.
 - **State is `defineState`, and app authors don't write Pi tasks.** `defineState({ name, scope, schema, initial, render })` with scopes `interaction` (one request across handoffs), `thread`, and `agent`, backed by Pi documents. `ctx.state(S).get/update` works in workflows (durable ops with IDs) and in tools (committed with the tool result). Agents see the states listed in `defineAgent.state` through `render`. Durable or long-running tool work is a workflow in `tools`. Pi tasks and raw documents stay internal / advanced, with no `defineTask` adapter. This replaces exposing raw Pi (`ctx.pi`) and `ctx.agent` document options, both of which made the DX convoluted.
 - **The agent registry is derived, and nothing is selected by default.** There is no app-level toolkit list. Installed = Fabrial's internal toolkit + every plugin's `toolkit` + every toolkit referenced by an agent reachable from the registered workflows. Each agent gets exactly what its `toolkits` and `tools` list. On startup, Fabrial aborts pending agent work whose toolkit is no longer installed and logs it.
 - **Approval is explicit code only.** A tool that needs approval is a workflow that calls `ctx.waitForApproval`, listed in an agent's `tools`. The approval sits next to the logic, so previews, conditions, and multiple approvals are plain code. Not for now: a declarative `approval` option on `defineWorkflow`, or a `requireApproval` option on `f.defineTool`. Add them later if needed.
-- **Conversations are addressable; subscriptions route events into them.** Sessions get app-chosen keys (default per thread), `ctx.send` complements `ctx.agent`, inputs carry a kind and priority that choose Pi's `steer`/`followUp`/`write`, and subscriptions (static or created at runtime, durable, many per conversation) generalize thread routing state. Subagents are Pi-native with `brief` and `fork` modes. See [Sessions, conversations, and subscriptions](#sessions-conversations-and-subscriptions).
+- **Conversations are addressable; subscriptions route events into them.** Sessions get app-chosen keys (default per thread), `ctx.send` complements `ctx.agent`, inputs carry a kind and priority that choose Pi's `steer`/`followUp`/`write`, and subscriptions (static or created at runtime, durable, many per conversation) generalize thread routing state. Subagents are Pi-native child conversations, one tool per subagent, fresh or forked, foreground or background. See [Sessions, conversations, and subscriptions](#sessions-conversations-and-subscriptions).
 - **Subscriptions and send (resolved open questions).** Names are `f.subscribe` (static, a trigger as source), `ctx.subscribe`/`ctx.unsubscribe` (dynamic), and `ctx.send` next to `ctx.agent`. Sessions are chosen per send or subscription: `"thread"` (default), `"channel"`, or a custom key. Sent runs answer through a built-in `reply` tool that targets a request; nothing is posted automatically. Subscriptions are stored in a Fabrial-owned `fabrial.subscriptions` table, because no runtime owns this state and it is looked up by resource. Sent input waits in `fabrial.inbox`, the other Fabrial-owned table: a busy Session's driver may run in another process, so `ctx.send` queues the input and notifies (`LISTEN`/`NOTIFY`, with a slow fallback poll). The driver deletes a row once Pi has admitted it; a later redelivery is dropped by Pi's request-ID dedup. Low-priority notifications use Pi `write` as planned: verified that the written entry does not wake the agent and is seen by the model on the next run.
 - **Dynamic subscriptions store references, never functions.** `ctx.subscribe` stores a record in `fabrial.subscriptions`; `filter` and `priority` functions live in `f.defineSubscriptionPolicy` objects referenced by name (a removed policy falls back to plugin defaults with a warning). Delivery is an internal observer workflow on every resource event, so ingress stays a fast insert and redeliveries dedupe at ingress; each delivery is a `ctx.send` with request ID `${event id}:${subscription id}`. Tools and the workflows they start carry their conversation in metadata, which is the default target.
 - **Orphaned agent work is aborted at startup.** When a deploy removes a toolkit that pending agent work still needs, `app.start()` aborts that work and logs it instead of failing the deploy.
