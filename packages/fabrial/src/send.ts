@@ -90,6 +90,25 @@ const text = (input: Json) =>
 export const shortRequestId = (requestId: string) =>
 	createHash("sha256").update(requestId).digest("hex").slice(0, 8);
 
+/**
+ * The request's alias in its Session: the shortest prefix (at least 8 hex digits) of its hash that `claim`
+ * maps to it. `claim` returns the request an alias belongs to, taking it when free, so a second request
+ * whose short id collides gets a longer one.
+ */
+export async function claimRequestAlias(
+	requestId: string,
+	claim: (alias: string) => Promise<string>,
+): Promise<string> {
+	const hash = createHash("sha256").update(requestId).digest("hex");
+	for (let length = 8; length <= hash.length; length++)
+		if ((await claim(hash.slice(0, length))) === requestId) return hash.slice(0, length);
+	throw new Error(`No free request alias for ${requestId}`);
+}
+
+/** Rendered input with its `request` attribute set to the alias it was admitted under. */
+export const withRequestAlias = (content: string, requestId: string, alias: string) =>
+	content.replace(` request="${shortRequestId(requestId)}"`, ` request="${alias}"`);
+
 /** Render an input for the model, with attribution and the request id `reply` can target. */
 export function renderInput(options: {
 	input: Json;
