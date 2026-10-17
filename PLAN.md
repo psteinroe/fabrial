@@ -668,6 +668,8 @@ Every input for a conversation is a delivery that Conductor queues under the Ses
 - The waiting delivery opens the Session, submits its input, and continues driving under the same rules.
 - `storage.lost` closes the harness. Otherwise a stalled owner whose lease was taken over can still send a duplicate model request when it resumes (its commits are fenced, its provider calls are not).
 
+**Cancelling.** Stopping a run (cancelling a `ctx.agent` call, Slack's stop button, a cancelled workflow tool's owner) cancels the delivery currently driving the Session through Conductor's cancel signal, with a reason naming the run. That delivery aborts the run in Pi (owned and background work included, per Pi ownership) and keeps driving any other work, so cancellation crosses processes without holding or polling the Session. If no delivery is driving, the cancel is itself a delivery that opens the Session and aborts the run.
+
 Verified in a spike against Fabrial's Postgres storage and a faux model: hand-over at `afterTools` and inside a task-owned child conversation, lease takeover with and without `storage.lost` wiring, and interruption of a non-replay-safe tool by `close()`.
 
 #### Use cases
