@@ -658,7 +658,17 @@ export const router = f.defineWorkflow({
 
 #### Delivery
 
-Every input for a conversation is a delivery that Conductor queues under the Session's mutex, one at a time and in order. A delivery opens the Session, submits its input to Pi (`steer`, `followUp`, or `write`), drives the conversation until the next turn boundary, closes it, and queues a continuation if work remains. Queued deliveries run between turns, and Pi places a steer at the next turn boundary anyway, so input from any process steers a busy agent through Pi's own inbox: there is no Fabrial queue, table, or polling. While every live task waits on a workflow (an approval), the Session is released.
+Every input for a conversation is a delivery that Conductor queues under the Session's mutex, one at a time and in order, deduplicated by request id. A delivery opens the Session, submits its input to Pi (`steer`, `followUp`, or `write`), and drives the conversation until it is idle, waiting only on workflows (then the Session is released), or another delivery is waiting. There is no Fabrial queue, table, or polling.
+
+**Handing over.** Pi has one owner per Session, so input from another process steers a busy agent by handing the Session over at a turn boundary:
+
+- The boundary is Pi's `afterTools` hook: the tool round is committed and Pi has not yet placed queued steers or created the next generation. A hand-over there loses nothing in memory; the next owner re-runs the hook, Pi places the steer, and the next model request includes it. Every model request is sent once. (`beforeRequest` also resumes cleanly, but a steer submitted meanwhile misses the held request and costs an extra turn.)
+- At each `afterTools`, the delivery checks once whether another delivery for the Session is queued. Only then does it hold the hook and close the Session; otherwise it keeps driving. The held hook rejects when its context is aborted, or `close()` hangs. The first `afterTools` after an open is the re-run and is never held.
+- It hands over only when the Session is quiet: every running task is a held generation or a replay-safe tool (subagent calls are). A tool that is not replay-safe would be interrupted by `close()`, so the delivery waits for its round to finish, which is where Pi would place the steer anyway.
+- The waiting delivery opens the Session, submits its input, and continues driving under the same rules.
+- `storage.lost` closes the harness. Otherwise a stalled owner whose lease was taken over can still send a duplicate model request when it resumes (its commits are fenced, its provider calls are not).
+
+Verified in a spike against Fabrial's Postgres storage and a faux model: hand-over at `afterTools` and inside a task-owned child conversation, lease takeover with and without `storage.lost` wiring, and interruption of a non-replay-safe tool by `close()`.
 
 #### Use cases
 
@@ -801,7 +811,7 @@ Recorded as open questions are resolved.
 - **Conversations answer where they live; threads route by session key.** Agents have triggers; an event goes to a conversation keyed by `[session, agent]`, computed from the event (`"thread"` by default, `"channel"`, or a function). Final replies post automatically to the input's thread when it is followed, otherwise to the conversation's home; `no_reply` stays silent; posting anywhere else is a plugin tool. An agent follows every thread it receives a message from, and `ctx.follow` / `ctx.unfollow` add other threads and resources; follows are records in Chat SDK thread state. There is no thread ownership, interaction, reply buffer, or `reply` tool, and workflows don't wait for chat replies (`waitForReply`, `ask`, `nextReply`, and `ctx.handoff` are removed). Modeled on Eve (automatic final reply, `no_reply`) and OpenClaw (session keys computed from the source).
   - Chat SDK thread state has a 30-day TTL refreshed on every write; a follow idle for longer lapses.
   - Chat SDK's `thread.signal` (Slack's native agent stop button) cancels the following conversation's current run.
-- **Conductor's per-Session queue is the inbox.** Each input is a delivery queued under the Session's mutex; a delivery submits to Pi, drives one turn, and hands over. Steering from any process is Pi's own steer. Fabrial owns no tables and polls nothing.
+- **Conductor's per-Session queue is the inbox.** Each input is a delivery queued under the Session's mutex. A delivery drives the conversation and hands the Session over at Pi's `afterTools` boundary only when another delivery is waiting and no non-replay-safe tool is running; steering from any process is Pi's own steer, placed by the next owner. `storage.lost` closes the harness. Fabrial owns no tables and polls nothing (see [Delivery](#delivery)).
 - **Trigger overlap: the most specific trigger receives the event, `observe: true` adds side work, and ties fail at startup.** Agent and workflow triggers compete together for messages that no conversation follows, so exactly one handles an interactive message. The most specific matching trigger wins. Specificity is defined per plugin (Slack: channel+thread > channel > workspace). Two owners with equal specificity on the same event make `app.start()` throw. Triggers marked `observe: true` always run as well, independently and without `ctx.thread`. They can't post into or receive replies from that thread, but can still use clients or a `replyTo` elsewhere.
   ```ts
   export const changelog = defineWorkflow({
