@@ -1,0 +1,236 @@
+import { createHash } from "node:crypto";
+import type { FabrialHost } from "./app.ts";
+import type { Json, JsonObject } from "./json.ts";
+import type { InvocationMetadata } from "./runtime.ts";
+import type { ChatMessage, Surface, Thread } from "./thread.ts";
+
+/** Which Session (and with the agent name, which conversation) an input goes to. */
+export type SessionOption = "thread" | "channel" | (string & {});
+export type InputKind = "message" | "notification";
+export type InputPriority = "urgent" | "normal" | "low";
+/** How Pi admits an input: join the running work, start the next run, or append without waking. */
+export type Delivery = "steer" | "followUp" | "write";
+
+export interface SendOptions {
+	/** `"thread"` (default), `"channel"`, or an app-chosen key such as `ticket:${id}`. */
+	session?: SessionOption;
+	/** A ChatMessage (rendered with attribution), a string, or any JSON value. */
+	input: Json;
+	/** Default `"message"`. */
+	kind?: InputKind;
+	/** Notifications only; default `"normal"`. */
+	priority?: InputPriority;
+	/** Where the agent's `reply` goes. Defaults to this execution's thread; `null` for none. */
+	replyTo?: Thread | Surface | null;
+}
+
+export interface SendReceipt extends JsonObject {
+	requestId: string;
+	session: string;
+}
+
+/** Context of a request delivered by `ctx.send`, kept in its `fabrial.invocation` document. */
+export interface SentRequest extends JsonObject {
+	kind: InputKind;
+	priority: InputPriority;
+}
+
+/** What core hands the agent integration: a rendered input for one conversation. */
+export interface SendRequest extends JsonObject {
+	session: string;
+	requestId: string;
+	content: string;
+	delivery: Delivery;
+	/** The request's own context: actor, replyTo, origin, kind. */
+	metadata: InvocationMetadata;
+}
+
+export function deliveryFor(kind: InputKind, priority: InputPriority = "normal"): Delivery {
+	if (kind === "message") return "steer";
+	return priority === "urgent" ? "steer" : priority === "low" ? "write" : "followUp";
+}
+
+/** Session key of a thread. The default Session, as for `ctx.agent`. */
+export const threadSession = (provider: string, threadId: string) => `${provider}:${threadId}`;
+export const channelSession = (provider: string, channelId: string) =>
+	`${provider}:channel:${channelId}`;
+/** Namespaced so an app key never collides with a chat Session. */
+export const customSession = (key: string) => `app:${key}`;
+
+const XML: Record<string, string> = {
+	"&": "&amp;",
+	"<": "&lt;",
+	">": "&gt;",
+	'"': "&quot;",
+	"'": "&apos;",
+};
+export const escapeXml = (value: string) => value.replaceAll(/[&<>"']/g, (c) => XML[c]!);
+
+export function isChatMessage(value: unknown): value is ChatMessage {
+	const message = value as Partial<ChatMessage> | null;
+	return (
+		typeof message === "object" &&
+		message !== null &&
+		typeof message.text === "string" &&
+		typeof message.messageId === "string" &&
+		typeof message.threadId === "string" &&
+		typeof message.author?.identity === "object"
+	);
+}
+
+const attributes = (values: Record<string, string | null | undefined>) =>
+	Object.entries(values)
+		.filter((entry): entry is [string, string] => typeof entry[1] === "string")
+		.map(([key, value]) => ` ${key}="${escapeXml(value)}"`)
+		.join("");
+const text = (input: Json) =>
+	isChatMessage(input) ? input.text : typeof input === "string" ? input : JSON.stringify(input);
+
+/** The short id the model sees in `request="…"`; `reply` maps it back to the full request id. */
+export const shortRequestId = (requestId: string) =>
+	createHash("sha256").update(requestId).digest("hex").slice(0, 8);
+
+/**
+ * The request's alias in its Session: the shortest prefix (at least 8 hex digits) of its hash that `claim`
+ * maps to it. `claim` returns the request an alias belongs to, taking it when free, so a second request
+ * whose short id collides gets a longer one.
+ */
+export async function claimRequestAlias(
+	requestId: string,
+	claim: (alias: string) => Promise<string>,
+): Promise<string> {
+	const hash = createHash("sha256").update(requestId).digest("hex");
+	for (let length = 8; length <= hash.length; length++)
+		if ((await claim(hash.slice(0, length))) === requestId) return hash.slice(0, length);
+	throw new Error(`No free request alias for ${requestId}`);
+}
+
+/** Rendered input with its `request` attribute set to the alias it was admitted under. */
+export const withRequestAlias = (content: string, requestId: string, alias: string) =>
+	content.replace(` request="${shortRequestId(requestId)}"`, ` request="${alias}"`);
+
+/** Render an input for the model, with attribution and the request id `reply` can target. */
+export function renderInput(options: {
+	input: Json;
+	kind: InputKind;
+	priority?: InputPriority;
+	requestId: string;
+	/** Fallback author for non-message input, e.g. the workflow's actor. */
+	from?: string | null;
+	/** Fallback thread for non-message input. */
+	thread?: string | null;
+	source?: string | null;
+	event?: string | null;
+	/** Extra notification attributes, e.g. the resource and the event's details. */
+	attributes?: Record<string, string | number | boolean | null>;
+}): string {
+	const { input, kind, requestId } = options;
+	if (kind === "message") {
+		const message = isChatMessage(input) ? input : undefined;
+		return `<message${attributes({
+			from: message ? (message.author.name ?? message.author.identity.subjectId) : options.from,
+			thread: message?.threadId ?? options.thread,
+			request: shortRequestId(requestId),
+		})}>${escapeXml(text(input))}</message>`;
+	}
+	return `<notification${attributes({
+		source: options.source,
+		kind: options.event,
+		priority: options.priority ?? "normal",
+		request: shortRequestId(requestId),
+		...Object.fromEntries(
+			Object.entries(options.attributes ?? {})
+				.filter(([key]) => !["source", "kind", "priority", "request"].includes(key))
+				.map(([key, value]) => [key, value === null ? null : String(value)]),
+		),
+	})}>${escapeXml(text(input))}</notification>`;
+}
+
+/** The Session key of a session option, relative to the caller's chat surface. */
+export async function resolveSession(
+	option: SessionOption,
+	surface: { current: InvocationMetadata["replyTo"]; channelId: () => Promise<string> },
+): Promise<string> {
+	if (option !== "thread" && option !== "channel") return customSession(option);
+	const current = surface.current;
+	if (!current) throw new Error(`Session "${option}" needs an execution with a chat surface`);
+	if (option === "channel")
+		return channelSession(
+			current.provider,
+			current.kind === "channel" ? current.channelId : await surface.channelId(),
+		);
+	if (current.kind !== "thread")
+		throw new Error(
+			"Post to the channel with ctx.thread.post before sending; a channel is not a thread",
+		);
+	return threadSession(current.provider, current.threadId);
+}
+
+/** A reply surface option (`Thread`, `Surface`, or `null`) as stored metadata. */
+export function replySurface(
+	option: Thread | Surface | null | undefined,
+	current: InvocationMetadata["replyTo"],
+): InvocationMetadata["replyTo"] {
+	if (option === undefined) return current;
+	if (option === null) return null;
+	return ("post" in option ? option.ref : option) as InvocationMetadata["replyTo"];
+}
+
+/**
+ * Resolve the Session, actor, and reply surface of a send, and render its input. Shared by workflow and
+ * tool `ctx.send`; `surface.current` is the sender's chat surface.
+ */
+export async function prepareSend(
+	host: FabrialHost,
+	metadata: InvocationMetadata,
+	surface: { current: InvocationMetadata["replyTo"]; channelId: () => Promise<string> },
+	requestId: string,
+	opts: SendOptions,
+): Promise<SendRequest> {
+	const kind = opts.kind ?? "message";
+	const priority = opts.priority ?? "normal";
+	const current = surface.current;
+	const session = await resolveSession(opts.session ?? "thread", surface);
+	const replyTo = replySurface(opts.replyTo, current);
+	const message = isChatMessage(opts.input) ? opts.input : undefined;
+	const actor = message
+		? await host.resolvePrincipal(message.author.identity)
+		: metadata.requestedBy;
+	const origin = message
+		? { provider: message.provider, threadId: message.threadId, messageId: message.messageId }
+		: metadata.origin;
+	const context = origin
+		? (
+				await Promise.all(
+					host.plugins.map(async (plugin) => plugin.context?.(origin, host.clients())),
+				)
+			).filter(Boolean)
+		: [];
+	const event = typeof metadata.triggerEvent === "string" ? metadata.triggerEvent : null;
+	const rendered = renderInput({
+		input: opts.input,
+		kind,
+		priority,
+		requestId,
+		from: actor?.name ?? actor?.id,
+		thread: current?.kind === "thread" ? current.threadId : null,
+		source: metadata.origin?.provider ?? event?.split(".")[0],
+		event,
+	});
+	return {
+		session,
+		requestId,
+		content: [...context, rendered].join("\n\n"),
+		delivery: deliveryFor(kind, priority),
+		metadata: {
+			...metadata,
+			requestedBy: actor as InvocationMetadata["requestedBy"],
+			replyTo,
+			origin: origin as InvocationMetadata["origin"],
+			ownsThread: false,
+			ownerWorkflow: null,
+			triggerEvent: null,
+			send: { kind, priority } satisfies SentRequest,
+		},
+	};
+}
