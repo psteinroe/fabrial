@@ -1051,10 +1051,9 @@ it("a background child waiting for approval releases the Session: a new message 
 			if (text === "Fix it") return use(toolName(runSql.name), { sql: "update x" });
 			if (text === '"ran"') return say("Fixed after approval.");
 			if (text.includes("Fix the row")) return use(tool, { task: "Fix it", background: true });
-			if (text.startsWith("Started")) return use("reply", { text: "On it." });
-			if (text.includes("Status?")) return use("reply", { text: "Still waiting for approval." });
-			if (text.startsWith("<subagent")) return use("reply", { text: `Done: ${text}` });
-			if (text === "Posted.") return say("ok");
+			if (text.startsWith("Started")) return say("On it.");
+			if (text.includes("Status?")) return say("Still waiting for approval.");
+			if (text.startsWith("<subagent")) return say(`Done: ${text}`);
 			return say(`unexpected: ${text}`);
 		}),
 	);
@@ -1125,6 +1124,8 @@ it("a background child waiting for approval releases the Session: a new message 
 			.poll(posts, { timeout: 10_000 })
 			.toEqual(["On it.", "Still waiting for approval."]);
 		await approve!();
+		// The report reaches the lead after its Session reopened; the run stays hosted until it is answered, so the
+		// answer posts.
 		await expect
 			.poll(posts, { timeout: 10_000 })
 			.toEqual([

@@ -220,7 +220,7 @@ export function resolveSubagents(lead: Agent): ResolvedSubagent[] {
 export function ownToolNames(definition: AgentDefinition<string, any>): string[] {
 	const name = (tool: AgentTool) => (isWorkflow(tool) ? toolName(tool.name) : tool.name);
 	return [
-		"reply",
+		"no_reply",
 		...(definition.tools ?? []).map(name),
 		...(definition.toolkits ?? []).flatMap((entry) =>
 			typeof entry === "string" ? [] : (entry.tools ?? []).map(name),

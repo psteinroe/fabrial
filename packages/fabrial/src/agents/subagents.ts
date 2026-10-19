@@ -493,7 +493,7 @@ const reporterTask = (deps: SubagentDeps) =>
 				let submissionId: number | null = null;
 				if (report !== undefined) {
 					const requestId = `fabrial.subagent-report:${reporter.id}`;
-					// The report acts for the request that started the child, so `reply` answers it there.
+					// The report acts for the request that started the child, so its answer posts to that request's reply thread.
 					const invocation = await runtime.snapshot(Invocation, reporter.input.request, context);
 					if (invocation)
 						await runtime.commit(async (tx) => {

@@ -25,14 +25,6 @@ export const Invocation = defineDocFamily({
 	version: 1,
 	initial: (metadata: InvocationMetadata) => ({ ...metadata, actor: metadata.requestedBy }),
 });
-/** A short request id, as rendered to the model, to its full request id. */
-export const RequestAlias = defineDocFamily({
-	family: true,
-	kind: "fabrial.request-alias",
-	scope: "session",
-	version: 1,
-	initial: (requestId: string): { requestId: string } => ({ requestId }),
-});
 export const Binding = defineDoc({
 	kind: "fabrial.binding",
 	scope: "conversation",
@@ -136,16 +128,16 @@ export const Runs = defineDoc({
 				done?: boolean;
 				children: Record<string, { executionId: string; detached: boolean }>;
 				intents?: string[];
+				/** Error ids of failed runs, by the request whose thread got the error reply; assigned once. */
+				errors?: Record<string, string>;
 				requests?: Record<
 					string,
 					{
 						content: string;
 						submissionId: number | null;
 						delivery?: import("../send.ts").Delivery;
-						/** Sent with `ctx.send` or a follow, so answered through `reply`. */
+						/** Sent with `ctx.send` or a subscription, so its answer posts to its reply thread. */
 						sent?: boolean;
-						/** Id of the error reply of sent input that ended unanswered, assigned once. */
-						errorId?: string;
 					}
 				>;
 			}

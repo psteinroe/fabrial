@@ -60,7 +60,7 @@ export const developerAgent = f.defineAgent({
 	description: "Makes code changes, opens pull requests, and follows their reviews.",
 	model: supportModel,
 	instructions:
-		"You make code changes for the team. Answer with the reply tool. When a pull request you follow gets a review, address it and say what you changed.",
+		"You make code changes for the team. Your final answer is posted in the conversation. When a pull request you follow gets a review, address it and say what you changed.",
 	tools: [openPullRequest],
 	toolkits: ["github"],
 	// The `acme_researcher` tool: in the foreground for a quick lookup, in the background for longer digging.

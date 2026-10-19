@@ -78,7 +78,7 @@ export interface SubscribeOptions {
 	 * workflow an agent tool started). Required from other workflows.
 	 */
 	to?: { agent: AgentRef; session?: SessionOption };
-	/** Where the agent's `reply` to a notification goes. Default: the current request's reply surface. */
+	/** Where the agent's final reply to a notification goes. Default: the current request's reply surface. */
 	replyTo?: Thread | Surface | null;
 }
 
@@ -490,7 +490,6 @@ export function deliveryWorkflow(
 								input: notification.summary,
 								kind: "notification",
 								priority,
-								requestId,
 								source: subscription.provider,
 								event: notification.kind,
 								attributes: { resource: notification.resource, ...notification.attributes },

@@ -604,17 +604,10 @@ it("read-only query cannot escape its transaction with multiple statements", asy
 	expect(await balances()).toEqual([{ balance: 0 }, { balance: 100 }]);
 });
 
-it("support channel: two threads share one conversation, reply posts to the asker, and a restart mid-run resumes", async () => {
-	const answered = (context: { messages: readonly { role: string; toolName?: string }[] }) =>
-		context.messages.filter((m) => m.role === "toolResult" && m.toolName === "reply").length;
-	const step = (context: {
-		messages: readonly { role: string; toolName?: string; content: unknown }[];
-	}) => {
-		const text = JSON.stringify(context.messages);
-		const asks = (text.match(/<message /g) ?? []).length;
-		return answered(context) >= asks
-			? reply.text("final answer, never posted")
-			: reply.toolCall("reply", { text: `Answer ${asks}` });
+it("support channel: two threads share one conversation, the final reply posts to the asker, and a restart mid-run resumes", async () => {
+	const step = (context: { messages: readonly { role: string; content: unknown }[] }) => {
+		const asks = (JSON.stringify(context.messages).match(/<message /g) ?? []).length;
+		return reply.text(`Answer ${asks}`);
 	};
 	faux.respond(Array.from({ length: 8 }, () => step));
 	const post = async (user: string, ts: string, text: string, thread?: string) =>
@@ -664,13 +657,11 @@ it("dev thread: the agent opens a PR, follows it, answers a review in the Slack 
 	let notification = "";
 	faux.respond([
 		reply.toolCall("open_pull_request", { title: "Fix flaky test", head: "fix-flaky" }),
-		reply.toolCall("reply", { text: "Opened acme/app#42." }),
-		reply.text("done"),
+		reply.text("Opened acme/app#42."),
 		(context) => {
 			notification = JSON.stringify(context.messages);
-			return reply.toolCall("reply", { text: "Addressing the requested changes." });
+			return reply.text("Addressing the requested changes.");
 		},
-		reply.text("done"),
 		reply.text("merged"),
 	]);
 	const ts = "1700000300.000001";
@@ -695,8 +686,8 @@ it("dev thread: the agent opens a PR, follows it, answers a review in the Slack 
 	await expect
 		.poll(async () => (await sql`SELECT resource_key FROM fabrial.subscriptions`).length, poll)
 		.toBe(1);
-	// The review arrives while the first run ends; the driver answers it whenever it lands.
-	await expect.poll(() => faux.calls, poll).toBe(3);
+	// The first run's answer is its second model call; the review's run makes the third.
+	await expect.poll(() => faux.calls, poll).toBe(2);
 
 	const pr = {
 		id: 42,
@@ -756,7 +747,12 @@ it("dev thread: the agent opens a PR, follows it, answers a review in the Slack 
 	await expect
 		.poll(async () => (await sql`SELECT 1 FROM fabrial.subscriptions`).length, poll)
 		.toBe(0);
-	expect(replies()).toHaveLength(2);
+	// The merge notification's final reply goes to the home thread too.
+	await expect.poll(() => replies().length, poll).toBe(3);
+	expect(replies()[2]!.args).toMatchObject({
+		thread_ts: ts,
+		text: expect.stringContaining("merged"),
+	});
 });
 
 it("dev thread: the developer asks its researcher in the foreground and the background, and replies with both", async () => {
@@ -784,10 +780,9 @@ it("dev thread: the developer asks its researcher in the foreground and the back
 					task: "Check its CI history",
 					background: true,
 				});
-			if (text.startsWith("Started"))
-				return reply.toolCall("reply", { text: "It is tests/flaky.test.ts; checking CI." });
+			if (text.startsWith("Started")) return reply.text("It is tests/flaky.test.ts; checking CI.");
 			if (text.includes("3 of the last 10"))
-				return reply.toolCall("reply", { text: "CI: it failed 3 of the last 10 runs." });
+				return reply.text("CI: it failed 3 of the last 10 runs.");
 			return reply.text("done");
 		}),
 	);

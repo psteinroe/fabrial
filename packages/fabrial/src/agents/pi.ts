@@ -24,6 +24,7 @@ import {
 	type HarnessSettings,
 	type ToolRegistration,
 	LiveDoc,
+	type EntryId,
 	type Submission,
 	type SubmissionId,
 } from "@earendil-works/pi-durable";
@@ -74,18 +75,11 @@ import {
 	currentRequest,
 	fields,
 	registerChild,
-	replyTool,
+	noReplyTool,
 	startChild,
 	type BridgeFrame,
 } from "./context.ts";
-import {
-	claimRequestAlias,
-	prepareSend,
-	threadSession,
-	withRequestAlias,
-	type Delivery,
-	type SendOptions,
-} from "../send.ts";
+import { prepareSend, threadSession, type Delivery, type SendOptions } from "../send.ts";
 import {
 	prepareSubscribe,
 	prepareUnsubscribe,
@@ -98,8 +92,8 @@ import {
 	ChildResults,
 	Conversations,
 	Invocation,
-	RequestAlias,
 	Runs,
+	SubagentWork,
 	WorkflowReceipts,
 	ChildIntents,
 	EFFECT_WORKFLOW,
@@ -141,10 +135,15 @@ interface HostedRun {
 	conversation: Conversation;
 	call?: { requestId: string; metadata: InvocationMetadata };
 	submissions: Map<string, Submission>;
-	/** Sent requests, answered through `reply`; the rest are the call's own. */
+	/** Sent requests, whose answers post to their reply threads; the rest are the call's own. */
 	sent: Set<string>;
 	unanswered: Set<string>;
+	/** Answers posted (or skipped) already, by answer entry id. */
+	posted: Set<EntryId>;
+	/** Requests with their reply thread's invocation, or null for none. */
+	threads: Map<string, InvocationMetadata | null>;
 	started: boolean;
+	/** Whether `no_reply` is offered. */
 	replying: boolean;
 	/** The thread a call owns. */
 	io?: ThreadIO;
@@ -275,7 +274,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	const observers = host.plugins.flatMap((plugin) =>
 		plugin.hooks?.agent ? [plugin.hooks.agent] : [],
 	);
-	const reply = replyTool();
+	const noReply = noReplyTool();
 	const subagentDeps: SubagentDeps = {
 		childAgent,
 		named: (conversationId, agent) => conversationAgents.set(conversationId, agent),
@@ -284,7 +283,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	};
 	const internal = defineExtension({
 		name: "fabrial.internal",
-		tools: [reply],
+		tools: [noReply],
 		// Background subagent tasks resume after a restart wherever a Session is opened.
 		tasks: subagentTasks(subagentDeps),
 		hooks: observers.length ? observerHooks(observers, agentNameOf, host) : [],
@@ -305,7 +304,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		return !supplied || host.workflows.some((candidate) => candidate.name === supplied.name);
 	};
 
-	/** A child's agent: its own definition, subagent tools only with levels left, and never `reply`. */
+	/** A child's agent: its own definition, subagent tools only with levels left, and never `no_reply`. */
 	function childAgent(agent: Agent, depth: number): AgentChange {
 		const { model, thinking } = agent.definition;
 		const parts = extensionsOf.get(agent.name)!;
@@ -319,7 +318,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			...(thinking ? { thinkingLevel: THINKING[thinking] } : {}),
 			instructions: null,
 			extensions,
-			tools: [...tools.values()].filter((tool) => tool !== reply && registered(tool)),
+			tools: [...tools.values()].filter((tool) => tool !== noReply && registered(tool)),
 		};
 	}
 
@@ -676,6 +675,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				submissions: new Map(),
 				sent: new Set(),
 				unanswered: new Set(),
+				posted: new Set(),
+				threads: new Map(),
 				started: false,
 				replying: false,
 			};
@@ -713,15 +714,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		) {
 			await harness.commit(async (tx) => {
 				await tx.doc(Invocation, requestId, cloneJson(metadata));
-				const alias = await claimRequestAlias(
-					requestId,
-					async (alias) => (await tx.doc(RequestAlias, alias, requestId)).requestId,
-				);
 				(await tx.doc(Binding, run.conversation.id)).requestId ??= requestId;
 				const record = (await tx.doc(Runs)).runs[run.id]!;
 				record.requests ??= {};
 				record.requests[requestId] ??= {
-					content: withRequestAlias(content, requestId, alias),
+					content,
 					submissionId: null,
 					delivery,
 					...(sent ? { sent } : {}),
@@ -787,22 +784,35 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		}
 
 		// Tools are not filtered by who is talking: a conversation can have many participants, and a tool that needs
-		// permission asks its own approvers. Only unregistered workflows drop out, and `reply` is offered only to runs
-		// that answer sent input.
-		async function offer(run: HostedRun, withReply: boolean) {
+		// permission asks its own approvers. Only unregistered workflows drop out, and `no_reply` is offered only to
+		// runs that answer input with a reply thread.
+		async function offer(run: HostedRun, withNoReply: boolean) {
 			const { offered } = await conversationOf(run.agent);
 			await run.conversation.configure(
-				{ tools: offered.filter((tool) => (tool === reply ? withReply : registered(tool))) },
+				{ tools: offered.filter((tool) => (tool === noReply ? withNoReply : registered(tool))) },
 				context,
 			);
-			run.replying = withReply;
+			run.replying = withNoReply;
+		}
+
+		/** The invocation of sent input or a report on it, when its answer posts to a reply thread. */
+		async function replyThread(run: HostedRun, requestId: string) {
+			if (!run.threads.has(requestId)) {
+				const invocation = (await harness.snapshot(Invocation, requestId, context)) as
+					| InvocationMetadata
+					| undefined;
+				run.threads.set(requestId, invocation?.send && invocation.replyTo ? invocation : null);
+			}
+			return run.threads.get(requestId) ?? undefined;
 		}
 
 		async function activate(run: HostedRun) {
 			run.started = true;
 			const record = (await harness.snapshot(Runs, context))!.runs[run.id]!;
-			const sent = Object.values(record.requests ?? {}).some((request) => request.sent);
-			await offer(run, !run.call || sent);
+			let threaded = false;
+			for (const [requestId, request] of Object.entries(record.requests ?? {}))
+				if (request.sent && (await replyThread(run, requestId))) threaded = true;
+			await offer(run, threaded);
 			if (run.call) {
 				const requestId = run.call.requestId;
 				await harness.commit(async (tx) => {
@@ -822,7 +832,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				if (run.submissions.has(requestId)) continue;
 				if (pending.sent) {
 					run.sent.add(requestId);
-					if (!run.replying) await offer(run, true);
+					if (!run.replying && (await replyThread(run, requestId))) await offer(run, true);
 					await run.ui?.follow(requestId);
 				}
 				// Pi dedupes by request id, so a request re-admitted after a crash is submitted once.
@@ -913,14 +923,44 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			return delivered.size;
 		}
 
-		// Sent input Pi gave up on: one error reply for a model error or no model, keyed by request id.
+		/** Text of an answer entry, or undefined when it ends in `no_reply`. */
+		async function answerOf(conversation: Conversation, answer: EntryId) {
+			const messages = (await conversation.commit((tx) => tx.entry(answer), context))?.model ?? [];
+			const assistant = messages.flatMap((message) =>
+				message.role === "assistant" ? message.content : [],
+			);
+			if (assistant.some((block) => block.type === "toolCall" && block.name === noReply.name))
+				return undefined;
+			return assistant.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
+		}
+
+		// Posted through a detached effect keyed by the answer, so a redelivered or restarted Session posts once.
+		async function postAnswer(run: HostedRun, answer: EntryId, requestId: string) {
+			run.posted.add(answer);
+			const text = await answerOf(run.conversation, answer);
+			if (!text?.trim()) return;
+			await startChild(
+				frame,
+				run.id,
+				`fabrial:pi:answer:${run.conversation.id}:${answer}`,
+				EFFECT_WORKFLOW,
+				{ method: "post", args: [text] },
+				(await replyThread(run, requestId))!,
+				true,
+				context,
+			);
+			host.logger.debug("Posting final reply", { requestId, answer });
+			await run.ui?.unfollow(requestId);
+		}
+
+		// Input Pi gave up on: one error reply for a model error or no model, in the newest input's reply thread.
 		async function settleUnanswered(
 			run: HostedRun,
-			requestId: string,
-			reason: string,
-			detail: Json,
+			failures: { requestId: string; id: number; reason: string; detail: Json }[],
 		) {
-			await run.ui?.unfollow(requestId);
+			for (const { requestId } of failures) await run.ui?.unfollow(requestId);
+			const newest = failures.reduce((a, b) => (b.id > a.id ? b : a));
+			const { requestId, reason, detail } = newest;
 			const error =
 				typeof detail === "string" ? detail : detail === null ? undefined : JSON.stringify(detail);
 			if (!sentErrorReply(reason, error, "")) {
@@ -929,26 +969,82 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			}
 			const fresh = newErrorId();
 			const errorId = await harness.commit(async (tx) => {
-				const pending = (await tx.doc(Runs)).runs[run.id]!.requests![requestId]!;
-				return (pending.errorId ??= fresh);
+				const record = (await tx.doc(Runs)).runs[run.id]!;
+				record.errors ??= {};
+				return (record.errors[requestId] ??= fresh);
 			}, context);
-			const invocation = (await harness.snapshot(Invocation, requestId, context)) as
-				| InvocationMetadata
-				| undefined;
 			// A stable intent and global dedupe key: a redelivered or restarted Session posts once.
-			if (invocation?.replyTo)
-				await startChild(
-					frame,
-					run.id,
-					`fabrial:pi:error:${requestId}`,
-					EFFECT_WORKFLOW,
-					{ method: "post", args: [sentErrorReply(reason, error, errorId)!] },
-					invocation,
-					true,
-					context,
-				);
+			await startChild(
+				frame,
+				run.id,
+				`fabrial:pi:error:${requestId}`,
+				EFFECT_WORKFLOW,
+				{ method: "post", args: [sentErrorReply(reason, error, errorId)!] },
+				(await replyThread(run, requestId))!,
+				true,
+				context,
+			);
 			if (errorId === fresh)
 				host.logger.error("Sent input failed", { requestId, reason, errorId, error });
+		}
+
+		/** Reports of background children to this run, submitted to the lead by their reporters. */
+		async function reports(run: HostedRun): Promise<[string, Submission][]> {
+			const work = await harness.snapshot(SubagentWork, context);
+			const found: [string, Submission][] = [];
+			for (const [id, entry] of Object.entries(work?.reporters ?? {})) {
+				if (entry.run !== run.id || entry.lead !== run.conversation.id || entry.report === null)
+					continue;
+				const submission = await harness.submission(entry.report as SubmissionId, context);
+				if (submission) found.push([`fabrial.subagent-report:${id}`, submission]);
+			}
+			return found;
+		}
+
+		/**
+		 * Post the answers to input with a reply thread: each answer once, to the thread of the newest input it answers
+		 * (steering inputs share their run's answer). Input that failed gets the error reply there instead. Returns whether
+		 * every sent request and report settled, from the same reads, so a run never finishes before its answers posted:
+		 * a report placed after its Session reopened has no live Pi run yet.
+		 */
+		async function postAnswers(run: HostedRun): Promise<{ settled: boolean; queued: boolean }> {
+			let settled = true;
+			let queued = false;
+			const answered = new Map<EntryId, { requestId: string; id: number }>();
+			const failures: { requestId: string; id: number; reason: string; detail: Json }[] = [];
+			const candidates = [
+				...[...run.submissions].filter(([requestId]) => run.sent.has(requestId)),
+				...(await reports(run)),
+			];
+			for (const [requestId, submission] of candidates) {
+				if (run.unanswered.has(requestId)) continue;
+				const status = await submission.status(context);
+				if (status.status !== "done" && status.status !== "unanswered") {
+					settled = false;
+					queued ||= status.status === "queued";
+				}
+				if (status.status === "unanswered") {
+					run.unanswered.add(requestId);
+					if (await replyThread(run, requestId))
+						failures.push({
+							requestId,
+							id: submission.id,
+							reason: status.reason,
+							detail: (status.detail ?? null) as Json,
+						});
+					else host.logger.info("Sent input unanswered", { requestId, reason: status.reason });
+					continue;
+				}
+				if (status.status !== "done" || status.type !== "input" || run.posted.has(status.answer))
+					continue;
+				if (!(await replyThread(run, requestId))) continue;
+				const newest = answered.get(status.answer);
+				if (!newest || submission.id > newest.id)
+					answered.set(status.answer, { requestId, id: submission.id });
+			}
+			for (const [answer, { requestId }] of answered) await postAnswer(run, answer, requestId);
+			if (failures.length) await settleUnanswered(run, failures);
+			return { settled, queued };
 		}
 
 		/** Settle a run: a call's answer becomes the event its caller waits for. */
@@ -976,15 +1072,15 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			let queued = false;
 			let failed: string | undefined;
 			let answer: Json | undefined;
+			const sent = await postAnswers(run);
+			complete = sent.settled;
+			queued = sent.queued;
 			for (const [requestId, submission] of run.submissions) {
+				if (run.sent.has(requestId)) continue;
 				const status = await submission.status(context);
 				// A failed run leaves the input queued behind it in Pi's inbox: keep running that.
 				if (status.status === "unanswered") {
-					if (!run.sent.has(requestId)) failed ??= status.reason;
-					else if (!run.unanswered.has(requestId)) {
-						run.unanswered.add(requestId);
-						await settleUnanswered(run, requestId, status.reason, (status.detail ?? null) as Json);
-					}
+					failed ??= status.reason;
 					continue;
 				}
 				if (status.status !== "done") {
@@ -992,8 +1088,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					queued ||= status.status === "queued";
 					continue;
 				}
-				// Sent input is answered through `reply`; a call returns its own answer.
-				if (status.type === "input" && !run.sent.has(requestId)) {
+				// A call returns its own answer.
+				if (status.type === "input") {
 					const entry = await run.conversation.commit((tx) => tx.entry(status.answer), context);
 					answer =
 						entry?.model
@@ -1025,7 +1121,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				await run.conversation.submit({ type: "write", entry: { kind: "fabrial.wake" } }, context);
 		}
 
-		/** No work, or every running task waits on a workflow (or on a subagent that does): the Session can close. */
+		/**
+		 * No work, or every running task waits on a workflow other than a short effect (or on a subagent that does): the
+		 * Session can close.
+		 */
 		async function closeable() {
 			if (inflight || [...runs.values()].some((run) => !run.started)) return false;
 			const inspection = await harness.inspect(context);
@@ -1033,9 +1132,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			if (!live.length && !inspection.submissions.length)
 				return !(await backgroundPending(harness, context));
 			const runners = live.filter((task) => task.state.kind === "running");
-			const parked = (id: number) => frame.children.has(id) || frame.waiting.has(id);
+			// A short managed effect (a thread post) is waited out; only workflows release the Session.
+			const workflow = (id: number) => frame.children.has(id) && !frame.children.get(id)!.effect;
+			const parked = (id: number) => workflow(id) || frame.waiting.has(id);
 			return (
-				runners.some((task) => frame.children.has(task.record.id)) &&
+				runners.some((task) => workflow(task.record.id)) &&
 				live.every(
 					(task) =>
 						task.state.kind === "waiting" ||

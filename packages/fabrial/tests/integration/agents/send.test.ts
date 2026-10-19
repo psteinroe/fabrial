@@ -67,6 +67,17 @@ async function submitted(session: string): Promise<string[]> {
 			if (write.type === "submission" && write.value.requestId) ids.add(write.value.requestId);
 	return [...ids];
 }
+/** A tool that does nothing, for a tool round the next input can steer. */
+const look = f.defineTool({
+	name: "look",
+	description: "Looking around",
+	input: z.object({}),
+	run: async () => "nothing",
+});
+const UNREACHABLE =
+	/^I couldn't reach the model provider while handling your request\. Please try again in a few minutes\.\n\n_Error id: `[0-9a-f]{12}`_$/;
+const FAILED =
+	/^I hit an error while handling your request\. Please try again, rephrase, or reach out if it keeps failing\.\n\n_Error id: `[0-9a-f]{12}`_$/;
 type Response = Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0][number];
 
 /** One app on a fresh channel: a channel-wide subscription and a notify workflow on a custom key. */
@@ -110,12 +121,17 @@ async function setup(
 			});
 		},
 	});
+	const ask = f.defineWorkflow({
+		name: `ask-${channel}`,
+		input: z.object({ question: z.string() }),
+		run: (input, ctx) => ctx.agent("ask", agent, { input: input.question }),
+	});
 	// Another process on the same database: its driver waits for the Session lease.
 	const launch = async () => {
 		const runtime = new MemoryRuntime({ idPrefix: randomUUID() });
 		const chat = new FakeChat(() => runtime.now());
 		const app = testApp(f, {
-			workflows: [notify],
+			workflows: [notify, ask],
 			subscriptions: [subscription],
 			runtime,
 			chat,
@@ -182,24 +198,20 @@ async function setup(
 		read,
 		respond,
 		notify,
+		ask,
 		launch,
 	};
 }
 
-it("lands messages from different threads in one channel conversation; reply targets a request and the final answer is not posted", async () => {
+it("lands messages from different threads in one channel conversation; each final answer posts to its input's thread", async () => {
 	const t = await setup();
 	let second = "";
 	t.respond([
-		fauxAssistantMessage(fauxToolCall("reply", { text: "Answer one" }), { stopReason: "toolUse" }),
-		fauxAssistantMessage("final answer one"),
+		fauxAssistantMessage("Answer one"),
 		(context) => {
 			second = text(context.messages);
-			const first = /request=\\"([^"\\]+)\\"/.exec(second)![1]!;
-			return fauxAssistantMessage(fauxToolCall("reply", { text: "Back to one", request: first }), {
-				stopReason: "toolUse",
-			});
+			return fauxAssistantMessage("Answer two");
 		},
-		fauxAssistantMessage("final answer two"),
 	]);
 	expect(await t.chat.receive(t.message("m1", "t1", "first <question>"))).toBe("new");
 	await t.settle();
@@ -208,15 +220,15 @@ it("lands messages from different threads in one channel conversation; reply tar
 	// One conversation saw both messages, attributed and escaped.
 	expect(second).toContain("first &lt;question&gt;");
 	expect(second).toContain('from=\\"Author m2\\"');
-	expect(t.faux.state.callCount).toBe(4);
+	expect(t.faux.state.callCount).toBe(2);
 	const session = `chat:channel:${t.channel}`;
 	const conversations = await t.read(session, (s) => s.snapshot(Conversations, BACKGROUND_CONTEXT));
 	expect(Object.keys(conversations!.ids)).toHaveLength(1);
-	// Both replies went to thread t1 (the default latest request, then the targeted one); t2 got none.
-	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Answer one", "Back to one"]);
-	expect(await t.posts("t2")).toEqual([]);
-	// The model saw short request ids, and the sent run showed progress on the reply thread.
-	expect(second).toMatch(/request=\\"[0-9a-f]{8}\\"/);
+	// Each answer went to the thread of the input it answers.
+	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Answer one"]);
+	expect((await t.posts("t2")).map((post) => post.content)).toEqual(["Answer two"]);
+	// Inputs render no request ids, and the sent run showed progress on the reply thread.
+	expect(second).not.toContain("request=");
 	const statuses = (
 		await t.chat.thread({ kind: "thread", provider: "chat", threadId: `chat:${t.channel}:t1` })
 	).statuses;
@@ -235,8 +247,8 @@ it("lands messages from different threads in one channel conversation; reply tar
 	});
 });
 
-it("steers a busy run with a second message and drops a redelivered event", async () => {
-	const t = await setup();
+it("steers a busy run with a second message, replies in the newest input's thread, and drops a redelivered event", async () => {
+	const t = await setup(() => [look]);
 	let release!: () => void;
 	const gate = new Promise<void>((resolve) => (release = resolve));
 	let busy!: () => void;
@@ -246,9 +258,7 @@ it("steers a busy run with a second message and drops a redelivered event", asyn
 		async () => {
 			busy();
 			await gate;
-			return fauxAssistantMessage(fauxToolCall("reply", { text: "Working on it" }), {
-				stopReason: "toolUse",
-			});
+			return fauxAssistantMessage(fauxToolCall("look", {}), { stopReason: "toolUse" });
 		},
 		(context) => {
 			steered = text(context.messages);
@@ -288,10 +298,13 @@ it("steers a busy run with a second message and drops a redelivered event", asyn
 		);
 	});
 	expect(new Set(answers).size).toBe(1);
+	// The one answer posts once, to the newest input's thread.
+	expect(await t.posts("t1")).toEqual([]);
+	expect((await t.posts("t2")).map((post) => post.content)).toEqual(["done"]);
 });
 
 it("maps notification priorities to write, followUp, and steer; written entries reach the next run", async () => {
-	const t = await setup();
+	const t = await setup(() => [look]);
 	const seen: string[] = [];
 	let release!: () => void;
 	const gate = new Promise<void>((resolve) => (release = resolve));
@@ -302,9 +315,7 @@ it("maps notification priorities to write, followUp, and steer; written entries 
 			seen.push(text(context.messages));
 			busy();
 			await gate;
-			return fauxAssistantMessage(fauxToolCall("reply", { text: "ack" }), {
-				stopReason: "toolUse",
-			});
+			return fauxAssistantMessage(fauxToolCall("look", {}), { stopReason: "toolUse" });
 		},
 		(context) => {
 			seen.push(text(context.messages));
@@ -402,7 +413,6 @@ it.each(["notification", "message"] as const)(
 		const session = kind === "message" ? `chat:channel:${t.channel}` : `app:ops-${t.channel}`;
 		const seen: string[] = [];
 		t.respond([
-			fauxAssistantMessage(fauxToolCall("reply", { text: "first" }), { stopReason: "toolUse" }),
 			async () => {
 				// Steer while this final answer is in flight; answer only once the driver admitted it.
 				if (kind === "message")
@@ -425,15 +435,12 @@ it.each(["notification", "message"] as const)(
 				await expect
 					.poll(async () => (await submitted(session)).length, { timeout: 10_000 })
 					.toBe(2);
-				return fauxAssistantMessage("done");
+				return fauxAssistantMessage("first");
 			},
 			(context) => {
 				seen.push(text(context.messages));
-				return fauxAssistantMessage(fauxToolCall("reply", { text: "second" }), {
-					stopReason: "toolUse",
-				});
+				return fauxAssistantMessage("second");
 			},
-			fauxAssistantMessage("done"),
 		]);
 		if (kind === "message") await t.chat.receive(t.message("m1", "t1"));
 		else
@@ -455,7 +462,16 @@ it.each(["notification", "message"] as const)(
 		await t.settle();
 		expect(seen).toHaveLength(1);
 		expect(seen[0]).toContain("late steer");
-		expect(t.faux.state.callCount).toBe(4);
+		expect(t.faux.state.callCount).toBe(2);
+		// Messages answer in their own threads; notifications without a reply thread post nothing.
+		const posted = async (thread: string) =>
+			(await other.chat.thread({
+				kind: "thread",
+				provider: "chat",
+				threadId: `chat:${t.channel}:${thread}`,
+			}))!.posts.length + (await t.posts(thread)).length;
+		expect(await posted("t1")).toBe(kind === "message" ? 1 : 0);
+		expect(await posted("t2")).toBe(kind === "message" ? 1 : 0);
 	},
 );
 
@@ -516,6 +532,22 @@ it.each(["notification", "message"] as const)(
 		expect(seen).toHaveLength(1);
 		expect(seen[0]).toContain("queued steer");
 		expect(t.faux.state.callCount).toBe(2);
+		if (kind === "message") {
+			// The failed input got the error reply in its thread; the queued one its answer in its own.
+			const [failure] = (await t.posts("t1")).map((post) => post.content as string);
+			expect(failure).toMatch(FAILED);
+			const answers = [
+				...(await t.posts("t2")),
+				...(
+					await other.chat.thread({
+						kind: "thread",
+						provider: "chat",
+						threadId: `chat:${t.channel}:t2`,
+					})
+				).posts,
+			];
+			expect(answers.map((post) => post.content)).toEqual(["answered"]);
+		}
 	},
 );
 
@@ -541,11 +573,8 @@ it("an urgent notification during a tool call steers the running run and is answ
 		fauxAssistantMessage(fauxToolCall("deploy", {}), { stopReason: "toolUse" }),
 		(context) => {
 			steered = text(context.messages);
-			return fauxAssistantMessage(fauxToolCall("reply", { text: "Rolled back" }), {
-				stopReason: "toolUse",
-			});
+			return fauxAssistantMessage("Rolled back");
 		},
-		fauxAssistantMessage("done"),
 	]);
 	const notify = (text: string, priority: "urgent" | "normal") =>
 		t.runtime.invoke(
@@ -577,7 +606,7 @@ it("an urgent notification during a tool call steers the running run and is answ
 	expect(steered).toContain("deployed");
 	expect(steered).toContain("error rate is up");
 	expect(steered).toContain('priority=\\"urgent\\"');
-	expect(t.faux.state.callCount).toBe(3);
+	expect(t.faux.state.callCount).toBe(2);
 	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Rolled back"]);
 	// Both inputs settled with the same answer: one run.
 	const answers = await t.read(session, async (s, storage) => {
@@ -594,10 +623,6 @@ it("an urgent notification during a tool call steers the running run and is answ
 	expect(new Set(answers).size).toBe(1);
 });
 
-const UNREACHABLE =
-	/^I couldn't reach the model provider while handling your request\. Please try again in a few minutes\.\n\n_Error id: `[0-9a-f]{12}`_$/;
-const FAILED =
-	/^I hit an error while handling your request\. Please try again, rephrase, or reach out if it keeps failing\.\n\n_Error id: `[0-9a-f]{12}`_$/;
 const statuses = async (t: Awaited<ReturnType<typeof setup>>, thread: string) =>
 	(
 		await t.chat.thread({
@@ -621,8 +646,7 @@ it("a non-retryable model error posts one error reply with an error id; the conv
 			stopReason: "error",
 			errorMessage: "invalid_request_error: tools.0.input_schema is invalid",
 		}),
-		fauxAssistantMessage(fauxToolCall("reply", { text: "Answer two" }), { stopReason: "toolUse" }),
-		fauxAssistantMessage("done"),
+		fauxAssistantMessage("Answer two"),
 	]);
 	await t.chat.receive(t.message("m1", "t1"));
 	await t.settle();
@@ -641,7 +665,7 @@ it("a non-retryable model error posts one error reply with an error id; the conv
 	await t.chat.receive(t.message("m2", "t1", "again"));
 	await t.settle();
 	expect((await t.posts("t1")).map((post) => post.content)).toEqual([failure, "Answer two"]);
-	expect(t.faux.state.callCount).toBe(3);
+	expect(t.faux.state.callCount).toBe(2);
 });
 
 it("a transient model error retried durably shows the waiting status and posts no error reply", async () => {
@@ -650,8 +674,7 @@ it("a transient model error retried durably shows the waiting status and posts n
 	});
 	t.respond([
 		fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 overloaded" }),
-		fauxAssistantMessage(fauxToolCall("reply", { text: "Answer one" }), { stopReason: "toolUse" }),
-		fauxAssistantMessage("done"),
+		fauxAssistantMessage("Answer one"),
 	]);
 	await t.chat.receive(t.message("m1", "t1"));
 	await t.settle();
@@ -660,7 +683,7 @@ it("a transient model error retried durably shows the waiting status and posts n
 	expect(shown).toContain(WAITING_STATUS);
 	expect(shown.slice(shown.indexOf(WAITING_STATUS))).toContain("Thinking…");
 	expect(shown.at(-1)).toBeNull();
-	expect(t.faux.state.callCount).toBe(3);
+	expect(t.faux.state.callCount).toBe(2);
 });
 
 it("a transient model error that exhausts its retries posts the couldn't-reach reply", async () => {
@@ -696,8 +719,7 @@ it("an aborted sent run posts no reply and the conversation stays usable", async
 	]);
 	t.respond([
 		fauxAssistantMessage(fauxToolCall("slow", {}), { stopReason: "toolUse" }),
-		fauxAssistantMessage(fauxToolCall("reply", { text: "Answer two" }), { stopReason: "toolUse" }),
-		fauxAssistantMessage("done"),
+		fauxAssistantMessage("Answer two"),
 	]);
 	await t.chat.receive(t.message("m1", "t1"));
 	void t.runtime.flush();
@@ -740,7 +762,7 @@ it("a driver redelivered after starting the error reply does not post it twice",
 	]);
 });
 
-it("a sent run's background child reports as a follow-up and the lead replies again", async () => {
+it("a sent run's background child reports as a follow-up; the lead's answer posts to the starting input's thread", async () => {
 	const t = await setup(undefined, { researcher: true });
 	const tool = `researcher_${t.channel}`;
 	const last = (messages: readonly Message[]) => {
@@ -752,14 +774,8 @@ it("a sent run's background child reports as a follow-up and the lead replies ag
 			const latest = last(context.messages);
 			if (latest === "Find the cause") return fauxAssistantMessage("It is DNS");
 			if (latest.includes("subagent name=") && latest.includes("It is DNS"))
-				return fauxAssistantMessage(fauxToolCall("reply", { text: "Found: DNS" }), {
-					stopReason: "toolUse",
-				});
-			if (latest.includes("Started"))
-				return fauxAssistantMessage(fauxToolCall("reply", { text: "Looking into it" }), {
-					stopReason: "toolUse",
-				});
-			if (latest.includes("Posted.")) return fauxAssistantMessage("done");
+				return fauxAssistantMessage("Found: DNS");
+			if (latest.includes("Started")) return fauxAssistantMessage("Looking into it");
 			return fauxAssistantMessage(
 				fauxToolCall(tool, { task: "Find the cause", background: true }),
 				{ stopReason: "toolUse" },
@@ -777,4 +793,108 @@ it("a sent run's background child reports as a follow-up and the lead replies ag
 			id.startsWith("fabrial.subagent-report:"),
 		),
 	).toHaveLength(1);
+});
+
+it("no_reply ends a run without posting and keeps its reason in the transcript", async () => {
+	const t = await setup();
+	let next = "";
+	t.respond([
+		fauxAssistantMessage(fauxToolCall("no_reply", { reason: "just chatter" }), {
+			stopReason: "toolUse",
+		}),
+		(context) => {
+			next = text(context.messages);
+			return fauxAssistantMessage("Answer two");
+		},
+	]);
+	await t.chat.receive(t.message("m1", "t1", "lol"));
+	await t.settle();
+	// The tool ended the run: no second model call, nothing posted, no status left.
+	expect(t.faux.state.callCount).toBe(1);
+	expect(await t.posts("t1")).toEqual([]);
+	expect((await statuses(t, "t1")).at(-1)).toBeNull();
+	await t.chat.receive(t.message("m2", "t1", "a real question"));
+	await t.settle();
+	expect(next).toContain("just chatter");
+	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Answer two"]);
+});
+
+it("posts a final reply exactly once across a restart and a redelivery", async () => {
+	let crashed = false;
+	const logger: Logger = {
+		debug: (message) => {
+			// Crash once right after the final reply's durable intent started.
+			if (message === "Posting final reply" && !crashed) {
+				crashed = true;
+				throw new Error("driver crashed");
+			}
+		},
+		info() {},
+		warn() {},
+		error() {},
+	};
+	const t = await setup(undefined, { logger });
+	t.runtime.workflows.get("fabrial.session")!.retries = { maxAttempts: 2 };
+	t.respond([fauxAssistantMessage("The answer"), fauxAssistantMessage("unexpected")]);
+	await t.chat.receive(t.message("m1", "t1"));
+	await t.settle();
+	expect(crashed).toBe(true);
+	expect(await t.chat.receive(t.message("m1", "t1"))).toBe("ignored");
+	// The same input signalled again, as a redelivered Conductor signal would be.
+	const [request] = await submitted(`chat:channel:${t.channel}`);
+	const input = t.runtime
+		.executions("fabrial.session")
+		.flatMap((e) => t.runtime.signals(e.executionId))
+		.find((signal) => signal.id === request)!.payload;
+	await t.runtime.signalWithStart({
+		workflow: "fabrial.session",
+		key: `chat:channel:${t.channel}`,
+		signal: { name: "input", id: `${request}:again`, payload: input },
+		input: { session: `chat:channel:${t.channel}` },
+		metadata: {
+			interactionId: request!,
+			origin: null,
+			replyTo: null,
+			requestedBy: null,
+			ownsThread: false,
+		},
+	});
+	await t.settle();
+	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["The answer"]);
+	expect(t.faux.state.callCount).toBe(1);
+});
+
+it("ctx.agent returns the answer and posts nothing, without offering no_reply", async () => {
+	const t = await setup();
+	let after = "";
+	t.respond([
+		fauxAssistantMessage(fauxToolCall("no_reply", {}), { stopReason: "toolUse" }),
+		(context) => {
+			after = text(context.messages);
+			return fauxAssistantMessage("42");
+		},
+	]);
+	const thread = { kind: "thread" as const, provider: "chat", threadId: `chat:${t.channel}:t3` };
+	const id = await t.runtime.invoke(
+		t.ask.name,
+		{ question: "What is the answer?" },
+		{
+			metadata: {
+				interactionId: randomUUID(),
+				origin: null,
+				replyTo: thread,
+				requestedBy: null,
+				ownsThread: false,
+			},
+		},
+	);
+	await t.settle();
+	expect(t.runtime.executions().find((e) => e.executionId === id)?.result).toMatchObject({
+		status: "completed",
+		output: "42",
+	});
+	// no_reply is not offered: the call failed as an unknown tool and the run went on.
+	expect(t.faux.state.callCount).toBe(2);
+	expect(after).toContain("no_reply");
+	expect(await t.posts("t3")).toEqual([]);
 });

@@ -229,7 +229,18 @@ async function released(key: string) {
 }
 
 it("a message ingested on another instance steers the run its host is busy with; never two Session executions run at once", async () => {
-	const lead = f.defineAgent({ name: `lead-${short()}`, description: "Answers.", model });
+	const look = f.defineTool({
+		name: "look",
+		description: "Looking around",
+		input: z.object({}),
+		run: async () => "nothing",
+	});
+	const lead = f.defineAgent({
+		name: `lead-${short()}`,
+		description: "Answers.",
+		model,
+		tools: [look],
+	});
 	const session = `ops-${short()}`;
 	const replyTo = thread();
 	const deliver = f.defineWorkflow({
@@ -243,7 +254,7 @@ it("a message ingested on another instance steers the run its host is busy with;
 	script = async ({ signal }) => {
 		if (requests.length === 1) {
 			await busy.pass(signal);
-			return use("reply", { text: "Working on it" });
+			return use("look", {});
 		}
 		return say("done");
 	};
@@ -269,16 +280,15 @@ it("a message ingested on another instance steers the run its host is busy with;
 	busy.open();
 	await released(await only());
 	clearInterval(sampler);
-	// The steer lands in the same run's next request, after the tool round. The reply tool waits on an effect
-	// workflow, so the Session may close meanwhile and its re-queued execution may run on either instance.
+	// The steer lands in the same run's next request, after the tool round; the one answer posts once.
 	expect(requests).toHaveLength(2);
 	expect(requests[0]!.instance).toBe("a");
 	expect(transcript(requests[0]!)).not.toContain("second question");
-	expect(transcript(requests[1]!)).toContain('"text":"Posted."');
+	expect(transcript(requests[1]!)).toContain('"text":"nothing"');
 	expect(transcript(requests[1]!)).toContain("second question");
 	expect(concurrent).toBe(1);
 	const posts = [...(await a.chat.thread(replyTo)).posts, ...(await b.chat.thread(replyTo)).posts];
-	expect(posts.map((post) => post.content)).toEqual(["Working on it"]);
+	expect(posts.map((post) => post.content)).toEqual(["done"]);
 });
 
 it("a message is answered while only a background child works; the child's report comes after", async () => {
@@ -307,10 +317,9 @@ it("a message is answered while only a background child works; the child's repor
 			return say("Fixed.");
 		}
 		if (text.includes("Fix the row")) return use(tool, { task: "Fix it", background: true });
-		if (text.startsWith("Started")) return use("reply", { text: "On it." });
-		if (text.includes("Status?")) return use("reply", { text: "Still working." });
-		if (text.startsWith("<subagent")) return use("reply", { text: "Done." });
-		if (text === "Posted.") return say("ok");
+		if (text.startsWith("Started")) return say("On it.");
+		if (text.includes("Status?")) return say("Still working.");
+		if (text.startsWith("<subagent")) return say("Done.");
 		return say(`unexpected: ${text}`);
 	};
 	const a = await launch("a", [deliver]);

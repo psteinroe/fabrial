@@ -34,7 +34,7 @@ it("resolves entries: names follow workflow tools, self is the lead, options def
 	]);
 });
 
-it("rejects duplicate names, collisions with tools, workflows, and reply, and invalid options", () => {
+it("rejects duplicate names, collisions with tools, workflows, and no_reply, and invalid options", () => {
 	const lookup = f.defineTool({
 		name: "bug_researcher",
 		description: "Look up",
@@ -56,8 +56,8 @@ it("rejects duplicate names, collisions with tools, workflows, and reply, and in
 			subagents: [researcher],
 		}),
 	).toThrow("already uses");
-	const reply = f.defineAgent({ name: "reply", description: "Clashes with reply." });
-	expect(define({ subagents: [reply] })).toThrow("already uses");
+	const noReply = f.defineAgent({ name: "no_reply", description: "Clashes with no_reply." });
+	expect(define({ subagents: [noReply] })).toThrow("already uses");
 	// @ts-expect-error context is "fresh" or "fork".
 	expect(define({ subagents: [{ agent: researcher, context: "copy" }] })).toThrow("context");
 	// @ts-expect-error background is "allow", "always", or "never".

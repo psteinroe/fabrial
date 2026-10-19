@@ -30,7 +30,7 @@ export interface WorkflowContext<TClients = Record<string, unknown>> {
 	agent<T extends Json = Json>(id: string, agent: AgentRef, options: AgentRunOptions): Promise<T>;
 	/**
 	 * Send: deliver input to the conversation `[session, agent]` and return. An idle conversation starts a
-	 * run; a busy one gets it by kind and priority. The agent answers with its `reply` tool.
+	 * run; a busy one gets it by kind and priority. The agent's final answer posts to the input's reply thread.
 	 */
 	send(id: string, agent: AgentRef, options: SendOptions): Promise<SendReceipt>;
 	/**

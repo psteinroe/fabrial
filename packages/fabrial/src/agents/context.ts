@@ -38,7 +38,6 @@ import {
 	stateDraft,
 	Runs,
 	Invocation,
-	RequestAlias,
 	ChildIntents,
 	EFFECT_WORKFLOW,
 	type ChildIntent,
@@ -51,8 +50,11 @@ export interface BridgeFrame {
 	harness: Harness;
 	/** The Pi Session key this execution hosts. */
 	session: string;
-	/** Tasks waiting on a workflow, by task id; while every running task waits, the Session closes. */
-	children: Map<number, { executionId: string; detached: boolean }>;
+	/**
+	 * Tasks waiting on a workflow, by task id; while every running task waits, the Session closes. A short managed
+	 * effect (`effect`, e.g. a thread post) keeps it open instead.
+	 */
+	children: Map<number, { executionId: string; detached: boolean; effect?: boolean }>;
 	/** Subagent calls waiting for their child's answer; they do not keep the Session open. */
 	waiting: Set<number>;
 	/** The run a conversation's current request belongs to, and the agent whose conversation runs it. */
@@ -106,7 +108,7 @@ export async function fields(
 		ids.set(id, count + 1);
 		return count ? `${id}#${count}` : id;
 	};
-	const childResult = async (child: string): Promise<Json> => {
+	const childResult = async (child: string, effect = false): Promise<Json> => {
 		let result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
 		if (!result) {
 			await registerChild(
@@ -115,6 +117,7 @@ export async function fields(
 				api!.taskId,
 				{ executionId: child, detached: false },
 				context,
+				effect,
 			);
 			result = await bridge.waitChild(api!.taskId, child, context);
 		}
@@ -135,7 +138,7 @@ export async function fields(
 			false,
 			context,
 		);
-		return childResult(child);
+		return childResult(child, true);
 	};
 	const start = async <W extends AnyWorkflow>(id: string, workflow: W, input: WorkflowInput<W>) => {
 		if (!api) throw new Error("Prompt sections cannot start workflows");
@@ -334,8 +337,9 @@ export async function registerChild(
 	taskId: number,
 	child: { executionId: string; detached: boolean },
 	context: Context,
+	effect = false,
 ): Promise<void> {
-	bridge.children.set(taskId, child);
+	bridge.children.set(taskId, effect ? { ...child, effect } : child);
 	await bridge.harness.commit(async (tx) => {
 		const record = (await tx.doc(Runs)).runs[run];
 		if (!record) throw new Error("Missing Pi bridge run binding");
@@ -364,79 +368,24 @@ export async function commitStaged(
 }
 
 /**
- * The built-in `reply` tool of runs that answer sent input: posts to a request's `replyTo` through the
- * managed effect workflow, so a replayed call reconnects to the same post.
+ * The built-in `no_reply` tool of runs that answer input with a reply thread: ends the run without posting its
+ * final answer. The reason stays in the transcript as the tool call's argument.
  */
-export function replyTool(): ToolRegistration {
+export function noReplyTool(): ToolRegistration {
 	return piTool({
-		name: "reply",
+		name: "no_reply",
 		description:
-			"Post a message to the person or thread a request came from. Without `request`, replies to the latest request in this run. Your final answer is not posted; use this tool to answer.",
+			"End your turn without posting a reply, e.g. for chatter that is not for you or a notification that needs no answer. Call it alone, as the only tool call of your response.",
 		parameters: {
 			type: "object",
 			properties: {
-				text: { type: "string", description: "Message to post (Markdown)" },
-				request: { type: "string", description: "The `request` attribute of the input to answer" },
+				reason: { type: "string", description: "Why no reply is needed; not shown to anyone" },
 			},
-			required: ["text"],
 			additionalProperties: false,
 		} as unknown as TSchema,
-		replay: "safe",
-		execute: async (input, api, context) => {
-			const bridge = frame(context);
-			const { text, request } = input as { text: string; request?: string };
-			const sent = async (id: string | undefined) => {
-				const invocation = id
-					? ((await bridge.harness.snapshot(Invocation, id, context)) as
-							| InvocationMetadata
-							| undefined)
-					: undefined;
-				return invocation?.send ? invocation : undefined;
-			};
-			const alias = request
-				? await bridge.harness.snapshot(RequestAlias, request, context)
-				: undefined;
-			let target = request ? await sent(alias?.requestId ?? request) : undefined;
-			if (!request) {
-				const live = await bridge.harness.snapshot(LiveDoc, api.conversationId, context);
-				for (const id of [...(live?.run?.inputs ?? [])].reverse()) {
-					const submission = await bridge.harness.submission(id, context);
-					target = await sent((await submission?.status(context))?.requestId);
-					if (target) break;
-				}
-			}
-			const error = (message: string) => ({
-				content: [{ type: "text" as const, text: message }],
-				isError: true,
-			});
-			if (!target) return error(request ? `Unknown request ${request}` : "No request to reply to");
-			if (!target.replyTo) return error("This request has no reply destination");
-			const key = `fabrial:pi:${api.conversationId}:${api.taskId}:reply`;
-			const run = (await bridge.runOf(api.conversationId, context)).id;
-			const child = await startChild(
-				bridge,
-				run,
-				key,
-				EFFECT_WORKFLOW,
-				{ method: "post", args: [text] },
-				target,
-				false,
-				context,
-			);
-			let result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
-			if (!result) {
-				await registerChild(
-					bridge,
-					run,
-					api.taskId,
-					{ executionId: child, detached: false },
-					context,
-				);
-				result = await bridge.waitChild(api.taskId, child, context);
-			}
-			return result.status === "completed"
-				? { content: [{ type: "text" as const, text: "Posted." }] }
-				: error(JSON.stringify(result.error ?? result.reason ?? result.status));
-		},
+		execute: async () => ({
+			content: [{ type: "text" as const, text: "No reply posted." }],
+			control: { terminate: true },
+		}),
 	});
 }

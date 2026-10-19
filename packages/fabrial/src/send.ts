@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import type { FabrialHost } from "./app.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { InvocationMetadata } from "./runtime.ts";
@@ -20,7 +19,7 @@ export interface SendOptions {
 	kind?: InputKind;
 	/** Notifications only; default `"normal"`. */
 	priority?: InputPriority;
-	/** Where the agent's `reply` goes. Defaults to this execution's thread; `null` for none. */
+	/** Where the agent's final reply goes. Defaults to this execution's thread; `null` for none. */
 	replyTo?: Thread | Surface | null;
 }
 
@@ -86,35 +85,11 @@ const attributes = (values: Record<string, string | null | undefined>) =>
 const text = (input: Json) =>
 	isChatMessage(input) ? input.text : typeof input === "string" ? input : JSON.stringify(input);
 
-/** The short id the model sees in `request="…"`; `reply` maps it back to the full request id. */
-export const shortRequestId = (requestId: string) =>
-	createHash("sha256").update(requestId).digest("hex").slice(0, 8);
-
-/**
- * The request's alias in its Session: the shortest prefix (at least 8 hex digits) of its hash that `claim`
- * maps to it. `claim` returns the request an alias belongs to, taking it when free, so a second request
- * whose short id collides gets a longer one.
- */
-export async function claimRequestAlias(
-	requestId: string,
-	claim: (alias: string) => Promise<string>,
-): Promise<string> {
-	const hash = createHash("sha256").update(requestId).digest("hex");
-	for (let length = 8; length <= hash.length; length++)
-		if ((await claim(hash.slice(0, length))) === requestId) return hash.slice(0, length);
-	throw new Error(`No free request alias for ${requestId}`);
-}
-
-/** Rendered input with its `request` attribute set to the alias it was admitted under. */
-export const withRequestAlias = (content: string, requestId: string, alias: string) =>
-	content.replace(` request="${shortRequestId(requestId)}"`, ` request="${alias}"`);
-
-/** Render an input for the model, with attribution and the request id `reply` can target. */
+/** Render an input for the model, with attribution. */
 export function renderInput(options: {
 	input: Json;
 	kind: InputKind;
 	priority?: InputPriority;
-	requestId: string;
 	/** Fallback author for non-message input, e.g. the workflow's actor. */
 	from?: string | null;
 	/** Fallback thread for non-message input. */
@@ -124,23 +99,21 @@ export function renderInput(options: {
 	/** Extra notification attributes, e.g. the resource and the event's details. */
 	attributes?: Record<string, string | number | boolean | null>;
 }): string {
-	const { input, kind, requestId } = options;
+	const { input, kind } = options;
 	if (kind === "message") {
 		const message = isChatMessage(input) ? input : undefined;
 		return `<message${attributes({
 			from: message ? (message.author.name ?? message.author.identity.subjectId) : options.from,
 			thread: message?.threadId ?? options.thread,
-			request: shortRequestId(requestId),
 		})}>${escapeXml(text(input))}</message>`;
 	}
 	return `<notification${attributes({
 		source: options.source,
 		kind: options.event,
 		priority: options.priority ?? "normal",
-		request: shortRequestId(requestId),
 		...Object.fromEntries(
 			Object.entries(options.attributes ?? {})
-				.filter(([key]) => !["source", "kind", "priority", "request"].includes(key))
+				.filter(([key]) => !["source", "kind", "priority"].includes(key))
 				.map(([key, value]) => [key, value === null ? null : String(value)]),
 		),
 	})}>${escapeXml(text(input))}</notification>`;
@@ -211,7 +184,6 @@ export async function prepareSend(
 		input: opts.input,
 		kind,
 		priority,
-		requestId,
 		from: actor?.name ?? actor?.id,
 		thread: current?.kind === "thread" ? current.threadId : null,
 		source: metadata.origin?.provider ?? event?.split(".")[0],

@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
@@ -10,17 +9,8 @@ import {
 	type ExternalIdentity,
 	type JsonObject,
 } from "../../src/index.ts";
-import {
-	claimRequestAlias,
-	deliveryFor,
-	escapeXml,
-	renderInput,
-	withRequestAlias,
-} from "../../src/send.ts";
+import { deliveryFor, escapeXml, renderInput } from "../../src/send.ts";
 import { createTestApp, fakeAgents } from "../../src/testing.ts";
-
-/** Short request id the model sees: the first 8 hex digits of its SHA-256. */
-const short = (id: string) => createHash("sha256").update(id).digest("hex").slice(0, 8);
 
 const message = (id: string, threadId: string, text = id): ChatMessage => ({
 	provider: "chat",
@@ -42,11 +32,11 @@ const message = (id: string, threadId: string, text = id): ChatMessage => ({
 describe("renderInput", () => {
 	it("renders attributed messages and escapes XML-unsafe content", () => {
 		const input = message("m1", 'chat:general:"t1"', "a < b & c > d");
-		expect(renderInput({ input, kind: "message", requestId: "r1" })).toBe(
-			`<message from="Alice" thread="chat:general:&quot;t1&quot;" request="${short("r1")}">a &lt; b &amp; c &gt; d</message>`,
+		expect(renderInput({ input, kind: "message" })).toBe(
+			`<message from="Alice" thread="chat:general:&quot;t1&quot;">a &lt; b &amp; c &gt; d</message>`,
 		);
-		expect(renderInput({ input: "hi", kind: "message", requestId: "r2", from: "Bob" })).toBe(
-			`<message from="Bob" request="${short("r2")}">hi</message>`,
+		expect(renderInput({ input: "hi", kind: "message", from: "Bob" })).toBe(
+			`<message from="Bob">hi</message>`,
 		);
 	});
 	it("renders notifications with source, kind and priority", () => {
@@ -55,42 +45,13 @@ describe("renderInput", () => {
 				input: { state: "changes_requested" },
 				kind: "notification",
 				priority: "urgent",
-				requestId: "r3",
 				source: "github",
 				event: "github.review",
 			}),
 		).toBe(
-			`<notification source="github" kind="github.review" priority="urgent" request="${short("r3")}">{&quot;state&quot;:&quot;changes_requested&quot;}</notification>`,
+			`<notification source="github" kind="github.review" priority="urgent">{&quot;state&quot;:&quot;changes_requested&quot;}</notification>`,
 		);
 		expect(escapeXml(`'&'`)).toBe("&apos;&amp;&apos;");
-	});
-});
-
-describe("request aliases", () => {
-	// Two request ids whose hashes share their first 8 hex digits.
-	const first = "request-105084";
-	const second = "request-110778";
-	it("extends the alias of a request whose short id is taken in the Session", async () => {
-		expect(short(first)).toBe(short(second));
-		const aliases = new Map<string, string>();
-		const claim = (requestId: string) =>
-			claimRequestAlias(requestId, async (alias) => {
-				if (!aliases.has(alias)) aliases.set(alias, requestId);
-				return aliases.get(alias)!;
-			});
-		expect(await claim(first)).toBe("edd91ebd");
-		expect(await claim(second)).toBe("edd91ebd1");
-		// Re-admitting either request keeps its alias.
-		expect(await claim(first)).toBe("edd91ebd");
-		expect(await claim(second)).toBe("edd91ebd1");
-		expect(aliases.get("edd91ebd")).toBe(first);
-	});
-	it("renders the claimed alias as the request attribute", () => {
-		const content = renderInput({ input: "hi", kind: "message", requestId: second, from: "Bob" });
-		expect(withRequestAlias(content, second, "edd91ebd1")).toBe(
-			`<message from="Bob" request="edd91ebd1">hi</message>`,
-		);
-		expect(withRequestAlias(content, second, short(second))).toBe(content);
 	});
 });
 
