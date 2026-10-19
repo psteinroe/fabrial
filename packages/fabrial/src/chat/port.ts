@@ -91,7 +91,8 @@ class LiveThread implements ThreadIO {
 	async setStatus(text: string | null): Promise<void> {
 		const now = Date.now();
 		if (text !== null && now - this.lastStatusAt < (text === this.statusText ? 5000 : 1000)) return;
-		this.lastStatusAt = now;
+		// Clearing doesn't throttle the next status: a new run's "Thinking…" right after a clear shows.
+		this.lastStatusAt = text === null ? 0 : now;
 		this.statusText = text;
 		try {
 			if (!this.fallbackStatus) {
