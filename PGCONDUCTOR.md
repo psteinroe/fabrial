@@ -15,20 +15,20 @@ Current behavior was checked against `main` @ `33228e3` ("fix(workflows): comple
 
 ## Summary
 
-| #   | Item                                                | Status on main                                                          | Priority                                 |
-| --- | --------------------------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------- |
-| 1   | Race-safe `waitForEvent`                            | Gap, documented                                                         | **P0**: approvals can be lost            |
-| 2   | Execution metadata, propagated                      | Gap. `trace_context` is a working precedent                             | **P0**                                   |
-| 3   | Middleware / per-run context hook                   | Gap. Context is static                                                  | **P0**                                   |
-| 4   | Strict per-key mutual exclusion                     | Gap. `groupConcurrency` is documented as soft                           | P1                                       |
-| 5   | Cancellation: opt-out propagation + distinct status | Partly there                                                            | P1                                       |
-| 6   | Wait for the first of several conditions            | Gap                                                                     | P1                                       |
-| 7   | Start a child without waiting (durable, deduped)    | Gap from inside `ctx`                                                   | P1                                       |
-| 8   | Idempotent `emit` + emit options                    | Gap: `emit(event, payload)` takes no options                            | **P0**                                   |
-| 9   | Node-compatible package                             | Gap: Bun-only build, no `exports`/types, `catalog:` deps                | **P0**: Fabrial vendors source meanwhile |
-| 10  | Terminal-state hooks                                | Gap: adapter polls for settled executions                               | P1                                       |
-| 11  | Stop hangs on queued claims                         | Bug: workers enter handlers with an aborted signal                      | **P0**: shutdown can hang forever        |
-| 12  | Signals to running executions + `signalWithStart`   | Partly there: cancel signals reach the running process on the heartbeat | **P0**: agent sessions are built on it   |
+| #   | Item                                                | Status on main                                                                | Priority                                 |
+| --- | --------------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------- |
+| 1   | Race-safe `waitForEvent`                            | Gap, documented                                                               | **P0**: approvals can be lost            |
+| 2   | Execution metadata, propagated                      | Gap. `trace_context` is a working precedent                                   | **P0**                                   |
+| 3   | Middleware / per-run context hook                   | Gap. Context is static                                                        | **P0**                                   |
+| 4   | Strict per-key mutual exclusion                     | Gap. `groupConcurrency` is documented as soft                                 | P1                                       |
+| 5   | Cancellation: opt-out propagation + distinct status | Partly there                                                                  | P1                                       |
+| 6   | Wait for the first of several conditions            | Gap                                                                           | P1                                       |
+| 7   | Start a child without waiting (durable, deduped)    | Gap from inside `ctx`                                                         | P1                                       |
+| 8   | Idempotent `emit` + emit options                    | Gap: `emit(event, payload)` takes no options                                  | **P0**                                   |
+| 9   | Node-compatible package                             | Gap: Bun-only build, no `exports`/types, `catalog:` deps                      | **P0**: Fabrial vendors source meanwhile |
+| 10  | Terminal-state hooks                                | Gap: adapter polls for settled executions                                     | P1                                       |
+| 11  | Stop hangs on queued claims                         | Bug: workers enter handlers with an aborted signal                            | **P0**: shutdown can hang forever        |
+| 12  | Signals to running executions + `signalWithStart`   | Implemented in PR #80 (`feat/signals`), pinned via the submodule until merged | **P0**: agent sessions are built on it   |
 
 How Fabrial's Conductor runtime (`packages/fabrial/src/runtime/conductor`) works around each item today, and what it learned along the way, is in [Findings from the Fabrial adapter](#findings-from-the-fabrial-adapter) at the end.
 
@@ -270,6 +270,8 @@ The source itself runs fine on Node. Fabrial's smoke test (`packages/fabrial/tes
 
 ## 12. Signals to running executions
 
+**Status.** Implemented in [PR #80](https://github.com/psteinroe/postgres-conductor/pull/80) (`feat/signals`, `5a058eb`), which Fabrial pins via the submodule until it merges. Fabrial's runtime port exposes it as `DurableExecution.onSignal` / `signalWithStart` and `DurableRuntime.signal` / `signalWithStart`, using the native API without shims. The text below is the original request.
+
 **Current.** `_private_orchestrator_signals` already routes a message to the orchestrator that runs a given execution, and the worker hands it to the running handler in process (`orchestrator.ts`, `case "cancel_execution"` → `worker.cancelExecutions`). Only `cancel_execution` and `shutdown` exist, and signals are read on the orchestrator heartbeat (`HEARTBEAT_INTERVAL_MS = 30000`). There is no way to send application data to a running execution, and no way to say "deliver to the running execution for this key, or start one".
 
 **Why Fabrial needs it.** An agent conversation lives in a Pi Durable Session, which one process owns at a time; Pi handles steering, follow-ups, aborts, and subagents inside that process. Fabrial hosts each Session in one Conductor execution while Pi has work. Every input for the conversation (a Slack message, a followed PR's review, a subagent report, a cancel) has to reach that execution in process, or start it when none is running. Without signals Fabrial needed an inbox table, cross-process hand-overs at turn boundaries, and polling.
@@ -323,8 +325,10 @@ Fabrial's Conductor runtime implements every item above on the pinned Conductor 
 - **#1:** Native `waitForEvent` is used as is. The pre-registration race is the one gap with no workaround (`test.todo` in the adapter suite), so approvals are not production-safe until Conductor fixes it.
 - **#2:** Metadata travels in a payload envelope, with reserved top-level fields (`__fabrial`, `__fabrialOwner`) on events. Filters on payload fields keep working.
 - **#4:** `groupConcurrency: 1` per key, which is soft. Fabrial's Pi storage keeps its own owner id and a Session epoch that increases monotonically across executions, so correctness doesn't depend on Conductor. A random per-claim UUID can't serve as that epoch. Strict claims are still wanted, to avoid wasted model calls and duplicate posts.
-- **#5:** Native running cancellation overwrites the requested reason with the claim's stale error, so the adapter stores the reason in the envelope. Cancellation of running executions arrives on the orchestrator heartbeat (up to 30 s). It is unclear whether a step that is mid-flight when cancellation settles the attempt gets its result recorded; Conductor should define this.
+- **#5:** Since PR #80, cancellation reaches a running handler on the worker poll and settlement keeps the requested reason, so the adapter's cancel-reason envelope (`SHIM(conductor#5)`) was removed. Pending native cancellations still don't set `cancelled`, so the adapter marks them. It is unclear whether a step that is mid-flight when cancellation settles the attempt gets its result recorded; Conductor should define this.
 - **#6:** Races use native subscriptions plus polling over retained dispatch receipts. This works but scans receipts, so an indexed, claim-guarded native race API is still needed.
 - **#7:** Native deduped invoke updates or re-invokes an execution that already completed. `ctx.start` needs insert-on-conflict that keeps the original execution, plus result retrieval by execution id.
 - **#8:** Dedupe by `(event, id)` requires disabling immediate deletion of dispatch receipts on the internal queue. There is no TTL yet.
+- **#12:** Used natively (PR #80). Keys are passed per `signalWithStart` call, not configured on the workflow. `signal_with_start` takes no group, so keyed starts ignore a workflow's `mutex` (the key already serializes them), and they are independent of the caller like `start`. An attempt receives signals only on worker polls, not with its claim: a handler that listens and returns before the next poll is re-queued and can repeat, so handlers should stay running until a delivery (or idle timeout). Because a re-queued attempt's result is discarded, the adapter overwrites its private output step instead of memoizing it.
+- **#11 (unverified):** Conductor #68 releases claims taken after stop and makes `stop()` wait for the running step or handler, so `SHIM(conductor#11)` may be redundant. It is kept until verified. As a consequence of #68, a handler blocked in a non-cooperative call (e.g. a chat post) delays `stop()` until the call returns.
 - **Cross-category dispatch:** one inbound chat message can match several events (e.g. `slack.message` + `slack.mentioned`). The adapter merges triggered invocations per `(dispatchId, workflow)`; the first submission wins. Core emits the owner's event first, so precedence only breaks if several ingress replicas race on the same message.
