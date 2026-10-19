@@ -658,19 +658,27 @@ export const router = f.defineWorkflow({
 
 #### Delivery
 
-Every input for a conversation is a delivery that Conductor queues under the Session's mutex, one at a time and in order, deduplicated by request id. A delivery opens the Session, submits its input to Pi (`steer`, `followUp`, or `write`), and drives the conversation until it is idle, waiting only on workflows (then the Session is released), or another delivery is waiting. There is no Fabrial queue, table, or polling.
+Each Session is hosted by one Conductor execution while Pi has work, addressed by the Session key. Every input for a conversation (a trigger match, a followed thread or resource, `ctx.send`, a subagent report, a cancel) is a Conductor signal sent with `signalWithStart` (Conductor item 12): it reaches the running execution in process, or starts one with the signal queued.
 
-**Handing over.** Pi has one owner per Session, so input from another process steers a busy agent by handing the Session over at a turn boundary:
+```ts
+// Every input:
+await conductor.signalWithStart({
+	task: "fabrial.session",
+	key: session,
+	signal: { name: "input", id: requestId, payload },
+});
 
-- The boundary is Pi's `afterTools` hook: the tool round is committed and Pi has not yet placed queued steers or created the next generation. A hand-over there loses nothing in memory; the next owner re-runs the hook, Pi places the steer, and the next model request includes it. Every model request is sent once. (`beforeRequest` also resumes cleanly, but a steer submitted meanwhile misses the held request and costs an extra turn.)
-- At each `afterTools`, the delivery checks once whether another delivery for the Session is queued. Only then does it hold the hook and close the Session; otherwise it keeps driving. The held hook rejects when its context is aborted, or `close()` hangs. The first `afterTools` after an open is the re-run and is never held.
-- It hands over only when the Session is quiet: every running task is a held generation or a replay-safe tool (subagent calls are). A tool that is not replay-safe would be interrupted by `close()`, so the delivery waits for its round to finish, which is where Pi would place the steer anyway.
-- The waiting delivery opens the Session, submits its input, and continues driving under the same rules.
-- `storage.lost` closes the harness. Otherwise a stalled owner whose lease was taken over can still send a duplicate model request when it resumes (its commits are fenced, its provider calls are not).
+// The Session execution:
+ctx.onSignal("input", (input) =>
+	input.kind === "cancel" ? abortRun(harness, input.run) : submit(harness, input),
+);
+```
 
-**Cancelling.** Stopping a run (cancelling a `ctx.agent` call, Slack's stop button, a cancelled workflow tool's owner) cancels the delivery currently driving the Session through Conductor's cancel signal, with a reason naming the run. That delivery aborts the run in Pi (owned and background work included, per Pi ownership) and keeps driving any other work, so cancellation crosses processes without holding or polling the Session. If no delivery is driving, the cancel is itself a delivery that opens the Session and aborts the run.
-
-Verified in a spike against Fabrial's Postgres storage and a faux model: hand-over at `afterTools` and inside a task-owned child conversation, lease takeover with and without `storage.lost` wiring, and interruption of a non-replay-safe tool by `close()`.
+- **Steering is native Pi.** A signal submits to Pi in process (`steer`, `followUp`, or `write`); Pi places it at its next turn boundary. Ownership never moves, and nothing is handed over, polled, or stored outside Pi and Conductor.
+- **Cancelling** is a signal: the execution aborts the run in Pi (owned and background work included) and keeps hosting the Session.
+- **Ending.** The execution closes the Session when Pi reports no active work (`Harness.wake()`), including while every live task waits durably on a workflow such as an approval; the workflow's completion is another signal. Conductor re-queues an execution that received signals while finishing, so no input is lost.
+- **Dedupe.** Signal ids are request ids derived from the source event; Conductor stores a signal once and Pi submits a request id once.
+- **Leases.** The Session's lease and fencing stay. `storage.lost` closes the harness, so a stalled owner whose lease was taken over can't send a duplicate model request.
 
 #### Use cases
 
@@ -813,7 +821,7 @@ Recorded as open questions are resolved.
 - **Conversations answer where they live; threads route by session key.** Agents have triggers; an event goes to a conversation keyed by `[session, agent]`, computed from the event (`"thread"` by default, `"channel"`, or a function). Final replies post automatically to the input's thread when it is followed, otherwise to the conversation's home; `no_reply` stays silent; posting anywhere else is a plugin tool. An agent follows every thread it receives a message from, and `ctx.follow` / `ctx.unfollow` add other threads and resources; follows are records in Chat SDK thread state. There is no thread ownership, interaction, reply buffer, or `reply` tool, and workflows don't wait for chat replies (`waitForReply`, `ask`, `nextReply`, and `ctx.handoff` are removed). Modeled on Eve (automatic final reply, `no_reply`) and OpenClaw (session keys computed from the source).
   - Chat SDK thread state has a 30-day TTL refreshed on every write; a follow idle for longer lapses.
   - Chat SDK's `thread.signal` (Slack's native agent stop button) cancels the following conversation's current run.
-- **Conductor's per-Session queue is the inbox.** Each input is a delivery queued under the Session's mutex. A delivery drives the conversation and hands the Session over at Pi's `afterTools` boundary only when another delivery is waiting and no non-replay-safe tool is running; steering from any process is Pi's own steer, placed by the next owner. `storage.lost` closes the harness. Fabrial owns no tables and polls nothing (see [Delivery](#delivery)).
+- **Sessions are hosted by keyed Conductor executions; inputs are signals.** One execution per Session key hosts the Pi Session while Pi has work, and every input reaches it with `signalWithStart` (Conductor item 12), so steering and cancelling are native Pi calls in process. This replaced an inbox table, then hand-overs at Pi's `afterTools` boundary (verified in a spike, but every edge case around closing a Session mid-run had to be handled), and boundary event reads. It follows the hosts other harnesses use: an addressable owner per conversation (Cloudflare Durable Objects, Temporal signals, Eve's run inbox, Mastra's lease-owner routing).
 - **Trigger overlap: the most specific trigger receives the event, `observe: true` adds side work, and ties fail at startup.** Agent and workflow triggers compete together for messages that no conversation follows, so exactly one handles an interactive message. The most specific matching trigger wins. Specificity is defined per plugin (Slack: channel+thread > channel > workspace). Two owners with equal specificity on the same event make `app.start()` throw. Triggers marked `observe: true` always run as well, independently and without `ctx.thread`. They can't post into or receive replies from that thread, but can still use clients or a `replyTo` elsewhere.
   ```ts
   export const changelog = defineWorkflow({
@@ -851,6 +859,7 @@ Conductor behaviors Fabrial relies on, checked against Conductor `main` @ `33228
 9. **Node-compatible package** (P0). Today's build is Bun-only, with no exports or types. Fabrial vendors Conductor as a pinned submodule until this ships.
 10. **Terminal-state hooks** (P1). Notify on completion, failure, and cancellation in every state. The adapter polls for settled executions meanwhile.
 11. **Stop hangs on queued claims** (P0). Workers enter handlers with an already-aborted signal after stop, so `stop()` can hang forever. The adapter releases those claims meanwhile.
+12. **Signals** (P0). `ctx.onSignal` in running handlers, `signalWithStart` for keyed executions, `pg_notify` delivery, and re-queueing an execution that received signals while finishing. Agent Sessions are built on it.
 
 ## Open questions
 

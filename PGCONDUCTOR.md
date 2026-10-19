@@ -15,19 +15,20 @@ Current behavior was checked against `main` @ `33228e3` ("fix(workflows): comple
 
 ## Summary
 
-| #   | Item                                                | Status on main                                           | Priority                                 |
-| --- | --------------------------------------------------- | -------------------------------------------------------- | ---------------------------------------- |
-| 1   | Race-safe `waitForEvent`                            | Gap, documented                                          | **P0**: approvals can be lost            |
-| 2   | Execution metadata, propagated                      | Gap. `trace_context` is a working precedent              | **P0**                                   |
-| 3   | Middleware / per-run context hook                   | Gap. Context is static                                   | **P0**                                   |
-| 4   | Strict per-key mutual exclusion                     | Gap. `groupConcurrency` is documented as soft            | P1                                       |
-| 5   | Cancellation: opt-out propagation + distinct status | Partly there                                             | P1                                       |
-| 6   | Wait for the first of several conditions            | Gap                                                      | P1                                       |
-| 7   | Start a child without waiting (durable, deduped)    | Gap from inside `ctx`                                    | P1                                       |
-| 8   | Idempotent `emit` + emit options                    | Gap: `emit(event, payload)` takes no options             | **P0**                                   |
-| 9   | Node-compatible package                             | Gap: Bun-only build, no `exports`/types, `catalog:` deps | **P0**: Fabrial vendors source meanwhile |
-| 10  | Terminal-state hooks                                | Gap: adapter polls for settled executions                | P1                                       |
-| 11  | Stop hangs on queued claims                         | Bug: workers enter handlers with an aborted signal       | **P0**: shutdown can hang forever        |
+| #   | Item                                                | Status on main                                                          | Priority                                 |
+| --- | --------------------------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------- |
+| 1   | Race-safe `waitForEvent`                            | Gap, documented                                                         | **P0**: approvals can be lost            |
+| 2   | Execution metadata, propagated                      | Gap. `trace_context` is a working precedent                             | **P0**                                   |
+| 3   | Middleware / per-run context hook                   | Gap. Context is static                                                  | **P0**                                   |
+| 4   | Strict per-key mutual exclusion                     | Gap. `groupConcurrency` is documented as soft                           | P1                                       |
+| 5   | Cancellation: opt-out propagation + distinct status | Partly there                                                            | P1                                       |
+| 6   | Wait for the first of several conditions            | Gap                                                                     | P1                                       |
+| 7   | Start a child without waiting (durable, deduped)    | Gap from inside `ctx`                                                   | P1                                       |
+| 8   | Idempotent `emit` + emit options                    | Gap: `emit(event, payload)` takes no options                            | **P0**                                   |
+| 9   | Node-compatible package                             | Gap: Bun-only build, no `exports`/types, `catalog:` deps                | **P0**: Fabrial vendors source meanwhile |
+| 10  | Terminal-state hooks                                | Gap: adapter polls for settled executions                               | P1                                       |
+| 11  | Stop hangs on queued claims                         | Bug: workers enter handlers with an aborted signal                      | **P0**: shutdown can hang forever        |
+| 12  | Signals to running executions + `signalWithStart`   | Partly there: cancel signals reach the running process on the heartbeat | **P0**: agent sessions are built on it   |
 
 How Fabrial's Conductor runtime (`packages/fabrial/src/runtime/conductor`) works around each item today, and what it learned along the way, is in [Findings from the Fabrial adapter](#findings-from-the-fabrial-adapter) at the end.
 
@@ -264,6 +265,49 @@ The source itself runs fine on Node. Fabrial's smoke test (`packages/fabrial/tes
 **Needed.** Workers must not start handlers after stop; release unstarted claims instead. Install abort listeners before creating task signals.
 
 **Acceptance.** Stopping an orchestrator with claimed-but-unstarted executions resolves promptly, and those executions run on the next start.
+
+---
+
+## 12. Signals to running executions
+
+**Current.** `_private_orchestrator_signals` already routes a message to the orchestrator that runs a given execution, and the worker hands it to the running handler in process (`orchestrator.ts`, `case "cancel_execution"` → `worker.cancelExecutions`). Only `cancel_execution` and `shutdown` exist, and signals are read on the orchestrator heartbeat (`HEARTBEAT_INTERVAL_MS = 30000`). There is no way to send application data to a running execution, and no way to say "deliver to the running execution for this key, or start one".
+
+**Why Fabrial needs it.** An agent conversation lives in a Pi Durable Session, which one process owns at a time; Pi handles steering, follow-ups, aborts, and subagents inside that process. Fabrial hosts each Session in one Conductor execution while Pi has work. Every input for the conversation (a Slack message, a followed PR's review, a subagent report, a cancel) has to reach that execution in process, or start it when none is running. Without signals Fabrial needed an inbox table, cross-process hand-overs at turn boundaries, and polling.
+
+**Needed.**
+
+```ts
+// In a running handler: listen for signals by name. Signals stored before the handler started are
+// delivered first, in order; later ones are delivered as they arrive, while the handler runs.
+ctx.onSignal("input", async (payload, { id }) => { … });
+
+// From anywhere (client, another task's ctx): deliver to the running execution of a task for a key,
+// or start one with the signal queued. One transaction under a lock on (task, key).
+await conductor.signalWithStart({
+	task: "session",
+	key: "slack:T1:C1:ts",                // at most one non-terminal execution per (task, key)
+	signal: { name: "input", id: requestId, payload },
+	input: {},                            // used only when it starts an execution
+});
+
+// Also: signal a known execution by id; inside tasks the same API on ctx, durable per step id.
+await conductor.signal(executionId, { name, id, payload });
+```
+
+- **Storage.** A signal row per message with `execution_id`, `name`, `id`, `payload`, and a delivered marker; unique on `(execution_id, id)`, so a redelivered signal is stored once.
+- **Delivery.** `pg_notify` on the owning orchestrator's channel when a signal is inserted for a running execution, so delivery is near-instant; the heartbeat remains the fallback. A signal for an execution that is pending, retrying, or suspended is kept and delivered when its handler next runs.
+- **Keyed executions.** `key` makes a task execution addressable: at most one non-terminal execution per `(task, key)`. A finished execution doesn't block a new one for the same key.
+- **No lost signals at settlement.** Completing an execution checks, in the same transaction, for signals that were stored but not delivered to the handler. If there are any, the execution is not completed but re-queued (a new attempt runs and receives them). This is the subtle part and the reason it belongs in Conductor.
+- **Guarantee.** At least once per signal id; handlers dedupe by id (Fabrial uses Pi's request id).
+- **Cancellation** keeps its own path; `cancel_execution` can move onto the same delivery mechanism to drop the 30 s heartbeat delay.
+
+**Acceptance.**
+
+- A signal sent to a running execution reaches its `onSignal` handler in well under a second, through `pg_notify`, with the heartbeat as fallback when the notification is missed.
+- `signalWithStart` with no running execution starts exactly one, which receives the signal first; concurrent `signalWithStart` calls for one key start one execution and deliver every signal.
+- A signal sent while the handler is returning is never lost: the execution re-queues and the next attempt receives it.
+- Signals for pending, retrying, and suspended executions are delivered when they run; redelivering a signal id stores it once.
+- Works across processes: the sender and the running execution in different orchestrators.
 
 ---
 
