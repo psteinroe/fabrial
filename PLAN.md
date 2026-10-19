@@ -851,20 +851,15 @@ Recorded as open questions are resolved.
 
 ## Conductor issues
 
-Conductor behaviors Fabrial relies on, checked against Conductor `main` @ `33228e3`. The full handover, with current behavior, proposed APIs, and acceptance criteria, is in [PGCONDUCTOR.md](./PGCONDUCTOR.md).
+Most of what Fabrial needed from Conductor has landed (race-safe subscriptions, metadata, middleware, start without waiting, idempotent emit, signals and keyed executions); a Node build is in progress. Still needed, so the adapter uses public APIs only, with no polling or private access ([PGCONDUCTOR.md](./PGCONDUCTOR.md) has the full spec and acceptance criteria):
 
-1. **Race-safe `waitForEvent`** (P0). Events emitted before the wait registers are lost, so a fast approval click can be missed.
-2. **Execution metadata** (P0). Propagated event → run → child, generalizing the existing `trace_context` plumbing.
-3. **Middleware** (P0). Per-run/resume context transformation. `context` is static today.
-4. **Strict per-key mutual exclusion** (P1). `groupConcurrency` is soft, but a Pi Session needs exactly one owner. Expose the claim token for fencing.
-5. **Cancellation** (P1). Per-call opt-out (`cancelWithParent: false`) and a terminal status distinct from failure.
-6. **Wait for any** (P1). Race events, child results, and timers (`ctx.race`).
-7. **Start without waiting** (P1). Durable, deduped `ctx.start` for deliveries and workflow tools.
-8. **Idempotent `emit` with options** (P0). Dedup ID and metadata, for webhook redelivery.
-9. **Node-compatible package** (P0). Today's build is Bun-only, with no exports or types. Fabrial vendors Conductor as a pinned submodule until this ships.
-10. **Terminal-state hooks** (P1). Notify on completion, failure, and cancellation in every state. The adapter polls for settled executions meanwhile.
-11. **Stop hangs on queued claims** (P0). Workers enter handlers with an already-aborted signal after stop, so `stop()` can hang forever. The adapter releases those claims meanwhile.
-12. **Signals** (P0). `ctx.onSignal` in running handlers, `signalWithStart` for keyed executions, delivery through the worker poll, and re-queueing an execution that received signals while finishing. Agent Sessions are built on it.
+1. **Wait for a started execution** with its outcome as a value (`ctx.waitForResult`, an `{ execution }` branch for `ctx.waitForAny`).
+2. **Children linked without being awaited** (`ctx.invoke(…, { cancelWithParent: true })`).
+3. **Notify on settlement** (`onSettled: { task, key, signal }`): a signal to a keyed execution in the settling transaction, for every terminal state.
+4. **Public `ctx.executionId`.**
+5. **Pending cancels set `cancelled = true`** (in progress).
+
+These live in Conductor rather than in Fabrial because only the engine sees every terminal state (crashes, retries exhausted, cancels while pending) in the transaction that settles it; Eve, on Vercel Workflow, builds the same reporting and cascading in its own session program.
 
 ## Open questions
 

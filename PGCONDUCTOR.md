@@ -1,334 +1,111 @@
 # PG Conductor changes for Fabrial
 
-This is a handover for work in [`psteinroe/postgres-conductor`](https://github.com/psteinroe/postgres-conductor). [Fabrial](./PLAN.md) builds on Conductor and assumes the behavior below. Its rule is that Conductor gaps are fixed in Conductor rather than worked around in Fabrial, so this file is the list of things to fix.
+This is a handover for work in [`psteinroe/postgres-conductor`](https://github.com/psteinroe/postgres-conductor). [Fabrial](./PLAN.md) builds on Conductor, and its rule is that Conductor gaps are fixed in Conductor rather than worked around in Fabrial. This file lists what Fabrial still needs so that its Conductor adapter (`packages/fabrial/src/runtime/conductor`) uses only public Conductor APIs: no private access, no polling, no `SHIM(conductor#…)` markers.
 
-Current behavior was checked against `main` @ `33228e3` ("fix(workflows): complete terminal settlement for cancelled and failed workflows (#49)"). Paths are relative to the Conductor repo. Re-check each item before starting, because main moves.
+Checked against Conductor `main` @ `7472dd4` ("refactor: simplify settlement buffering and remove dead code (#81)"). Re-check each item before starting, because main moves.
 
-## Context: how Fabrial uses Conductor
+## How Fabrial uses Conductor
 
-- `defineWorkflow` registers a Conductor task. Plugin triggers (Slack, GitHub, Linear, Sentry, …) become typed Conductor events and event triggers.
-- Every durable Fabrial operation is a Conductor step or wait keyed by an explicit ID: `ctx.thread.post("ack", …)`, `ctx.agent("investigate", …)`, `ctx.evaluate("route", …)`, `ctx.waitForApproval("approve-sql", …)`.
-- Fabrial carries a small serializable **invocation context** through every execution, rebuilds live objects (`ctx.thread`, `ctx.clients`, `ctx.actor`) from it on every start and resume, and passes it to child workflows. Its shape is `{ interactionId, origin, replyTo, requestedBy }`.
-- Approvals and thread replies are Fabrial-internal events that a suspended execution waits on, correlated by `interactionId` / approval ID.
-- Agent runs (Pi Durable) are driven inside Conductor executions. A Pi Session must have at most one owner at a time.
-- Cancellation is structured. Cancelling an execution cancels the calls it is waiting on unless a call was made `detached`. Handoffs start independent executions.
+- `f.defineWorkflow` registers a Conductor task; plugin triggers become typed events and event triggers. Every durable Fabrial operation is a step or wait keyed by an explicit id.
+- Fabrial's invocation context (`origin`, `replyTo`, `requestedBy`, the request id) is execution metadata, rebuilt into `ctx.thread`, `ctx.clients`, and `ctx.actor` by middleware on every attempt.
+- Each agent Session is hosted by one keyed execution (`signalWithStart`, key = Session key) while Pi has work. Every input (a chat message, a followed PR's review, a subagent report, a cancel) is a signal to it.
+- A Session starts workflows as tools and keeps hosting Pi while they run; it needs their outcomes, and they must be cancelled with the run that started them. A workflow can call an agent (`ctx.agent`) or another workflow (`ctx.invoke`), optionally detached or with a timeout.
+- Approvals post a card, then wait for the click event.
 
-## Summary
+## Done
 
-| #   | Item                                                | Status on main                                                                | Priority                                 |
-| --- | --------------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------- |
-| 1   | Race-safe `waitForEvent`                            | Gap, documented                                                               | **P0**: approvals can be lost            |
-| 2   | Execution metadata, propagated                      | Gap. `trace_context` is a working precedent                                   | **P0**                                   |
-| 3   | Middleware / per-run context hook                   | Gap. Context is static                                                        | **P0**                                   |
-| 4   | Strict per-key mutual exclusion                     | Gap. `groupConcurrency` is documented as soft                                 | P1                                       |
-| 5   | Cancellation: opt-out propagation + distinct status | Partly there                                                                  | P1                                       |
-| 6   | Wait for the first of several conditions            | Gap                                                                           | P1                                       |
-| 7   | Start a child without waiting (durable, deduped)    | Gap from inside `ctx`                                                         | P1                                       |
-| 8   | Idempotent `emit` + emit options                    | Gap: `emit(event, payload)` takes no options                                  | **P0**                                   |
-| 9   | Node-compatible package                             | Gap: Bun-only build, no `exports`/types, `catalog:` deps                      | **P0**: Fabrial vendors source meanwhile |
-| 10  | Terminal-state hooks                                | Gap: adapter polls for settled executions                                     | P1                                       |
-| 11  | Stop hangs on queued claims                         | Bug: workers enter handlers with an aborted signal                            | **P0**: shutdown can hang forever        |
-| 12  | Signals to running executions + `signalWithStart`   | Implemented in PR #80 (`feat/signals`), pinned via the submodule until merged | **P0**: agent sessions are built on it   |
+| Need                                       | Conductor                                                                                             |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| Race-safe waits                            | `ctx.subscribe` (#74); `ctx.waitForAny` over subscriptions (#79)                                      |
+| Execution metadata, propagated             | #72                                                                                                   |
+| Middleware on every attempt                | #71                                                                                                   |
+| Start without waiting, durable and deduped | `ctx.invoke` starts, `ctx.invokeAndWait` waits (#78)                                                  |
+| Idempotent emit                            | `dedupe_key` (#77)                                                                                    |
+| Execution results                          | `getExecution`, `waitForResult` (#70)                                                                 |
+| Stop doesn't hang on queued claims         | `stop()` waits for the running step or handler (#68)                                                  |
+| Signals and keyed executions               | `ctx.onSignal`, `signal`, `signalWithStart`, cancel on the worker poll, cancel reason preserved (#80) |
+| One owner per Session                      | Keyed executions (#80); Fabrial's Session storage fences writes                                       |
+| Node-compatible package                    | #75 (in progress)                                                                                     |
 
-How Fabrial's Conductor runtime (`packages/fabrial/src/runtime/conductor`) works around each item today, and what it learned along the way, is in [Findings from the Fabrial adapter](#findings-from-the-fabrial-adapter) at the end.
+## Still needed
 
-Fabrial can be prototyped against 1–3 and 8 alone. Items 4–7 are needed before the v1 reference flow (Slack → agent → `run-sql` tool workflow → approval in a DM → resume) is reliable.
+### 1. Wait for a started execution, with its outcome as a value
 
----
+**Current.** `ctx.invokeAndWait` starts and waits in one call, and a failed child cascade-fails the parent. There is no way to wait for an execution started earlier with `ctx.invoke`, to wait with a timeout without cancelling the child, or to receive a failure or cancellation as a value.
 
-## 1. Race-safe `waitForEvent`
-
-**Current.** `ctx.waitForEvent` (`packages/pgconductor-js/src/task-context.ts`, `waitForEvent`) loads the cached step, then calls `db.registerEventWait(...)` and hangs up. `docs/content/api/task-context.md` says:
-
-> The subscription becomes active when registration commits; an event racing registration or timeout is not guaranteed to win. Earlier events do not satisfy the wait.
-
-**Why it breaks Fabrial.** `waitForApproval` must post the approval card and then wait for the click. If the post happens in a step before the wait registers, a fast click is lost and the execution waits until it times out. Posting after registration is impossible, because `waitForEvent` hangs up. Fabrial-internal waits on child results have the same problem.
-
-**Needed.** A way to guarantee that an event emitted after the side effect that causes it satisfies the wait. Options, in order of preference:
-
-1. **Correlated buffered events.** Events carry an optional correlation key (or the filter already acts as one). `waitForEvent` with `since: <step-start | timestamp | event-id>`, or a `buffered: true` mode, matches events emitted after the wait's _step began_, not only after registration commits. The first run of the step records its start position before user code runs any side effect.
-2. **Register-then-act.** Split into `ctx.subscribe(stepKey, { event, filter })`, which registers durably and returns, and `await subscription.wait({ timeout })`. Code in between, such as posting the card, runs while the subscription is already active.
-3. **Atomic emit-and-wait.** A wait whose registration commits in the same transaction as a step result.
-
-**Acceptance.**
-
-- A test where the event is emitted from inside the step that precedes the wait (before registration commits) and the wait resolves with it.
-- An event emitted _before_ the wait's step started still does not satisfy it, so stale clicks from an earlier approval are ignored.
-- Exactly-once delivery to the waiter still holds, and a timeout racing a buffered event resolves deterministically.
-
----
-
-## 2. Execution metadata, propagated
-
-**Current.** No user metadata exists on executions. But `trace_context jsonb` already does exactly what Fabrial needs, for OTel only:
-
-- column on `pgconductor._private_executions` (`migrations/0000000001_setup.sql`)
-- set from `conductor.invoke` / `conductor.emit` (`src/conductor.ts`, `trace_context: this.telemetry.traceContext()`)
-- carried from event → dispatched execution and parent → child (`src/query-builder.ts`: `parent.trace_context as parent_trace_context`, `p.trace_context` on insert)
-
-**Needed.** A user-facing, typed `metadata` with the same propagation:
+**Needed.** An `{ execution: id }` branch for `ctx.waitForAny` (listed as a follow-up in #79), plus a shorthand:
 
 ```ts
-await conductor.emit("slack.mentioned", payload, {
-	metadata: { fabrial: { interactionId, replyTo, origin, requestedBy } },
-});
-await conductor.invoke(task, payload, { metadata }); // explicit
-await ctx.invoke("child", task, payload); // inherits parent metadata
-await ctx.invoke("child", task, payload, {
-	metadata: (m) => ({ ...m, fabrial: { ...m.fabrial, replyTo: other } }),
-}); // override
-await ctx.emit("x", payload); // events emitted from a run inherit too
-ctx.metadata; // readonly, typed
+const id = await ctx.invoke("start-tool", tool, input);
+// … other work …
+const outcome = await ctx.waitForResult("tool-result", id, { timeout: "24h" });
+// { status: "completed", result } | { status: "failed", error } | { status: "cancelled", reason } | { status: "timeout" }
+
+const winner = await ctx.waitForAny(
+	"tool-or-click",
+	{ tool: { execution: id }, click },
+	{ timeout: "1h" },
+);
 ```
 
-- Inherited on: event → triggered execution, `ctx.invoke` children, `ctx.emit`, cron executions from dynamic schedules (`ctx.schedule`), and DLQ deliveries.
-- Optional typing via a `metadata` schema on `Conductor.create` (Standard Schema, like event payloads).
-- Size limit, documented. Fabrial metadata is small references, not payloads.
-- Prior art: Temporal headers + context propagators, Hatchet `additional_metadata` (propagates event → run → child), Trigger.dev `metadata.parent` / `metadata.root`.
+- Settling the execution wakes the waiter, as `invokeAndWait` resumes its parent today; no polling.
+- The outcome is a value: a failed or cancelled execution never fails the waiter.
+- An execution already settled when the wait registers returns at once. The result is memoized under the step key.
 
-**Acceptance.** Metadata is visible in the handler for event-triggered, invoked, child, cron, retried, and resumed executions, and an override on `ctx.invoke` affects only that child.
+**Acceptance.** Completed, failed (after retries), cancelled-while-pending, and cancelled-while-running executions each wake a waiter with the matching outcome; a timeout returns `{ status: "timeout" }` and leaves the execution running; an execution branch races event branches correctly; replays return the memoized outcome.
 
----
+### 2. Children linked without being awaited
 
-## 3. Middleware: per-run context transformation
+**Current.** Only `invokeAndWait` children are cancelled with their parent. `ctx.invoke` executions are independent.
 
-**Current.** `Conductor.create({ context })` is static. `src/worker.ts` passes the same `extraContext` object to every `TaskContext.create(...)`. The only special case is the maintenance task, which gets `{ ...this.extraContext, db, tasks }`. Nothing runs per execution or per resume.
+**Needed.** `ctx.invoke(key, task, payload, { cancelWithParent: true })`: the parent keeps running, and the child is cancelled (with the parent's reason) when the parent is cancelled or fails permanently, including children of children that opted in. Reuse the existing parent link and cascade.
 
-**Needed.** A middleware chain that runs on **every** start and resume, before the handler, and can extend `ctx` and wrap execution:
+**Acceptance.** Cancelling or permanently failing the parent cancels linked children in every state (pending, running, suspended); unlinked `invoke` children keep running; a linked child that completed before the parent ended stays completed.
+
+### 3. Notify on settlement
+
+**Current.** Nothing tells another execution that an execution reached a terminal state outside of `invokeAndWait`. Fabrial's adapter polls for settled executions.
+
+**Needed.** An option on `ctx.invoke`, `conductor.invoke`, and `signalWithStart`:
 
 ```ts
-Conductor.create({
-  context: { … },
-  middleware: [
-    async ({ execution, ctx }, next) => {
-      // execution: id, task_key, queue, metadata (item 2), attempt, parent id, root id
-      const thread = rebuildThread(execution.metadata.fabrial?.replyTo);
-      return als.run({ executionId: execution.id }, () => next({ ...ctx, thread }));
-    },
-  ],
+await ctx.invoke("start-tool", tool, input, {
+	onSettled: {
+		task: "session",
+		key: sessionKey,
+		signal: { name: "child", id: `child:${requestId}` },
+	},
 });
 ```
 
-- Typed: each middleware's added keys are inferred into the handler's `ctx` (like Inngest `transformFunctionInput`).
-- Can wrap the handler (try/finally, `AsyncLocalStorage`, tracing spans).
-- Must see whether the run is a first start or a resume, and must not break `abortAndHangup` control flow (a hang-up rejection has to pass through untouched).
-- Prior art: Inngest `transformFunctionInput` / `wrapFunctionHandler`, Trigger.dev `middleware` + `locals`, Temporal interceptors.
+When the execution reaches any terminal state, Conductor sends the signal with `signalWithStart` to the target in the same transaction as the settlement, with `payload: { executionId, outcome }` (the same outcome shape as item 1). It is delivered once per settlement.
 
-**Acceptance.** Middleware runs once per attempt (including after `sleep`, `waitForEvent`, and child resumes), added context is typed in handlers, and errors thrown in middleware fail the attempt like handler errors.
+**Acceptance.** Completion, failure after the last retry, cancellation while pending, running, or suspended, and dead-lettering each send exactly one signal, including after a restart; the target is started if it isn't running.
 
----
+### 4. Public execution id
 
-## 4. Strict per-key mutual exclusion
+**Current.** `TaskContext` doesn't expose the execution's id; Fabrial reads the private `opts.execution`.
 
-**Current.** `groupConcurrency` limits active executions per `(queue, task, group)`. `docs/content/task-execution/concurrency.md` says limits are **"intentionally soft across concurrent workers"** (claims use `FOR UPDATE SKIP LOCKED`, `src/query-builder.ts` around `group_concurrency_limit`).
+**Needed.** `ctx.executionId` (and the queue, if cheap).
 
-**Why Fabrial needs it.** A Pi Durable storage backend has no cross-process locking: "one process owns a storage at a time". Fabrial runs one Pi Session per chat thread and drives it from a Conductor execution grouped by Session ID with `groupConcurrency: 1`. A soft limit can let two workers own the same Session at once. Fabrial also uses an epoch fence on every Pi commit, so the worst case is wasted work rather than corruption, but the claim itself should be exclusive.
+### 5. Pending cancels set the cancelled flag
 
-**Needed.** A strict mode, for example `groupConcurrency: { limit: 1, strict: true }` or a separate `mutex: (payload, metadata) => key`. The guarantee: at most one _running_ execution per key across all workers, including during retries, lease expiry, and worker loss, where the old lease must be revoked before another claim. Expose the claim token / epoch to the handler (`ctx.claimToken`) so Fabrial can use it as the Pi fencing epoch (see the `fix/claim-token-fencing` branch).
+**Current.** `cancel_execution()` sets `failed_at` and `last_error` on pending executions but not `cancelled = true`; running ones get the flag. Fabrial updates the flag itself after the call.
 
-**Acceptance.** A concurrency test with N workers racing on one key, where the running count never exceeds 1, and a test where a worker dies mid-run and another worker takes over only after its lease expires, with a strictly greater claim token.
+**Needed.** Pending executions (and pending descendants) cancelled by `cancel_execution()` get `cancelled = true` with the reason. In progress.
 
----
+## What Fabrial removes once these land
 
-## 5. Cancellation: opt-out propagation and a distinct status
-
-**Current** (`docs/content/task-execution/cancellation.md`, `ctx.cancel` / `conductor.cancel`):
-
-- Pending executions are marked failed with "Cancelled by user". Running executions get `ctx.signal` aborted and are checked at step boundaries.
-- Cancelling an execution also cancels the executions it is waiting on. Waiting parents fail with "Child execution failed: <reason>".
-
-That matches Fabrial's default (structured cancellation). Two things are missing:
-
-1. **Opt-out per call.** `ctx.invoke("audit", task, payload, { cancelWithParent: false })`: the parent still waits for the result, but cancelling the parent does not cancel this child. Fabrial exposes this as `{ detached: true }`.
-2. **A distinct terminal status.** Cancelled and failed both look like failures today. Fabrial needs to tell them apart, e.g. to render an approval card as "Cancelled" rather than "Failed", and to return `decision.status = "cancelled"`. Either add a `cancelled` status or a `cancelled: true` flag plus a reason on the execution, on the parent-visible child error, and in `ctx` (`ctx.signal.reason`).
-
-Also confirm that cancelling an execution suspended in `waitForEvent` or `sleep` settles it immediately and removes its subscription.
-
-**Acceptance.** Parent → child (default) and parent → child (`cancelWithParent: false`) cancellation tests. The child's cancellation is distinguishable from failure in the parent's caught error and in the stored execution.
-
----
-
-## 6. Wait for the first of several conditions
-
-**Current.** `ctx.waitForEvent` waits for one event definition with one filter. `ctx.invoke` waits for one child. `ctx.sleep` waits for one timer. Nothing combines them.
-
-**Why Fabrial needs it.** `ctx.race("approval-or-reply", { decision, reply })` has to wake on whichever comes first: an approval decision, a thread reply from the requester, a child result, or a timer. Fabrial could funnel its _own_ internal events through a single event name and discriminate, but racing a child result or timer against an event needs Conductor.
-
-**Needed.**
-
-```ts
-const winner = await ctx.waitForAny("approval-or-reply", {
-	decision: { event: approvalDecided, filter: { approvalId: [id] } },
-	reply: { event: threadReplied, filter: { interactionId: [iid] } },
-	child: { execution: childExecutionId }, // optional
-	timeout: "24h",
-});
-// winner: { key: "decision", event } | { key: "reply", event } | { key: "child", result } | { key: "timeout" }
-```
-
-Losing subscriptions are removed atomically when one wins, and the result is cached under the step key like `waitForEvent`. Item 1's race-safety applies to every branch.
-
-**Acceptance.** Each branch can win, and only one wins under concurrent emits.
-
----
-
-## 7. Start a child without waiting
-
-**Current.** `ctx.invoke` always hangs up and waits (`abortAndHangup({ reason: "child-invocation" })`). From inside a task, the only way to start independent work is `ctx.emit` (event-triggered tasks) or calling the outer `conductor.invoke` inside a `ctx.step`, which loses metadata propagation (item 2) and depends on `dedupe_key` for idempotency.
-
-**Why Fabrial needs it.**
-
-- `ctx.start` starts independent work, such as a detached child or a managed effect, and returns.
-- A workflow in an agent's `tools` starts or reconnects to a workflow by a stable key and is awaited later through a separate wake-up.
-
-**Needed.**
-
-```ts
-const executionId = await ctx.start("handoff", task, payload, {
-	dedupeKey: `${ctx.executionId}:handoff`, // idempotent across retries; defaults from step key
-	metadata, // inherits by default (item 2)
-});
-```
-
-This is a memoized step that creates an independent execution (not cancelled with the parent, not awaited), returns its ID, and is idempotent under retry. Pairs with item 6 (`waitForAny` on `{ execution }`) and a client-side `conductor.waitForResult(executionId)` / result event for awaiting it elsewhere.
-
-**Acceptance.** Retrying the starting step never creates a second execution, the child gets inherited metadata, and cancelling the starter does not cancel the child.
-
----
-
-## 8. Idempotent `emit` and emit options
-
-**Current.** `conductor.emit(event, payload)` (`src/conductor.ts`) and `ctx.emit(event, payload)` (`src/task-context.ts`) take no options. Each call inserts a new dispatch execution. There is no dedupe key and no way to pass metadata (item 2).
-
-**Why Fabrial needs it.** Slack, GitHub, Linear, and Sentry redeliver webhooks. Ingress turns each delivery into `emit(...)`, so a redelivered approval click or mention must not dispatch twice.
-
-**Needed.**
-
-```ts
-await conductor.emit("slack.mentioned", payload, {
-	id: `slack:${eventId}`, // repeated id → no-op, returns the original event id
-	metadata, // item 2
-});
-```
-
-Dedup window and scope must be documented: per event name or global, and retention.
-
-**Acceptance.** Emitting the same `id` twice (also concurrently) creates one dispatch, and triggered tasks and waiters see it once.
-
----
-
-## 9. Node-compatible package
-
-**Current.** Fabrial runs on Node, but the published `pgconductor-js@0.1.0` can't be used there:
-
-- `package.json` has only `"module": "dist/index.js"`. With no `main`/`exports`, Node can't resolve `import "pgconductor-js"`.
-- No type declarations are published.
-- The entry point (`src/index.ts`) doesn't export documented APIs: `defineTask`, `TaskSchemas`, `EventSchemas`.
-- Dependencies use Bun `catalog:` specifiers, so the package also can't be installed from git by pnpm.
-- `src/lib/batching-async-queue.ts` uses Bun's global `Timer` type.
-- npm is far behind `main`.
-
-The source itself runs fine on Node. Fabrial's smoke test (`packages/fabrial/tests/integration/conductor/pgconductor.test.ts`) runs a task with a memoized step on Node against Postgres 17.
-
-**What Fabrial does meanwhile** (all marked `SHIM(conductor#9)`): `vendor/postgres-conductor` is a git submodule pinned to a commit and included in Fabrial's pnpm workspace, which supplies the catalog versions. Fabrial's Conductor runtime imports source subpaths (`pgconductor-js/src/...`), vitest inlines it, and a `.d.ts` declares `Timer`.
-
-**Needed.**
-
-- An ESM build for Node: `exports` map with `types` + `default`, `.d.ts` emitted, `engines.node`.
-- Export `defineTask`, `TaskSchemas`, `EventSchemas` (and the other documented APIs) from the entry point.
-- Resolve `catalog:` on publish (Bun publish or a release script), and replace `Timer` with `ReturnType<typeof setTimeout>`.
-- Run the test suite on Node in CI as well as Bun, or at least the integration smoke tests.
-- Publish releases as the items above land, so Fabrial can drop the submodule.
-
-**Acceptance.** `npm i pgconductor-js` in a plain Node 22 ESM project, `import { Conductor, Orchestrator, defineTask, TaskSchemas } from "pgconductor-js"` typechecks and runs.
-
----
-
-## 10. Terminal-state hooks
-
-**Current.** Nothing notifies application code when an execution reaches a terminal state outside its own handler, e.g. retries exhausted or cancelled while suspended. Fabrial needs this to clear thread routing state and to emit `fabrial.execution.settled`, which waiting parents and agent bridges wake on.
-
-**What Fabrial does meanwhile.** Fabrial's Conductor runtime runs a restart-safe monitor that polls for terminal executions and calls `RuntimeWorkflow.onSettled` at least once, isolating hooks that fail repeatedly.
-
-**Needed.** A native `onSettled(execution, result)` per task, or a terminal-state event: at-least-once, restart-safe, covering completion, failure (incl. retry exhaustion), and cancellation in every state, with the cancellation reason preserved.
-
-**Acceptance.** Hooks fire for completed, failed-after-retries, cancelled-while-pending, cancelled-while-suspended, and cancelled-while-running executions, including after a restart, and one failing hook doesn't block others.
-
----
-
-## 11. Stop hangs on queued claims
-
-**Current.** When `orchestrator.stop()` aborts a worker, the worker still drains executions it already claimed. Their task signal is created already aborted, before the worker installs its abort listener, so a handler that reaches a checkpoint or step hangs up forever and the worker's abort race never resolves. `stop()` never returns. Fabrial's CI hit this with a restart during an approval on a slow runner.
-
-**What Fabrial does meanwhile** (`SHIM(conductor#11)`, `packages/fabrial/src/runtime/conductor/shutdown.ts`): wraps each worker's `executeSingleTask`/`executeBatchTask` so that once the worker is aborted, queued claims are returned as `released` instead of entering handlers, preserving them for the next start.
-
-**Needed.** Workers must not start handlers after stop; release unstarted claims instead. Install abort listeners before creating task signals.
-
-**Acceptance.** Stopping an orchestrator with claimed-but-unstarted executions resolves promptly, and those executions run on the next start.
-
----
-
-## 12. Signals to running executions
-
-**Status.** Implemented in [PR #80](https://github.com/psteinroe/postgres-conductor/pull/80) (`feat/signals`, `5a058eb`), which Fabrial pins via the submodule until it merges. Fabrial's runtime port exposes it as `DurableExecution.onSignal` / `signalWithStart` and `DurableRuntime.signal` / `signalWithStart`, using the native API without shims. The text below is the original request.
-
-**Current.** `_private_orchestrator_signals` already routes a message to the orchestrator that runs a given execution, and the worker hands it to the running handler in process (`orchestrator.ts`, `case "cancel_execution"` → `worker.cancelExecutions`). Only `cancel_execution` and `shutdown` exist, and signals are read on the orchestrator heartbeat (`HEARTBEAT_INTERVAL_MS = 30000`). There is no way to send application data to a running execution, and no way to say "deliver to the running execution for this key, or start one".
-
-**Why Fabrial needs it.** An agent conversation lives in a Pi Durable Session, which one process owns at a time; Pi handles steering, follow-ups, aborts, and subagents inside that process. Fabrial hosts each Session in one Conductor execution while Pi has work. Every input for the conversation (a Slack message, a followed PR's review, a subagent report, a cancel) has to reach that execution in process, or start it when none is running. Without signals Fabrial needed an inbox table, cross-process hand-overs at turn boundaries, and polling.
-
-**Needed.**
-
-```ts
-// In a running handler: listen for signals by name. Signals stored before the handler started are
-// delivered first, in order; later ones are delivered as they arrive, while the handler runs.
-ctx.onSignal("input", async (payload, { id }) => { … });
-
-// From anywhere (client, another task's ctx): deliver to the running execution of a task for a key,
-// or start one with the signal queued. One transaction under a lock on (task, key).
-await conductor.signalWithStart({
-	task: "session",
-	key: "slack:T1:C1:ts",                // at most one non-terminal execution per (task, key)
-	signal: { name: "input", id: requestId, payload },
-	input: {},                            // used only when it starts an execution
-});
-
-// Also: signal a known execution by id; inside tasks the same API on ctx, durable per step id.
-await conductor.signal(executionId, { name, id, payload });
-```
-
-- **Storage.** A signal row per message with `execution_id`, `name`, `id`, `payload`, and a delivered marker; unique on `(execution_id, id)`, so a redelivered signal is stored once.
-- **Delivery.** Through the worker's existing poll loop (`pollIntervalMs`, default 1 s): each fetch cycle also reads undelivered signals for the executions the worker is running and hands them to their handlers. No `LISTEN/NOTIFY`, so no dedicated session connection and nothing extra behind a transaction pooler. A signal for an execution that is pending, retrying, or suspended is kept and delivered when its handler next runs.
-- **Keyed executions.** `key` makes a task execution addressable: at most one non-terminal execution per `(task, key)`. A finished execution doesn't block a new one for the same key.
-- **No lost signals at settlement.** Completing an execution checks, in the same transaction, for signals that were stored but not delivered to the handler. If there are any, the execution is not completed but re-queued (a new attempt runs and receives them). This is the subtle part and the reason it belongs in Conductor.
-- **Guarantee.** At least once per signal id; handlers dedupe by id (Fabrial uses Pi's request id).
-- **Cancellation** moves onto the same per-worker poll, so a cancel reaches a running handler within about one poll interval instead of the 30 s orchestrator heartbeat.
-
-**Acceptance.**
-
-- A signal sent to a running execution reaches its `onSignal` handler within about one poll interval.
-- `signalWithStart` with no running execution starts exactly one, which receives the signal first; concurrent `signalWithStart` calls for one key start one execution and deliver every signal.
-- A signal sent while the handler is returning is never lost: the execution re-queues and the next attempt receives it.
-- Signals for pending, retrying, and suspended executions are delivered when they run; redelivering a signal id stores it once.
-- Works across processes: the sender and the running execution in different orchestrators.
-
----
+- Its own `invoke` and `start` (independent submission, a parent link in its metadata, a polling wait-for-any, output copied into a private step), replaced by native `invoke`, `invokeAndWait`, `waitForResult`, and `waitForAny`.
+- The reconcile loop that cancels children of ended parents (item 2) and the settled-execution monitor (item 3).
+- Private access to the task context (item 4) and the abort-controller calls used to reschedule (item 1).
+- The metadata envelope in payloads and the event-position sequence (native metadata, middleware, subscriptions).
+- The vendored submodule and the Bun type shim, once #75 publishes a Node build.
+- The extra `UPDATE` after cancelling (item 5).
 
 ## Not needed from Conductor
 
-- **Repeated step IDs.** Conductor requires unique step names per execution. Fabrial suffixes repeated IDs itself (`processed`, `processed:1`, …), which is deterministic because handlers re-run from the top on every resume.
-- **Event filters.** The current filter operators (top-level scalar fields, ≤ 8 fields) are enough for correlating by `interactionId` / `approvalId`.
-
-## Findings from the Fabrial adapter
-
-Fabrial's Conductor runtime implements every item above on the pinned Conductor revision. `packages/fabrial/README.md` has the full shim table. What it learned, per item:
-
-- **#1:** Native `waitForEvent` is used as is. The pre-registration race is the one gap with no workaround (`test.todo` in the adapter suite), so approvals are not production-safe until Conductor fixes it.
-- **#2:** Metadata travels in a payload envelope, with reserved top-level fields (`__fabrial`, `__fabrialOwner`) on events. Filters on payload fields keep working.
-- **#4:** `groupConcurrency: 1` per key, which is soft. Fabrial's Pi storage keeps its own owner id and a Session epoch that increases monotonically across executions, so correctness doesn't depend on Conductor. A random per-claim UUID can't serve as that epoch. Strict claims are still wanted, to avoid wasted model calls and duplicate posts.
-- **#5:** Since PR #80, cancellation reaches a running handler on the worker poll and settlement keeps the requested reason, so the adapter's cancel-reason envelope (`SHIM(conductor#5)`) was removed. Pending native cancellations still don't set `cancelled`, so the adapter marks them. It is unclear whether a step that is mid-flight when cancellation settles the attempt gets its result recorded; Conductor should define this.
-- **#6:** Races use native subscriptions plus polling over retained dispatch receipts. This works but scans receipts, so an indexed, claim-guarded native race API is still needed.
-- **#7:** Native deduped invoke updates or re-invokes an execution that already completed. `ctx.start` needs insert-on-conflict that keeps the original execution, plus result retrieval by execution id.
-- **#8:** Dedupe by `(event, id)` requires disabling immediate deletion of dispatch receipts on the internal queue. There is no TTL yet.
-- **#12:** Used natively (PR #80). Keys are passed per `signalWithStart` call, not configured on the workflow. `signal_with_start` takes no group, so keyed starts ignore a workflow's `mutex` (the key already serializes them), and they are independent of the caller like `start`. An attempt receives signals only on worker polls, not with its claim: a handler that listens and returns before the next poll is re-queued and can repeat, so handlers should stay running until a delivery (or idle timeout). Because a re-queued attempt's result is discarded, the adapter overwrites its private output step instead of memoizing it.
-- **#11 (unverified):** Conductor #68 releases claims taken after stop and makes `stop()` wait for the running step or handler, so `SHIM(conductor#11)` may be redundant. It is kept until verified. As a consequence of #68, a handler blocked in a non-cooperative call (e.g. a chat post) delays `stop()` until the call returns.
-- **Cross-category dispatch:** one inbound chat message can match several events (e.g. `slack.message` + `slack.mentioned`). The adapter merges triggered invocations per `(dispatchId, workflow)`; the first submission wins. Core emits the owner's event first, so precedence only breaks if several ingress replicas race on the same message.
+- **Strict per-key locks.** Keyed executions give one host per Session; Fabrial's Session storage fences writes with its own epoch.
+- **Event cursors.** `ctx.subscribe` makes waits race-safe; a wait that sees the same event stream repeatedly (approval clicks) filters on its subscription.
+- **Repeated step ids.** Fabrial suffixes repeated ids itself.
+- **`cancelWithParent: false` for awaited children (#73).** Fabrial's detached calls use `invoke` plus item 1 instead.
