@@ -859,7 +859,7 @@ Conductor behaviors Fabrial relies on, checked against Conductor `main` @ `33228
 9. **Node-compatible package** (P0). Today's build is Bun-only, with no exports or types. Fabrial vendors Conductor as a pinned submodule until this ships.
 10. **Terminal-state hooks** (P1). Notify on completion, failure, and cancellation in every state. The adapter polls for settled executions meanwhile.
 11. **Stop hangs on queued claims** (P0). Workers enter handlers with an already-aborted signal after stop, so `stop()` can hang forever. The adapter releases those claims meanwhile.
-12. **Signals** (P0). `ctx.onSignal` in running handlers, `signalWithStart` for keyed executions, `pg_notify` delivery, and re-queueing an execution that received signals while finishing. Agent Sessions are built on it.
+12. **Signals** (P0). `ctx.onSignal` in running handlers, `signalWithStart` for keyed executions, delivery through the worker poll, and re-queueing an execution that received signals while finishing. Agent Sessions are built on it.
 
 ## Open questions
 

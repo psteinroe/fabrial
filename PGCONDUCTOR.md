@@ -295,15 +295,15 @@ await conductor.signal(executionId, { name, id, payload });
 ```
 
 - **Storage.** A signal row per message with `execution_id`, `name`, `id`, `payload`, and a delivered marker; unique on `(execution_id, id)`, so a redelivered signal is stored once.
-- **Delivery.** `pg_notify` on the owning orchestrator's channel when a signal is inserted for a running execution, so delivery is near-instant; the heartbeat remains the fallback. A signal for an execution that is pending, retrying, or suspended is kept and delivered when its handler next runs.
+- **Delivery.** Through the worker's existing poll loop (`pollIntervalMs`, default 1 s): each fetch cycle also reads undelivered signals for the executions the worker is running and hands them to their handlers. No `LISTEN/NOTIFY`, so no dedicated session connection and nothing extra behind a transaction pooler. A signal for an execution that is pending, retrying, or suspended is kept and delivered when its handler next runs.
 - **Keyed executions.** `key` makes a task execution addressable: at most one non-terminal execution per `(task, key)`. A finished execution doesn't block a new one for the same key.
 - **No lost signals at settlement.** Completing an execution checks, in the same transaction, for signals that were stored but not delivered to the handler. If there are any, the execution is not completed but re-queued (a new attempt runs and receives them). This is the subtle part and the reason it belongs in Conductor.
 - **Guarantee.** At least once per signal id; handlers dedupe by id (Fabrial uses Pi's request id).
-- **Cancellation** keeps its own path; `cancel_execution` can move onto the same delivery mechanism to drop the 30 s heartbeat delay.
+- **Cancellation** moves onto the same per-worker poll, so a cancel reaches a running handler within about one poll interval instead of the 30 s orchestrator heartbeat.
 
 **Acceptance.**
 
-- A signal sent to a running execution reaches its `onSignal` handler in well under a second, through `pg_notify`, with the heartbeat as fallback when the notification is missed.
+- A signal sent to a running execution reaches its `onSignal` handler within about one poll interval.
 - `signalWithStart` with no running execution starts exactly one, which receives the signal first; concurrent `signalWithStart` calls for one key start one execution and deliver every signal.
 - A signal sent while the handler is returning is never lost: the execution re-queues and the next attempt receives it.
 - Signals for pending, retrying, and suspended executions are delivered when they run; redelivering a signal id stores it once.
