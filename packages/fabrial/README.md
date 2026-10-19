@@ -332,7 +332,7 @@ Session keys come from the event: `<provider>:<threadId>` for `"thread"`, `<prov
 
 An incoming chat message is routed in this order:
 
-1. **Followers.** An agent follows every thread it receives a message from, so every later message there reaches the same conversation, mention or not: it steers a running run or starts the next one. `"thread"` conversations are found by their key (a lookup in `fabrial_pi.conversations`); other sessions leave a follow record `{ session, agent }` in the thread's Chat SDK state. A message naming one agent (`@agent-name`) goes only to that agent, which then follows the thread too.
+1. **Followers.** An agent follows every thread it receives a message from, so every later message there reaches the same conversation, mention or not: it steers a running run or starts the next one. Every followed thread, whatever the session kind, holds a follow record `{ session, agent }` in its Chat SDK state; ingress reads it with the redelivery check, so routing needs no table. A message naming one agent (`@agent-name`) goes only to that agent, which then follows the thread too.
 2. **Triggers.** Otherwise the most specific matching trigger wins, an agent's or a workflow's. Equal specificity on overlapping filters fails `app.start()`; `observe: true` workflow triggers run alongside.
 3. Otherwise the message is ignored.
 

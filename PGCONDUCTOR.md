@@ -42,7 +42,7 @@ Fabrial can be prototyped against 1–3 and 8 alone. Items 4–7 are needed befo
 
 > The subscription becomes active when registration commits; an event racing registration or timeout is not guaranteed to win. Earlier events do not satisfy the wait.
 
-**Why it breaks Fabrial.** `waitForApproval` must post the approval card and then wait for the click. If the post happens in a step before the wait registers, a fast click is lost and the execution waits until it times out. Posting after registration is impossible, because `waitForEvent` hangs up. Thread replies (`ctx.thread.waitForReply`) have the same problem.
+**Why it breaks Fabrial.** `waitForApproval` must post the approval card and then wait for the click. If the post happens in a step before the wait registers, a fast click is lost and the execution waits until it times out. Posting after registration is impossible, because `waitForEvent` hangs up. Fabrial-internal waits on child results have the same problem.
 
 **Needed.** A way to guarantee that an event emitted after the side effect that causes it satisfies the wait. Options, in order of preference:
 
@@ -178,7 +178,7 @@ Losing subscriptions are removed atomically when one wins, and the result is cac
 
 **Why Fabrial needs it.**
 
-- `ctx.handoff(id, workflow, input)` starts a workflow that takes over the interaction, and the caller then ends.
+- `ctx.start` starts independent work, such as a detached child or a managed effect, and returns.
 - A workflow in an agent's `tools` starts or reconnects to a workflow by a stable key and is awaited later through a separate wake-up.
 
 **Needed.**
