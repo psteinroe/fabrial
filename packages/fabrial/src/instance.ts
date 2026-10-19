@@ -62,6 +62,8 @@ export interface FabrialConfig<P extends readonly AnyPlugin[] = readonly AnyPlug
 
 export interface AppConfig {
 	workflows: readonly AnyWorkflow[];
+	/** Agents whose `triggers` receive events. Agents only reached by `ctx.send` or `ctx.agent` need no entry. */
+	agents?: readonly Agent[];
 	/** Static subscriptions from `f.subscribe`. */
 	subscriptions?: readonly Subscription[];
 	logger?: Logger;
@@ -78,7 +80,10 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 		this: void,
 		definition: WorkflowDefinition<TName, TInput, TOutput, TTriggers, ClientsOf<P>>,
 	): Workflow<TName, TInput, TOutput>;
-	defineAgent(this: void, definition: AgentDefinition<ToolkitIdsOf<P>, ClientsOf<P>>): Agent;
+	defineAgent<const TTriggers extends readonly TriggerSpec<any>[] = []>(
+		this: void,
+		definition: AgentDefinition<ToolkitIdsOf<P>, ClientsOf<P>, TTriggers>,
+	): Agent;
 	defineTool<TInput>(this: void, definition: ToolDefinition<TInput, ClientsOf<P>>): Tool<TInput>;
 	defineToolkit(this: void, definition: ToolkitDefinition<ClientsOf<P>>): Toolkit;
 	defineState<T extends JsonObject>(
@@ -141,6 +146,7 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 				...appConfig.workflows,
 				...(appConfig.subscriptions ?? []).map((subscription) => subscription.workflow),
 			],
+			routedAgents: appConfig.agents ?? [],
 			logger: appConfig.logger,
 			reservationTimeout,
 			definitionScope: instance,
@@ -150,7 +156,7 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 		plugins,
 		// Definitions are plain data; the instance only supplies their contextual types.
 		defineWorkflow: defineWorkflow as Fabrial<P>["defineWorkflow"],
-		defineAgent: (definition) => defineAgent(definition, instance),
+		defineAgent: (definition) => defineAgent(definition as AgentDefinition, instance),
 		defineTool: defineTool as Fabrial<P>["defineTool"],
 		defineToolkit,
 		defineState,

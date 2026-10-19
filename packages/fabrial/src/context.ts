@@ -5,7 +5,7 @@ import { boundedTimeout, duration } from "./internal.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { DurableExecution, InvocationMetadata, ThreadIO, WaitBranch } from "./runtime.ts";
 import { parseSchema } from "./schema.ts";
-import { prepareSend } from "./send.ts";
+import { follow, prepareSend } from "./send.ts";
 import {
 	prepareSubscribe,
 	prepareUnsubscribe,
@@ -69,6 +69,7 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 							handlerExecutionId: null,
 							reservedAt,
 							...(state?.ingestedDedupeIds ? { ingestedDedupeIds: state.ingestedDedupeIds } : {}),
+							...(state?.follows ? { follows: state.follows } : {}),
 							agentActive: false,
 							statusMessageId: null,
 							bufferedReplies: [],
@@ -373,9 +374,19 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 		send: async (id, agent, opts) => {
 			if (!agents) throw new Error("Agent integration required");
 			const key = op(id);
-			const request = await execution.step(`fabrial:${key}:send`, async () =>
-				prepareSend(host, metadata, surfaces(), `${execution.executionId}:${key}`, opts),
-			);
+			const request = await execution.step(`fabrial:${key}:send`, async () => {
+				const prepared = await prepareSend(
+					host,
+					metadata,
+					surfaces(),
+					`${execution.executionId}:${key}`,
+					agent,
+					opts,
+				);
+				// Later messages in the thread reach the conversation directly.
+				await follow(host, prepared.follow, { session: prepared.session, agent: agent.name });
+				return prepared;
+			});
 			return agents.agents.send(execution, key, agent, request);
 		},
 		subscribe: async (id, resource, opts) => {

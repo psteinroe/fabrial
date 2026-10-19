@@ -1,10 +1,26 @@
 import type { App, CoreConfig, FabrialHost, Logger } from "./app.ts";
 import { createDirectory, identityKey } from "./directory.ts";
 import { boundedTimeout, filtersOverlap, matchesFilter } from "./internal.ts";
-import { clearInteraction, hasIngress, rememberIngress } from "./routing.ts";
+import { definedAgents, type Agent } from "./agent.ts";
+import { addFollow, clearInteraction, hasIngress, rememberIngress } from "./routing.ts";
+import {
+	conversationSession,
+	follow,
+	isChatMessage,
+	prepareInput,
+	threadSession,
+	type ConversationKey,
+} from "./send.ts";
+import type { AnyWorkflow } from "./workflow.ts";
 import type { Json } from "./json.ts";
 import { AGENT_SETTLED_EVENT, EXECUTION_SETTLED_EVENT } from "./runtime.ts";
-import type { ExecutionResult, InvocationMetadata, RuntimeWorkflow } from "./runtime.ts";
+import type {
+	AgentRef,
+	ExecutionResult,
+	InvocationMetadata,
+	RuntimeWorkflow,
+	ThreadRoutingState,
+} from "./runtime.ts";
 import { createContext } from "./context.ts";
 import { APPROVAL_CLOSED_EVENT, CLEANUP_WORKFLOW, PRESENTATION_EVENT, cleanup } from "./cleanup.ts";
 import type { TriggerSpec } from "./trigger.ts";
@@ -31,9 +47,31 @@ export function buildApp(config: CoreConfig): App {
 		() => host.clients(),
 		now,
 	);
-	const triggers = config.workflows.flatMap((workflow) =>
-		(workflow.definition.triggers ?? []).map((spec: TriggerSpec) => ({ workflow, spec })),
-	);
+	/** Workflow and agent triggers compete for the same events: the most specific owner receives each. */
+	const triggers: {
+		owner: AnyWorkflow | Agent;
+		name: string;
+		workflow?: AnyWorkflow;
+		agent?: Agent;
+		spec: TriggerSpec;
+	}[] = [
+		...config.workflows.flatMap((workflow) =>
+			(workflow.definition.triggers ?? []).map((spec: TriggerSpec) => ({
+				owner: workflow,
+				name: workflow.name,
+				workflow,
+				spec,
+			})),
+		),
+		...(config.routedAgents ?? []).flatMap((agent) =>
+			(agent.definition.triggers ?? []).map((spec: TriggerSpec) => ({
+				owner: agent,
+				name: `agent ${agent.name}`,
+				agent,
+				spec,
+			})),
+		),
+	];
 	const specificity = (spec: TriggerSpec) =>
 		spec.specificity ?? Object.keys(spec.filter ?? {}).length;
 	const select = (events: readonly string[], payload: import("./json.ts").JsonObject) => {
@@ -47,16 +85,50 @@ export function buildApp(config: CoreConfig): App {
 		if (
 			selected &&
 			owners.some(
-				(t) =>
-					t.workflow.name !== selected.workflow.name &&
-					specificity(t.spec) === specificity(selected.spec),
+				(t) => t.owner !== selected.owner && specificity(t.spec) === specificity(selected.spec),
 			)
 		)
 			throw new Error(`Ambiguous owner for ${events.join(", ")}`);
 		return {
 			selected,
-			observers: [...new Set(matching.filter((t) => t.spec.observe).map((t) => t.workflow.name))],
+			observers: [...new Set(matching.filter((t) => t.spec.observe).map((t) => t.workflow!.name))],
 		};
+	};
+	/** Agents a message can name (`@agent-name`): those with triggers and every agent of the instance. */
+	const knownAgents = () =>
+		new Map(
+			[
+				...(definedAgents.get(config.definitionScope ?? host) ?? []),
+				...(config.routedAgents ?? []),
+			].map((agent) => [agent.name, agent]),
+		);
+	const mentionedAgent = (text: string): Agent | undefined => {
+		const named = [...knownAgents().values()].filter((agent) =>
+			new RegExp(
+				`(^|[^\\w-])@${agent.name.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`,
+			).test(text),
+		);
+		return named.length === 1 ? named[0] : undefined;
+	};
+	/** Deliver an event to an agent's conversation: one signal to its Session (started when closed). */
+	const deliver = async (
+		agent: AgentRef,
+		conversation: ConversationKey,
+		input: import("./json.ts").JsonObject,
+		metadata: InvocationMetadata,
+	) => {
+		const port = agents?.agents;
+		if (!port?.deliver) throw new Error("Agents receiving events need the agent integration");
+		const request = await prepareInput(host, metadata, {
+			agent: agent.name,
+			session: conversation.session,
+			requestId: `${metadata.interactionId}:${agent.name}`,
+			input,
+			kind: isChatMessage(input) ? "message" : "notification",
+			replyTo: metadata.replyTo,
+		});
+		await port.deliver(agent, request);
+		return request;
 	};
 	const host: FabrialHost = {
 		definitionScope: config.definitionScope,
@@ -71,6 +143,44 @@ export function buildApp(config: CoreConfig): App {
 		resolvePrincipal: (identity) => directory.resolveIdentity(identity),
 		async ingest(event, payload, options) {
 			const { selected, observers } = select([event], payload);
+			if (selected?.agent) {
+				// An agent's trigger: the event goes to a conversation; observers still run.
+				const metadata: InvocationMetadata = {
+					interactionId:
+						options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID()),
+					origin: (options.origin ?? {
+						provider: event.split(".")[0]!,
+					}) as InvocationMetadata["origin"],
+					replyTo: (options.replyTo ??
+						selected.agent.definition.home ??
+						selected.spec.replyTo ??
+						null) as InvocationMetadata["replyTo"],
+					requestedBy: options.requestedBy
+						? ((await directory.resolveIdentity(
+								options.requestedBy,
+							)) as InvocationMetadata["requestedBy"])
+						: null,
+					ownsThread: false,
+					ownerWorkflow: null,
+					triggerEvent: event,
+				};
+				if (observers.length)
+					await runtime.emit(event, payload, { id: options.id, metadata, owner: undefined });
+				const session = conversationSession(
+					selected.agent.definition.session,
+					payload,
+					metadata.replyTo,
+					metadata.interactionId,
+				);
+				const request = await deliver(
+					selected.agent,
+					{ session, agent: selected.agent.name },
+					payload,
+					metadata,
+				);
+				await follow(host, request.follow, { session, agent: selected.agent.name });
+				return { owner: `agent:${selected.agent.name}`, observers };
+			}
 			const metadata: InvocationMetadata = {
 				interactionId:
 					options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID()),
@@ -85,19 +195,19 @@ export function buildApp(config: CoreConfig): App {
 							options.requestedBy,
 						)) as InvocationMetadata["requestedBy"])
 					: null,
-				ownsThread: !!selected && !selected.workflow.subscription,
-				ownerWorkflow: selected?.workflow.name ?? null,
+				ownsThread: !!selected && !selected.workflow!.subscription,
+				ownerWorkflow: selected?.workflow!.name ?? null,
 				triggerEvent: event,
 			};
 			await runtime.emit(event, payload, {
 				id: options.id,
 				metadata,
-				owner: selected?.workflow.name,
+				owner: selected?.workflow!.name,
 				dispatchOwner: selected
-					? { workflow: selected.workflow.name, event: selected.spec.event }
+					? { workflow: selected.workflow!.name, event: selected.spec.event }
 					: undefined,
 			});
-			return { owner: selected?.workflow.name, observers };
+			return { owner: selected?.workflow!.name, observers };
 		},
 		async receiveMessage(message, options) {
 			if (message.author.isBot) return "ignored";
@@ -112,13 +222,29 @@ export function buildApp(config: CoreConfig): App {
 			if (!events.length) throw new Error("Inbound messages need at least one event category");
 			const interactionId = `${message.provider}:${options.dedupeId}`;
 			const receivedAt = now();
+			const threadKey = threadSession(message.provider, message.threadId);
+			// Conversations keyed by this thread follow it implicitly; others leave a record in its state.
+			const implicit = (await agents?.agents.conversations?.(threadKey)) ?? [];
+			const mentioned = mentionedAgent(message.text);
 			const decision: {
-				route: "new" | "reply" | "ignored";
+				route: "new" | "reply" | "follow" | "ignored";
 				selected: ReturnType<typeof select>["selected"];
-			} = { route: "new", selected: undefined };
+				conversations: ConversationKey[];
+			} = { route: "new", selected: undefined, conversations: [] };
+			const followed = (state: ThreadRoutingState | null, targets: ConversationKey[]) =>
+				rememberIngress(
+					targets.reduce<ThreadRoutingState | null>(
+						(next, target) => (target.session === threadKey ? next : addFollow(next, target)),
+						state,
+					),
+					"message",
+					options.dedupeId,
+					receivedAt,
+				);
 			// Recompute the local decision on every lock retry; no dispatch/I/O occurs in the updater.
-			const state = await io?.updateState((state) => {
+			const decide = (state: ThreadRoutingState | null): ThreadRoutingState | null => {
 				decision.selected = undefined;
+				decision.conversations = [];
 				if (hasIngress(state, "message", options.dedupeId)) {
 					decision.route = "ignored";
 					return state;
@@ -143,13 +269,50 @@ export function buildApp(config: CoreConfig): App {
 						receivedAt,
 					);
 				}
+				// 1. Followers: everyone in a followed thread steers. Naming one agent addresses only that agent.
+				const followers = [
+					...(state?.follows ?? []),
+					...implicit.map((agent) => ({ session: threadKey, agent })),
+				].filter(
+					(f, i, all) => all.findIndex((o) => o.session === f.session && o.agent === f.agent) === i,
+				);
+				if (followers.length) {
+					decision.route = "follow";
+					const own = mentioned ? followers.filter((f) => f.agent === mentioned.name) : followers;
+					decision.conversations =
+						own.length || !mentioned
+							? own
+							: [
+									{
+										session: conversationSession(
+											mentioned.definition.session,
+											message,
+											ref,
+											threadKey,
+										),
+										agent: mentioned.name,
+									},
+								];
+					return followed(state, decision.conversations);
+				}
+				// 2. Triggers: the most specific one wins, an agent's or a workflow's.
 				decision.route = "new";
 				decision.selected = select(events, message).selected;
 				const idle = clearInteraction(state);
+				const agent = decision.selected?.agent;
+				if (agent) {
+					decision.conversations = [
+						{
+							session: conversationSession(agent.definition.session, message, ref, threadKey),
+							agent: agent.name,
+						},
+					];
+					return followed(idle, decision.conversations);
+				}
 				// A subscription delivers the message and returns at once; it never holds the routing slot,
 				// so the next message in this thread matches its trigger again instead of being buffered.
 				return rememberIngress(
-					decision.selected && !decision.selected.workflow.subscription
+					decision.selected && !decision.selected.workflow!.subscription
 						? {
 								...idle,
 								interactionId,
@@ -167,10 +330,39 @@ export function buildApp(config: CoreConfig): App {
 					options.dedupeId,
 					receivedAt,
 				);
-			});
+			};
+			const state = io ? await io.updateState(decide) : decide(null);
 			if (decision.route === "ignored") return "ignored";
-			if (!io) decision.selected = select(events, message).selected;
 			const { selected } = decision;
+			if (decision.route === "follow" || selected?.agent) {
+				const named = knownAgents();
+				const metadata: InvocationMetadata = {
+					interactionId,
+					origin: { provider: message.provider, messageId: message.messageId },
+					replyTo: ref as InvocationMetadata["replyTo"],
+					requestedBy: actor as InvocationMetadata["requestedBy"],
+					ownsThread: false,
+					ownerWorkflow: null,
+					triggerEvent: selected?.spec.event ?? events[0]!,
+				};
+				for (const conversation of decision.conversations)
+					await deliver(
+						named.get(conversation.agent) ?? { kind: "fabrial.agent", name: conversation.agent },
+						conversation,
+						message,
+						metadata,
+					);
+				if (decision.route === "follow") return "reply";
+				// Observers of the message still run, without the thread.
+				for (const event of events)
+					await runtime.emit(event, message, {
+						id: options.dedupeId,
+						metadata: { ...metadata, ownerWorkflow: null },
+						owner: undefined,
+						dispatchId: interactionId,
+					});
+				return "new";
+			}
 			if (decision.route === "reply" && state?.interactionId != null) {
 				await runtime.emit(
 					"fabrial.reply",
@@ -201,8 +393,8 @@ export function buildApp(config: CoreConfig): App {
 				origin: { provider: message.provider, messageId: message.messageId },
 				replyTo: ref as InvocationMetadata["replyTo"],
 				requestedBy: actor as InvocationMetadata["requestedBy"],
-				ownsThread: !!selected && !selected.workflow.subscription,
-				ownerWorkflow: selected?.workflow.name ?? null,
+				ownsThread: !!selected && !selected.workflow!.subscription,
+				ownerWorkflow: selected?.workflow!.name ?? null,
 				triggerEvent: selected?.spec.event ?? events[0]!,
 				initialMessageId: message.messageId,
 			};
@@ -211,10 +403,10 @@ export function buildApp(config: CoreConfig): App {
 				await runtime.emit(event, message, {
 					id: options.dedupeId,
 					metadata: invocation,
-					owner: event === selected?.spec.event ? selected.workflow.name : undefined,
+					owner: event === selected?.spec.event ? selected.workflow!.name : undefined,
 					dispatchId: interactionId,
 					dispatchOwner: selected
-						? { workflow: selected.workflow.name, event: selected.spec.event }
+						? { workflow: selected.workflow!.name, event: selected.spec.event }
 						: undefined,
 				});
 			return "new";
@@ -451,20 +643,23 @@ export function buildApp(config: CoreConfig): App {
 				throw new Error("Duplicate workflow name");
 			if (config.plugins.some((p) => p.chat) && !config.chat)
 				throw new Error("Chat integration required");
+			const routed = config.routedAgents ?? [];
+			if (new Set(routed.map((a) => a.name)).size !== routed.length)
+				throw new Error("Duplicate agent name");
+			if (routed.some((a) => a.definition.triggers?.length) && !agents?.agents.deliver)
+				throw new Error("Agents with triggers need the agent integration");
 			for (let i = 0; i < triggers.length; i++)
 				for (const b of triggers.slice(i + 1)) {
 					const a = triggers[i]!;
 					if (
 						!a.spec.observe &&
 						!b.spec.observe &&
-						a.workflow !== b.workflow &&
+						a.owner !== b.owner &&
 						a.spec.event === b.spec.event &&
 						specificity(a.spec) === specificity(b.spec) &&
 						filtersOverlap(a.spec.filter, b.spec.filter)
 					)
-						throw new Error(
-							`Ambiguous trigger owners: ${a.workflow.name}, ${b.workflow.name} on ${a.spec.event}`,
-						);
+						throw new Error(`Ambiguous trigger owners: ${a.name}, ${b.name} on ${a.spec.event}`);
 				}
 			for (const plugin of config.plugins) await plugin.init?.();
 			await config.resources?.open();

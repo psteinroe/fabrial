@@ -11,18 +11,40 @@ export function hasIngress(
 	return state?.ingestedDedupeIds?.some((entry) => entry.kind === kind && entry.id === id) ?? false;
 }
 
-/** Clear interaction-scoped data, retaining only bounded ingress receipts. */
+/** Clear interaction-scoped data, retaining only bounded ingress receipts and follows. */
 export function clearInteraction(state: ThreadRoutingState | null): ThreadRoutingState | null {
-	return state?.ingestedDedupeIds?.length
+	return state?.ingestedDedupeIds?.length || state?.follows?.length
 		? {
 				interactionId: null,
 				handlerExecutionId: null,
 				agentActive: false,
 				statusMessageId: null,
 				bufferedReplies: [],
-				ingestedDedupeIds: state.ingestedDedupeIds.slice(-TOMBSTONE_LIMIT),
+				...(state.ingestedDedupeIds
+					? { ingestedDedupeIds: state.ingestedDedupeIds.slice(-TOMBSTONE_LIMIT) }
+					: {}),
+				...(state.follows?.length ? { follows: state.follows } : {}),
 			}
 		: null;
+}
+
+type Follow = NonNullable<ThreadRoutingState["follows"]>[number];
+
+/** Add a follow record for a conversation (idempotent). */
+export function addFollow(state: ThreadRoutingState | null, follow: Follow): ThreadRoutingState {
+	const base = state ?? {
+		interactionId: null,
+		handlerExecutionId: null,
+		agentActive: false,
+		statusMessageId: null,
+		bufferedReplies: [],
+	};
+	if (base.follows?.some((f) => f.session === follow.session && f.agent === follow.agent))
+		return base;
+	return {
+		...base,
+		follows: [...(base.follows ?? []), { session: follow.session, agent: follow.agent }],
+	};
 }
 
 export function rememberIngress(

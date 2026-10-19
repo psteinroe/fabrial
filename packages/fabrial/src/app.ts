@@ -118,6 +118,8 @@ export interface CoreConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[
 	resources?: { open(): Promise<void> | void; close(): Promise<void> };
 	plugins: P;
 	workflows: readonly AnyWorkflow[];
+	/** Agents whose triggers receive events. */
+	routedAgents?: readonly import("./agent.ts").Agent[];
 	/** Known users only; groups are resolved directly by reference in access/approval options. */
 	identity?: readonly UserDefinition[];
 	logger?: Logger;

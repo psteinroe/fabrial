@@ -896,6 +896,14 @@ export function fakeAgents(
 							sent.push({ ...request, agent: agent.name });
 							return { requestId: request.requestId, session: request.session };
 						})),
+				async deliver(agent, request) {
+					if (!sent.some((s) => s.requestId === request.requestId && s.agent === agent.name))
+						sent.push(clone({ ...request, agent: agent.name }));
+					return { requestId: request.requestId, session: request.session };
+				},
+				async conversations(session) {
+					return [...new Set(sent.filter((s) => s.session === session).map((s) => s.agent))];
+				},
 			},
 			state: options.state ?? state,
 			evaluator: {
@@ -919,18 +927,21 @@ export function createTestRuntime(
 /** Build an app from an instance with explicit test ports (in-memory runtime, fake or real chat, agents). */
 export function testApp<const P extends readonly import("./plugin.ts").AnyPlugin[]>(
 	instance: import("./instance.ts").Fabrial<P>,
-	config: import("./instance.ts").AppConfig & {
+	config: Omit<import("./instance.ts").AppConfig, "agents"> & {
 		runtime: DurableRuntime;
 		chat?: ChatIntegration;
 		agents?: AgentIntegration;
+		/** `f.app({ agents })`: agents whose triggers receive events. */
+		routedAgents?: import("./instance.ts").AppConfig["agents"];
 		reservationTimeout?: import("./runtime.ts").DurationInput;
 		/** Store of dynamic subscriptions. Default: in memory. */
 		subscriptionStore?: SubscriptionStore;
 	},
 ): import("./app.ts").App<import("./instance.ts").ClientsOf<P>> {
-	const { workflows, subscriptions, logger, subscriptionStore, ...overrides } = config;
+	const { workflows, routedAgents, subscriptions, logger, subscriptionStore, ...overrides } =
+		config;
 	return internal(instance).app(
-		{ workflows, subscriptions, logger },
+		{ workflows, agents: routedAgents, subscriptions, logger },
 		{ ...overrides, subscriptionStore: subscriptionStore ?? new MemorySubscriptions() },
 	) as never;
 }
@@ -944,9 +955,10 @@ function internal(instance: object): import("./instance.ts").InternalInstance {
 /** Build an isolated in-memory app from the same typed catalog as production. */
 export function createTestApp<const P extends readonly import("./plugin.ts").AnyPlugin[]>(
 	instance: import("./instance.ts").Fabrial<P>,
-	config: import("./instance.ts").AppConfig & {
+	config: Omit<import("./instance.ts").AppConfig, "agents"> & {
 		now?: number | Date;
 		agents?: AgentIntegration;
+		routedAgents?: import("./instance.ts").AppConfig["agents"];
 	},
 ) {
 	const { now, ...appConfig } = config;
@@ -1082,10 +1094,10 @@ export function createIntegrationApp<const P extends readonly import("./plugin.t
 		concurrency?: number;
 	},
 ): import("./app.ts").App<import("./instance.ts").ClientsOf<P>> {
-	const { workflows, subscriptions, logger, models, modelRetries = false } = config;
+	const { workflows, agents: routed, subscriptions, logger, models, modelRetries = false } = config;
 	const poll = config.pollIntervalMs ?? 20;
 	return internal(instance).app(
-		{ workflows, subscriptions, logger },
+		{ workflows, agents: routed, subscriptions, logger },
 		{
 			models: scripted.get(models),
 			agentSettings: {

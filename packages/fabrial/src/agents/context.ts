@@ -192,9 +192,10 @@ export async function fields(
 			if (!api) throw new Error("Prompt sections cannot send");
 			const replyTo =
 				options.replyTo && "post" in options.replyTo ? options.replyTo.ref : options.replyTo;
+			const home = options.home && "post" in options.home ? options.home.ref : options.home;
 			return (await operation(id, "send", [
 				agent.name,
-				cloneJson({ ...options, replyTo }) as unknown as Json,
+				cloneJson({ ...options, replyTo, home }) as unknown as Json,
 			])) as SendReceipt;
 		},
 		subscribe: async (id, resource, options) => {

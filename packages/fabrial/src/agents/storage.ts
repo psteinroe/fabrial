@@ -42,6 +42,10 @@ export class PostgresStorage extends MemoryStorage {
 			session_key text NOT NULL REFERENCES fabrial_pi.sessions(key),
 			seq bigint NOT NULL, writes text NOT NULL, PRIMARY KEY (session_key, seq)
 		)`;
+			// Conversations that received sent input, by Session key: a thread's followers are found by its key.
+			await sql`CREATE TABLE IF NOT EXISTS fabrial_pi.conversations (
+			session_key text NOT NULL, agent text NOT NULL, PRIMARY KEY (session_key, agent)
+		)`;
 		});
 	}
 

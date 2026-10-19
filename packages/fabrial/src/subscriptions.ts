@@ -495,6 +495,7 @@ export function deliveryWorkflow(
 								attributes: { resource: notification.resource, ...notification.attributes },
 							}),
 							delivery: deliveryFor("notification", priority),
+							follow: null,
 							metadata: {
 								interactionId: requestId,
 								origin: execution.metadata.origin,

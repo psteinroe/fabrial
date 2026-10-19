@@ -3,11 +3,12 @@ import type { Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { AgentRef, InvocationMetadata } from "./runtime.ts";
 import type { Schema } from "./schema.ts";
-import type { SendOptions, SendReceipt } from "./send.ts";
+import type { AgentSession, SendOptions, SendReceipt } from "./send.ts";
 import type { ResourceRef } from "./plugin.ts";
 import type { SubscribeOptions, SubscriptionReceipt, UnsubscribeReceipt } from "./subscriptions.ts";
 import type { StateDefinition, ToolStateHandle } from "./state.ts";
-import type { ChatMessage, MessageRef, OutboundMessage } from "./thread.ts";
+import type { ChatMessage, MessageRef, OutboundMessage, Surface } from "./thread.ts";
+import type { TriggerPayload, TriggerSpec } from "./trigger.ts";
 import type { AnyWorkflow, WorkflowInput, WorkflowOutput } from "./workflow.ts";
 
 export type ThinkingLevel = "off" | "low" | "medium" | "high";
@@ -101,9 +102,17 @@ export interface Toolkit extends ToolkitDefinition<any> {
 	readonly kind: "fabrial.toolkit";
 }
 
+/** The event an agent's `session` function receives: its triggers' payloads, or any JSON for `ctx.send`. */
+export type AgentEvent<TTriggers extends readonly TriggerSpec<any>[]> = [
+	TriggerPayload<TTriggers[number]>,
+] extends [never]
+	? any
+	: TriggerPayload<TTriggers[number]>;
+
 export interface AgentDefinition<
 	TPluginId extends string = string,
 	TClients = Record<string, unknown>,
+	TTriggers extends readonly TriggerSpec<any>[] = readonly TriggerSpec<any>[],
 > {
 	/** Stable: the continuation key; labels traces and progress. */
 	name: string;
@@ -121,6 +130,21 @@ export interface AgentDefinition<
 	/** Agents this one delegates to, one tool each: an agent, `"self"` (a copy of this one), or options. */
 	subagents?: readonly SubagentEntry[];
 	limits?: SubagentLimits;
+	/**
+	 * Events delivered to one of the agent's conversations, like workflow triggers (plugin helpers such as
+	 * `slack.mentioned({ channel })`). They compete with workflow triggers: the most specific one wins.
+	 */
+	triggers?: TTriggers;
+	/**
+	 * Which conversation an event reaches: one per thread (`"thread"`, default), one per channel (`"channel"`),
+	 * or the app's key computed from the event (e.g. `(issue) => \`ticket:${issue.id}\``).
+	 */
+	session?: AgentSession<AgentEvent<TTriggers>>;
+	/**
+	 * Where conversations started by events without a thread (a Sentry issue, a schedule) live, e.g.
+	 * `slack.channel("C_BUGS")`: the first final reply creates the thread, which the conversation follows.
+	 */
+	home?: Surface;
 }
 
 /** A subagent with options. */
@@ -189,6 +213,24 @@ export function defineAgent(definition: AgentDefinition<string, any>, scope: obj
 	if (typeof definition.description !== "string" || !definition.description.trim())
 		throw new Error(`Agent ${definition.name} needs a description`);
 	if (definition.model !== undefined) parseModel(definition.model);
+	for (const spec of definition.triggers ?? []) {
+		if ((spec as TriggerSpec | undefined)?.kind !== "fabrial.trigger")
+			throw new Error(`Agent ${definition.name}: triggers must be plugin triggers`);
+		if (spec.observe)
+			throw new Error(
+				`Agent ${definition.name}: observe triggers belong on workflows; an agent's trigger receives the event`,
+			);
+	}
+	const { session, home } = definition;
+	if (
+		session !== undefined &&
+		session !== "thread" &&
+		session !== "channel" &&
+		typeof session !== "function"
+	)
+		throw new Error(`Agent ${definition.name}: session must be "thread", "channel", or a function`);
+	if (home !== undefined && home?.kind !== "thread" && home?.kind !== "channel")
+		throw new Error(`Agent ${definition.name}: home must be a thread or channel surface`);
 	const agent: Agent = { kind: "fabrial.agent", name: definition.name, definition };
 	validateSubagents(agent);
 	let agents = definedAgents.get(scope);

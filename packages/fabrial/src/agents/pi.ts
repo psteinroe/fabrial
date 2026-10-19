@@ -79,7 +79,15 @@ import {
 	startChild,
 	type BridgeFrame,
 } from "./context.ts";
-import { prepareSend, threadSession, type Delivery, type SendOptions } from "../send.ts";
+import {
+	follow,
+	prepareSend,
+	threadSession,
+	type ConversationKey,
+	type Delivery,
+	type SendOptions,
+	type SendRequest,
+} from "../send.ts";
 import {
 	prepareSubscribe,
 	prepareUnsubscribe,
@@ -1399,8 +1407,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			}
 			if (method === "send") {
 				const [agent, options] = args as [string, SendOptions];
-				const request = await execution.step("fabrial:pi:send", () =>
-					prepareSend(
+				const ref = agents.get(agent) ?? { kind: "fabrial.agent" as const, name: agent };
+				const request = await execution.step("fabrial:pi:send", async () => {
+					const prepared = await prepareSend(
 						host,
 						execution.metadata,
 						{
@@ -1412,18 +1421,29 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 							},
 						},
 						`${execution.executionId}:send`,
+						ref,
 						options,
-					),
-				);
-				return port.send(execution, "send", { kind: "fabrial.agent", name: agent }, request);
+					);
+					await follow(host, prepared.follow, { session: prepared.session, agent });
+					return prepared;
+				});
+				return port.send(execution, "send", ref, request);
 			}
 			return execution.step("fabrial:pi:effect", async () => {
 				const io = await thread(execution);
 				if (!io) throw new Error("Managed Pi thread operation has no thread");
-				if (method === "post")
-					return cloneJson(
-						await io.post(args[0] as Parameters<ThreadIO["post"]>[0]),
-					) as unknown as Json;
+				if (method === "post") {
+					const posted = await io.post(args[0] as Parameters<ThreadIO["post"]>[0]);
+					// A reply to a channel home created the conversation's thread: follow it.
+					const conversation = execution.metadata.follow as ConversationKey | undefined;
+					if (conversation && execution.metadata.replyTo?.kind === "channel")
+						await follow(
+							host,
+							{ kind: "thread", provider: posted.provider, threadId: posted.threadId },
+							conversation,
+						);
+					return cloneJson(posted) as unknown as Json;
+				}
 				if (method === "update") {
 					await io.update(
 						args[0] as unknown as Parameters<ThreadIO["update"]>[0],
@@ -1437,17 +1457,44 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			});
 		},
 	};
+	/** Who follows a thread by its session key: conversations that received sent input. */
+	const register = (session: string, agent: string) =>
+		options.sql`INSERT INTO fabrial_pi.conversations (session_key, agent) VALUES (${session}, ${agent})
+			ON CONFLICT DO NOTHING`;
+	const sessionInput = (agent: AgentRef, request: SendRequest): SessionInput => ({
+		kind: "input",
+		agent: agent.name,
+		requestId: request.requestId,
+		content: request.content,
+		delivery: request.delivery,
+		metadata: request.metadata,
+	});
 	const port: AgentPort = {
 		workflows: () => [session, effect],
+		async conversations(key) {
+			const rows = await options.sql<{ agent: string }[]>`SELECT agent FROM fabrial_pi.conversations
+				WHERE session_key = ${key} ORDER BY agent`;
+			return rows.map((row) => row.agent);
+		},
+		async deliver(agent, request) {
+			if (!agents.has(agent.name))
+				throw new Error(
+					`Agent ${agent.name} is not installed; defineAgent must be evaluated before app.start()`,
+				);
+			await register(request.session, agent.name);
+			await signalSession(
+				request.session,
+				request.requestId,
+				sessionInput(agent, request),
+				request.metadata,
+			);
+			return { requestId: request.requestId, session: request.session };
+		},
 		async send(execution, id, agent, request) {
-			const input: SessionInput = {
-				kind: "input",
-				agent: agent.name,
-				requestId: request.requestId,
-				content: request.content,
-				delivery: request.delivery,
-				metadata: request.metadata,
-			};
+			await execution.step(`fabrial:pi:register:${id}`, () =>
+				register(request.session, agent.name).then(() => undefined),
+			);
+			const input = sessionInput(agent, request);
 			await execution.signalWithStart(`fabrial:pi:deliver:${id}`, {
 				workflow: SESSION_WORKFLOW,
 				key: request.session,

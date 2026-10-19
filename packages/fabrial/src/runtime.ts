@@ -266,6 +266,11 @@ export type ThreadRoutingState = JsonObject & {
 	requesterId?: string;
 	participantIds?: string[];
 	cancellationIds?: string[];
+	/**
+	 * Conversations following this thread whose session key isn't the thread's: its messages reach them. Kept
+	 * across interactions (subject to the thread TTL).
+	 */
+	follows?: { session: string; agent: string }[];
 };
 
 /** Port implemented by the chat module. */
@@ -309,6 +314,13 @@ export interface AgentPort {
 		metadata: InvocationMetadata,
 		result: ExecutionResult,
 	): Promise<void>;
+	/** Deliver input from ingress, outside any execution: `signalWithStart` to the conversation's Session. */
+	deliver?(
+		agent: AgentRef,
+		request: import("./send.ts").SendRequest,
+	): Promise<import("./send.ts").SendReceipt>;
+	/** Agents with a conversation in a Session that received sent input: who follows a thread by its key. */
+	conversations?(session: string): Promise<string[]>;
 	/** A reply was buffered in a thread whose interaction an agent call drives: steer it. */
 	reply?(thread: ThreadRef, interactionId: string, dedupeId: string): Promise<void>;
 }
