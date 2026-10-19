@@ -45,6 +45,8 @@ export function setup(state: StateAdapter = createMemoryState()) {
 			emit: vi.fn(),
 			invoke: vi.fn(),
 			cancel: vi.fn(async () => true),
+			signalWithStart: vi.fn(),
+			signal: vi.fn(),
 			start: vi.fn(),
 			stop: vi.fn(),
 		},

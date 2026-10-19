@@ -57,6 +57,29 @@ export type ExecutionResult =
 	| { status: "failed"; error: string }
 	| { status: "cancelled"; reason: string };
 
+/**
+ * Data sent to one execution (Conductor item 12). `id` dedupes: sending an id to an execution again stores
+ * it once. Delivery is at least once per id, so handlers must be idempotent by `id`.
+ */
+export interface RuntimeSignal {
+	name: string;
+	id: string;
+	payload: Json;
+}
+
+/**
+ * Signal the non-terminal execution of `workflow` for `key`, or start one that receives the signal first.
+ * At most one non-terminal execution exists per (workflow, key); a settled one releases its key. `input`
+ * and `metadata` are used only when an execution starts. Keyed starts are independent (not cancelled with
+ * the caller) and ignore the workflow's `mutex`: the key already serializes them.
+ */
+export interface SignalWithStartOptions {
+	workflow: string;
+	key: string;
+	signal: RuntimeSignal;
+	input?: Json;
+}
+
 /** One running attempt of a workflow execution, as seen by core. Replays from the top on every resume. */
 export interface DurableExecution {
 	readonly executionId: string;
@@ -101,6 +124,23 @@ export interface DurableExecution {
 		workflow: string,
 		input: Json,
 		options?: { metadata?: Partial<InvocationMetadata>; dedupeKey?: string; mutex?: string },
+	): Promise<string>;
+	/**
+	 * Listen for signals by name, once per name and attempt; register again on every replay. Signals stored
+	 * before the listener registers are delivered first, in order, then later ones while the handler runs,
+	 * one at a time. A signal counts as delivered when `handler` returns; a throwing handler fails the
+	 * attempt. Signals that arrive while the execution is suspended wait for its next attempt (they don't
+	 * wake it). If listened-for signals are undelivered when the workflow handler returns, the execution is
+	 * re-queued instead of settled, and its next attempt receives them.
+	 */
+	onSignal(
+		name: string,
+		handler: (payload: Json, info: { id: string }) => Promise<void> | void,
+	): void;
+	/** Memoized per id like `start`. Starts inherit this execution's metadata, merged with `metadata`. */
+	signalWithStart(
+		id: string,
+		options: SignalWithStartOptions & { metadata?: Partial<InvocationMetadata> },
 	): Promise<string>;
 	/** Emit an event from inside an execution (not memoized; wrap in `step` if needed). */
 	emit(
@@ -171,6 +211,12 @@ export interface DurableRuntime {
 		options: { metadata: InvocationMetadata; dedupeKey?: string },
 	): Promise<string>;
 	cancel(executionId: string, reason?: string): Promise<boolean>;
+	/** See `SignalWithStartOptions`. Returns the id of the execution that received the signal. */
+	signalWithStart(
+		options: SignalWithStartOptions & { metadata: InvocationMetadata },
+	): Promise<string>;
+	/** Store a signal for an execution. False if it is settled or unknown. */
+	signal(executionId: string, signal: RuntimeSignal): Promise<boolean>;
 	start(): Promise<void>;
 	stop(): Promise<void>;
 }

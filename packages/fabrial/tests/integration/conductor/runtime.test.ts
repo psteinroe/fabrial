@@ -1719,3 +1719,115 @@ test("stop drains a fetch that delivers queued executions after worker abort", a
 	await expect.poll(() => completed(id!), poll).toBe(true);
 	expect(handlerCalls).toBe(1);
 });
+
+/** Collects "input" signals until one carries "stop". */
+function session(received: Json[]): RuntimeWorkflow {
+	return workflow("session", async (_input, ctx) => {
+		await new Promise<void>((resolve) =>
+			ctx.onSignal("input", (payload) => {
+				received.push(payload);
+				if (payload === "stop") resolve();
+			}),
+		);
+		return received;
+	});
+}
+const input = (id: string, payload: Json = id) => ({ name: "input", id, payload });
+async function output(id: string): Promise<Json> {
+	const [row] = await sql<{ result: { result: Json } }[]>`
+		select result from pgconductor._private_steps where execution_id = ${id}::uuid and key = '__fabrial:output'`;
+	return row?.result.result ?? null;
+}
+
+test("a running handler receives signals from outside; stored signals arrive first, in order, deduped by id", async () => {
+	const received: Json[] = [];
+	const runtime = await setup([session(received)]);
+	const start = { workflow: "session", key: "thread-1", metadata };
+	const id = await runtime.signalWithStart({ ...start, signal: input("1", "a") });
+	expect(await runtime.signal(id, input("2", "b"))).toBe(true);
+	expect(await runtime.signalWithStart({ ...start, signal: input("1", "dup") })).toBe(id);
+	await expect.poll(() => received, poll).toEqual(["a", "b"]);
+	const [running] = await sql<{ locked: boolean }[]>`
+		select locked_by is not null as locked from pgconductor._private_executions where id = ${id}::uuid`;
+	expect(running?.locked).toBe(true);
+	expect(await runtime.signal(id, input("2", "dup"))).toBe(true);
+	expect(await runtime.signal(id, input("3", "stop"))).toBe(true);
+	await expect.poll(() => completed(id), poll).toBe(true);
+	expect(received).toEqual(["a", "b", "stop"]);
+	expect(await output(id)).toEqual(["a", "b", "stop"]);
+	expect(await runtime.signal(id, input("4"))).toBe(false);
+});
+
+test("concurrent signalWithStart calls start exactly one execution per key; ctx.signalWithStart is memoized and inherits metadata", async () => {
+	const received: Json[] = [];
+	const seen: InvocationMetadata[] = [];
+	let replays = 0;
+	const runtime = await setup([
+		session(received),
+		workflow("recorder", async (_input, ctx) => {
+			seen.push(ctx.metadata);
+			await new Promise<void>((resolve) => ctx.onSignal("input", () => resolve()));
+		}),
+		workflow("caller", async (_input, ctx) => {
+			const options = { workflow: "recorder", key: "k", metadata: { ownsThread: false } };
+			const first = await ctx.signalWithStart("send", { ...options, signal: input("a") });
+			if (++replays === 1) await ctx.sleep("pause", 1);
+			const again = await ctx.signalWithStart("send", { ...options, signal: input("b") });
+			return [first, again];
+		}),
+	]);
+	const send = (id: string) =>
+		runtime.signalWithStart({ workflow: "session", key: "thread-1", signal: input(id), metadata });
+	const ids = await Promise.all(Array.from({ length: 10 }, (_, i) => send(`s${i}`)));
+	expect(new Set(ids).size).toBe(1);
+	const [count] = await sql<{ count: number }[]>`
+		select count(*)::int as count from pgconductor._private_executions where task_key = 'session'`;
+	expect(count?.count).toBe(1);
+	await send("stop");
+	await expect.poll(() => completed(ids[0]!), poll).toBe(true);
+	expect(new Set(received.slice(0, 10))).toEqual(new Set(ids.map((_, i) => `s${i}`)));
+	// Settlement releases the key.
+	const next = await send("next");
+	expect(next).not.toBe(ids[0]);
+	await send("stop");
+	await expect.poll(() => completed(next), poll).toBe(true);
+
+	const caller = await runtime.invoke("caller", null, { metadata });
+	await expect.poll(() => completed(caller), poll).toBe(true);
+	const [first, again] = (await output(caller)) as string[];
+	expect(again).toBe(first);
+	await expect.poll(() => completed(first!), poll).toBe(true);
+	expect(seen[0]).toEqual({ ...metadata, ownsThread: false });
+});
+
+test("signals arriving while the handler returns re-queue it; the final attempt's output is kept", async () => {
+	let attempts = 0;
+	const runtime = await setup([
+		workflow(
+			"returning",
+			async (_input, ctx) => {
+				attempts++;
+				const received: Json[] = [];
+				// Signals arrive on worker polls, so an attempt must run until one delivers.
+				await new Promise<void>((resolve) =>
+					ctx.onSignal("input", (payload) => {
+						received.push(payload);
+						resolve();
+					}),
+				);
+				// Stored as this attempt stops reading signals: settlement re-queues it.
+				if (attempts === 1) await runtime.signal(ctx.executionId, input("late"));
+				return { attempts, received };
+			},
+			{ retries: { maxAttempts: 1 } },
+		),
+	]);
+	const id = await runtime.signalWithStart({
+		workflow: "returning",
+		key: "k",
+		signal: input("early"),
+		metadata,
+	});
+	await expect.poll(() => completed(id), poll).toBe(true);
+	expect(await output(id)).toEqual({ attempts: 2, received: ["late"] });
+});

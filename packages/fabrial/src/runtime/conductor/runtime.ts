@@ -8,7 +8,9 @@ import {
 	type Json,
 	type JsonObject,
 	type RuntimeEvent,
+	type RuntimeSignal,
 	type RuntimeWorkflow,
+	type SignalWithStartOptions,
 	type WaitBranch,
 	type WaitForAnyResult,
 	type ExecutionResult,
@@ -47,7 +49,7 @@ type Carrier = {
 	dispatchOwner?: { workflow: string; event: string };
 	parent?: string;
 };
-type NativeExecution = { id: string; locked_by: string; task_key: string };
+type NativeExecution = { id: string; locked_by: string; task_key: string; queue: string };
 // SHIM(conductor#3): today's context hides execution identity. Keep the private access in one place;
 // core's per-attempt wrapper still runs on every replay. Never catch Conductor's hang-up control flow.
 function nativeExecution(ctx: TaskContext): NativeExecution {
@@ -65,9 +67,13 @@ function release(ctx: TaskContext, ms: number): Promise<never> {
 	});
 	return new Promise(() => {});
 }
-async function rawOutput(ctx: TaskContext, output: Json): Promise<void> {
-	// SHIM(conductor#7): independent native executions don't retain their output.
-	await ctx.step("__fabrial:output", () => output);
+async function rawOutput(sql: postgres.Sql, ctx: TaskContext, output: Json): Promise<void> {
+	// SHIM(conductor#7): independent native executions don't retain their output. Overwrite, not
+	// memoize: an attempt re-queued for undelivered signals discards its result and returns again.
+	const { id, queue } = nativeExecution(ctx);
+	await sql`insert into pgconductor._private_steps (execution_id, queue, key, result)
+		values (${id}::uuid, ${queue}, '__fabrial:output', ${sql.json({ result: output })})
+		on conflict (execution_id, key) do update set result = excluded.result`;
 }
 function carrier(payload: JsonObject): Carrier {
 	return payload[RESERVED] as unknown as Carrier;
@@ -308,7 +314,7 @@ class ConductorRuntime implements DurableRuntime {
 						const payload = event.payload!;
 						const execution = this.execution(definition.name, ctx, carrier(payload).metadata);
 						const output = await definition.handler(payload.input!, execution);
-						await rawOutput(ctx, output ?? null);
+						await rawOutput(this.sql, ctx, output ?? null);
 						return { output: output ?? null };
 					},
 				),
@@ -534,6 +540,27 @@ class ConductorRuntime implements DurableRuntime {
 		return true;
 	}
 
+	async signal(executionId: string, signal: RuntimeSignal): Promise<boolean> {
+		this.assertReady();
+		return this.client!.signal(executionId, signal);
+	}
+	async signalWithStart(
+		options: SignalWithStartOptions & { metadata: InvocationMetadata },
+	): Promise<string> {
+		this.assertReady();
+		return this.client!.signalWithStart(this.keyedStart(options, options.metadata));
+	}
+	private keyedStart(options: SignalWithStartOptions, metadata: InvocationMetadata) {
+		this.definition(options.workflow);
+		return {
+			task: options.workflow,
+			queue: this.queue,
+			key: options.key,
+			signal: options.signal,
+			input: { input: options.input ?? null, [RESERVED]: { metadata } },
+		} as unknown as Parameters<Conductor["signalWithStart"]>[0];
+	}
+
 	async start(): Promise<void> {
 		if (!this.orchestrator) throw new Error("Register workflows before starting Conductor");
 		if (this.running) return;
@@ -704,6 +731,13 @@ class ConductorRuntime implements DurableRuntime {
 				if (winner.result.status === "completed") return winner.result.output;
 				throw new ExecutionError(child, winner.result);
 			},
+			onSignal: (name, handler) =>
+				raw.onSignal(name, (payload, info) => handler(payload as Json, { id: info.id })),
+			signalWithStart: (id, options) =>
+				raw.signalWithStart(
+					operationId(id),
+					this.keyedStart(options, mergeMetadata(metadata, options.metadata)),
+				),
 			emit: (event, payload, options) =>
 				this.emit(event, payload, {
 					id: options?.id,

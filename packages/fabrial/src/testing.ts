@@ -21,7 +21,9 @@ import type {
 	ExecutionResult,
 	InvocationMetadata,
 	RuntimeEvent,
+	RuntimeSignal,
 	RuntimeWorkflow,
+	SignalWithStartOptions,
 	StatePort,
 	ThreadIO,
 	ThreadRoutingState,
@@ -56,6 +58,61 @@ interface Run {
 	result?: ExecutionResult;
 	settledAt?: number;
 	mutex?: string;
+	/** Set by signalWithStart; held in `keys` until settlement. */
+	key?: string;
+	signals: (RuntimeSignal & { delivered: boolean })[];
+	inbox?: Inbox;
+}
+type SignalHandler = (payload: Json, info: { id: string }) => Promise<void> | void;
+
+/** Delivers one attempt's signals to its handlers, one at a time in stored order (Conductor's SignalInbox). */
+class Inbox {
+	readonly handlers = new Map<string, SignalHandler>();
+	failure?: Error;
+	private pumping?: Promise<void>;
+	private closed = false;
+	constructor(private readonly run: Run) {}
+	listen(name: string, handler: SignalHandler): void {
+		if (this.closed)
+			throw new Error(`Cannot listen for signal "${name}" after the handler returned`);
+		if (this.handlers.has(name))
+			throw new Error(`A handler for signal "${name}" is already registered`);
+		this.handlers.set(name, handler);
+		this.pump();
+	}
+	/** Undelivered signals this attempt listens for. */
+	pending(): boolean {
+		return this.run.signals.some((signal) => !signal.delivered && this.handlers.has(signal.name));
+	}
+	pump(): void {
+		if (this.pumping || this.closed || !this.pending()) return;
+		this.pumping = (async () => {
+			let signal;
+			while (
+				!this.closed &&
+				(signal = this.run.signals.find((s) => !s.delivered && this.handlers.has(s.name)))
+			) {
+				try {
+					await this.handlers.get(signal.name)!(clone(signal.payload), { id: signal.id });
+				} catch (error) {
+					this.failure ??= new Error(
+						`Signal handler for "${signal.name}" failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
+					this.closed = true;
+					return;
+				}
+				signal.delivered = true;
+			}
+		})().finally(() => {
+			this.pumping = undefined;
+			this.pump();
+		});
+	}
+	/** Stop delivering after the running handler returns. */
+	async close(): Promise<void> {
+		this.closed = true;
+		await this.pumping;
+	}
 }
 
 /** Replaying, in-memory port implementation. Emit/invoke enqueue work; await flush() to run until idle,
@@ -68,6 +125,8 @@ export class MemoryRuntime implements DurableRuntime {
 	private readonly emitKeys = new Set<string>();
 	private readonly invocationKeys = new Map<string, string>();
 	private readonly mutexes = new Map<string, string>();
+	/** (workflow, key) → its non-terminal execution. */
+	private readonly keys = new Map<string, string>();
 	private readonly queue = new Set<string>();
 	private readonly settlements = new Set<string>();
 	private clock: number;
@@ -164,6 +223,14 @@ export class MemoryRuntime implements DurableRuntime {
 		input: Json,
 		options: { metadata: InvocationMetadata; dedupeKey?: string },
 	): Promise<string> {
+		return this.create(workflow, input, options);
+	}
+	/** Synchronous, so that signalWithStart's lookup and start are atomic. */
+	private create(
+		workflow: string,
+		input: Json,
+		options: { metadata: InvocationMetadata; dedupeKey?: string; key?: string },
+	): string {
 		const invocationKey =
 			options.dedupeKey === undefined ? undefined : JSON.stringify([workflow, options.dedupeKey]);
 		if (invocationKey !== undefined && this.invocationKeys.has(invocationKey))
@@ -182,8 +249,11 @@ export class MemoryRuntime implements DurableRuntime {
 			children: new Set(),
 			attempts: 0,
 			status: "pending",
+			key: options.key,
+			signals: [],
 		};
-		run.mutex = definition.mutex?.(input, options.metadata);
+		// Like Conductor, keyed starts ignore the workflow mutex: the key serializes them.
+		if (options.key === undefined) run.mutex = definition.mutex?.(input, options.metadata);
 		this.runs.set(id, run);
 		this.queue.add(id);
 		if (invocationKey !== undefined) this.invocationKeys.set(invocationKey, id);
@@ -196,6 +266,39 @@ export class MemoryRuntime implements DurableRuntime {
 		for (const child of run.children) await this.cancel(child, reason);
 		if (run.status !== "running") await this.settle(run, { status: "cancelled", reason });
 		return true;
+	}
+	async signal(executionId: string, signal: RuntimeSignal): Promise<boolean> {
+		const run = this.runs.get(executionId);
+		if (!run || run.result) return false;
+		this.store(run, signal);
+		return true;
+	}
+	async signalWithStart(
+		options: SignalWithStartOptions & { metadata: InvocationMetadata },
+	): Promise<string> {
+		if (!options.key.trim()) throw new Error("signalWithStart requires a non-empty key");
+		if (!this.workflows.has(options.workflow))
+			throw new Error(`Unknown workflow: ${options.workflow}`);
+		const key = JSON.stringify([options.workflow, options.key]);
+		let id = this.keys.get(key);
+		if (id === undefined) {
+			id = this.create(options.workflow, options.input ?? null, {
+				metadata: options.metadata,
+				key: options.key,
+			});
+			this.keys.set(key, id);
+		}
+		this.store(this.runs.get(id)!, options.signal);
+		return id;
+	}
+	private store(run: Run, signal: RuntimeSignal): void {
+		if (run.signals.some((stored) => stored.id === signal.id)) return;
+		run.signals.push({ ...clone(signal), delivered: false });
+		if (run.status === "running") run.inbox?.pump();
+	}
+	/** Signals stored for an execution, in delivery order. */
+	signals(executionId: string): (RuntimeSignal & { delivered: boolean })[] {
+		return clone(this.runs.get(executionId)?.signals ?? []);
 	}
 	result(id: string): ExecutionResult | undefined {
 		return clone(this.runs.get(id)?.result);
@@ -281,6 +384,10 @@ export class MemoryRuntime implements DurableRuntime {
 		run.waits.clear();
 		this.queue.delete(run.id);
 		this.settlements.add(run.id);
+		if (run.key !== undefined) {
+			const key = JSON.stringify([run.workflow.name, run.key]);
+			if (this.keys.get(key) === run.id) this.keys.delete(key);
+		}
 		for (const waiting of this.runs.values())
 			if (
 				(waiting.status === "suspended" || waiting.status === "running") &&
@@ -294,15 +401,29 @@ export class MemoryRuntime implements DurableRuntime {
 	}
 	private async attempt(run: Run) {
 		run.status = "running";
+		const inbox = (run.inbox = new Inbox(run));
 		try {
-			const output = await run.workflow.handler(clone(run.input), this.execution(run));
+			let output;
+			try {
+				output = await run.workflow.handler(clone(run.input), this.execution(run));
+			} finally {
+				await inbox.close();
+			}
+			if (inbox.failure) throw inbox.failure;
+			// Listened-for signals that arrived while the handler returned re-queue it, not as an attempt.
+			if (!run.controller.signal.aborted && inbox.pending()) {
+				run.status = "pending";
+				this.queue.add(run.id);
+				return;
+			}
 			await this.settle(
 				run,
 				run.controller.signal.aborted
 					? { status: "cancelled", reason: String(run.controller.signal.reason) }
 					: { status: "completed", output: output ?? null },
 			);
-		} catch (error) {
+		} catch (caught) {
+			const error = inbox.failure ?? caught;
 			if (error instanceof Suspension) run.status = "suspended";
 			else if (error instanceof Cancellation || run.controller.signal.aborted)
 				await this.settle(run, {
@@ -319,11 +440,13 @@ export class MemoryRuntime implements DurableRuntime {
 				});
 		} finally {
 			if (run.mutex) this.mutexes.delete(run.mutex);
+			run.inbox = undefined;
 		}
 	}
 	private execution(run: Run): DurableExecution {
 		const boundary = () => {
 			if (run.controller.signal.aborted) throw new Cancellation();
+			if (run.inbox?.failure) throw run.inbox.failure;
 		};
 		const step: DurableExecution["step"] = async (id, fn) => {
 			boundary();
@@ -451,6 +574,14 @@ export class MemoryRuntime implements DurableRuntime {
 					);
 				return result.result.output;
 			},
+			onSignal: (name, handler) => run.inbox!.listen(name, handler),
+			signalWithStart: (id, { metadata, ...options }) =>
+				step(id, () =>
+					this.signalWithStart({
+						...options,
+						metadata: { ...run.metadata, ...metadata } as InvocationMetadata,
+					}),
+				),
 			emit: (event, payload, options = {}) =>
 				this.emit(event, payload, {
 					...options,
