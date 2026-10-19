@@ -15,6 +15,24 @@ import {
 const options = { botToken: "xoxb-test", signingSecret: "secret", workspace: "acme" };
 
 describe("Slack plugin", () => {
+	it("slack_post posts to a channel with the canonical client", async () => {
+		const plugin = slack(options);
+		const client = plugin.clients!({}).slack;
+		const post = vi
+			.spyOn(client.chat, "postMessage")
+			.mockResolvedValue({ ok: true, channel: "C1", ts: "1700000000.000100" } as never);
+		const [tool] = plugin.toolkit({ slack: client }).tools;
+		expect(tool!.name).toBe("slack_post");
+		const run = (input: { channel: string; text: string }) =>
+			tool!.run(input, { clients: { slack: client } } as never);
+		expect(await run({ channel: "C1", text: "Shipped *#42*" })).toBe(
+			"Posted to C1 (ts 1700000000.000100).",
+		);
+		expect(post).toHaveBeenCalledWith({ channel: "C1", text: "Shipped *#42*" });
+		post.mockResolvedValueOnce({ ok: false, error: "channel_not_found" } as never);
+		await expect(run({ channel: "C9", text: "x" })).rejects.toThrow("channel_not_found");
+	});
+
 	it("declares the adapter, standard events, canonical client and installation", () => {
 		const plugin = slack(options);
 		expect(plugin.id).toBe("slack");

@@ -7,7 +7,9 @@ import {
 	type ExternalIdentity,
 	type GroupResolveContext,
 	type Surface,
+	type ToolDefinition,
 } from "fabrial";
+import { z } from "zod";
 
 export interface SlackOptions {
 	botToken: string;
@@ -70,6 +72,22 @@ class ScopedSlackAdapter extends SlackAdapter {
 
 const workspaces = new WeakMap<WebClient, string>();
 
+/** Post outside the conversation's home thread; final replies post there on their own. */
+const postTool: ToolDefinition<{ channel: string; text: string }, { slack: WebClient }> = {
+	name: "slack_post",
+	description:
+		"Post a message to a Slack channel (a channel id such as C0123, not #name). Your final answer already posts in this conversation's thread: use this only to write somewhere else.",
+	input: z.object({
+		channel: z.string().min(1).describe("Slack channel id, e.g. C0123"),
+		text: z.string().min(1).describe("Slack mrkdwn"),
+	}),
+	async run({ channel, text }, ctx) {
+		const posted = await ctx.clients.slack.chat.postMessage({ channel, text });
+		if (!posted.ok || !posted.ts) throw new Error(`Slack did not post: ${posted.error ?? "no ts"}`);
+		return `Posted to ${posted.channel ?? channel} (ts ${posted.ts}).`;
+	},
+};
+
 const createPlugin = definePlugin<
 	[SlackOptions],
 	"slack",
@@ -88,6 +106,7 @@ const createPlugin = definePlugin<
 		installationId: options.workspace,
 		history: { mode: "since-last-reply", limit: 50 },
 	}),
+	toolkit: () => ({ tools: [postTool] }),
 	clients: () => {
 		const client = new WebClient(options.botToken);
 		workspaces.set(client, options.workspace);
