@@ -166,6 +166,12 @@ export function sessionKey(metadata: InvocationMetadata): string {
 	return metadata.interactionId;
 }
 
+/**
+ * Takes the Session lease, retrying while another owner holds it. Two uses remain, both unavoidable: the Session's
+ * execution opening after a crashed owner (its lease lasts until it expires) or while `ctx.state` holds the lease
+ * briefly; and `ctx.state` from a workflow, which waits until the hosting execution releases the Session (it does
+ * once every live task waits on a workflow).
+ */
 async function acquire(sql: Sql, key: string, signal: AbortSignal): Promise<PostgresStorage> {
 	for (;;) {
 		signal.throwIfAborted();
