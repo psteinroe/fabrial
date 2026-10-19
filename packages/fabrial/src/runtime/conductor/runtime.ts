@@ -46,7 +46,6 @@ type Carrier = {
 	dispatchId?: string;
 	dispatchOwner?: { workflow: string; event: string };
 	parent?: string;
-	cancelReason?: string;
 };
 type NativeExecution = { id: string; locked_by: string; task_key: string };
 // SHIM(conductor#3): today's context hides execution identity. Keep the private access in one place;
@@ -96,12 +95,7 @@ function resultOf(
 ): ExecutionResult | undefined {
 	if (!row.failed_at && !row.completed_at) return undefined;
 	// SHIM(conductor#5): cancellation is stored as failed_at + cancelled, not a terminal status.
-	if (row.cancelled)
-		return {
-			status: "cancelled",
-			// Native running settlement overwrites last_error using the claim's stale error.
-			reason: carrier(row.payload)?.cancelReason ?? row.last_error ?? "Cancelled by user",
-		};
+	if (row.cancelled) return { status: "cancelled", reason: row.last_error ?? "Cancelled by user" };
 	if (row.failed_at) return { status: "failed", error: row.last_error ?? "Execution failed" };
 	if (row.completed_at) return { status: "completed", output: row.result?.result ?? null };
 	return undefined;
@@ -528,10 +522,7 @@ class ConductorRuntime implements DurableRuntime {
 				select pgconductor.cancel_execution(${executionId}::uuid, ${reason}) as cancelled
 			`;
 			if (!row?.cancelled) return false;
-			// Preserve the requested reason atomically: native settlement can replace last_error.
-			await sql`update pgconductor._private_executions set cancelled = true,
-				payload = jsonb_set(payload, array[${RESERVED}, 'cancelReason'], to_jsonb(${reason}::text))
-				where id = ${executionId}::uuid`;
+			await sql`update pgconductor._private_executions set cancelled = true where id = ${executionId}::uuid`;
 			return true;
 		});
 		if (!cancelled) return false;
@@ -582,7 +573,7 @@ class ConductorRuntime implements DurableRuntime {
 		// restart. Prefer the core settlement hook; without it, success notifications belong to core.
 		// Receipts live only in Conductor's tables. Settlement hooks must be idempotent.
 		const orphans = await this.sql<{ id: string; last_error: string | null }[]>`
-			select child.id, coalesce(parent.payload -> ${RESERVED} ->> 'cancelReason', parent.last_error) as last_error
+			select child.id, parent.last_error
 			from pgconductor._private_executions child
 			join pgconductor._private_executions parent on parent.id::text = child.payload -> ${RESERVED} ->> 'parent'
 			where child.queue = ${this.queue} and child.completed_at is null and child.failed_at is null and not child.cancelled
