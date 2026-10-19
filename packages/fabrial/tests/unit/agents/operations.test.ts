@@ -40,7 +40,6 @@ async function fixture(workflows: FabrialHost["workflows"] = []) {
 		origin: { provider: "slack" },
 		replyTo: { kind: "thread", provider: "slack", threadId: "thread" },
 		requestedBy: { id: "alice", known: true, identities: [] },
-		ownsThread: true,
 		triggerEvent: "slack.mentioned",
 		ownerWorkflow: "router",
 	};
@@ -103,7 +102,6 @@ it("ordinary tool children carry request identity, not the driver's trigger owne
 		const intent = await f.harness.snapshot(ChildIntents, key, BACKGROUND_CONTEXT);
 		expect(intent?.metadata).toMatchObject({
 			...f.metadata,
-			ownsThread: false,
 			triggerEvent: null,
 			ownerWorkflow: null,
 		});

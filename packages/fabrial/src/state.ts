@@ -1,7 +1,7 @@
 import type { JsonObject } from "./json.ts";
 import type { Schema } from "./schema.ts";
 
-export type StateScope = "interaction" | "thread" | "agent";
+export type StateScope = "thread" | "agent";
 
 /**
  * State that agents see and change and that outlives a single step. Backed by Pi documents in the

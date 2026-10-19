@@ -1,22 +1,16 @@
 import type { App, CoreConfig, FabrialHost, Logger } from "./app.ts";
-import { createDirectory, identityKey } from "./directory.ts";
-import { boundedTimeout, filtersOverlap, matchesFilter } from "./internal.ts";
+import { createDirectory } from "./directory.ts";
+import { filtersOverlap, matchesFilter } from "./internal.ts";
 import { definedAgents, type Agent } from "./agent.ts";
-import { addFollow, clearInteraction, hasIngress, rememberIngress } from "./routing.ts";
-import {
-	conversationSession,
-	follow,
-	isChatMessage,
-	prepareInput,
-	threadSession,
-	type ConversationKey,
-} from "./send.ts";
+import { addFollow, confirmIngress, hasIngress, ingress, rememberIngress } from "./routing.ts";
+import { conversationSession, follow, isChatMessage, prepareInput, threadSession } from "./send.ts";
 import type { AnyWorkflow } from "./workflow.ts";
 import type { Json } from "./json.ts";
 import { AGENT_SETTLED_EVENT, EXECUTION_SETTLED_EVENT } from "./runtime.ts";
 import type {
 	AgentRef,
 	ExecutionResult,
+	Follow,
 	InvocationMetadata,
 	RuntimeWorkflow,
 	ThreadRoutingState,
@@ -32,7 +26,6 @@ const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 export function buildApp(config: CoreConfig): App {
 	const runtime = config.runtime;
 	const now = () => runtime.now?.() ?? Date.now();
-	const reservationTimeout = boundedTimeout(config.reservationTimeout ?? "10m");
 	let chat: ReturnType<NonNullable<CoreConfig["chat"]>["connect"]> | undefined;
 	let agents: ReturnType<NonNullable<CoreConfig["agents"]>["connect"]> | undefined;
 	let liveClients: Record<string, unknown> | undefined;
@@ -113,7 +106,7 @@ export function buildApp(config: CoreConfig): App {
 	/** Deliver an event to an agent's conversation: one signal to its Session (started when closed). */
 	const deliver = async (
 		agent: AgentRef,
-		conversation: ConversationKey,
+		conversation: Follow,
 		input: import("./json.ts").JsonObject,
 		metadata: InvocationMetadata,
 	) => {
@@ -160,7 +153,6 @@ export function buildApp(config: CoreConfig): App {
 								options.requestedBy,
 							)) as InvocationMetadata["requestedBy"])
 						: null,
-					ownsThread: false,
 					ownerWorkflow: null,
 					triggerEvent: event,
 				};
@@ -195,7 +187,6 @@ export function buildApp(config: CoreConfig): App {
 							options.requestedBy,
 						)) as InvocationMetadata["requestedBy"])
 					: null,
-				ownsThread: !!selected && !selected.workflow!.subscription,
 				ownerWorkflow: selected?.workflow!.name ?? null,
 				triggerEvent: event,
 			};
@@ -223,237 +214,94 @@ export function buildApp(config: CoreConfig): App {
 			const interactionId = `${message.provider}:${options.dedupeId}`;
 			const receivedAt = now();
 			const threadKey = threadSession(message.provider, message.threadId);
-			// Conversations keyed by this thread follow it implicitly; others leave a record in its state.
-			const implicit = (await agents?.agents.conversations?.(threadKey)) ?? [];
 			const mentioned = mentionedAgent(message.text);
-			const decision: {
-				route: "new" | "reply" | "follow" | "ignored";
-				selected: ReturnType<typeof select>["selected"];
-				conversations: ConversationKey[];
-			} = { route: "new", selected: undefined, conversations: [] };
-			const followed = (state: ThreadRoutingState | null, targets: ConversationKey[]) =>
-				rememberIngress(
-					targets.reduce<ThreadRoutingState | null>(
-						(next, target) => (target.session === threadKey ? next : addFollow(next, target)),
-						state,
-					),
-					"message",
-					options.dedupeId,
-					receivedAt,
-				);
-			// Recompute the local decision on every lock retry; no dispatch/I/O occurs in the updater.
+			const decision: { route: "new" | "follow" | "ignored"; conversations: Follow[] } = {
+				route: "new",
+				conversations: [],
+			};
+			// Recompute the decision on every lock retry; no dispatch/I/O occurs in the updater. The route is
+			// recorded as pending before it's dispatched, so a redelivery after a failed dispatch replays it.
 			const decide = (state: ThreadRoutingState | null): ThreadRoutingState | null => {
-				decision.selected = undefined;
-				decision.conversations = [];
-				if (hasIngress(state, "message", options.dedupeId)) {
-					decision.route = "ignored";
+				const receipt = ingress(state, "message", options.dedupeId);
+				if (receipt) {
+					decision.route = receipt.pending?.route ?? "ignored";
+					decision.conversations = receipt.pending?.conversations ?? [];
 					return state;
 				}
-				const stale =
-					state?.handlerExecutionId === null &&
-					(state.reservedAt === undefined || receivedAt - state.reservedAt >= reservationTimeout);
-				if (state?.interactionId != null && !stale) {
-					decision.route = "reply";
-					return rememberIngress(
-						{
-							...state,
-							participantIds: [...new Set([...(state.participantIds ?? []), actor.id])],
-							bufferedReplies:
-								state.bufferedReplies.some((m) => m.messageId === message.messageId) ||
-								state.consumedReplyIds?.includes(message.messageId)
-									? state.bufferedReplies
-									: [...state.bufferedReplies, message],
-						},
-						"message",
-						options.dedupeId,
-						receivedAt,
-					);
-				}
 				// 1. Followers: everyone in a followed thread steers. Naming one agent addresses only that agent.
-				const followers = [
-					...(state?.follows ?? []),
-					...implicit.map((agent) => ({ session: threadKey, agent })),
-				].filter(
-					(f, i, all) => all.findIndex((o) => o.session === f.session && o.agent === f.agent) === i,
-				);
+				const followers = state?.follows ?? [];
+				const conversation = (agent: Agent): Follow => ({
+					session: conversationSession(agent.definition.session, message, ref, threadKey),
+					agent: agent.name,
+				});
 				if (followers.length) {
 					decision.route = "follow";
 					const own = mentioned ? followers.filter((f) => f.agent === mentioned.name) : followers;
-					decision.conversations =
-						own.length || !mentioned
-							? own
-							: [
-									{
-										session: conversationSession(
-											mentioned.definition.session,
-											message,
-											ref,
-											threadKey,
-										),
-										agent: mentioned.name,
-									},
-								];
-					return followed(state, decision.conversations);
+					decision.conversations = own.length || !mentioned ? own : [conversation(mentioned)];
+				} else {
+					// 2. Triggers: the most specific one wins, an agent's or a workflow's.
+					decision.route = "new";
+					const agent = select(events, message).selected?.agent;
+					decision.conversations = agent ? [conversation(agent)] : [];
 				}
-				// 2. Triggers: the most specific one wins, an agent's or a workflow's.
-				decision.route = "new";
-				decision.selected = select(events, message).selected;
-				const idle = clearInteraction(state);
-				const agent = decision.selected?.agent;
-				if (agent) {
-					decision.conversations = [
-						{
-							session: conversationSession(agent.definition.session, message, ref, threadKey),
-							agent: agent.name,
-						},
-					];
-					return followed(idle, decision.conversations);
-				}
-				// A subscription delivers the message and returns at once; it never holds the routing slot,
-				// so the next message in this thread matches its trigger again instead of being buffered.
+				// Every conversation that receives a message from this thread follows it.
 				return rememberIngress(
-					decision.selected && !decision.selected.workflow!.subscription
-						? {
-								...idle,
-								interactionId,
-								handlerExecutionId: null,
-								reservedAt: receivedAt,
-								agentActive: false,
-								statusMessageId: null,
-								bufferedReplies: [],
-								consumedReplyIds: [message.messageId],
-								requesterId: actor.id,
-								participantIds: [actor.id],
-							}
-						: idle,
+					decision.conversations.reduce(addFollow, state),
 					"message",
 					options.dedupeId,
 					receivedAt,
+					{ route: decision.route, conversations: decision.conversations },
 				);
 			};
-			const state = io ? await io.updateState(decide) : decide(null);
+			if (io) await io.updateState(decide);
+			else decide(null);
 			if (decision.route === "ignored") return "ignored";
-			const { selected } = decision;
-			if (decision.route === "follow" || selected?.agent) {
-				const named = knownAgents();
-				const metadata: InvocationMetadata = {
-					interactionId,
-					origin: { provider: message.provider, messageId: message.messageId },
-					replyTo: ref as InvocationMetadata["replyTo"],
-					requestedBy: actor as InvocationMetadata["requestedBy"],
-					ownsThread: false,
-					ownerWorkflow: null,
-					triggerEvent: selected?.spec.event ?? events[0]!,
-				};
-				for (const conversation of decision.conversations)
-					await deliver(
-						named.get(conversation.agent) ?? { kind: "fabrial.agent", name: conversation.agent },
-						conversation,
-						message,
-						metadata,
-					);
-				if (decision.route === "follow") return "reply";
-				// Observers of the message still run, without the thread.
-				for (const event of events)
-					await runtime.emit(event, message, {
-						id: options.dedupeId,
-						metadata: { ...metadata, ownerWorkflow: null },
-						owner: undefined,
-						dispatchId: interactionId,
-					});
-				return "new";
-			}
-			if (decision.route === "reply" && state?.interactionId != null) {
-				await runtime.emit(
-					"fabrial.reply",
-					{
-						interactionId: state.interactionId,
-						message,
-						from: actor.id,
-						messageId: message.messageId,
-					},
-					{
-						id: options.dedupeId,
-						metadata: {
-							interactionId: state.interactionId,
-							origin: { provider: message.provider },
-							replyTo: ref as InvocationMetadata["replyTo"],
-							requestedBy: actor as InvocationMetadata["requestedBy"],
-							ownsThread: false,
-						},
-					},
-				);
-				// A reply in a thread an agent call drives steers that call's run in its Session.
-				if (state.agentActive)
-					await agents?.agents.reply?.(ref, state.interactionId, options.dedupeId);
-				return "reply";
-			}
-			const invocation: InvocationMetadata = {
+			const { selected } =
+				decision.route === "new" ? select(events, message) : { selected: undefined };
+			const owner = selected?.workflow?.name;
+			const metadata: InvocationMetadata = {
 				interactionId,
 				origin: { provider: message.provider, messageId: message.messageId },
 				replyTo: ref as InvocationMetadata["replyTo"],
 				requestedBy: actor as InvocationMetadata["requestedBy"],
-				ownsThread: !!selected && !selected.workflow!.subscription,
-				ownerWorkflow: selected?.workflow!.name ?? null,
+				ownerWorkflow: owner ?? null,
 				triggerEvent: selected?.spec.event ?? events[0]!,
-				initialMessageId: message.messageId,
 			};
-			// Only the winning event dispatches an owner; the shared key merges overlapping observers.
-			for (const event of new Set([...(selected ? [selected.spec.event] : []), ...events]))
-				await runtime.emit(event, message, {
-					id: options.dedupeId,
-					metadata: invocation,
-					owner: event === selected?.spec.event ? selected.workflow!.name : undefined,
-					dispatchId: interactionId,
-					dispatchOwner: selected
-						? { workflow: selected.workflow!.name, event: selected.spec.event }
-						: undefined,
-				});
-			return "new";
+			const named = knownAgents();
+			for (const conversation of decision.conversations)
+				await deliver(
+					named.get(conversation.agent) ?? { kind: "fabrial.agent", name: conversation.agent },
+					conversation,
+					message,
+					{ ...metadata, ownerWorkflow: null },
+				);
+			// Only the winning event dispatches an owner; the shared key merges overlapping observers, which
+			// run without the thread.
+			if (decision.route === "new")
+				for (const event of new Set([...(selected ? [selected.spec.event] : []), ...events]))
+					await runtime.emit(event, message, {
+						id: options.dedupeId,
+						metadata,
+						owner: event === selected?.spec.event ? owner : undefined,
+						dispatchId: interactionId,
+						dispatchOwner: owner ? { workflow: owner, event: selected!.spec.event } : undefined,
+					});
+			await io?.updateState((state) => confirmIngress(state, "message", options.dedupeId));
+			return decision.route;
 		},
 		async receiveCancellation(action) {
 			const io = await chat?.port.thread(action.thread);
 			const state = await io?.getState();
-			if (
-				!state?.handlerExecutionId ||
-				hasIngress(state, "cancellation", action.dedupeId) ||
-				state.cancellationIds?.includes(action.dedupeId)
-			)
-				return;
+			if (!state?.follows?.length || hasIngress(state, "cancellation", action.dedupeId)) return;
+			// A stop cancels the current run of each conversation following the thread; anyone there may stop.
 			const actor = await directory.resolveIdentity(action.actor);
-			const participants = [
-				...new Set([
-					...(state.participantIds ?? []),
-					...(state.requesterId ? [state.requesterId] : []),
-				]),
-			];
-			const aliases = await Promise.all(participants.map((id) => directory.identitiesFor(id)));
-			if (
-				!participants.includes(actor.id) &&
-				!aliases.flat().some((identity) => identityKey(identity) === identityKey(action.actor))
-			) {
-				await chat!.port.postEphemeral(
-					action.thread,
-					action.actor,
-					"Only participants in this interaction may stop it.",
-				);
-				return;
-			}
-			await runtime.cancel(state.handlerExecutionId, `Stopped by ${actor.id}`);
+			for (const conversation of state.follows)
+				await agents?.agents.stop?.(conversation, action.dedupeId, `Stopped by ${actor.id}`);
 			const receivedAt = now();
 			await io!.updateState((latest) =>
-				latest?.interactionId === state.interactionId &&
-				latest.handlerExecutionId === state.handlerExecutionId
-					? rememberIngress(
-							{
-								...latest,
-								cancellationIds: [...new Set([...(latest.cancellationIds ?? []), action.dedupeId])],
-							},
-							"cancellation",
-							action.dedupeId,
-							receivedAt,
-						)
-					: latest,
+				hasIngress(latest, "cancellation", action.dedupeId)
+					? latest
+					: rememberIngress(latest, "cancellation", action.dedupeId, receivedAt),
 			);
 		},
 		async receiveAction(action) {
@@ -488,7 +336,6 @@ export function buildApp(config: CoreConfig): App {
 						origin: { provider: action.actor.provider },
 						replyTo: null,
 						requestedBy: actor as InvocationMetadata["requestedBy"],
-						ownsThread: false,
 					},
 				},
 			);
@@ -501,26 +348,6 @@ export function buildApp(config: CoreConfig): App {
 		result: ExecutionResult,
 	) {
 		await agents?.agents.settled?.(executionId, metadata, result);
-		if (metadata.ownsThread && metadata.replyTo?.kind === "thread" && chat) {
-			const io = await chat.port.thread(metadata.replyTo);
-			const state = await io.getState();
-			if (
-				state?.interactionId === metadata.interactionId &&
-				state.handlerExecutionId === executionId
-			) {
-				try {
-					await io.setStatus(null);
-				} catch (error) {
-					host.logger.warn("Could not clear thread status", { error });
-				}
-				await io.updateState((latest) =>
-					latest?.interactionId === metadata.interactionId &&
-					latest.handlerExecutionId === executionId
-						? clearInteraction(latest)
-						: latest,
-				);
-			}
-		}
 		await runtime.emit(
 			EXECUTION_SETTLED_EVENT,
 			{ executionId, result: result as unknown as Json },
@@ -546,9 +373,7 @@ export function buildApp(config: CoreConfig): App {
 		async handler(input, execution) {
 			const observer =
 				!!execution.metadata.triggerEvent && execution.metadata.ownerWorkflow !== workflow.name;
-			const metadata = observer
-				? { ...execution.metadata, replyTo: null, ownsThread: false }
-				: execution.metadata;
+			const metadata = observer ? { ...execution.metadata, replyTo: null } : execution.metadata;
 			const context = await createContext({ host, execution, metadata, agents, now });
 			const run = (index: number, ctx: typeof context): Promise<Json | void> =>
 				index < middleware.length
@@ -610,7 +435,6 @@ export function buildApp(config: CoreConfig): App {
 					filterable: (event as { filterable: string[] }).filterable,
 				})),
 			),
-			{ name: "fabrial.reply", filterable: ["interactionId", "from", "messageId"] },
 			{ name: "fabrial.approval.decided", filterable: ["approvalId"] },
 			{ name: APPROVAL_CLOSED_EVENT, filterable: ["approvalId"] },
 			{ name: PRESENTATION_EVENT, filterable: ["presentationId"] },

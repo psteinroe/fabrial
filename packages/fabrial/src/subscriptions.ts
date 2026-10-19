@@ -1,7 +1,7 @@
 /**
  * Dynamic subscriptions: `ctx.subscribe` stores a record in `fabrial.subscriptions`; an internal observer
  * workflow on every resource event finds the records for the event's resources and sends each matching
- * conversation a notification. Static subscriptions (`f.subscribe`) are in `subscription.ts`.
+ * conversation a notification. Agent triggers replace static subscriptions.
  */
 import type { Sql } from "postgres";
 import type { FabrialHost, Logger } from "./app.ts";
@@ -501,7 +501,6 @@ export function deliveryWorkflow(
 								origin: execution.metadata.origin,
 								replyTo: subscription.replyTo,
 								requestedBy: execution.metadata.requestedBy,
-								ownsThread: false,
 								ownerWorkflow: null,
 								triggerEvent: null,
 								send: { kind: "notification", priority } satisfies SentRequest,

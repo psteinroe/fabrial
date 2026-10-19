@@ -46,7 +46,6 @@ export {
 	type SentRequest,
 	type SessionOption,
 } from "./send.ts";
-export type { Subscription, SubscriptionDefinition } from "./subscription.ts";
 export {
 	matchResources,
 	selectDeliveries,
@@ -76,7 +75,6 @@ export {
 export type {
 	WorkflowContext,
 	RaceResult,
-	HandoffResult,
 	ExecutionInfo,
 	WorkflowMiddleware,
 	WorkflowDefinition,

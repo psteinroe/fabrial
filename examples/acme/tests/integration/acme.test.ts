@@ -280,9 +280,16 @@ async function finalReply(text: string) {
 	const thread = await app.host
 		.chat()!
 		.thread({ kind: "thread", provider: "slack", threadId: "slack:C_SUPPORT:1700000000.000001" });
+	// The support agent follows the thread; every routed message was delivered.
 	await expect
-		.poll(() => thread.getState(), poll)
-		.toMatchObject({ interactionId: null, handlerExecutionId: null, agentActive: false });
+		.poll(async () => {
+			const state = await thread.getState();
+			return {
+				follows: state?.follows?.map((each) => each.agent),
+				pending: state?.ingestedDedupeIds?.some((receipt) => receipt.pending) ?? false,
+			};
+		}, poll)
+		.toEqual({ follows: ["acme-support"], pending: false });
 	expect(calls.some((c) => c.method === "assistant.threads.setStatus" && c.args.status)).toBe(true);
 	// Results, including findings and tool receipts, really reached Pi's Postgres log.
 	expect((await sql`SELECT 1 FROM fabrial_pi.commits`).length).toBeGreaterThan(0);
@@ -338,7 +345,6 @@ it("requester Cancel request updates the card to Cancelled without writing SQL",
 		requestedBy: { id: "alice" },
 		origin: { provider: "slack" },
 		replyTo: { kind: "thread", provider: "slack", threadId: "slack:C_SUPPORT:1700000000.000001" },
-		ownsThread: false,
 		triggerEvent: null,
 		ownerWorkflow: null,
 	});
@@ -501,12 +507,11 @@ it("signed GitHub PR opened webhook has one PR-thread owner plus a changelog obs
 		}, poll)
 		.toBe(2);
 	const runs = await sql`SELECT task_key,
-		payload -> '__fabrial' -> 'metadata' -> 'ownsThread' AS owns_thread,
 		payload -> '__fabrial' -> 'metadata' -> 'replyTo' ->> 'provider' AS reply_provider
 		FROM pgconductor._private_executions WHERE task_key IN ('pr-review', 'changelog') ORDER BY task_key`;
 	expect(runs).toEqual([
-		{ task_key: "changelog", owns_thread: false, reply_provider: null },
-		{ task_key: "pr-review", owns_thread: true, reply_provider: "github" },
+		{ task_key: "changelog", reply_provider: null },
+		{ task_key: "pr-review", reply_provider: "github" },
 	]);
 });
 
@@ -516,7 +521,7 @@ it("read-only query rejects writes at the database, not by a model instruction",
 	});
 	expect(await balances()).toEqual([{ balance: 0 }, { balance: 100 }]);
 });
-it("#bugs hands off to bugIntake rather than answering in the router", async () => {
+it("#bugs: the router investigates inline with ctx.agent and posts the analysis; nothing follows the thread", async () => {
 	faux.respond([reply.text("Investigated the bug; engineering should add a regression test.")]);
 	await mention("C_BUGS");
 	await expect
@@ -534,9 +539,8 @@ it("#bugs hands off to bugIntake rather than answering in the router", async () 
 	const thread = await app.host
 		.chat()!
 		.thread({ kind: "thread", provider: "slack", threadId: "slack:C_BUGS:1700000000.000001" });
-	await expect
-		.poll(() => thread.getState(), poll)
-		.toMatchObject({ interactionId: null, handlerExecutionId: null, agentActive: false });
+	// The investigation ran in the call's own Session: the thread has no follower.
+	expect((await thread.getState())?.follows).toBeUndefined();
 	expect(calls.some((c) => String(c.args.text).includes("I'll investigate this bug report"))).toBe(
 		true,
 	);

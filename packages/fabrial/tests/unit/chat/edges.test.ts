@@ -151,16 +151,16 @@ it("serializes independent Chat instances and releases the state lock after upda
 		Array.from({ length: 20 }, (_, i) =>
 			(i % 2 ? a : b).updateState((state) => ({
 				...state!,
-				participantIds: [...(state?.participantIds ?? []), `user-${i}`],
+				follows: [...(state?.follows ?? []), { session: `user-${i}`, agent: "a" }],
 			})),
 		),
 	);
 	const state = await a.getState();
-	expect(state?.participantIds).toHaveLength(22);
-	expect(new Set(state?.participantIds).size).toBe(22);
+	expect(state?.follows).toHaveLength(21);
+	expect(new Set(state?.follows?.map((f) => f.session)).size).toBe(21);
 	// Caller mutation must not change persisted state in memory adapters either.
-	state?.participantIds?.push("outside-mutation");
-	expect((await a.getState())?.participantIds).toHaveLength(22);
+	state?.follows?.push({ session: "outside-mutation", agent: "a" });
+	expect((await a.getState())?.follows).toHaveLength(21);
 });
 
 it("bounds lock contention retries without force-releasing another updater's lock", async () => {
@@ -190,13 +190,13 @@ it("retries a pure updater after losing its lease and preserves unrelated fields
 	vi.mocked(env.adapter.postMessage).mockImplementationOnce(async () => {
 		await other.updateState((current) => ({
 			...current!,
-			participantIds: ["alice", "bob", "carol"],
+			follows: [{ session: "slack:C1:root", agent: "carol" }],
 		}));
 		return { id: "status-post", threadId: ref.threadId, raw: {} };
 	});
 	await thread.setStatus("Thinking");
 	expect(await thread.getState()).toMatchObject({
-		participantIds: ["alice", "bob", "carol"],
+		follows: [{ session: "slack:C1:root", agent: "carol" }],
 		statusMessageId: "status-post",
 	});
 });

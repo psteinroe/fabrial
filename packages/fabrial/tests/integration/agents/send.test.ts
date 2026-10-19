@@ -102,11 +102,7 @@ async function setup(
 		model,
 		tools: tools(channel, (): AgentRef => agent),
 		...(researcher ? { subagents: [researcher] } : {}),
-	});
-	const subscription = f.subscribe({
-		name: `channel-${channel}`,
-		source: trigger({ event: "chat.message", filter: { channelId: [channel] } }),
-		agent,
+		triggers: [trigger({ event: "chat.message", filter: { channelId: [channel] } })],
 		session: "channel",
 	});
 	const notify = f.defineWorkflow({
@@ -116,7 +112,6 @@ async function setup(
 			await ctx.send("notify", agent, {
 				session: `ops-${channel}`,
 				input: input.text,
-				kind: "notification",
 				priority: input.priority,
 			});
 		},
@@ -132,7 +127,7 @@ async function setup(
 		const chat = new FakeChat(() => runtime.now());
 		const app = testApp(f, {
 			workflows: [notify, ask],
-			subscriptions: [subscription],
+			routedAgents: [agent],
 			runtime,
 			chat,
 			agents: pi({ models, sql, settings: { retry: options.retry ?? { enabled: false } } }),
@@ -333,7 +328,6 @@ it("maps notification priorities to write, followUp, and steer; written entries 
 				origin: { provider: "github" },
 				replyTo: null,
 				requestedBy: null,
-				ownsThread: false,
 			},
 		});
 	await notify({ text: "low: a label was added", priority: "low" });
@@ -383,7 +377,6 @@ it("a tool sends to another conversation through the same send path", async () =
 				const receipt = await ctx.send("escalate", self(), {
 					session: `ops-${channel}`,
 					input: input.summary,
-					kind: "notification",
 				});
 				return receipt.session;
 			},
@@ -427,7 +420,6 @@ it.each(["notification", "message"] as const)(
 								origin: { provider: "github" },
 								replyTo: null,
 								requestedBy: null,
-								ownsThread: false,
 							},
 						},
 					);
@@ -453,7 +445,6 @@ it.each(["notification", "message"] as const)(
 						origin: { provider: "github" },
 						replyTo: null,
 						requestedBy: null,
-						ownsThread: false,
 					},
 				},
 			);
@@ -497,7 +488,6 @@ it.each(["notification", "message"] as const)(
 								origin: { provider: "github" },
 								replyTo: null,
 								requestedBy: null,
-								ownsThread: false,
 							},
 						},
 					);
@@ -523,7 +513,6 @@ it.each(["notification", "message"] as const)(
 						origin: { provider: "github" },
 						replyTo: null,
 						requestedBy: null,
-						ownsThread: false,
 					},
 				},
 			);
@@ -586,7 +575,6 @@ it("an urgent notification during a tool call steers the running run and is answ
 					origin: { provider: "github" },
 					replyTo: { kind: "thread", provider: "chat", threadId: `chat:${t.channel}:t1` },
 					requestedBy: null,
-					ownsThread: false,
 				},
 			},
 		);
@@ -856,7 +844,6 @@ it("posts a final reply exactly once across a restart and a redelivery", async (
 			origin: null,
 			replyTo: null,
 			requestedBy: null,
-			ownsThread: false,
 		},
 	});
 	await t.settle();
@@ -884,7 +871,6 @@ it("ctx.agent returns the answer and posts nothing, without offering no_reply", 
 				origin: null,
 				replyTo: thread,
 				requestedBy: null,
-				ownsThread: false,
 			},
 		},
 	);

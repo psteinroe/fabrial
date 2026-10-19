@@ -1,44 +1,28 @@
-import type { ThreadRoutingState } from "./runtime.ts";
+import type { Follow, ThreadRoutingState } from "./runtime.ts";
 
 const TOMBSTONE_LIMIT = 100;
-type IngressKind = NonNullable<ThreadRoutingState["ingestedDedupeIds"]>[number]["kind"];
+type Receipt = NonNullable<ThreadRoutingState["ingestedDedupeIds"]>[number];
+type IngressKind = Receipt["kind"];
+
+export function ingress(
+	state: ThreadRoutingState | null,
+	kind: IngressKind,
+	id: string,
+): Receipt | undefined {
+	return state?.ingestedDedupeIds?.find((entry) => entry.kind === kind && entry.id === id);
+}
 
 export function hasIngress(
 	state: ThreadRoutingState | null,
 	kind: IngressKind,
 	id: string,
 ): boolean {
-	return state?.ingestedDedupeIds?.some((entry) => entry.kind === kind && entry.id === id) ?? false;
+	return !!ingress(state, kind, id);
 }
-
-/** Clear interaction-scoped data, retaining only bounded ingress receipts and follows. */
-export function clearInteraction(state: ThreadRoutingState | null): ThreadRoutingState | null {
-	return state?.ingestedDedupeIds?.length || state?.follows?.length
-		? {
-				interactionId: null,
-				handlerExecutionId: null,
-				agentActive: false,
-				statusMessageId: null,
-				bufferedReplies: [],
-				...(state.ingestedDedupeIds
-					? { ingestedDedupeIds: state.ingestedDedupeIds.slice(-TOMBSTONE_LIMIT) }
-					: {}),
-				...(state.follows?.length ? { follows: state.follows } : {}),
-			}
-		: null;
-}
-
-type Follow = NonNullable<ThreadRoutingState["follows"]>[number];
 
 /** Add a follow record for a conversation (idempotent). */
 export function addFollow(state: ThreadRoutingState | null, follow: Follow): ThreadRoutingState {
-	const base = state ?? {
-		interactionId: null,
-		handlerExecutionId: null,
-		agentActive: false,
-		statusMessageId: null,
-		bufferedReplies: [],
-	};
+	const base = state ?? {};
 	if (base.follows?.some((f) => f.session === follow.session && f.agent === follow.agent))
 		return base;
 	return {
@@ -47,22 +31,34 @@ export function addFollow(state: ThreadRoutingState | null, follow: Follow): Thr
 	};
 }
 
+/** Record an ingress receipt; `pending` marks a routed delivery that isn't confirmed yet. */
 export function rememberIngress(
 	state: ThreadRoutingState | null,
 	kind: IngressKind,
 	id: string,
 	at: number,
+	pending?: Receipt["pending"],
 ): ThreadRoutingState {
 	return {
-		...(state ?? {
-			interactionId: null,
-			handlerExecutionId: null,
-			agentActive: false,
-			statusMessageId: null,
-			bufferedReplies: [],
-		}),
-		ingestedDedupeIds: [...(state?.ingestedDedupeIds ?? []), { kind, id, at }].slice(
-			-TOMBSTONE_LIMIT,
+		...state,
+		ingestedDedupeIds: [
+			...(state?.ingestedDedupeIds ?? []),
+			{ kind, id, at, ...(pending ? { pending } : {}) },
+		].slice(-TOMBSTONE_LIMIT),
+	};
+}
+
+/** Confirm a pending receipt once its delivery succeeded. */
+export function confirmIngress(
+	state: ThreadRoutingState | null,
+	kind: IngressKind,
+	id: string,
+): ThreadRoutingState | null {
+	if (!ingress(state, kind, id)?.pending) return state;
+	return {
+		...state,
+		ingestedDedupeIds: state!.ingestedDedupeIds!.map((entry) =>
+			entry.kind === kind && entry.id === id ? { kind, id, at: entry.at } : entry,
 		),
 	};
 }

@@ -25,9 +25,9 @@ import {
 import { FakeChat, MemoryRuntime } from "../../../src/testing.ts";
 import postgres, { type Sql } from "postgres";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
-import { ChildIntents, Invocation, Runs } from "../../../src/agents/documents.ts";
+import { ChildIntents, Runs } from "../../../src/agents/documents.ts";
 import { z } from "zod";
-import { pi, PostgresStorage, sessionKey } from "../../../src/agents/index.ts";
+import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 const definitions = createFabrial({ plugins: [] });
 const { defineWorkflow } = definitions;
@@ -46,7 +46,8 @@ afterAll(async () => {
 });
 
 function fixture(plugins: FabrialHost["plugins"] = [], definitionScope: object = definitions) {
-	const runtime = new MemoryRuntime();
+	// Calls key their Session by execution id: unique ids keep tests apart in the shared database.
+	const runtime = new MemoryRuntime({ idPrefix: randomUUID() });
 	const chat = new FakeChat();
 	const faux = fauxProvider();
 	const models = createModels();
@@ -56,7 +57,6 @@ function fixture(plugins: FabrialHost["plugins"] = [], definitionScope: object =
 		origin: null,
 		replyTo: { kind: "thread", provider: "slack-test", threadId: randomUUID() },
 		requestedBy: { id: "alice", known: true, identities: [], name: "Alice" },
-		ownsThread: true,
 		ownerWorkflow: null,
 		triggerEvent: null,
 	};
@@ -98,7 +98,7 @@ function runtimeRegister(
 	});
 }
 
-it("runs durable structured answers, memoizes submissions, and continues one agent conversation", async () => {
+it("runs durable structured answers and memoizes submissions; each call has a Session of its own", async () => {
 	const f = fixture();
 	const agent = defineAgent({
 		name: randomUUID(),
@@ -121,22 +121,28 @@ it("runs durable structured answers, memoizes submissions, and continues one age
 			return { first, again };
 		},
 	};
-	const { result } = await execute(f, workflow);
+	const { id, result } = await execute(f, workflow);
 	expect(result).toEqual({
 		status: "completed",
 		output: { first: { answer: 42 }, again: "continued" },
 	});
 	expect(f.faux.state.callCount).toBe(2);
-	const commits =
-		await sql`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${sessionKey(f.metadata)} ORDER BY seq`;
-	const conversations = commits
-		.flatMap((row) => JSON.parse(String(row.writes)) as { type: string }[])
-		.filter((write) => write.type === "conversation");
-	expect(conversations).toHaveLength(1);
+	for (const call of ["answer", "again"]) {
+		const commits =
+			await sql`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${callSession(id, call)} ORDER BY seq`;
+		const conversations = commits
+			.flatMap((row) => JSON.parse(String(row.writes)) as { type: string }[])
+			.filter((write) => write.type === "conversation");
+		expect(conversations).toHaveLength(1);
+	}
+	// Neither call wrote to the thread's Session.
+	const [thread] =
+		await sql`SELECT 1 FROM fabrial_pi.sessions WHERE key = ${`slack-test:${(f.metadata.replyTo as { threadId: string }).threadId}`}`;
+	expect(thread).toBeUndefined();
 	await f.integration.stop();
 });
 
-it("binds adapter identity, clients, sections and durable posts; commits tool state with a result receipt", async () => {
+it("binds adapter identity, clients, sections and durable posts; commits tool state to the call's Session with a result receipt", async () => {
 	const f = fixture();
 	const state = defineState({
 		name: randomUUID(),
@@ -189,9 +195,10 @@ it("binds adapter identity, clients, sections and durable posts; commits tool st
 		},
 	};
 	const { result } = await execute(f, workflow);
+	// Thread state belongs to the thread's Session; the call's tools write the call Session's state.
 	expect(result).toEqual({
 		status: "completed",
-		output: { answer: "finished", state: { notes: ["seed", "hello"] } },
+		output: { answer: "finished", state: { notes: ["seed"] } },
 	});
 	expect(actor).toBe("alice");
 	const io = await f.chat.resolve(f.metadata.replyTo!);
@@ -253,11 +260,10 @@ it("releases the Session while a workflow tool waits and reconnects with a stabl
 			handler: async (_input, execution) => {
 				expect(execution.metadata).toMatchObject({
 					...f.metadata,
-					ownsThread: false,
 					triggerEvent: null,
 					ownerWorkflow: null,
 				});
-				const storage = await PostgresStorage.open(sql, sessionKey(f.metadata));
+				const storage = await PostgresStorage.open(sql, execution.metadata.piChild as string);
 				await storage.close(BACKGROUND_CONTEXT);
 				return "ok";
 			},
@@ -398,7 +404,7 @@ it.each([[false], [true]])(
 			true,
 		);
 		const [lease] =
-			await sql`SELECT owner FROM fabrial_pi.sessions WHERE key = ${sessionKey(f.metadata)}`;
+			await sql`SELECT owner FROM fabrial_pi.sessions WHERE key = ${callSession(id, "agent")}`;
 		expect(lease?.owner).toBeNull();
 		await f.integration.stop();
 	},
@@ -579,100 +585,7 @@ it("sends a non-string tool result to the model as serialized JSON", async () =>
 	await f.integration.stop();
 });
 
-it("consumes buffered steering replies with stable request ids", async () => {
-	const f = fixture();
-	const io = await f.chat.resolve(f.metadata.replyTo!);
-	await io.updateState(() => ({
-		interactionId: f.metadata.interactionId,
-		handlerExecutionId: null,
-		agentActive: false,
-		statusMessageId: null,
-		bufferedReplies: [
-			{
-				provider: "slack-test",
-				threadId: io.ref.threadId,
-				channelId: io.channelId,
-				messageId: "steer",
-				text: "Use the new account",
-				author: {
-					identity: { provider: "slack-test", installationId: "test", subjectId: "bob" },
-					name: "Bob",
-					isBot: false,
-				},
-				isMention: false,
-				isDM: false,
-				sentAt: new Date().toISOString(),
-			},
-		],
-	}));
-	const agent = defineAgent({
-		name: randomUUID(),
-		description: "Answers test questions.",
-		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
-	});
-	const routing = await io.getState();
-	// Admit steering only after the original input finishes. The driver must still drain it.
-	vi.spyOn(io, "getState").mockImplementationOnce(async () => {
-		await expect
-			.poll(async () => {
-				const rows =
-					await sql`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${sessionKey(f.metadata)}`;
-				return rows.some((row) =>
-					(JSON.parse(String(row.writes)) as { type: string; value?: { status?: string } }[]).some(
-						(write) => write.type === "submission" && write.value?.status === "done",
-					),
-				);
-			})
-			.toBe(true);
-		return routing;
-	});
-	f.faux.setResponses([
-		fauxAssistantMessage("ok"),
-		async () => {
-			await new Promise((resolve) => setTimeout(resolve, 100));
-			return fauxAssistantMessage("steered");
-		},
-	]);
-	const { result } = await execute(f, {
-		name: randomUUID(),
-		triggers: [],
-		handler: (_input, execution) =>
-			f.integration.agents.run(execution, "agent", agent, { input: "Hello" }),
-	});
-	expect(result).toEqual({ status: "completed", output: "steered" });
-	expect(f.faux.state.callCount).toBe(2);
-	const storage = await PostgresStorage.open(sql, sessionKey(f.metadata));
-	const session = createSession(storage);
-	try {
-		const requestId = JSON.stringify([
-			"fabrial.pi.reply",
-			f.metadata.interactionId,
-			"slack-test",
-			"steer",
-		]);
-		expect(await session.snapshot(Invocation, requestId, BACKGROUND_CONTEXT)).toMatchObject({
-			requestedBy: { id: "bob" },
-			actor: { id: "bob" },
-			interactionId: f.metadata.interactionId,
-			replyTo: f.metadata.replyTo,
-			origin: { provider: "slack-test", threadId: io.ref.threadId, messageId: "steer" },
-		});
-		const runs = await session.snapshot(Runs, BACKGROUND_CONTEXT);
-		const requests = Object.values(runs!.runs).flatMap((run) => Object.values(run.requests ?? {}));
-		expect(requests).toHaveLength(2);
-		for (const request of requests)
-			expect(
-				(await storage.submission(request.submissionId as never, BACKGROUND_CONTEXT))?.status,
-			).toBe("done");
-	} finally {
-		await session.close(BACKGROUND_CONTEXT);
-	}
-	expect((await io.getState())?.bufferedReplies).toHaveLength(0);
-	expect((await io.getState())?.agentActive).toBe(false);
-	await f.integration.stop();
-});
-
-it("does not promote an unposted channel locator to a Pi Session key", async () => {
+it("workflow state needs a posted thread; an unposted channel locator is not a Session key", async () => {
 	const f = fixture();
 	f.metadata.replyTo = { kind: "channel", provider: "slack-test", channelId: "C1" };
 	const state = defineState({
@@ -688,18 +601,10 @@ it("does not promote an unposted channel locator to a Pi Session key", async () 
 			await expect(f.integration.state.get(execution, "state", state)).rejects.toThrow(
 				"ctx.thread.post",
 			);
-			return f.integration.agents.run(
-				execution,
-				"agent",
-				{ kind: "fabrial.agent", name: "unused" },
-				{ input: "Hello" },
-			);
+			return "ok";
 		},
 	});
-	expect(result).toMatchObject({
-		status: "failed",
-		error: expect.stringContaining("ctx.thread.post"),
-	});
+	expect(result).toEqual({ status: "completed", output: "ok" });
 	expect(f.runtime.executions("fabrial.session")).toHaveLength(0);
 	expect(f.chat.threads.size).toBe(0);
 	await f.integration.stop();
@@ -760,12 +665,12 @@ it("delayed cancellation reconciles lost start receipts and leaves a newer conve
 	await f.integration.start();
 	await f.runtime.start();
 	const key = "fabrial:pi:lost-start";
-	const dedupeKey = JSON.stringify([sessionKey(f.metadata), key]);
+	const dedupeKey = JSON.stringify([callSession("old", "agent"), key]);
 	const child = await f.runtime.invoke(childWorkflow.name, null, {
 		metadata: f.metadata,
 		dedupeKey,
 	});
-	const storage = await PostgresStorage.open(sql, sessionKey(f.metadata));
+	const storage = await PostgresStorage.open(sql, callSession("old", "agent"));
 	const harness = await Harness.open(
 		storage,
 		{ models: createModels(), registry: createRegistry() },
@@ -828,7 +733,7 @@ it("delayed cancellation reconciles lost start receipts and leaves a newer conve
 	await f.runtime.flush();
 	expect(f.runtime.executions(childWorkflow.name)).toHaveLength(1);
 	expect(f.runtime.result(child)).toMatchObject({ status: "cancelled" });
-	const reopened = await PostgresStorage.open(sql, sessionKey(f.metadata));
+	const reopened = await PostgresStorage.open(sql, callSession("old", "agent"));
 	const session = createSession(reopened);
 	try {
 		// The Session went on to run the newer request (it has no model here), but never aborted it.
@@ -862,22 +767,14 @@ it("stop joins driver routing cleanup after the harness has closed", async () =>
 	const cleanup = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const update = io.updateState.bind(io);
-	vi.spyOn(io, "updateState").mockImplementation(async (change) => {
-		const next = change(await io.getState());
-		if (next?.agentActive === false) {
+	const setStatus = io.setStatus.bind(io);
+	vi.spyOn(io, "setStatus").mockImplementation(async (status) => {
+		if (status === null) {
 			reached();
 			await cleanup;
 		}
-		return update(change);
+		return setStatus(status);
 	});
-	await io.updateState(() => ({
-		interactionId: f.metadata.interactionId,
-		handlerExecutionId: null,
-		statusMessageId: null,
-		agentActive: true,
-		bufferedReplies: [],
-	}));
 	const workflow: RuntimeWorkflow = {
 		name: randomUUID(),
 		triggers: [],

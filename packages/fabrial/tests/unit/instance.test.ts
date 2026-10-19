@@ -57,7 +57,6 @@ it("reuses definitions across isolated apps with definition-time plugins and spi
 					origin: null,
 					replyTo: null,
 					requestedBy: null,
-					ownsThread: false,
 				},
 			});
 			await fixture.runtime.flush();

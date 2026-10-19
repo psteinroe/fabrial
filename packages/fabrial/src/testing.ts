@@ -218,7 +218,6 @@ export class MemoryRuntime implements DurableRuntime {
 			await this.invoke(workflow.name, payload, {
 				metadata: {
 					...options.metadata,
-					ownsThread: owns,
 					replyTo: owns ? options.metadata.replyTo : null,
 				},
 				dedupeKey: options.dispatchId
@@ -805,7 +804,7 @@ export class FakeChat implements ChatPort, ChatIntegration {
 	async receive(
 		message: ChatMessage,
 		options: { events?: readonly string[]; event?: string; dedupeId?: string } = {},
-	): Promise<"reply" | "new" | "ignored"> {
+	): Promise<"follow" | "new" | "ignored"> {
 		if (!this.host) throw new Error("FakeChat must be connected to an app");
 		const thread = await this.thread({
 			kind: "thread",
@@ -901,9 +900,6 @@ export function fakeAgents(
 						sent.push(clone({ ...request, agent: agent.name }));
 					return { requestId: request.requestId, session: request.session };
 				},
-				async conversations(session) {
-					return [...new Set(sent.filter((s) => s.session === session).map((s) => s.agent))];
-				},
 			},
 			state: options.state ?? state,
 			evaluator: {
@@ -933,15 +929,13 @@ export function testApp<const P extends readonly import("./plugin.ts").AnyPlugin
 		agents?: AgentIntegration;
 		/** `f.app({ agents })`: agents whose triggers receive events. */
 		routedAgents?: import("./instance.ts").AppConfig["agents"];
-		reservationTimeout?: import("./runtime.ts").DurationInput;
 		/** Store of dynamic subscriptions. Default: in memory. */
 		subscriptionStore?: SubscriptionStore;
 	},
 ): import("./app.ts").App<import("./instance.ts").ClientsOf<P>> {
-	const { workflows, routedAgents, subscriptions, logger, subscriptionStore, ...overrides } =
-		config;
+	const { workflows, routedAgents, logger, subscriptionStore, ...overrides } = config;
 	return internal(instance).app(
-		{ workflows, agents: routedAgents, subscriptions, logger },
+		{ workflows, agents: routedAgents, logger },
 		{ ...overrides, subscriptionStore: subscriptionStore ?? new MemorySubscriptions() },
 	) as never;
 }
@@ -1094,10 +1088,10 @@ export function createIntegrationApp<const P extends readonly import("./plugin.t
 		concurrency?: number;
 	},
 ): import("./app.ts").App<import("./instance.ts").ClientsOf<P>> {
-	const { workflows, agents: routed, subscriptions, logger, models, modelRetries = false } = config;
+	const { workflows, agents: routed, logger, models, modelRetries = false } = config;
 	const poll = config.pollIntervalMs ?? 20;
 	return internal(instance).app(
-		{ workflows, agents: routed, subscriptions, logger },
+		{ workflows, agents: routed, logger },
 		{
 			models: scripted.get(models),
 			agentSettings: {

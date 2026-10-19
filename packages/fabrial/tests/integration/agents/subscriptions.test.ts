@@ -53,17 +53,13 @@ const f = createFabrial({ plugins: [chatPlugin, githubPlugin] });
 const faux = fauxProvider();
 const models = createModels();
 models.setProvider(faux.provider);
+const channel = `c${randomUUID().slice(0, 8)}`;
 const developer = f.defineAgent({
 	name: "developer",
 	description: "Answers test questions.",
 	model: `${faux.provider.id}/${faux.getModel().id}`,
 	toolkits: ["github"],
-});
-const channel = `c${randomUUID().slice(0, 8)}`;
-const conversation = f.subscribe({
-	name: "dev-thread",
-	source: trigger({ event: "chat.message", filter: { channelId: [channel] } }),
-	agent: developer,
+	triggers: [trigger({ event: "chat.message", filter: { channelId: [channel] } })],
 });
 
 async function launch() {
@@ -71,7 +67,7 @@ async function launch() {
 	const chat = new FakeChat(() => runtime.now());
 	const app = testApp(f, {
 		workflows: [],
-		subscriptions: [conversation],
+		routedAgents: [developer],
 		runtime,
 		chat,
 		agents: pi({ models, sql, settings: { retry: { enabled: false } } }),

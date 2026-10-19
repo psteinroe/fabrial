@@ -71,7 +71,6 @@ export const BridgeKey = createContextKey<BridgeFrame>("fabrial.pi.bridge");
 export type FabrialFields = Omit<import("../agent.ts").ToolContext, "signal">;
 export type StagedState = {
 	definition: StateDefinition;
-	interactionId: string;
 	changes: ((draft: JsonObject) => void | JsonObject)[];
 	value: JsonObject;
 };
@@ -190,12 +189,10 @@ export async function fields(
 		// Sent from a managed child execution, through the same path as workflow `ctx.send`.
 		send: async (id, agent, options) => {
 			if (!api) throw new Error("Prompt sections cannot send");
-			const replyTo =
-				options.replyTo && "post" in options.replyTo ? options.replyTo.ref : options.replyTo;
 			const home = options.home && "post" in options.home ? options.home.ref : options.home;
 			return (await operation(id, "send", [
 				agent.name,
-				cloneJson({ ...options, replyTo, home }) as unknown as Json,
+				cloneJson({ ...options, home }) as unknown as Json,
 			])) as SendReceipt;
 		},
 		subscribe: async (id, resource, options) => {
@@ -233,13 +230,11 @@ export async function fields(
 				let entry = staged.get(key);
 				if (!entry) {
 					const value = await bridge.harness.commit(
-						async (tx) =>
-							cloneJson(await stateDraft(tx, definition, metadata.interactionId, conversationId)),
+						async (tx) => cloneJson(await stateDraft(tx, definition, conversationId)),
 						context,
 					);
 					entry = {
 						definition: definition as unknown as StateDefinition,
-						interactionId: metadata.interactionId,
 						value,
 						changes: [],
 					};
@@ -306,7 +301,6 @@ export async function startChild(
 			// `piChild` makes the settlement of a child the Session waits for a signal to it.
 			metadata: {
 				...inherited,
-				ownsThread: false,
 				triggerEvent: null,
 				ownerWorkflow: null,
 				...(detached ? {} : { piChild: bridge.session }),
@@ -357,13 +351,7 @@ export async function commitStaged(
 	await api.commit(async (tx) => {
 		for (const entry of staged.values())
 			if (entry.changes.length)
-				await applyState(
-					tx,
-					entry.definition,
-					entry.interactionId,
-					api.conversationId,
-					entry.changes,
-				);
+				await applyState(tx, entry.definition, api.conversationId, entry.changes);
 		await change(tx);
 	}, context);
 }

@@ -77,7 +77,6 @@ export async function createApproval(
 		{
 			metadata: {
 				...metadata,
-				ownsThread: false,
 				replyTo: null,
 				ownerWorkflow: null,
 				triggerEvent: null,

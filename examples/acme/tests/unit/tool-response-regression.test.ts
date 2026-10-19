@@ -27,7 +27,6 @@ it("a tool child retains its response thread without inheriting trigger ownershi
 		origin: null,
 		replyTo: { kind: "thread", provider: "slack", threadId: "slack:C_SUPPORT:root" },
 		requestedBy: null,
-		ownsThread: false,
 		triggerEvent: null,
 		ownerWorkflow: null,
 	};

@@ -39,7 +39,6 @@ const emptyMetadata = (interactionId: string): InvocationMetadata => ({
 	origin: null,
 	replyTo: null,
 	requestedBy: null,
-	ownsThread: false,
 });
 
 type Carrier = {
@@ -365,7 +364,6 @@ class ConductorRuntime implements DurableRuntime {
 								return {};
 							const metadata = {
 								...inherited,
-								ownsThread: Boolean(isOwner && inherited.ownsThread),
 								replyTo: isOwner ? inherited.replyTo : null,
 							};
 							const input: Json = payload ? clean(payload) : { name: event.name };

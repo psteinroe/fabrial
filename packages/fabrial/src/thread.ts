@@ -1,4 +1,4 @@
-import type { ExternalIdentity, Principal } from "./identity.ts";
+import type { ExternalIdentity } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 
 /** Serializable reference to a chat thread. `threadId` is Chat SDK's full id (`adapter:channel:thread`). */
@@ -64,20 +64,6 @@ export interface Thread {
 
 	post(id: string, message: OutboundMessage): Promise<MessageRef>;
 	update(id: string, message: MessageRef, content: OutboundMessage): Promise<void>;
-
-	/** Durable wait for the next reply in this interaction's thread; buffered replies are consumed first. */
-	waitForReply(
-		id: string,
-		options?: { from?: Principal; timeout?: string | number },
-	): Promise<ChatMessage | null>;
-	/** `post` + `waitForReply` as one durable operation. */
-	ask(
-		id: string,
-		message: OutboundMessage,
-		options?: { from?: Principal; timeout?: string | number },
-	): Promise<ChatMessage | null>;
-	/** Reply awaitable for `ctx.race`. */
-	nextReply(options?: { from?: Principal }): Awaitable<ChatMessage>;
 
 	/** Messages for model context (bounded, attributed). Durable: loaded once per id. */
 	history(id: string, options?: { limit?: number }): Promise<ChatMessage[]>;

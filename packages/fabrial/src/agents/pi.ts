@@ -132,7 +132,7 @@ type SessionInput =
 			caller: string;
 			detached: boolean;
 	  }
-	| { kind: "replies"; interactionId: string }
+	| { kind: "stop"; agent: string; reason: string }
 	| { kind: "child"; executionId: string; result: ExecutionResult }
 	| { kind: "cancel"; caller: string; reason: string };
 
@@ -163,6 +163,10 @@ interface HostedRun {
 		stop(): Promise<void>;
 	};
 }
+/** The Session of a `ctx.agent` call: one per call, keyed by the calling workflow run and operation id. */
+export const callSession = (executionId: string, id: string) => `run:${executionId}:${id}`;
+
+/** The Session of a workflow's `ctx.state`: its thread's, else its own. */
 export function sessionKey(metadata: InvocationMetadata): string {
 	const surface = metadata.replyTo;
 	if (surface?.kind === "thread") return threadSession(surface.provider, surface.threadId);
@@ -474,7 +478,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	/** Metadata of a Session execution: it serves many requests, so it carries none of theirs. */
 	const sessionMetadata = (key: string): Partial<InvocationMetadata> => ({
 		replyTo: null,
-		ownsThread: false,
 		ownerWorkflow: null,
 		triggerEvent: null,
 		piSession: key,
@@ -758,10 +761,12 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					await admit(run, input.requestId, input.content, input.metadata, "steer", false);
 					return;
 				}
-				case "replies": {
-					for (const run of runs.values())
-						if (run.started && run.io && run.call?.metadata.interactionId === input.interactionId)
-							await drainReplies(run);
+				case "stop": {
+					// A stop in a followed thread ends the conversation's current run; calls belong to their workflow.
+					const run = [...runs.values()].find((r) => r.agent === input.agent && !r.call);
+					if (!run) return;
+					await cancelRun(harness, run.id, input.reason);
+					await finish(run, undefined);
 					return;
 				}
 				case "child": {
@@ -826,10 +831,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				await harness.commit(async (tx) => {
 					(await tx.doc(Binding, run.conversation.id)).requestId = requestId;
 				}, context);
-				if (run.call.metadata.ownsThread) {
+				// A call shows its progress on the calling workflow's thread.
+				if (run.call.metadata.replyTo?.kind === "thread")
 					run.io = await thread({ metadata: run.call.metadata } as DurableExecution);
-					if (run.io) await setActive(run.io, run.call.metadata.interactionId, true);
-				}
 			}
 			if (!run.call || run.io) run.ui = await progressOf(run, harness, context);
 		}
@@ -875,60 +879,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						(await tx.doc(Runs)).runs[run.id]!.requests![requestId]!.submissionId = submission.id;
 					}, context);
 			}
-		}
-
-		/**
-		 * Replies in a thread a call owns steer its run, admitted before they leave the thread's buffer. Returns how
-		 * many it admitted.
-		 */
-		async function drainReplies(run: HostedRun): Promise<number> {
-			const metadata = run.call!.metadata;
-			const routing = await run.io!.getState();
-			if (routing?.interactionId !== metadata.interactionId || !routing.bufferedReplies.length)
-				return 0;
-			const delivered = new Set<string>();
-			for (const message of routing.bufferedReplies) {
-				const requestId = JSON.stringify([
-					"fabrial.pi.reply",
-					routing.interactionId,
-					message.provider,
-					message.messageId,
-				]);
-				const actor = await host.resolvePrincipal(message.author.identity);
-				await admit(
-					run,
-					requestId,
-					`${message.author.name ?? message.author.identity.subjectId}: ${message.text}`,
-					{
-						...metadata,
-						requestedBy: actor as InvocationMetadata["requestedBy"],
-						origin: {
-							provider: message.provider,
-							threadId: message.threadId,
-							messageId: message.messageId,
-						},
-						triggerEvent: null,
-						ownerWorkflow: null,
-					},
-					"steer",
-					false,
-				);
-				delivered.add(message.messageId);
-			}
-			await submitPending(run);
-			// Only acknowledge durably admitted submissions, preserving concurrent ingress.
-			await run.io!.updateState((latest) =>
-				latest?.interactionId === routing.interactionId
-					? {
-							...latest,
-							bufferedReplies: latest.bufferedReplies.filter(
-								(message) => !delivered.has(message.messageId),
-							),
-							consumedReplyIds: [...new Set([...(latest.consumedReplyIds ?? []), ...delivered])],
-						}
-					: latest,
-			);
-			return delivered.size;
 		}
 
 		/** Text of an answer entry, or undefined when it ends in `no_reply`. */
@@ -1069,10 +1019,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			}, context);
 			runs.delete(run.id);
 			await run.ui?.stop();
-			if (run.io && run.call) {
-				await setActive(run.io, run.call.metadata.interactionId, false);
-				await run.io.setStatus(null).catch(() => {});
-			}
+			if (run.io && run.call) await run.io.setStatus(null).catch(() => {});
 		}
 
 		async function evaluate(run: HostedRun) {
@@ -1116,8 +1063,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			// only once the lead has answered the last of them.
 			if (complete && !failed && ((await backgroundPending(harness, context)) || (await live())))
 				complete = false;
-			// A reply buffered while the run was finishing, whose signal found it busy, steers it still.
-			if (complete && !failed && run.io && (await drainReplies(run))) complete = false;
 			if (complete) {
 				if (failed) return finish(run, { status: "failed", error: `Pi run unanswered: ${failed}` });
 				answer = (await reportedAnswer(harness, run.id, run.conversation.id, context)) ?? answer;
@@ -1163,8 +1108,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				const fresh = !run.started;
 				if (fresh) await activate(run);
 				await submitPending(run);
-				// Replies buffered before the run started steer it after its own input.
-				if (fresh && run.io) await drainReplies(run);
 				await evaluate(run);
 			}
 			if (runs.size !== before) return schedule();
@@ -1457,10 +1400,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			});
 		},
 	};
-	/** Who follows a thread by its session key: conversations that received sent input. */
-	const register = (session: string, agent: string) =>
-		options.sql`INSERT INTO fabrial_pi.conversations (session_key, agent) VALUES (${session}, ${agent})
-			ON CONFLICT DO NOTHING`;
 	const sessionInput = (agent: AgentRef, request: SendRequest): SessionInput => ({
 		kind: "input",
 		agent: agent.name,
@@ -1471,17 +1410,19 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	});
 	const port: AgentPort = {
 		workflows: () => [session, effect],
-		async conversations(key) {
-			const rows = await options.sql<{ agent: string }[]>`SELECT agent FROM fabrial_pi.conversations
-				WHERE session_key = ${key} ORDER BY agent`;
-			return rows.map((row) => row.agent);
+		async stop(conversation, id, reason) {
+			await signalSession(
+				conversation.session,
+				`fabrial.stop:${id}:${conversation.agent}`,
+				{ kind: "stop", agent: conversation.agent, reason },
+				{ interactionId: id, origin: null, replyTo: null, requestedBy: null },
+			);
 		},
 		async deliver(agent, request) {
 			if (!agents.has(agent.name))
 				throw new Error(
 					`Agent ${agent.name} is not installed; defineAgent must be evaluated before app.start()`,
 				);
-			await register(request.session, agent.name);
 			await signalSession(
 				request.session,
 				request.requestId,
@@ -1491,9 +1432,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			return { requestId: request.requestId, session: request.session };
 		},
 		async send(execution, id, agent, request) {
-			await execution.step(`fabrial:pi:register:${id}`, () =>
-				register(request.session, agent.name).then(() => undefined),
-			);
 			const input = sessionInput(agent, request);
 			await execution.signalWithStart(`fabrial:pi:deliver:${id}`, {
 				workflow: SESSION_WORKFLOW,
@@ -1505,10 +1443,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			return { requestId: request.requestId, session: request.session };
 		},
 		async run(execution, id, agent: AgentRef, request) {
-			// A channel locator is not a durable Session identity. Core rebinds metadata from
-			// the first workflow post receipt; never promote a provisional ThreadIO.ref.
+			// A call has its own Session, keyed by the workflow run: it never shares a transcript with a thread's
+			// conversation and never follows a thread.
 			const metadata = execution.metadata;
-			const key = sessionKey(metadata);
+			const key = callSession(execution.executionId, id);
 			const requestId = `${execution.executionId}:${id}`;
 			// Taken before the input is sent, so the answer is never emitted before the wait.
 			const cursor = await execution.cursor(`fabrial:pi:cursor:${id}`);
@@ -1578,36 +1516,16 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					metadata,
 				);
 			if (result.status !== "cancelled") return;
-			// A cancelled caller cancels its calls (unless detached) in the Session they reached.
-			let key: string;
-			try {
-				key = sessionKey(metadata);
-			} catch {
-				return;
-			}
-			const [known] = await options.sql`SELECT 1 FROM fabrial_pi.sessions WHERE key = ${key}`;
-			if (known)
+			// A cancelled caller cancels its calls (unless detached) in the Sessions they reached.
+			const known = await options.sql<{ key: string }[]>`SELECT key FROM fabrial_pi.sessions
+				WHERE starts_with(key, ${callSession(executionId, "")})`;
+			for (const { key } of known)
 				await signalSession(
 					key,
 					`fabrial.cancel:${executionId}`,
 					{ kind: "cancel", caller: executionId, reason: result.reason },
 					metadata,
 				);
-		},
-		async reply(thread, interactionId, dedupeId) {
-			const key = threadSession(thread.provider, thread.threadId);
-			await signalSession(
-				key,
-				`fabrial.reply:${dedupeId}`,
-				{ kind: "replies", interactionId },
-				{
-					interactionId,
-					origin: null,
-					replyTo: null,
-					requestedBy: null,
-					ownsThread: false,
-				},
-			);
 		},
 	};
 	const state: StatePort = {
@@ -1630,13 +1548,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						);
 						if (receipt.value !== null)
 							return cloneJson(receipt.value) as ReturnType<typeof definition.initial>;
-						const value = await applyState(
-							tx,
-							definition,
-							execution.metadata.interactionId,
-							undefined,
-							[change],
-						);
+						const value = await applyState(tx, definition, undefined, [change]);
 						receipt.value = cloneJson(value);
 						return value;
 					}, context);
@@ -1683,12 +1595,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			await Promise.all(active.values());
 		},
 	};
-}
-
-async function setActive(io: ThreadIO, interactionId: string, agentActive: boolean) {
-	await io.updateState((routing) =>
-		routing?.interactionId === interactionId ? { ...routing, agentActive } : routing,
-	);
 }
 
 /**

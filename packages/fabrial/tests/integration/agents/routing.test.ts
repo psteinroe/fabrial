@@ -170,7 +170,7 @@ it("use case 1: a mention in #help starts a conversation that follows its thread
 	await t.settle();
 	// Bob doesn't mention the bot: the thread is followed, so the message reaches the same conversation.
 	expect(await t.receive(t.message("m2", "t1", "and for annual plans?", { author: "bob" }))).toBe(
-		"reply",
+		"follow",
 	);
 	expect(await t.receive(t.message("m2", "t1", "and for annual plans?", { author: "bob" }))).toBe(
 		"ignored",
@@ -211,13 +211,17 @@ it("use case 2: every message in a channel reaches the agent in its thread; irre
 	expect(t.faux.state.callCount).toBe(2);
 	expect(await t.posts("t1")).toEqual(["Restart the worker."]);
 	expect(await t.posts("t2")).toEqual([]);
-	// Two threads, two conversations: one Session per thread.
-	const rows = await sql`SELECT session_key FROM fabrial_pi.conversations
-		WHERE agent = ${`watcher-${t.channel}`} ORDER BY session_key`;
-	expect(rows.map((row) => row.session_key)).toEqual([
-		`chat:chat:${t.channel}:t1`,
-		`chat:chat:${t.channel}:t2`,
-	]);
+	// Two threads, two conversations: one Session per thread, each recorded as the thread's follower.
+	for (const thread of ["t1", "t2"]) {
+		const io = await t.chat.thread({
+			kind: "thread",
+			provider: "chat",
+			threadId: `chat:${t.channel}:${thread}`,
+		});
+		expect((await io.getState())?.follows).toEqual([
+			{ session: `chat:chat:${t.channel}:${thread}`, agent: `watcher-${t.channel}` },
+		]);
+	}
 });
 
 it('use case 3: session "channel" puts many threads in one conversation, answers each in its thread, and follows each', async () => {
@@ -241,7 +245,7 @@ it('use case 3: session "channel" puts many threads in one conversation, answers
 	expect(await t.receive(t.message("m2", "t2", "@bot disk usage?", { mention: true }))).toBe("new");
 	await t.settle();
 	// Unmentioned, but t1 is followed: a follow record in its thread state.
-	expect(await t.receive(t.message("m3", "t1", "thanks, and staging?"))).toBe("reply");
+	expect(await t.receive(t.message("m3", "t1", "thanks, and staging?"))).toBe("follow");
 	await t.settle();
 	expect(seen[2]).toContain("deploy status?");
 	expect(seen[2]).toContain("disk usage?");
@@ -277,7 +281,7 @@ it("use case 5: started on GitHub, the home is the PR and replies post there", a
 		),
 	).toBe("new");
 	await t.settle();
-	expect(await t.receive(t.message("c2", pr, "pushed a fix", { provider: "gh" }))).toBe("reply");
+	expect(await t.receive(t.message("c2", pr, "pushed a fix", { provider: "gh" }))).toBe("follow");
 	await t.settle();
 	expect(await t.posts(pr, "gh")).toEqual(["Looks good.", "Fixed now."]);
 });
@@ -318,10 +322,52 @@ it("use case 6: an event without a thread starts a conversation in its home; the
 		...t.message("m1", "x", "is this the checkout bug?"),
 		threadId: created.ref.threadId,
 	};
-	expect(await t.receive(reply)).toBe("reply");
+	expect(await t.receive(reply)).toBe("follow");
 	await t.settle();
 	expect(seen[1]).toContain("TypeError in checkout");
 	expect(created.posts.map((post) => post.content)).toEqual(["Answer 1", "Answer 2"]);
+});
+
+it("a ctx.agent call runs in its own Session and never follows the thread: later replies don't reach it", async () => {
+	const seen: string[] = [];
+	const t = await setup(({ channel, model }) => {
+		const investigator = f.defineAgent({
+			name: `investigator-${channel}`,
+			description: "Investigates bugs.",
+			model,
+		});
+		const intake = f.defineWorkflow({
+			name: `intake-${channel}`,
+			triggers: [chatTrigger("chat", "mentioned", { channel })],
+			async run(message, ctx) {
+				const answer = await ctx.agent<string>("investigate", investigator, {
+					input: message.text,
+				});
+				await ctx.thread!.post("analysis", answer);
+			},
+		});
+		return { agents: [investigator], workflows: [intake] };
+	});
+	t.respond([asked(seen), asked(seen)]);
+	expect(await t.receive(t.message("m1", "b1", "@bot checkout is broken", { mention: true }))).toBe(
+		"new",
+	);
+	await t.settle();
+	expect(await t.posts("b1")).toEqual(["Answer 1"]);
+	const io = await t.chat.thread({
+		kind: "thread",
+		provider: "chat",
+		threadId: `chat:${t.channel}:b1`,
+	});
+	expect((await io.getState())?.follows).toBeUndefined();
+	// No conversation follows the thread and nothing triggers on an unmentioned reply: it reaches no one.
+	await t.receive(t.message("m2", "b1", "it fails on step 2"));
+	await t.settle();
+	expect(t.faux.state.callCount).toBe(1);
+	expect(await t.posts("b1")).toEqual(["Answer 1"]);
+	const [thread] =
+		await sql`SELECT 1 FROM fabrial_pi.sessions WHERE key = ${`chat:chat:${t.channel}:b1`}`;
+	expect(thread).toBeUndefined();
 });
 
 it("a router workflow picks an agent with ctx.send; later replies go straight to it, and a more specific agent trigger wins over the router", async () => {
@@ -359,9 +405,9 @@ it("a router workflow picks an agent with ctx.send; later replies go straight to
 	expect(await t.receive(elsewhere("m1", "@bot checkout is broken", true))).toBe("new");
 	await t.settle();
 	expect(routed).toBe(1);
-	expect(await t.receive(elsewhere("m2", "it fails on step 2"))).toBe("reply");
+	expect(await t.receive(elsewhere("m2", "it fails on step 2"))).toBe("follow");
 	await t.settle();
-	expect(await t.receive(elsewhere("m3", "@bot any update?", true))).toBe("reply");
+	expect(await t.receive(elsewhere("m3", "@bot any update?", true))).toBe("follow");
 	await t.settle();
 	expect(routed).toBe(1);
 	const other = await t.chat.thread({
@@ -410,7 +456,7 @@ it("a message naming another agent in a followed thread goes only to that agent,
 	await t.receive(t.message("m1", "t1", "@bot question", { mention: true }));
 	await t.settle();
 	expect(await t.receive(t.message("m2", "t1", `@expert-${t.channel} can you take this?`))).toBe(
-		"reply",
+		"follow",
 	);
 	await t.settle();
 	expect(seen.lead).toHaveLength(1);
@@ -418,7 +464,7 @@ it("a message naming another agent in a followed thread goes only to that agent,
 	expect(seen.expert[0]).toContain("can you take this?");
 	expect(await t.posts("t1")).toEqual(["lead 1", "expert 1"]);
 	// Both follow the thread now: an unaddressed message reaches both conversations.
-	expect(await t.receive(t.message("m3", "t1", "thanks both"))).toBe("reply");
+	expect(await t.receive(t.message("m3", "t1", "thanks both"))).toBe("follow");
 	await t.settle();
 	expect(seen.lead).toHaveLength(2);
 	expect(seen.expert).toHaveLength(2);

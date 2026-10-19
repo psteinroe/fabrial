@@ -22,7 +22,7 @@ import {
 	type RuntimeWorkflow,
 } from "../../../src/index.ts";
 import { toolName } from "../../../src/agent.ts";
-import { pi, PostgresStorage, sessionKey } from "../../../src/agents/index.ts";
+import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { SubagentWork } from "../../../src/agents/documents.ts";
 import { FakeChat, MemoryRuntime, testApp } from "../../../src/testing.ts";
 
@@ -42,7 +42,8 @@ afterAll(async () => {
 });
 
 function fixture() {
-	const runtime = new MemoryRuntime();
+	// Calls key their Session by execution id: unique ids keep tests apart in the shared database.
+	const runtime = new MemoryRuntime({ idPrefix: randomUUID() });
 	const chat = new FakeChat();
 	const faux = fauxProvider();
 	const models = createModels();
@@ -52,7 +53,6 @@ function fixture() {
 		origin: null,
 		replyTo: { kind: "thread", provider: "slack-test", threadId: randomUUID() },
 		requestedBy: { id: "alice", known: true, identities: [], name: "Alice" },
-		ownsThread: true,
 		ownerWorkflow: null,
 		triggerEvent: null,
 	};
@@ -79,6 +79,9 @@ function fixture() {
 				return typeof step === "function" ? step(context, ...rest) : step;
 			}),
 		);
+	/** The Session of the latest call: a `ctx.agent` call runs in its own. */
+	let calling = "";
+	const key = () => callSession(calling, "agent");
 	/** Runs `agent` from a workflow call with `input`; the runtime settles everything it started. */
 	const call = async (agent: Agent, input: string, others: RuntimeWorkflow[] = []) => {
 		const workflow: RuntimeWorkflow = {
@@ -93,11 +96,12 @@ function fixture() {
 		await integration.start();
 		await runtime.start();
 		const id = await runtime.invoke(workflow.name, null, { metadata });
+		calling = id;
 		return { id, settled: runtime.flush().then(() => runtime.result(id)) };
 	};
 	const writes = async () =>
 		(
-			await sql`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${sessionKey(metadata)} ORDER BY seq`
+			await sql`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${key()} ORDER BY seq`
 		).flatMap((row) => JSON.parse(String(row.writes)) as StorageWrite[]);
 	return {
 		runtime,
@@ -111,6 +115,7 @@ function fixture() {
 		contexts,
 		respond,
 		call,
+		key,
 		writes,
 	};
 }
@@ -420,7 +425,7 @@ it("a child's workflow tool acts for the lead's request; the Session is released
 			handler: async (_input, execution) => {
 				seen.push(execution.metadata);
 				// The driver released the Session while the child waits on this workflow.
-				await leaseFreed(sessionKey(f.metadata));
+				await leaseFreed(f.key());
 				return "approved and ran";
 			},
 		},
@@ -431,7 +436,6 @@ it("a child's workflow tool acts for the lead's request; the Session is released
 		interactionId: f.metadata.interactionId,
 		replyTo: f.metadata.replyTo,
 		requestedBy: f.metadata.requestedBy,
-		ownsThread: false,
 	});
 	expect(toolResults(f.contexts[2]!)).toEqual(['"approved and ran"']);
 	// The driver waited for the workflow with the Session released, then reran the lead's call: the same
@@ -678,7 +682,7 @@ it("a background child's report survives the Session being released and the driv
 			// The first run replaces the Session owner, so the driver loses its lease and is redelivered.
 			if (!crashes++)
 				await sql`UPDATE fabrial_pi.sessions SET epoch = epoch + 1, owner = NULL, lease_until = NULL
-					WHERE key = ${sessionKey(f.metadata)}`;
+					WHERE key = ${f.key()}`;
 			return "flaked";
 		},
 	});
@@ -706,7 +710,7 @@ it("a background child's report survives the Session being released and the driv
 			triggers: [],
 			handler: async () => {
 				// The driver released the Session while the background child waits on this workflow.
-				await leaseFreed(sessionKey(f.metadata));
+				await leaseFreed(f.key());
 				released = true;
 				return "approved and ran";
 			},
@@ -735,7 +739,7 @@ it("limits.concurrent counts a running background child durably across driver at
 			// The first run replaces the Session owner: the driver loses its lease and is redelivered.
 			if (!runs++) {
 				await sql`UPDATE fabrial_pi.sessions SET epoch = epoch + 1, owner = NULL, lease_until = NULL
-					WHERE key = ${sessionKey(f.metadata)}`;
+					WHERE key = ${f.key()}`;
 				crashed.open();
 			}
 			await Promise.race([
@@ -896,7 +900,6 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 				origin: null,
 				replyTo: null,
 				requestedBy: { id: alice.id, known: true, identities: [], name: "Alice" },
-				ownsThread: false,
 				ownerWorkflow: null,
 				triggerEvent: null,
 			},
@@ -1042,7 +1045,7 @@ it("a background child waiting for approval releases the Session: a new message 
 		name: `ask-${short()}`,
 		input: z.object({ text: z.string() }),
 		run: async (input, ctx) => {
-			await ctx.send("ask", lead, { session, input: input.text, replyTo: thread });
+			await ctx.send("ask", lead, { session, input: input.text, home: thread });
 		},
 	});
 	faux.setResponses(
@@ -1088,7 +1091,6 @@ it("a background child waiting for approval releases the Session: a new message 
 					origin: null,
 					replyTo: null,
 					requestedBy: { id: alice.id, known: true, identities: [], name: "Alice" },
-					ownsThread: false,
 					ownerWorkflow: null,
 					triggerEvent: null,
 				},
@@ -1161,7 +1163,7 @@ it("a child's answer frees its concurrency slot as it settles, and its status li
 	});
 	const { settled } = await f.call(lead, "Go");
 	expect(await settled).toEqual({ status: "completed", output: "Final" });
-	const storage = await PostgresStorage.open(sql, sessionKey(f.metadata));
+	const storage = await PostgresStorage.open(sql, f.key());
 	const session = createSession(storage);
 	try {
 		// Holders stay recorded, so a rerun is admitted, but none counts against the limit.

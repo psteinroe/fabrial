@@ -41,12 +41,10 @@ it("persists thread routing state and subscription through a Postgres-backed res
 				[0, null],
 			]);
 			const updated = await thread.getState();
-			expect(updated?.consumedReplyIds).toHaveLength(41);
-			expect(new Set(updated?.consumedReplyIds).size).toBe(41);
+			expect(updated?.follows).toHaveLength(41);
+			expect(new Set(updated?.follows?.map((f) => f.session)).size).toBe(41);
 			expect(updated).toMatchObject({
-				requesterId: "alice",
-				participantIds: ["alice", "bob"],
-				cancellationIds: ["stop-1"],
+				ingestedDedupeIds: [{ kind: "message", id: "message-1", at: 1 }],
 			});
 			// Restore the codec fixture for the restart/TTL assertions below.
 			await thread.updateState(() => routingState);

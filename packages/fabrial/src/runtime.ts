@@ -15,14 +15,12 @@ import type { ChatMessage, MessageRef, OutboundMessage, Surface, ThreadRef } fro
 
 /** Serializable invocation context carried by every execution (Conductor execution metadata, item 2). */
 export interface InvocationMetadata extends JsonObject {
-	/** One user request, across handoffs. */
+	/** Correlates one request: derived from the source event (or the run), it keys request ids. */
 	interactionId: string;
 	origin: (Origin & JsonObject) | null;
 	/** Where `ctx.thread` points. `null` for executions without a surface (observers, cron without replyTo). */
 	replyTo: (Surface & JsonObject) | null;
 	requestedBy: (Principal & JsonObject) | null;
-	/** True when this execution owns the interaction's thread (renders progress, receives replies). */
-	ownsThread: boolean;
 	// Requests delivered by `ctx.send` also carry `send: SentRequest` (kind and priority). Tools and the
 	// workflows they start carry `conversation: ConversationRef`, the agent conversation they belong to.
 }
@@ -238,39 +236,33 @@ export interface ThreadIO {
 	/**
 	 * Atomic read-modify-write of the routing state under a per-thread lock (Chat SDK state adapter lock),
 	 * across processes. `fn` may run more than once; keep it pure. Returning `null` clears the state.
-	 * Every writer (ingress, binding, handoff, buffering, consumption, settlement) must use this.
 	 */
 	updateState(
 		fn: (state: ThreadRoutingState | null) => ThreadRoutingState | null,
 	): Promise<ThreadRoutingState | null>;
 }
 
+/** A conversation following a thread: `[session, agent]`. */
+export interface Follow extends JsonObject {
+	session: string;
+	agent: string;
+}
+
+/** Fabrial's state of a thread: ingress receipts, follows, and the progress status message. */
 export type ThreadRoutingState = JsonObject & {
-	/** null explicitly means no active interaction; the state may still hold ingress tombstones. */
-	interactionId: string | null;
-	handlerExecutionId: string | null;
-	/** Epoch ms when an unbound slot was reserved. Missing on legacy states (ingress treats these as stale). */
-	reservedAt?: number;
-	/** Last 100 accepted message/action dedupe ids, retained across settlement (subject to thread TTL). */
-	ingestedDedupeIds?: { kind: "message" | "action" | "cancellation"; id: string; at: number }[];
-	/** True while an agent run drives the thread; replies go to the Pi conversation as steering. */
-	agentActive: boolean;
-	statusMessageId: string | null;
-	/** Replies received while nobody waited; consumed by the next `waitForReply` / `ctx.agent`. */
-	bufferedReplies: ChatMessage[];
-	/** Message ids already delivered to a workflow reply wait (buffer/event deduplication). */
-	consumedReplyIds?: string[];
-	/** Idempotent acknowledgement owner per message; a replay of the same consuming operation is accepted. */
-	consumedReplyOperations?: Record<string, string>;
-	/** Cancellation authority is scoped to the current interaction. */
-	requesterId?: string;
-	participantIds?: string[];
-	cancellationIds?: string[];
 	/**
-	 * Conversations following this thread whose session key isn't the thread's: its messages reach them. Kept
-	 * across interactions (subject to the thread TTL).
+	 * Last 100 ingress receipts (subject to the thread TTL). A receipt with `pending` was routed, but its
+	 * delivery isn't confirmed yet: a redelivery replays that route instead of routing again.
 	 */
-	follows?: { session: string; agent: string }[];
+	ingestedDedupeIds?: {
+		kind: "message" | "action" | "cancellation";
+		id: string;
+		at: number;
+		pending?: { route: "follow" | "new"; conversations: Follow[] };
+	}[];
+	statusMessageId?: string | null;
+	/** Conversations following this thread, whatever their session kind: its messages reach them. */
+	follows?: Follow[];
 };
 
 /** Port implemented by the chat module. */
@@ -319,10 +311,8 @@ export interface AgentPort {
 		agent: AgentRef,
 		request: import("./send.ts").SendRequest,
 	): Promise<import("./send.ts").SendReceipt>;
-	/** Agents with a conversation in a Session that received sent input: who follows a thread by its key. */
-	conversations?(session: string): Promise<string[]>;
-	/** A reply was buffered in a thread whose interaction an agent call drives: steer it. */
-	reply?(thread: ThreadRef, interactionId: string, dedupeId: string): Promise<void>;
+	/** A stop in a followed thread: cancel the conversation's current run (Pi abort; the Session stays). */
+	stop?(conversation: Follow, id: string, reason: string): Promise<void>;
 }
 
 /** Minimal shape core needs from `f.defineAgent`. */

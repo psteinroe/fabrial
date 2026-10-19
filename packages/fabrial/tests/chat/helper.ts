@@ -6,16 +6,9 @@ import { vi } from "vitest";
 import { chat, chatCapability, chatEvents } from "../../src/chat/index.ts";
 
 export const routingState: ThreadRoutingState = {
-	interactionId: "interaction-1",
-	handlerExecutionId: "execution-1",
-	agentActive: false,
+	ingestedDedupeIds: [{ kind: "message", id: "message-1", at: 1 }],
 	statusMessageId: null,
-	bufferedReplies: [],
-	consumedReplyIds: ["consumed-1"],
-	consumedReplyOperations: { "consumed-1": "operation-1" },
-	requesterId: "alice",
-	participantIds: ["alice", "bob"],
-	cancellationIds: ["stop-1"],
+	follows: [{ session: "slack:C1:root", agent: "support" }],
 };
 
 export function setup(state: StateAdapter = createMemoryState()) {

@@ -24,21 +24,23 @@ export interface ConversationKey extends JsonObject {
 }
 
 export interface SendOptions {
-	/** A ChatMessage (rendered with attribution), a string, or any JSON value. */
+	/**
+	 * A ChatMessage (rendered with attribution, delivered as a message) or any other JSON value (delivered as a
+	 * notification), as if the agent's trigger had matched it.
+	 */
 	input: Json;
 	/**
 	 * Where the conversation lives when the input has no thread (e.g. `slack.channel("C_BUGS")`): the first final
-	 * reply creates the thread, which the conversation follows.
+	 * reply creates the thread, which the conversation follows. Default: this execution's thread.
 	 */
 	home?: Thread | Surface;
-	/** Overrides the agent's `session`: `"thread"`, `"channel"`, or an app key such as `ticket:${id}`. */
+	/**
+	 * Overrides the agent's `session` (`"thread"`, `"channel"`, or an app key such as `ops`). Needed for input
+	 * without a thread: without it, each such send would start a conversation of its own.
+	 */
 	session?: SessionOption;
-	/** Default `"message"`. */
-	kind?: InputKind;
-	/** Notifications only; default `"normal"`. */
+	/** Notifications only (default `"normal"`): `urgent` steers, `normal` follows up, `low` is written unread. */
 	priority?: InputPriority;
-	/** Where the agent's final reply goes. Default: the input's thread, `home`, or this execution's thread. */
-	replyTo?: Thread | Surface | null;
 }
 
 export interface SendReceipt extends JsonObject {
@@ -60,7 +62,7 @@ export interface SendRequest extends JsonObject {
 	delivery: Delivery;
 	/** The request's own context: actor, replyTo, origin, kind. */
 	metadata: InvocationMetadata;
-	/** The thread the conversation follows after this delivery, when its session key doesn't say so. */
+	/** The thread the conversation follows after this delivery. */
 	follow: (ThreadRef & JsonObject) | null;
 }
 
@@ -202,15 +204,14 @@ export function conversationSession(
 }
 
 /**
- * The thread a delivery makes the conversation follow: its reply thread, unless the session key is that thread's
- * (implicit). A channel home is followed once the first final reply creates its thread (`metadata.follow`).
+ * The thread a delivery makes the conversation follow: its reply thread, whatever the session kind (follow records
+ * are the routing index). A channel home is followed once the first final reply creates its thread
+ * (`metadata.follow`).
  */
 export function followedThread(
-	session: string,
 	replyTo: InvocationMetadata["replyTo"],
 ): (ThreadRef & JsonObject) | null {
-	if (replyTo?.kind !== "thread" || session === threadSession(replyTo.provider, replyTo.threadId))
-		return null;
+	if (replyTo?.kind !== "thread") return null;
 	return { kind: "thread", provider: replyTo.provider, threadId: replyTo.threadId };
 }
 
@@ -261,13 +262,12 @@ export async function prepareInput(
 		requestId: options.requestId,
 		content: [...context, rendered].join("\n\n"),
 		delivery: deliveryFor(kind, priority),
-		follow: followedThread(session, replyTo),
+		follow: followedThread(replyTo),
 		metadata: {
 			...metadata,
 			requestedBy: actor as InvocationMetadata["requestedBy"],
 			replyTo,
 			origin: origin as InvocationMetadata["origin"],
-			ownsThread: false,
 			ownerWorkflow: null,
 			triggerEvent: null,
 			send: { kind, priority } satisfies SentRequest,
@@ -290,31 +290,20 @@ export async function prepareSend(
 	agent: AgentRef & { definition?: { session?: AgentSession } },
 	opts: SendOptions,
 ): Promise<SendRequest> {
-	const current = surface.current;
 	const message = isChatMessage(opts.input) ? opts.input : undefined;
 	const home = opts.home ? replySurface(opts.home, null) : undefined;
-	const replyTo =
-		opts.replyTo !== undefined
-			? replySurface(opts.replyTo, current)
-			: message
-				? threadOf(message)
-				: (home ?? current);
+	const replyTo = message ? threadOf(message) : (home ?? surface.current);
 	const option = opts.session ?? agent.definition?.session ?? "thread";
 	const session =
 		message || home || typeof option === "function" || (option !== "thread" && option !== "channel")
-			? conversationSession(
-					option,
-					opts.input,
-					message ? threadOf(message) : (home ?? replyTo),
-					`send:${requestId}`,
-				)
+			? conversationSession(option, opts.input, replyTo, `send:${requestId}`)
 			: await resolveSession(option, surface);
 	return prepareInput(host, metadata, {
 		agent: agent.name,
 		session,
 		requestId,
 		input: opts.input,
-		kind: opts.kind,
+		kind: message ? "message" : "notification",
 		priority: opts.priority,
 		replyTo,
 	});

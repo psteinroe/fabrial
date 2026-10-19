@@ -1,7 +1,7 @@
 # Acme — Fabrial v1 reference app
 
 A private workspace example, not a hosted service. The app has one Slack entry
-workflow, a support agent, a SQL repair workflow with triage approval, bug handoff,
+workflow, a support agent, a SQL repair workflow with triage approval, inline bug investigation (the router calls the support agent with `ctx.agent`),
 a GitHub PR review owner/changelog observer, and Linear issue triage.
 
 `src/fabrial.ts` creates the instance with `createFabrial({ database, models,
@@ -39,7 +39,7 @@ Configure these environment variables:
 `src/app.ts` is the whole wiring:
 
 ```ts
-export const app = f.app({ workflows });
+export const app = f.app({ workflows, agents });
 await app.start(); // migrates Postgres, validates credentials, starts workers
 // Mount app.fetch in your Node HTTP server; call app.stop() on shutdown.
 ```

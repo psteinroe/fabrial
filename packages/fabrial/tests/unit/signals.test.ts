@@ -7,7 +7,6 @@ const metadata: InvocationMetadata = {
 	origin: null,
 	replyTo: null,
 	requestedBy: null,
-	ownsThread: false,
 };
 const signal = (id: string, payload: Json = id) => ({ name: "input", id, payload });
 
@@ -99,7 +98,7 @@ test("ctx.signalWithStart is memoized per id and passes merged metadata to the e
 			name: "caller",
 			triggers: [],
 			handler: async (_input, ctx) => {
-				const options = { workflow: "recorder", key: "k", metadata: { ownsThread: true } };
+				const options = { workflow: "recorder", key: "k", metadata: { ownerWorkflow: "recorder" } };
 				const first = await ctx.signalWithStart("send", { ...options, signal: signal("a") });
 				replays++;
 				if (replays === 1) await ctx.sleep("pause", 10);
@@ -119,7 +118,7 @@ test("ctx.signalWithStart is memoized per id and passes merged metadata to the e
 	// The first keyed execution settled during the sleep and released its key.
 	expect(stop).not.toBe(first);
 	expect(received).toEqual(["a", "stop"]);
-	expect(seen[0]).toEqual({ ...metadata, ownsThread: true });
+	expect(seen[0]).toMatchObject(metadata);
 });
 
 test("signals arriving while the handler returns re-queue the execution without counting an attempt", async () => {

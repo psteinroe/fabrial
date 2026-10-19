@@ -253,7 +253,6 @@ describe("dynamic subscriptions in an app", () => {
 					origin: null,
 					replyTo: null,
 					requestedBy: null,
-					ownsThread: false,
 				},
 			});
 			await runtime.flush();
@@ -285,7 +284,7 @@ describe("dynamic subscriptions in an app", () => {
 			agent: "dev",
 			session: "app:pr-5",
 			delivery: "steer",
-			metadata: { replyTo: t.slackThread, ownsThread: false, send: { priority: "urgent" } },
+			metadata: { replyTo: t.slackThread, send: { priority: "urgent" } },
 		});
 		expect(review!.content).toContain('<notification source="github" kind="review"');
 		expect(review!.content).toContain('resource="github:acme/app#5"');

@@ -82,7 +82,6 @@ const metadata: InvocationMetadata = {
 	origin: null,
 	replyTo: null,
 	requestedBy: null,
-	ownsThread: false,
 };
 
 async function enter(test: ReturnType<typeof setup>) {
@@ -213,11 +212,6 @@ describe("routing and lifecycle", () => {
 		expect(await test.chat.receive(bot)).toBe("ignored");
 		await test.chat.receive(message("human"));
 		await test.runtime.flush();
-		expect(await (await test.chat.thread(surface)).getState()).toMatchObject({
-			interactionId: null,
-			handlerExecutionId: null,
-			bufferedReplies: [],
-		});
 		expect(test.runtime.emitted.filter((e) => e.name === "fabrial.execution.settled")).toHaveLength(
 			1,
 		);
@@ -335,89 +329,16 @@ describe("durability and context", () => {
 			output: { answer: "echo", count: 1 },
 		});
 	});
-	it("loads bounded history durably and asks once", async () => {
+	it("loads bounded history durably", async () => {
 		const test = setup([
 			workflow(async (_i, ctx) => {
 				const history = await ctx.thread!.history("history", { limit: 1 });
-				const answer = await ctx.thread!.ask("question", "Question?", { timeout: 100 });
-				return { history: history.length, answer: answer!.text };
+				return { history: history.length };
 			}),
 		]);
 		await enter(test);
-		await test.chat.receive(message("answer"));
 		await test.runtime.flush();
-		expect((await test.chat.thread(surface)).posts).toHaveLength(1);
-		expect(test.runtime.executions()[0]!.result).toMatchObject({
-			output: { history: 1, answer: "answer" },
-		});
-	});
-});
-
-describe("replies and races", () => {
-	it("consumes buffered replies, restricts from, and never consumes a message twice", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx.sleep("pause", 10);
-				const from = await ctx.thread!.waitForReply("from", { from: ctx.actor! });
-				const other = await ctx.thread!.waitForReply("other");
-				const noDuplicate = await ctx.thread!.waitForReply("third", { timeout: 10 });
-				return [from!.messageId, other!.messageId, noDuplicate];
-			}),
-		]);
-		await enter(test);
-		await test.chat.receive(message("bob", bob));
-		await test.chat.receive(message("alice"));
-		await test.chat.receive(message("alice"));
-		await test.runtime.advanceBy(10);
-		await test.runtime.advanceBy(10);
-		expect(test.runtime.executions()[0]!.result).toMatchObject({
-			status: "completed",
-			output: ["alice", "bob", null],
-		});
-	});
-	it("filters a live reply by from", async () => {
-		const test = setup([
-			workflow(
-				async (_i, ctx) =>
-					(await ctx.thread!.waitForReply("reply", { from: ctx.actor!, timeout: 100 }))!.text,
-			),
-		]);
-		await enter(test);
-		await test.chat.receive(message("bob", bob));
-		await test.runtime.flush();
-		expect(test.runtime.executions()[0]!.status).toBe("suspended");
-		await test.chat.receive(message("alice"));
-		await test.runtime.flush();
-		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: "alice" });
-	});
-	it.each(["reply", "timer"])("races replies and timers: %s wins", async (winner) => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				const result = await ctx.race("race", {
-					reply: ctx.thread!.nextReply(),
-					timer: ctx.timer(100),
-				});
-				return result.key;
-			}),
-		]);
-		await enter(test);
-		if (winner === "reply") {
-			await test.chat.receive(message("answer"));
-			await test.runtime.flush();
-		} else await test.runtime.advanceBy(100);
-		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: winner });
-	});
-	it("asserts reply timeouts below thread TTL", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx.thread!.waitForReply("reply", { timeout: "30d" });
-			}),
-		]);
-		await enter(test);
-		expect(test.runtime.executions()[0]!.result).toMatchObject({
-			status: "failed",
-			error: expect.stringContaining("30 days"),
-		});
+		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: { history: 1 } });
 	});
 });
 
@@ -500,29 +421,6 @@ describe("approvals", () => {
 			card: { actions: [] },
 		});
 	});
-	it("supports handle.cancel after a reply wins and renders Superseded", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				const handle = await ctx.requestApproval("approval", {
-					title: "Approval",
-					details: "x",
-					approvers: team,
-				});
-				const winner = await ctx.race("race", {
-					decision: handle.decision(),
-					reply: ctx.thread!.nextReply(),
-				});
-				if (winner.key === "reply") await handle.cancel("cancel", "superseded");
-				return (await handle.wait("decision")).status;
-			}),
-		]);
-		await enter(test);
-		const c = await card(test);
-		await test.chat.receive(message("amend"));
-		await test.runtime.flush();
-		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: "cancelled" });
-		expect(c.post.content).toMatchObject({ card: { text: "Superseded" } });
-	});
 	it("cancellation of a suspended workflow updates pending cards", async () => {
 		const test = setup([approvalWorkflow()]);
 		await enter(test);
@@ -530,11 +428,6 @@ describe("approvals", () => {
 		await test.runtime.cancel(test.runtime.executions()[0]!.executionId);
 		await test.runtime.flush();
 		expect(c.post.content).toMatchObject({ card: { text: "Cancelled", actions: [] } });
-		expect(await (await test.chat.thread(surface)).getState()).toMatchObject({
-			interactionId: null,
-			handlerExecutionId: null,
-			bufferedReplies: [],
-		});
 	});
 	it("asserts approval timeouts below 30 days", async () => {
 		const test = setup([approvalWorkflow("30d")]);
@@ -553,7 +446,6 @@ describe("children and identity", () => {
 			input: z.object({ value: z.number() }),
 			run: async (input, ctx) => {
 				expect(ctx.actor?.id).toBe("alice");
-				expect(ctx.metadata.ownsThread).toBe(false);
 				return input.value * 2;
 			},
 		});
@@ -569,48 +461,23 @@ describe("children and identity", () => {
 		expect(test.runtime.executions("child")).toHaveLength(2);
 		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: { result: 6 } });
 	});
-	it.each(["invoke", "start", "handoff"] as const)(
-		"validates %s input before starting",
-		async (method) => {
-			const child = defineWorkflow({
-				name: "child",
-				input: z.object({ value: z.number() }),
-				run: async () => {},
-			});
-			const test = setup([
-				workflow(async (_i, ctx) => {
-					await ctx[method]("call", child, { value: "bad" } as never);
-				}),
-				child,
-			]);
-			await enter(test);
-			expect(test.runtime.executions("child")).toHaveLength(0);
-			expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-				status: "failed",
-				error: expect.stringContaining("Invalid child input"),
-			});
-		},
-	);
-	it("handoff transfers thread ownership and is independent of the caller", async () => {
+	it.each(["invoke", "start"] as const)("validates %s input before starting", async (method) => {
 		const child = defineWorkflow({
 			name: "child",
-			input: z.object({}),
-			run: async (_i, ctx) => {
-				expect(ctx.metadata.ownsThread).toBe(true);
-				return (await ctx.thread!.waitForReply("reply"))!.text;
-			},
+			input: z.object({ value: z.number() }),
+			run: async () => {},
 		});
-		const test = setup([workflow(async (_i, ctx) => ctx.handoff("handoff", child, {})), child]);
+		const test = setup([
+			workflow(async (_i, ctx) => {
+				await ctx[method]("call", child, { value: "bad" } as never);
+			}),
+			child,
+		]);
 		await enter(test);
-		const childId = test.runtime.executions("child")[0]!.executionId;
-		expect((await (await test.chat.thread(surface)).getState())?.handlerExecutionId).toBe(childId);
-		await test.chat.receive(message("answer"));
-		await test.runtime.flush();
-		expect(test.runtime.result(childId)).toMatchObject({ output: "answer" });
-		expect(await (await test.chat.thread(surface)).getState()).toMatchObject({
-			interactionId: null,
-			handlerExecutionId: null,
-			bufferedReplies: [],
+		expect(test.runtime.executions("child")).toHaveLength(0);
+		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
+			status: "failed",
+			error: expect.stringContaining("Invalid child input"),
 		});
 	});
 	it.each([false, true])("structured cancellation, detached=%s", async (detached) => {
@@ -748,10 +615,6 @@ describe("multi-category chat ingress", () => {
 		expect(seen).toHaveLength(2);
 		expect(test.runtime.executions("specific")).toHaveLength(1);
 		expect(test.runtime.executions("observer")).toHaveLength(1);
-		await test.chat.receive(message("reply", bob), { events: [event, "chat.mentioned"] });
-		expect(
-			(await (await test.chat.thread(surface)).getState())?.bufferedReplies.map((m) => m.messageId),
-		).toEqual(["reply"]);
 	});
 	it("detects dynamic cross-category ownership ties before emitting", async () => {
 		const a = workflow(async () => {});
@@ -820,9 +683,6 @@ describe("lazy channel threads and cancellation ingress", () => {
 		await test.runtime.flush();
 		expect(test.chat.threads.size).toBe(1);
 		const thread = [...test.chat.threads.values()][0]!;
-		expect((await thread.getState())?.handlerExecutionId).toBe(
-			test.runtime.executions("owner")[0]!.executionId,
-		);
 		await test.runtime.advanceBy(10);
 		expect(test.chat.threads.size).toBe(1);
 		expect(thread.posts.map((p) => p.content)).toEqual(["updated", "second", "child"]);
@@ -848,90 +708,6 @@ describe("lazy channel threads and cancellation ingress", () => {
 		await test.runtime.advanceBy(10);
 		expect(test.chat.threads.size).toBe(0);
 	});
-	it.each(["requester", "participant"])(
-		"allows the %s to stop, rejects outsiders, and ignores duplicates",
-		async (actor) => {
-			const test = setup([
-				workflow(async (_i, ctx) => {
-					await ctx.sleep("sleep", 100);
-				}),
-			]);
-			await enter(test);
-			await test.chat.cancel(surface, outsider.identities[0]!);
-			expect(test.chat.ephemeral).toHaveLength(1);
-			expect(test.runtime.executions("owner")[0]!.result).toBeUndefined();
-			if (actor === "participant") await test.chat.receive(message("participant", bob));
-			const identity = actor === "participant" ? bob.identities[0]! : alice.identities[0]!;
-			await test.chat.cancel(surface, identity, "stop");
-			await test.chat.cancel(surface, identity, "stop");
-			await test.runtime.flush();
-			expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ status: "cancelled" });
-			expect(await (await test.chat.thread(surface)).getState()).toMatchObject({
-				interactionId: null,
-				handlerExecutionId: null,
-				bufferedReplies: [],
-			});
-		},
-	);
-	it("calls chat, agent and plugin lifecycle callbacks", async () => {
-		const calls: string[] = [];
-		const runtime = new MemoryRuntime();
-		const chat = new FakeChat(() => runtime.now());
-		const agents = fakeAgents();
-		const app = testApp(
-			createFabrial({
-				plugins: [
-					definePlugin({
-						id: "lifecycle",
-						init: () => {
-							calls.push("init");
-						},
-						shutdown: () => {
-							calls.push("shutdown");
-						},
-					}),
-				],
-			}),
-			{
-				runtime,
-				workflows: [],
-				chat: {
-					kind: "fabrial.chat",
-					connect: (host) => ({
-						...chat.connect(host),
-						start: async () => {
-							calls.push("chat:start");
-						},
-						stop: async () => {
-							calls.push("chat:stop");
-						},
-					}),
-				},
-				agents: {
-					kind: "fabrial.agents",
-					connect: (host) => ({
-						...agents.connect(host),
-						start: async () => {
-							calls.push("agents:start");
-						},
-						stop: async () => {
-							calls.push("agents:stop");
-						},
-					}),
-				},
-			},
-		);
-		await app.start();
-		await app.stop();
-		expect(calls).toEqual([
-			"init",
-			"chat:start",
-			"agents:start",
-			"agents:stop",
-			"chat:stop",
-			"shutdown",
-		]);
-	});
 });
 
 describe("approval edge cases", () => {
@@ -947,28 +723,6 @@ describe("approval edge cases", () => {
 		};
 		await enter(test);
 		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "approved" });
-	});
-	it("free-text replies do not decide or cancel approvals and remain available afterwards", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				const approval = await ctx.waitForApproval("approval", {
-					title: "Proposal",
-					details: {},
-					approvers: team,
-				});
-				return { status: approval.status, reply: (await ctx.thread!.waitForReply("reply"))!.text };
-			}),
-		]);
-		await enter(test);
-		const c = await card(test);
-		await test.chat.receive(message("never mind"));
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.result).toBeUndefined();
-		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-			output: { status: "approved", reply: "never mind" },
-		});
 	});
 	it("keeps assigned approvers fixed through replay and excludes newly rotated-in members", async () => {
 		let members = [alice];
@@ -1158,7 +912,7 @@ describe("runtime fidelity", () => {
 		let initializations = 0;
 		const state = defineState({
 			name: "state",
-			scope: "interaction",
+			scope: "thread",
 			schema: z.object({ count: z.number() }),
 			initial: () => ({ count: ++initializations }),
 		});
@@ -1309,39 +1063,6 @@ describe("additional port and correlation guarantees", () => {
 		});
 		expect(await test.app.host.directory.identitiesFor("dynamic")).toEqual(user.identities);
 	});
-	it("forwards agent detached options and leaves agent-active reply buffers for the bridge", async () => {
-		const agents = fakeAgents({
-			run: async (execution, id, _agent, options) => {
-				expect(options.detached).toBe(true);
-				const thread = await test.chat.thread(surface);
-				const state = await thread.getState();
-				if (state)
-					await thread.updateState((latest) =>
-						latest ? { ...latest, agentActive: true } : latest,
-					);
-				await execution.sleep(id, 100);
-				return "agent-result";
-			},
-		});
-		const test = setup(
-			[
-				workflow(async (_i, ctx) =>
-					ctx.agent(
-						"agent",
-						{ kind: "fabrial.agent", name: "fake" },
-						{ input: {}, detached: true },
-					),
-				),
-			],
-			{ agents },
-		);
-		await enter(test);
-		await test.chat.receive(message("steer"));
-		await test.runtime.flush();
-		expect(
-			(await (await test.chat.thread(surface)).getState())?.bufferedReplies.map((m) => m.messageId),
-		).toEqual(["steer"]);
-	});
 	it("handles generated-id collisions deterministically without repeating effects", async () => {
 		let effects = 0;
 		const test = setup([
@@ -1382,57 +1103,6 @@ describe("additional port and correlation guarantees", () => {
 });
 
 describe("ingress tombstones and reservation recovery", () => {
-	it.each(["completed", "failed", "cancelled"])(
-		"ignores redelivery after %s settlement and routes the next interaction normally",
-		async (status) => {
-			const test = setup([
-				workflow(async (input, ctx) => {
-					if ((input as ChatMessage).messageId === "initial") {
-						if (status === "failed") throw new Error("failed");
-						if (status === "cancelled") await ctx.sleep("pause", "1h");
-						return;
-					}
-					return (await ctx.thread!.waitForReply("answer"))!.messageId;
-				}),
-			]);
-			await enter(test);
-			if (status === "cancelled") {
-				await test.chat.cancel(surface, alice.identities[0]!, "stop");
-				await test.runtime.flush();
-			}
-			const thread = await test.chat.thread(surface);
-			const idle = await thread.getState();
-			expect(idle).toMatchObject({ interactionId: null, handlerExecutionId: null });
-			expect(test.runtime.executions("owner")[0]!.result?.status).toBe(status);
-			expect(await test.chat.receive(message("initial"))).toBe("ignored");
-			expect(await thread.getState()).toEqual(idle);
-			expect(await test.chat.receive(message("next"))).toBe("new");
-			await test.runtime.flush();
-			expect(await test.chat.receive(message("initial"))).toBe("ignored");
-			expect(await test.chat.receive(message("answer"))).toBe("reply");
-			await test.runtime.flush();
-			expect(test.runtime.executions("owner")).toHaveLength(2);
-			expect(test.runtime.executions("owner")[1]!.result).toMatchObject({ output: "answer" });
-			expect(await test.chat.receive(message("answer"))).toBe("ignored");
-			expect((await thread.getState())?.interactionId).toBeNull();
-		},
-	);
-
-	it("only accepts one of two concurrent deliveries of the same ingress", async () => {
-		const test = setup([workflow(async () => {})]);
-		await test.app.start();
-		expect(
-			(
-				await Promise.all([test.chat.receive(message("same")), test.chat.receive(message("same"))])
-			).sort(),
-		).toEqual(["ignored", "new"]);
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")).toHaveLength(1);
-		expect((await (await test.chat.thread(surface)).getState())?.ingestedDedupeIds).toEqual([
-			{ kind: "message", id: "same", at: test.runtime.now() },
-		]);
-	});
-
 	it("keeps the last 100 receipts across settlements, including actions", async () => {
 		const test = setup([workflow(async () => {})]);
 		await test.app.start();
@@ -1448,7 +1118,6 @@ describe("ingress tombstones and reservation recovery", () => {
 		expect(await test.chat.receive(message("inbound-0"))).toBe("new");
 		await test.runtime.flush();
 		expect(test.runtime.executions("owner")).toHaveLength(101);
-		expect((await thread.getState())?.handlerExecutionId).toBeNull();
 		await test.runtime.advanceBy(10 * 60 * 1000);
 		const ref = { ...surface, messageId: "card" };
 		let actionEmissions = 0;
@@ -1483,188 +1152,25 @@ describe("ingress tombstones and reservation recovery", () => {
 		expect(await thread.getState()).toBeNull();
 	});
 
-	it.each([undefined, 10 * 60 * 1000])("recovers a stale reservation of age %s", async (age) => {
-		const test = setup([
-			workflow(async (_i, ctx) => (await ctx.thread!.waitForReply("answer"))!.messageId),
-		]);
-		await test.app.start();
-		const thread = await test.chat.thread(surface);
-		await thread.updateState(() => ({
-			interactionId: "lost",
-			handlerExecutionId: null,
-			agentActive: false,
-			statusMessageId: "old-status",
-			bufferedReplies: [message("old-reply")],
-			requesterId: "outsider",
-			participantIds: ["outsider"],
-			cancellationIds: ["old-stop"],
-			...(age === undefined ? {} : { reservedAt: test.runtime.now() - age }),
-			ingestedDedupeIds: [{ kind: "message", id: "old", at: test.runtime.now() - 600000 }],
-		}));
-		expect(await test.chat.receive(message("next"))).toBe("new");
-		const reserved = await thread.getState();
-		expect(reserved).toMatchObject({
-			interactionId: "chat:next",
-			reservedAt: test.runtime.now(),
-			bufferedReplies: [],
-			requesterId: "alice",
-			participantIds: ["alice"],
-		});
-		expect(reserved?.cancellationIds).toBeUndefined();
-		expect(await test.chat.receive(message("old"))).toBe("ignored");
-		await test.runtime.flush();
-		expect(await test.chat.receive(message("answer"))).toBe("reply");
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "answer" });
-	});
-
-	it("recovers a lost dispatch after the configured grace without refreshing it for replies", async () => {
-		const test = setup([workflow(async () => "recovered")], { reservationTimeout: "1s" });
-		await test.app.start();
-		const emit = test.runtime.emit.bind(test.runtime);
-		test.runtime.emit = async (...args) => {
-			if (args[2].id !== "lost") await emit(...args);
-		};
-		await test.chat.receive(message("lost"));
-		await test.runtime.advanceBy(999);
-		expect(await test.chat.receive(message("during-grace"))).toBe("reply");
-		expect(test.runtime.executions("owner")).toHaveLength(0);
-		await test.runtime.advanceBy(1);
-		expect(await test.chat.receive(message("recovered"))).toBe("new");
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")).toHaveLength(1);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "recovered" });
-		expect(await test.chat.receive(message("lost"))).toBe("ignored");
-		expect(await test.chat.receive(message("during-grace"))).toBe("ignored");
-	});
-
-	it("does not expire a bound handler after the reservation grace", async () => {
-		const test = setup([workflow(async (_i, ctx) => ctx.sleep("pause", "1h"))]);
-		await enter(test);
-		await test.runtime.advanceBy(10 * 60 * 1000);
-		expect(await test.chat.receive(message("reply"))).toBe("reply");
-		expect(test.runtime.executions("owner")).toHaveLength(1);
-	});
-
-	it("does not reserve an interaction for observer-only ingress", async () => {
-		const test = setup([
-			defineWorkflow({
-				name: "observer",
-				triggers: [trigger({ event, observe: true })],
-				run: async () => {},
-			}),
-		]);
-		await test.app.start();
-		expect(await test.chat.receive(message("observe"))).toBe("new");
-		await test.runtime.flush();
-		expect(await test.chat.receive(message("observe"))).toBe("ignored");
-		expect(await test.chat.receive(message("next"))).toBe("new");
-		await test.runtime.flush();
-		expect(test.runtime.executions("observer")).toHaveLength(2);
-		expect((await (await test.chat.thread(surface)).getState())?.interactionId).toBeNull();
-	});
-
-	it("preserves tombstones when independent cleanup clears a channel binding", async () => {
-		const test = setup([]);
-		const thread = await test.chat.thread(surface);
-		const ref = await thread.post("hello");
-		const tombstones = [{ kind: "message" as const, id: "initial", at: test.runtime.now() }];
-		await thread.updateState(() => ({
-			interactionId: "old",
-			handlerExecutionId: "old",
-			agentActive: true,
-			statusMessageId: "status",
-			bufferedReplies: [message("reply")],
-			requesterId: "alice",
-			ingestedDedupeIds: tombstones,
-		}));
-		await test.app.start();
-		await test.runtime.invoke(
-			"fabrial.cleanup",
-			{
-				executionId: "old",
-				presentationId: "p",
-				after: "0",
-			},
-			{ metadata: { ...metadata, interactionId: "old" } },
-		);
-		await test.runtime.emit(
-			"fabrial.presentation",
-			{
-				presentationId: "p",
-				ref: ref as unknown as Json,
-			},
-			{ metadata },
-		);
-		await test.runtime.emit("fabrial.execution.settled", { executionId: "old" }, { metadata });
-		await test.runtime.flush();
-		expect(await thread.getState()).toEqual({
-			interactionId: null,
-			handlerExecutionId: null,
-			agentActive: false,
-			statusMessageId: null,
-			bufferedReplies: [],
-			ingestedDedupeIds: tombstones,
-		});
-		expect(await test.chat.receive(message("initial"))).toBe("ignored");
-	});
-
-	it("lets non-message executions reserve idle state without losing tombstones", async () => {
-		const test = setup([
-			workflow(async (input, ctx) => {
-				if ((input as JsonObject).later) await ctx.sleep("pause", "1h");
-			}),
-		]);
-		await enter(test);
-		await test.app.emit(event, { later: true }, { id: "later", replyTo: surface });
-		await test.runtime.flush();
-		const state = await (await test.chat.thread(surface)).getState();
-		expect(state).toMatchObject({
-			interactionId: `${event}:later`,
-			handlerExecutionId: test.runtime.executions("owner")[1]!.executionId,
-		});
-		expect(state?.ingestedDedupeIds).toContainEqual({
-			kind: "message",
-			id: "initial",
-			at: test.runtime.now(),
-		});
-		expect(await test.chat.receive(message("initial"))).toBe("ignored");
-	});
-
 	it("uses the final updater decision when a lock retry sees an ingress tombstone", async () => {
 		const test = setup([workflow(async () => {})]);
 		await test.app.start();
 		const thread = await test.chat.thread(surface);
 		const update = thread.updateState.bind(thread);
+		let retried = false;
 		thread.updateState = async (fn) => {
+			if (retried) return update(fn);
+			retried = true;
 			const speculative = fn(null);
 			await update(() => speculative);
 			return update(fn);
 		};
-		expect(await test.chat.receive(message("retry"))).toBe("ignored");
-		expect(test.runtime.emitted).toHaveLength(0);
-		expect((await thread.getState())?.ingestedDedupeIds).toHaveLength(1);
-	});
-
-	it.each([-1, Infinity, "30d"])("rejects unbounded reservation grace %s", (reservationTimeout) => {
-		expect(() => setup([], { reservationTimeout })).toThrow();
-	});
-});
-
-describe("ingress redelivery correlation", () => {
-	it("never delivers the triggering message again as a reply", async () => {
-		const test = setup([
-			workflow(
-				async (_i, ctx) => (await ctx.thread!.waitForReply("reply", { timeout: 100 }))!.messageId,
-			),
+		// The retry sees the pending receipt of its own attempt and dispatches its route once.
+		expect(await test.chat.receive(message("retry"))).toBe("new");
+		expect(test.runtime.emitted).toHaveLength(1);
+		expect((await thread.getState())?.ingestedDedupeIds).toEqual([
+			{ kind: "message", id: "retry", at: expect.any(Number) },
 		]);
-		await enter(test);
-		await test.chat.receive(message("initial"));
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.result).toBeUndefined();
-		await test.chat.receive(message("answer"));
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "answer" });
 	});
 });
 
@@ -1733,28 +1239,6 @@ describe("provider route response context", () => {
 });
 
 describe("thread ownership during parent cancellation", () => {
-	it("never clears the receiver's binding when a handoff caller is cancelled", async () => {
-		const child = defineWorkflow({
-			name: "child",
-			input: z.object({}),
-			run: async (_i, ctx) => (await ctx.thread!.waitForReply("reply"))!.text,
-		});
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx.handoff("handoff", child, {});
-				await ctx.sleep("after-handoff", 100);
-			}),
-			child,
-		]);
-		await enter(test);
-		const childId = test.runtime.executions("child")[0]!.executionId;
-		await test.runtime.cancel(test.runtime.executions("owner")[0]!.executionId);
-		await test.runtime.flush();
-		expect((await (await test.chat.thread(surface)).getState())?.handlerExecutionId).toBe(childId);
-		await test.chat.receive(message("answer"));
-		await test.runtime.flush();
-		expect(test.runtime.result(childId)).toMatchObject({ output: "answer" });
-	});
 	it("treats missing prototype-named filter fields as absent", async () => {
 		const owner = defineWorkflow({
 			name: "owner",
@@ -1867,179 +1351,6 @@ describe("review regressions", () => {
 		await test.runtime.flush();
 		await test.runtime.advanceBy(10);
 		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "timer" });
-	});
-
-	it("does not restart a reply deadline after rejecting a duplicate event", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => ctx.thread!.waitForReply("reply", { timeout: 100 })),
-		]);
-		await enter(test);
-		await test.runtime.advanceBy(90);
-		const interactionId = test.runtime.executions("owner")[0]!.metadata.interactionId;
-		await test.runtime.emit(
-			"fabrial.reply",
-			{ interactionId, message: message("initial") },
-			{ metadata },
-		);
-		await test.runtime.flush();
-		await test.runtime.advanceBy(10);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-			status: "completed",
-			output: null,
-		});
-	});
-
-	it("atomically reserves an ingress slot before the worker starts and appends concurrent replies", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				const a = await ctx.thread!.waitForReply("a");
-				const b = await ctx.thread!.waitForReply("b");
-				return [a!.messageId, b!.messageId];
-			}),
-		]);
-		await test.app.start();
-		expect(
-			(
-				await Promise.all([
-					test.chat.receive(message("initial")),
-					test.chat.receive(message("second", bob)),
-				])
-			).sort(),
-		).toEqual(["new", "reply"]);
-		await test.chat.receive(message("third"));
-		const thread = await test.chat.thread(surface);
-		expect((await thread.getState())?.handlerExecutionId).toBeNull();
-		expect((await thread.getState())?.bufferedReplies.map((m) => m.messageId)).toEqual([
-			"second",
-			"third",
-		]);
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")).toHaveLength(1);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-			output: ["second", "third"],
-		});
-	});
-
-	it("replay binding and settlement never overwrite a different interaction, even with the same handler id", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx.sleep("pause", 10);
-			}),
-		]);
-		await enter(test);
-		const thread = await test.chat.thread(surface);
-		await thread.updateState((state) => state && { ...state, interactionId: "newer" });
-		const newer = await thread.getState();
-		await test.runtime.advanceBy(10);
-		expect(await thread.getState()).toEqual(newer);
-	});
-
-	it("settlement conditionally clears state after status I/O, not from a stale read", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx.sleep("pause", 10);
-			}),
-		]);
-		await enter(test);
-		const thread = await test.chat.thread(surface);
-		thread.setStatus = async () => {
-			await thread.updateState((state) => state && { ...state, interactionId: "newer" });
-		};
-		await test.runtime.advanceBy(10);
-		expect((await thread.getState())?.interactionId).toBe("newer");
-	});
-
-	it("handoff only transfers from the current handler", async () => {
-		const child = defineWorkflow({
-			name: "child",
-			input: z.object({}),
-			run: async (_i, ctx) => {
-				await ctx.sleep("pause", 100);
-			},
-		});
-		const test = setup([workflow(async (_i, ctx) => ctx.handoff("handoff", child, {})), child]);
-		const invoke = test.runtime.invoke.bind(test.runtime);
-		test.runtime.invoke = async (...args) => {
-			const id = await invoke(...args);
-			if (args[0] === "child")
-				await (
-					await test.chat.thread(surface)
-				).updateState((state) => state && { ...state, handlerExecutionId: "replacement" });
-			return id;
-		};
-		await enter(test);
-		expect((await (await test.chat.thread(surface)).getState())?.handlerExecutionId).toBe(
-			"replacement",
-		);
-	});
-
-	it.each(["buffer", "event"])(
-		"replays a selected %s reply after a crash during acknowledgement, without losing concurrent messages",
-		async (source) => {
-			const owner = defineWorkflow({
-				name: "owner",
-				triggers: [trigger({ event })],
-				retries: { maxAttempts: 2 },
-				run: async (_i, ctx) => {
-					if (source === "buffer") await ctx.sleep("pause", 10);
-					const first = await ctx.thread!.waitForReply("first");
-					const second = await ctx.thread!.waitForReply("second");
-					const duplicate = await ctx.thread!.waitForReply("duplicate", { timeout: 10 });
-					return [first!.messageId, second!.messageId, duplicate];
-				},
-			});
-			const test = setup([owner]);
-			const thread = await test.chat.thread(surface);
-			const update = thread.updateState.bind(thread);
-			let crashed = false;
-			thread.updateState = async (fn) => {
-				const state = await update(fn);
-				if (!crashed && state?.consumedReplyOperations?.first) {
-					crashed = true;
-					const id = test.runtime.executions("owner")[0]!.executionId;
-					expect(test.runtime.stepIds(id)).toContain(state.consumedReplyOperations.first);
-					await test.chat.receive(message("second"));
-					throw new Error("crash after acknowledgement");
-				}
-				return state;
-			};
-			await enter(test);
-			await test.chat.receive(message("first"));
-			if (source === "buffer") await test.runtime.advanceBy(10);
-			else await test.runtime.flush();
-			await test.chat.receive(message("first"));
-			await test.runtime.flush();
-			await test.runtime.advanceBy(10);
-			expect(crashed).toBe(true);
-			expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-				status: "completed",
-				output: ["first", "second", null],
-			});
-		},
-	);
-
-	it("passes the canonical dispatchOwner on every ingress category", async () => {
-		const owner = defineWorkflow({
-			name: "owner",
-			triggers: [
-				trigger({ event: "chat.mentioned", specificity: 2 }),
-				trigger({ event, observe: true }),
-			],
-			run: async () => {},
-		});
-		const test = setup([owner]);
-		const emit = test.runtime.emit.bind(test.runtime);
-		const owners: unknown[] = [];
-		test.runtime.emit = async (name, payload, options) => {
-			if (options.dispatchId) owners.push(options.dispatchOwner);
-			return emit(name, payload, options);
-		};
-		await test.app.start();
-		await test.chat.receive(message("initial"), { events: [event, "chat.mentioned"] });
-		expect(owners).toEqual([
-			{ workflow: "owner", event: "chat.mentioned" },
-			{ workflow: "owner", event: "chat.mentioned" },
-		]);
 	});
 
 	it("preserves cron replyTo in the registered runtime contract", () => {
@@ -2303,21 +1614,13 @@ describe("updated in-memory port fidelity", () => {
 		await runtime.emit("owned", {}, { ...options, owner: "owner" });
 		await runtime.flush();
 		expect(runtime.executions()).toHaveLength(1);
-		expect(runtime.executions()[0]!.metadata.ownsThread).toBe(true);
 		expect(runtime.executions()[0]!.metadata.replyTo).toEqual(surface);
 	});
 
 	it("fake ChatPort atomically updates state without exposing mutable stored objects", async () => {
 		const chat = new FakeChat();
 		const thread = await chat.thread(surface);
-		await thread.updateState(() => ({
-			interactionId: "test",
-			handlerExecutionId: null,
-			agentActive: false,
-			statusMessageId: null,
-			bufferedReplies: [],
-			count: 0,
-		}));
+		await thread.updateState(() => ({ count: 0 }));
 		await Promise.all(
 			Array.from({ length: 100 }, () =>
 				thread.updateState((state) => state && { ...state, count: Number(state.count) + 1 }),
@@ -2329,37 +1632,31 @@ describe("updated in-memory port fidelity", () => {
 		expect((await thread.getState())?.count).toBe(100);
 	});
 
-	it.each(["interaction", "handler"])(
-		"cleanup does not clear a thread with a different %s",
-		async (changed) => {
-			const test = setup([]);
-			const thread = await test.chat.thread(surface);
-			const ref = await thread.post("hello");
-			await thread.updateState(() => ({
-				interactionId: changed === "interaction" ? "new" : "old",
-				handlerExecutionId: changed === "handler" ? "new" : "old",
-				agentActive: false,
-				statusMessageId: null,
-				bufferedReplies: [],
-			}));
-			const state = await thread.getState();
-			await test.app.start();
-			const id = await test.runtime.invoke(
-				"fabrial.cleanup",
-				{ executionId: "old", presentationId: "p", after: "0" },
-				{ metadata: { ...metadata, interactionId: "old" } },
-			);
-			await test.runtime.emit(
-				"fabrial.presentation",
-				{ presentationId: "p", ref: ref as unknown as Json },
-				{ metadata },
-			);
-			await test.runtime.emit("fabrial.execution.settled", { executionId: "old" }, { metadata });
-			await test.runtime.flush();
-			expect(test.runtime.result(id)?.status).toBe("completed");
-			expect(await thread.getState()).toEqual(state);
-		},
-	);
+	it.each(["first", "second"])("cleanup leaves the thread's routing state alone (%s)", async () => {
+		const test = setup([]);
+		const thread = await test.chat.thread(surface);
+		const ref = await thread.post("hello");
+		await thread.updateState(() => ({
+			statusMessageId: null,
+			follows: [{ session: "chat:thread", agent: "support" }],
+		}));
+		const state = await thread.getState();
+		await test.app.start();
+		const id = await test.runtime.invoke(
+			"fabrial.cleanup",
+			{ executionId: "old", presentationId: "p", after: "0" },
+			{ metadata: { ...metadata, interactionId: "old" } },
+		);
+		await test.runtime.emit(
+			"fabrial.presentation",
+			{ presentationId: "p", ref: ref as unknown as Json },
+			{ metadata },
+		);
+		await test.runtime.emit("fabrial.execution.settled", { executionId: "old" }, { metadata });
+		await test.runtime.flush();
+		expect(test.runtime.result(id)?.status).toBe("completed");
+		expect(await thread.getState()).toEqual(state);
+	});
 });
 
 describe("registration interleavings", () => {
@@ -2385,29 +1682,6 @@ describe("registration interleavings", () => {
 		const id = await runtime.invoke("waiter", {}, { metadata });
 		await runtime.flush();
 		expect(runtime.result(id)).toMatchObject({ output: { payload: { value: "registered" } } });
-	});
-
-	it("reselects an owner if settlement frees the slot between ingress read and update", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx.sleep("pause", 100);
-			}),
-		]);
-		await enter(test);
-		const thread = await test.chat.thread(surface);
-		const update = thread.updateState.bind(thread);
-		let cleared = false;
-		thread.updateState = async (fn) => {
-			if (!cleared) {
-				cleared = true;
-				await update(() => null);
-			}
-			return update(fn);
-		};
-		expect(await test.chat.receive(message("next"))).toBe("new");
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")).toHaveLength(2);
-		expect((await thread.getState())?.interactionId).toBe("chat:next");
 	});
 
 	it("waitForApproval accepts framework-generated repetition suffixes without relaxing user id validation", async () => {

@@ -35,7 +35,10 @@ try {
 				if (!current) throw new Error("Missing initial state");
 				return {
 					...current,
-					consumedReplyIds: [...(current.consumedReplyIds ?? []), `${process.env.WORKER_ID}:${i}`],
+					follows: [
+						...(current.follows ?? []),
+						{ session: `${process.env.WORKER_ID}:${i}`, agent: "a" },
+					],
 				};
 			}),
 		),

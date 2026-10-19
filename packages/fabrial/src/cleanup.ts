@@ -3,7 +3,6 @@ import type { FabrialHost } from "./app.ts";
 import type { DurableExecution, WaitBranch } from "./runtime.ts";
 import { EXECUTION_SETTLED_EVENT } from "./runtime.ts";
 import type { MessageRef } from "./thread.ts";
-import { clearInteraction } from "./routing.ts";
 
 export const CLEANUP_WORKFLOW = "fabrial.cleanup";
 export const APPROVAL_CLOSED_EVENT = "fabrial.approval.closed";
@@ -61,29 +60,11 @@ export async function cleanup(
 				provider: ref.provider,
 				threadId: ref.threadId,
 			});
+			// Only approval cards register a presentation with this watcher.
 			if (data.approvalId)
 				await io.update(ref, {
 					card: { title: data.title as string, text: "Cancelled", actions: [] },
 				});
-			else {
-				const state = await io.getState();
-				if (
-					state?.interactionId === execution.metadata.interactionId &&
-					state.handlerExecutionId === data.executionId
-				) {
-					try {
-						await io.setStatus(null);
-					} catch (error) {
-						host.logger.warn("Could not clear thread status", { error });
-					}
-					await io.updateState((latest) =>
-						latest?.interactionId === execution.metadata.interactionId &&
-						latest.handlerExecutionId === data.executionId
-							? clearInteraction(latest)
-							: latest,
-					);
-				}
-			}
 		}
 	});
 }

@@ -42,7 +42,6 @@ const metadata: InvocationMetadata = {
 		known: true,
 		identities: [{ provider: "test", installationId: "workspace", subjectId: "user" }],
 	},
-	ownsThread: true,
 };
 const logger = { debug() {}, info() {}, warn() {}, error() {} };
 const poll = { timeout: 15_000, interval: 20 };
@@ -536,7 +535,6 @@ test("owner routing, observers, overlapping subscriptions, clean payload and con
 	});
 	expect(seen.find((entry) => entry.workflow === "observer")?.metadata).toEqual({
 		...metadata,
-		ownsThread: false,
 	});
 	await runtime.emit("test.event", { key: "yes" }, { metadata, id: "no-owner" });
 	await expect.poll(() => seen.length, poll).toBe(3);
@@ -599,11 +597,10 @@ test("invoke/start/emit inherit metadata; overrides affect only the child; start
 	expect(seen).toContainEqual(metadata);
 	expect(seen).toContainEqual({ ...metadata, interactionId: "start-override" });
 	await expect.poll(() => emitted.length, poll).toBe(2);
-	expect(emitted).toContainEqual({ ...metadata, ownsThread: false });
+	expect(emitted).toContainEqual({ ...metadata });
 	expect(emitted).toContainEqual({
 		...metadata,
 		interactionId: "emit-override",
-		ownsThread: false,
 	});
 	expect(await runtime.invoke("parent", {}, { metadata, dedupeKey: "parent" })).toBe(ids[0]);
 	expect(await completed(childId!)).toBe(true);
@@ -896,7 +893,6 @@ test("cron registers native schedules and executes through the metadata wrapper"
 	await expect.poll(() => seen, poll).toBeDefined();
 	expect(seen?.input).toEqual({ name: "tick" });
 	expect(seen?.metadata).toMatchObject({
-		ownsThread: false,
 		replyTo: null,
 		origin: null,
 		requestedBy: null,
@@ -926,7 +922,7 @@ test("an observer match on the named owner does not gain thread ownership when i
 	};
 	await runtime.emit("test.event", { key: "observer" }, { metadata: withThread, owner: "mixed" });
 	await expect.poll(() => seen.length, poll).toBe(1);
-	expect(seen[0]).toEqual({ ...withThread, ownsThread: false, replyTo: null });
+	expect(seen[0]).toEqual({ ...withThread, replyTo: null });
 	await runtime.emit("test.event", { key: "owner" }, { metadata: withThread, owner: "mixed" });
 	await expect.poll(() => seen.length, poll).toBe(2);
 	expect(seen[1]).toEqual(withThread);
@@ -1436,7 +1432,6 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 		name: "core-child",
 		input: z.string(),
 		run: async (input, ctx) => {
-			expect(ctx.metadata.ownsThread).toBe(false);
 			await ctx.step("effect", () => {
 				childEffects++;
 			});
@@ -1448,7 +1443,6 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 		triggers: [trigger<{ key: string }>({ event: "test.begin", filter: { key: ["go"] } })],
 		run: async (input, ctx) => {
 			parentId = ctx.executionId;
-			expect(ctx.metadata.ownsThread).toBe(true);
 			await ctx.step("effect", () => {
 				effects++;
 			});
@@ -1488,7 +1482,6 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 	await expect.poll(() => parentId, poll).toBeDefined();
 	await waiting(parentId!);
 	const thread = await chat.thread(surface);
-	expect((await thread.getState())?.handlerExecutionId).toBe(parentId);
 	expect(thread.posts).toHaveLength(1);
 	// With no after cursor this wait intentionally starts at registration.
 	await app.emit("test.reply", { key: "wrong" });
@@ -1769,7 +1762,7 @@ test("concurrent signalWithStart calls start exactly one execution per key; ctx.
 			await new Promise<void>((resolve) => ctx.onSignal("input", () => resolve()));
 		}),
 		workflow("caller", async (_input, ctx) => {
-			const options = { workflow: "recorder", key: "k", metadata: { ownsThread: false } };
+			const options = { workflow: "recorder", key: "k", metadata: { origin: metadata.origin } };
 			const first = await ctx.signalWithStart("send", { ...options, signal: input("a") });
 			if (++replays === 1) await ctx.sleep("pause", 1);
 			const again = await ctx.signalWithStart("send", { ...options, signal: input("b") });
@@ -1797,7 +1790,7 @@ test("concurrent signalWithStart calls start exactly one execution per key; ctx.
 	const [first, again] = (await output(caller)) as string[];
 	expect(again).toBe(first);
 	await expect.poll(() => completed(first!), poll).toBe(true);
-	expect(seen[0]).toEqual({ ...metadata, ownsThread: false });
+	expect(seen[0]).toEqual({ ...metadata });
 });
 
 test("signals arriving while the handler returns re-queue it; the final attempt's output is kept", async () => {

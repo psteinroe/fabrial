@@ -65,7 +65,7 @@ describe("deliveryFor", () => {
 	});
 });
 
-describe("static subscriptions", () => {
+describe("follow records", () => {
 	const plugin = definePlugin({
 		id: "chat",
 		events: {
@@ -73,51 +73,88 @@ describe("static subscriptions", () => {
 		},
 	});
 	const f = createFabrial({ plugins: [plugin] });
-	const agent = f.defineAgent({ name: "support", description: "Answers test questions." });
+	const agent = f.defineAgent({
+		name: "support",
+		description: "Answers test questions.",
+		triggers: [trigger({ event: "chat.message", filter: { channelId: ["general"] } })],
+	});
+	const ref = { kind: "thread", provider: "chat", threadId: "chat:general:t1" } as const;
 
-	it("sends every message without holding the thread, keyed by channel or a computed key", async () => {
-		const channel = f.subscribe({
-			name: "support-channel",
-			source: trigger({ event: "chat.message", filter: { channelId: ["general"] } }),
-			agent,
-			session: "channel",
-		});
-		const tickets = f.subscribe({
-			name: "tickets",
-			source: trigger({ event: "chat.message", filter: { channelId: ["tickets"] } }),
-			agent,
-			session: (event) => `ticket:${event.text as string}`,
-		});
+	it("writes a follow record for a thread session and routes the next message by it", async () => {
 		const agents = fakeAgents();
-		const { app, runtime, chat } = createTestApp(f, {
-			workflows: [],
-			subscriptions: [channel, tickets],
-			agents,
-		});
+		const { app, chat } = createTestApp(f, { workflows: [], routedAgents: [agent], agents });
 		await app.start();
-		expect(await chat.receive(message("m1", "chat:general:t1"))).toBe("new");
-		// The compiled workflow may still be running: the routing slot must stay free.
-		expect(await chat.receive(message("m2", "chat:general:t1"))).toBe("new");
-		expect(await chat.receive(message("m3", "chat:general:t2"))).toBe("new");
-		expect(await chat.receive(message("m3", "chat:general:t2"))).toBe("ignored");
-		await chat.receive({ ...message("m4", "chat:tickets:t9", "42"), channelId: "tickets" });
-		await runtime.flush();
-		const sent = [...agents.sent].sort((a, b) => a.requestId.localeCompare(b.requestId));
-		expect(sent.map((each) => [each.session, each.agent, each.delivery])).toEqual([
-			["chat:channel:general", "support", "steer"],
-			["chat:channel:general", "support", "steer"],
-			["chat:channel:general", "support", "steer"],
-			["app:ticket:42", "support", "steer"],
+		expect(await chat.receive(message("m1", ref.threadId))).toBe("new");
+		const session = agents.sent[0]!.session;
+		expect(session).toBe("chat:chat:general:t1");
+		const thread = await chat.thread(ref);
+		expect((await thread.getState())?.follows).toEqual([{ session, agent: "support" }]);
+		// The follow record, not the trigger, routes the next message: it needs no mention or channel match.
+		expect(await chat.receive({ ...message("m2", ref.threadId), channelId: "other" })).toBe(
+			"follow",
+		);
+		expect(agents.sent.map((each) => [each.session, each.agent])).toEqual([
+			[session, "support"],
+			[session, "support"],
 		]);
-		expect(sent[2]!.metadata).toMatchObject({
-			replyTo: { kind: "thread", threadId: "chat:general:t2" },
-			requestedBy: { id: "chat:w:A" },
-			send: { kind: "message", priority: "normal" },
-			ownsThread: false,
+		await app.stop();
+	});
+
+	it("a stop cancels the current run of every conversation following the thread; anyone there may stop", async () => {
+		const agents = fakeAgents();
+		const connect = agents.connect.bind(agents);
+		const stops: unknown[][] = [];
+		agents.connect = (host) => {
+			const connected = connect(host);
+			connected.agents.stop = async (...args) => {
+				stops.push(args);
+			};
+			return connected;
+		};
+		const { app, chat } = createTestApp(f, { workflows: [], routedAgents: [agent], agents });
+		await app.start();
+		await chat.receive(message("m1", ref.threadId));
+		// Bob never wrote in the thread; he may stop it all the same. A redelivered stop is dropped.
+		const bob = { provider: "chat", installationId: "w", subjectId: "B" };
+		await chat.cancel(ref, bob, "stop-1");
+		await chat.cancel(ref, bob, "stop-1");
+		expect(stops).toEqual([
+			[
+				{ session: "chat:chat:general:t1", agent: "support" },
+				"stop-1",
+				expect.stringContaining("Stopped by"),
+			],
+		]);
+		await app.stop();
+	});
+
+	it("processes a redelivery after a failed delivery, exactly once", async () => {
+		const agents = fakeAgents();
+		const connect = agents.connect.bind(agents);
+		let failures = 1;
+		agents.connect = (host) => {
+			const connected = connect(host);
+			const deliver = connected.agents.deliver!.bind(connected.agents);
+			connected.agents.deliver = async (target, request) => {
+				if (failures-- > 0) throw new Error("agents unavailable");
+				return deliver(target, request);
+			};
+			return connected;
+		};
+		const { app, chat } = createTestApp(f, { workflows: [], routedAgents: [agent], agents });
+		await app.start();
+		await expect(chat.receive(message("m1", ref.threadId))).rejects.toThrow("agents unavailable");
+		const thread = await chat.thread(ref);
+		expect((await thread.getState())?.ingestedDedupeIds?.[0]?.pending).toMatchObject({
+			route: "new",
 		});
-		expect(sent[0]!.content).toContain('<message from="Alice" thread="chat:general:t1"');
-		const thread = await chat.thread(sent[0]!.metadata.replyTo as never);
-		expect((await thread.getState())?.interactionId ?? null).toBeNull();
+		// The provider redelivers: the pending route is replayed, then confirmed.
+		expect(await chat.receive(message("m1", ref.threadId))).toBe("new");
+		expect(await chat.receive(message("m1", ref.threadId))).toBe("ignored");
+		expect(agents.sent).toHaveLength(1);
+		expect((await thread.getState())?.ingestedDedupeIds).toEqual([
+			{ kind: "message", id: "m1", at: expect.any(Number) },
+		]);
 		await app.stop();
 	});
 });

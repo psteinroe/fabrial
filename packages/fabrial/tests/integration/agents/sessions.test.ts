@@ -165,7 +165,6 @@ const metadataOf = (): InvocationMetadata => ({
 	origin: null,
 	replyTo: null,
 	requestedBy: { id: alice.id, known: true, identities: [], name: "Alice" },
-	ownsThread: false,
 	ownerWorkflow: null,
 	triggerEvent: null,
 });
@@ -247,7 +246,13 @@ it("a message ingested on another instance steers the run its host is busy with;
 		name: `deliver-${short()}`,
 		input: z.string(),
 		run: async (input, ctx) => {
-			await ctx.send("send", lead, { session, input, replyTo });
+			// Plain workflow input is a notification; urgent ones steer a busy run like a chat message.
+			await ctx.send("send", lead, {
+				session,
+				input,
+				priority: "urgent",
+				...(replyTo ? { home: replyTo } : {}),
+			});
 		},
 	});
 	const busy = gate();
@@ -306,7 +311,7 @@ it("a message is answered while only a background child works; the child's repor
 		name: `deliver-${short()}`,
 		input: z.string(),
 		run: async (input, ctx) => {
-			await ctx.send("send", lead, { session, input, replyTo });
+			await ctx.send("send", lead, { session, input, ...(replyTo ? { home: replyTo } : {}) });
 		},
 	});
 	const child = gate();
@@ -505,7 +510,7 @@ it("a host that loses its Session lease during a model call closes its harness a
 		name: `deliver-${short()}`,
 		input: z.string(),
 		run: async (input, ctx) => {
-			await ctx.send("send", lead, { session, input, replyTo });
+			await ctx.send("send", lead, { session, input, ...(replyTo ? { home: replyTo } : {}) });
 		},
 	});
 	const held = gate();

@@ -83,7 +83,7 @@ describe("inbound Chat SDK dispatch", () => {
 		const env = setup();
 		await env.connection.port.thread(ref);
 		await env.state.subscribe(ref.threadId);
-		vi.mocked(env.host.receiveMessage).mockResolvedValue("reply");
+		vi.mocked(env.host.receiveMessage).mockResolvedValue("follow");
 		await env.sdk().processMessage(env.adapter, ref.threadId, message("reply-1", "followup"));
 		await env.sdk().processMessage(env.adapter, ref.threadId, message("reply-2", "mention", true));
 		expect(env.host.receiveMessage).toHaveBeenCalledTimes(2);

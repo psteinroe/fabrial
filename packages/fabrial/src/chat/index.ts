@@ -77,7 +77,7 @@ export function chat(options: ChatOptions): ChatIntegration {
 				adapters,
 				state: options.state,
 				userName: options.userName ?? "../index.ts",
-				// Queue/debounce strategies coalesce messages, which would lose buffered replies.
+				// Queue/debounce strategies coalesce messages; every message is an input of its own.
 				concurrency: { strategy: "concurrent", maxConcurrent: 1 },
 				logger,
 			});
@@ -94,7 +94,7 @@ export function chat(options: ChatOptions): ChatIntegration {
 				if (normalized.isMention) events.push(`${provider}.mentioned`);
 				const dedupeId = JSON.stringify([provider, normalized.channelId, message.id]);
 				const routed = await host.receiveMessage(normalized, { events, dedupeId });
-				if (routed === "new") await thread.subscribe();
+				if (routed !== "ignored") await thread.subscribe();
 				if (thread.signal.aborted) {
 					// A bare SDK abort carries no stopper identity. Never attribute it to the message
 					// author: Slack aborts the turn BEFORE delivering its actor-bearing stop event.

@@ -19,7 +19,6 @@ import { production, type ProductionOverrides } from "./production.ts";
 import { defineState, type StateDefinition, type StateScope } from "./state.ts";
 import type { Schema } from "./schema.ts";
 import type { TriggerSpec } from "./trigger.ts";
-import { subscribe, type Subscription, type SubscriptionDefinition } from "./subscription.ts";
 import {
 	defineSubscriptionPolicy,
 	type SubscriptionPolicy,
@@ -64,8 +63,6 @@ export interface AppConfig {
 	workflows: readonly AnyWorkflow[];
 	/** Agents whose `triggers` receive events. Agents only reached by `ctx.send` or `ctx.agent` need no entry. */
 	agents?: readonly Agent[];
-	/** Static subscriptions from `f.subscribe`. */
-	subscriptions?: readonly Subscription[];
 	logger?: Logger;
 }
 
@@ -98,11 +95,6 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 			migrate?: (old: unknown, fromVersion: number) => T;
 		},
 	): StateDefinition<T>;
-	/** Route a trigger's events into an agent conversation with `ctx.send`. */
-	subscribe<const TTrigger extends TriggerSpec<any>>(
-		this: void,
-		definition: SubscriptionDefinition<TTrigger>,
-	): Subscription;
 	/**
 	 * Filter and priority functions for `ctx.subscribe({ policy })`. Subscriptions store the name, so
 	 * define policies at module level, like agents.
@@ -121,9 +113,7 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 /** Internal app construction for `fabrial/testing`. Not part of the public API. */
 export const INTERNAL = Symbol.for("fabrial.internal");
 export type InternalOverrides = ProductionOverrides &
-	Partial<
-		Pick<CoreConfig, "runtime" | "chat" | "agents" | "reservationTimeout" | "subscriptionStore">
-	>;
+	Partial<Pick<CoreConfig, "runtime" | "chat" | "agents" | "subscriptionStore">>;
 export interface InternalInstance {
 	app(config: AppConfig, overrides: InternalOverrides): App;
 }
@@ -134,7 +124,7 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 ): Fabrial<P> {
 	const plugins = Object.freeze([...config.plugins]) as unknown as P;
 	const build = (appConfig: AppConfig, overrides: InternalOverrides = {}): App => {
-		const { runtime, chat, agents, reservationTimeout, subscriptionStore, ...settings } = overrides;
+		const { runtime, chat, agents, subscriptionStore, ...settings } = overrides;
 		const integrations = runtime
 			? { runtime, chat, agents, subscriptionStore }
 			: production({ database: config.database, models: config.models ?? {} }, settings);
@@ -142,13 +132,9 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 			...integrations,
 			plugins,
 			identity: config.identity,
-			workflows: [
-				...appConfig.workflows,
-				...(appConfig.subscriptions ?? []).map((subscription) => subscription.workflow),
-			],
+			workflows: appConfig.workflows,
 			routedAgents: appConfig.agents ?? [],
 			logger: appConfig.logger,
-			reservationTimeout,
 			definitionScope: instance,
 		});
 	};
@@ -161,7 +147,6 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 		defineToolkit,
 		defineState,
 		defineGroup,
-		subscribe,
 		defineSubscriptionPolicy: (definition) => defineSubscriptionPolicy(definition, instance),
 		app: (appConfig) => build(appConfig) as App<ClientsOf<P>>,
 		[INTERNAL]: { app: build },

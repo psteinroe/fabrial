@@ -31,8 +31,8 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 	chat(): ChatPort | undefined;
 
 	/**
-	 * New work from a plugin: resolves trigger ownership (most specific owner + all observers), creates
-	 * the interaction, and emits through the runtime. Returns the owning workflow name, if any.
+	 * New work from a plugin: resolves trigger ownership (most specific owner + all observers) and
+	 * emits through the runtime, or delivers to an agent's conversation. Returns the owning workflow name, if any.
 	 */
 	ingest(
 		event: string,
@@ -46,8 +46,8 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 	): Promise<{ owner: string | undefined; observers: string[] }>;
 
 	/**
-	 * Inbound chat message. Routes to the thread's active interaction (agent steering, a waiting
-	 * `waitForReply`, or the buffer) or, if none, through `ingest` as new work. Returns how it was routed.
+	 * Inbound chat message. Goes to the conversations following its thread, else to the most specific
+	 * matching trigger. Returns how it was routed.
 	 */
 	receiveMessage(
 		message: ChatMessage,
@@ -56,7 +56,7 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 			/** @deprecated Use events. */ event?: string;
 			dedupeId: string;
 		},
-	): Promise<"reply" | "new" | "ignored">;
+	): Promise<"follow" | "new" | "ignored">;
 
 	/** Inbound card action (approval buttons, [Cancel request]). */
 	receiveAction(action: {
@@ -68,7 +68,7 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 		dedupeId: string;
 	}): Promise<void>;
 
-	/** Requesters and participants in the current interaction may stop its handler. */
+	/** A stop in a thread cancels the current run of every conversation following it. */
 	receiveCancellation(action: {
 		actor: ExternalIdentity;
 		thread: ThreadRef;
@@ -123,8 +123,6 @@ export interface CoreConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[
 	/** Known users only; groups are resolved directly by reference in access/approval options. */
 	identity?: readonly UserDefinition[];
 	logger?: Logger;
-	/** Grace period for an ingress reservation with no bound handler. Default: 10m; must be below 30 days. */
-	reservationTimeout?: import("./runtime.ts").DurationInput;
 }
 
 export interface App<TClients = Record<string, unknown>> {

@@ -1,7 +1,7 @@
 import type { ApprovalDecision, ApprovalHandle, ApprovalOptions } from "./approval.ts";
 import type { EvaluateQuestion, EvaluateRequest, EvaluateResult } from "./evaluate.ts";
 import type { GroupDefinition, Principal } from "./identity.ts";
-import type { Json, JsonObject } from "./json.ts";
+import type { Json } from "./json.ts";
 import type { AgentRef, AgentRunOptions, InvocationMetadata } from "./runtime.ts";
 import type { Schema } from "./schema.ts";
 import type { SendOptions, SendReceipt } from "./send.ts";
@@ -71,13 +71,6 @@ export interface WorkflowContext<TClients = Record<string, unknown>> {
 	): Promise<WorkflowOutput<W>>;
 	/** Start an independent execution without waiting; returns its execution id. */
 	start<W extends AnyWorkflow>(id: string, workflow: W, input: WorkflowInput<W>): Promise<string>;
-	/** Transfer the interaction (thread, final response) to another workflow; return its result from `run`. */
-	handoff<W extends AnyWorkflow>(
-		id: string,
-		workflow: W,
-		input: WorkflowInput<W>,
-	): Promise<HandoffResult>;
-
 	/** True when `principal` is a member of `group` (resolved now). */
 	isMember(principal: Principal, group: GroupDefinition): Promise<boolean>;
 }
@@ -85,11 +78,6 @@ export interface WorkflowContext<TClients = Record<string, unknown>> {
 export type RaceResult<R extends Record<string, Awaitable>> = {
 	[K in keyof R]: { key: K; value: R[K] extends Awaitable<infer T> ? T : never };
 }[keyof R];
-
-export interface HandoffResult extends JsonObject {
-	handedOffTo: string;
-	executionId: string;
-}
 
 /** Information about the current run, passed to middleware. */
 export interface ExecutionInfo {
@@ -114,7 +102,7 @@ export interface WorkflowDefinition<
 	name: TName;
 	/** Shown to agents that list this workflow in `tools`. */
 	description?: string;
-	/** Input schema for `invoke`, `handoff`, `start`, and agent tool calls. */
+	/** Input schema for `invoke`, `start`, and agent tool calls. */
 	input?: Schema<TInput>;
 	output?: Schema<TOutput>;
 	triggers?: TTriggers;
@@ -136,8 +124,6 @@ export interface Workflow<
 	readonly kind: "fabrial.workflow";
 	readonly name: TName;
 	readonly definition: WorkflowDefinition<TName, TInput, TOutput, readonly TriggerSpec<any>[]>;
-	/** @internal Compiled from `f.subscribe`: delivers input and never holds the thread's routing slot. */
-	readonly subscription?: true;
 }
 
 export type AnyWorkflow = Workflow<string, any, any>;

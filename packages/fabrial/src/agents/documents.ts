@@ -155,7 +155,6 @@ export const ToolReceipt = defineDoc({
 export async function stateDraft<T extends JsonObject>(
 	tx: Tx,
 	definition: StateDefinition<T>,
-	interactionId: string,
 	conversationId?: ConversationId,
 ) {
 	const common = {
@@ -180,17 +179,16 @@ export async function stateDraft<T extends JsonObject>(
 		scope: "session",
 		initial: (_seed: string) => definition.initial(),
 	});
-	return tx.doc(token, definition.scope === "thread" ? "thread" : interactionId, "");
+	return tx.doc(token, "thread", "");
 }
 
 export async function applyState<T extends JsonObject>(
 	tx: Tx,
 	definition: StateDefinition<T>,
-	interactionId: string,
 	conversationId: ConversationId | undefined,
 	changes: readonly ((draft: T) => void | T)[],
 ): Promise<T> {
-	const draft = await stateDraft(tx, definition, interactionId, conversationId);
+	const draft = await stateDraft(tx, definition, conversationId);
 	let value = JSON.parse(JSON.stringify(draft)) as T;
 	for (const change of changes) value = change(value) ?? value;
 	value = await parseSchema(definition.schema, value, `state ${definition.name}`);
