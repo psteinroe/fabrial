@@ -1,4 +1,6 @@
+import type { Context } from "@earendil-works/chord";
 import {
+	awaitWithContext,
 	BACKGROUND_CONTEXT,
 	withAbortSignal,
 	withContextValue,
@@ -16,6 +18,7 @@ import {
 	ToolTask,
 	watchEvents,
 	type AgentChange,
+	type Conversation,
 	type ConversationId,
 	type Extension,
 	type HarnessSettings,
@@ -28,7 +31,9 @@ import {
 	parseSchema,
 	type AgentPort,
 	type AgentRef,
+	AGENT_SETTLED_EVENT,
 	type DurableExecution,
+	type ExecutionResult,
 	type FabrialHost,
 	type InvocationMetadata,
 	type Json,
@@ -66,6 +71,7 @@ import type { Sql } from "postgres";
 import {
 	BridgeKey,
 	cloneJson,
+	currentRequest,
 	fields,
 	registerChild,
 	replyTool,
@@ -86,7 +92,6 @@ import {
 	type StoredSubscribeOptions,
 } from "../subscriptions.ts";
 import type { ResourceRefJson } from "../plugin.ts";
-import { Inbox } from "./inbox.ts";
 import {
 	applyState,
 	Binding,
@@ -104,7 +109,53 @@ import { createEvaluator } from "./evaluate.ts";
 import { LeaseLost, PostgresStorage, SessionBusy } from "./storage.ts";
 import type { AgentIntegration, Logger } from "../app.ts";
 
-const RUN_WORKFLOW = "fabrial.pi.run";
+const SESSION_WORKFLOW = "fabrial.session";
+
+/** The signals a Session execution receives, all named `input`; ids dedupe them. */
+type SessionInput =
+	| {
+			kind: "input";
+			agent: string;
+			requestId: string;
+			content: string;
+			delivery: Delivery;
+			metadata: InvocationMetadata;
+	  }
+	| {
+			kind: "call";
+			agent: string;
+			requestId: string;
+			content: string;
+			metadata: InvocationMetadata;
+			caller: string;
+			detached: boolean;
+	  }
+	| { kind: "replies"; interactionId: string }
+	| { kind: "child"; executionId: string; result: ExecutionResult }
+	| { kind: "cancel"; caller: string; reason: string };
+
+/** A run of one conversation in the hosted Session: the requests it answers, until Pi has finished them. */
+interface HostedRun {
+	id: string;
+	agent: string;
+	conversation: Conversation;
+	call?: { requestId: string; metadata: InvocationMetadata };
+	submissions: Map<string, Submission>;
+	/** Sent requests, answered through `reply`; the rest are the call's own. */
+	sent: Set<string>;
+	unanswered: Set<string>;
+	started: boolean;
+	replying: boolean;
+	/** The thread a call owns. */
+	io?: ThreadIO;
+	ui?: {
+		follow(requestId: string): Promise<void>;
+		unfollow(requestId: string): Promise<void>;
+		status(text: string): Promise<void>;
+		clearStatus(label: string): Promise<void>;
+		stop(): Promise<void>;
+	};
+}
 export function sessionKey(metadata: InvocationMetadata): string {
 	const surface = metadata.replyTo;
 	if (surface?.kind === "thread") return threadSession(surface.provider, surface.threadId);
@@ -219,7 +270,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		plugin.hooks?.agent ? [plugin.hooks.agent] : [],
 	);
 	const reply = replyTool();
-	const inbox = new Inbox(options.sql);
 	const subagentDeps: SubagentDeps = {
 		childAgent,
 		named: (conversationId, agent) => conversationAgents.set(conversationId, agent),
@@ -379,12 +429,23 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						],
 						isError: result.status !== "completed",
 					};
-				await registerChild(frame, api.taskId, { executionId: child, detached: false }, context);
-				return new Promise((_, reject) => {
-					const signal = context.abortSignal;
-					if (signal?.aborted) reject(signal.reason);
-					else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
-				});
+				await registerChild(
+					frame,
+					(await frame.runOf(api.conversationId, context)).id,
+					api.taskId,
+					{ executionId: child, detached: false },
+					context,
+				);
+				const settled = await frame.waitChild(api.taskId, child, context);
+				return {
+					content: [
+						{
+							type: "text",
+							text: JSON.stringify(settled.status === "completed" ? settled.output : settled),
+						},
+					],
+					isError: settled.status !== "completed",
+				};
 			},
 		});
 		workflowTools.set(native, workflow);
@@ -397,515 +458,755 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			: undefined;
 	}
 
-	async function drive(input: Json, execution: DurableExecution): Promise<Json> {
+	/** Metadata of a Session execution: it serves many requests, so it carries none of theirs. */
+	const sessionMetadata = (key: string): Partial<InvocationMetadata> => ({
+		replyTo: null,
+		ownsThread: false,
+		ownerWorkflow: null,
+		triggerEvent: null,
+		piSession: key,
+		piChild: null,
+	});
+
+	/** Every input reaches the Session's execution as a signal, starting one when the Session is closed. */
+	const signalSession = (
+		key: string,
+		id: string,
+		payload: SessionInput,
+		metadata: InvocationMetadata,
+	) =>
+		host.runtime.signalWithStart({
+			workflow: SESSION_WORKFLOW,
+			key,
+			signal: { name: "input", id, payload: payload as unknown as Json },
+			input: { session: key },
+			metadata: { ...metadata, ...sessionMetadata(key) } as InvocationMetadata,
+		});
+
+	/**
+	 * The Session execution: hosts the Pi Session while it has work. Signals arriving while it opens or closes wait
+	 * for the next opening; a signal delivered after the handler returned is sent again, which re-queues the execution.
+	 */
+	async function hostSession(input: Json, execution: DurableExecution): Promise<Json> {
 		if (!started) throw new Error("Start the Pi integration before running agents");
-		// A call drives its own request; a send drains the conversation's inbox. Both drain sent input.
-		const request = input as {
-			agent: string;
-			session: string;
-			mode?: "call" | "send";
-			requestId?: string;
-			input?: Json;
-			structured?: boolean;
-		};
-		const sending = request.mode === "send";
-		const agent = agents.get(request.agent);
-		if (!agent)
-			throw new Error(
-				`Agent ${request.agent} is not installed; defineAgent must be evaluated before app.start()`,
+		const key = (input as { session: string }).session;
+		let phase: "opening" | "open" | "closing" | "returned" = "opening";
+		let hosted: SessionHost | undefined;
+		const late: { payload: SessionInput; id: string; done: (error?: unknown) => void }[] = [];
+		execution.onSignal("input", async (payload, { id }) => {
+			const input = payload as unknown as SessionInput;
+			if (phase === "returned") {
+				await signalSession(key, `${id}:requeued`, input, execution.metadata);
+				return;
+			}
+			if (phase === "open" && hosted) return hosted.handle(input);
+			await new Promise<void>((resolve, reject) =>
+				late.push({ payload: input, id, done: (error) => (error ? reject(error) : resolve()) }),
 			);
-		const io = await thread(execution);
-		let cycle = 0;
-		for (;;) {
-			const storage = await acquire(options.sql, request.session, execution.signal);
-			const signal = AbortSignal.any([execution.signal, storage.lost.signal]);
-			const frame: BridgeFrame = {
-				host,
-				execution,
-				evaluator,
-				harness: undefined as unknown as Harness,
-				session: request.session,
-				agent: request.agent,
-				thread: io,
-				children: new Map(),
-				waiting: new Set(),
-			};
-			const context = withContextValue(
-				BridgeKey,
-				frame,
-				withAbortSignal(signal, BACKGROUND_CONTEXT),
-			);
-			let conversationId: ConversationId | undefined;
-			let events: Awaited<ReturnType<typeof watchEvents>> | undefined;
-			let watcher: ReturnType<Inbox["watch"]> | undefined;
-			let outcome: Json | undefined;
-			let children: { executionId: string; detached: boolean }[] = [];
-			const shown = new Set<ThreadIO>();
-			let finish!: () => void;
-			active.set(
-				frame,
-				new Promise<void>((resolve) => {
-					finish = resolve;
-				}),
-			);
-			try {
-				frame.harness = await Harness.open(
-					storage,
-					{
-						models: options.models,
-						registry,
-						settings: { ...options.settings, extensions: [internal] },
-						onReport: (error) => host.logger.warn("Pi report", { error }),
-					},
-					context,
-				);
-				const ids = await frame.harness.snapshot(Conversations, context);
-				conversationId = ids?.ids[request.agent] as ConversationId | undefined;
-				let conversation = conversationId
-					? await frame.harness.conversation(conversationId, context)
-					: undefined;
-				if (!conversation) {
-					conversation = await frame.harness.createConversation(
-						{ ownership: { kind: "ownerless" } },
-						context,
-					);
-					conversationId = conversation.id;
-					await frame.harness.commit(async (tx) => {
-						(await tx.doc(Conversations)).ids[request.agent] = conversationId!;
-					}, context);
-				}
-				conversationAgents.set(conversationId!, request.agent);
-				await conversation.configure(configs.get(request.agent)!, context);
-				const offered = (await conversation.agent(context)).tools;
-				// Tools are not filtered by who is talking: a conversation can have many participants,
-				// and a tool that needs permission asks its own approvers. Only unregistered workflows drop
-				// out, and `reply` is offered only to runs that answer sent input.
-				let replying = false;
-				const offer = async (withReply: boolean) => {
-					replying = withReply;
-					const allowed = offered.map((tool) => (tool === reply ? withReply : registered(tool)));
-					await conversation!.configure(
-						{ tools: offered.filter((_tool, index) => allowed[index]) },
-						context,
-					);
-				};
-				await offer(sending);
-				const originContext = await execution.step("fabrial:pi:origin", async () => {
-					if (sending || !execution.metadata.origin) return "";
-					const sections = await Promise.all(
-						host.plugins.map(async (plugin) =>
-							plugin.context?.(execution.metadata.origin!, host.clients()),
-						),
-					);
-					return sections.filter(Boolean).join("\n\n");
-				});
-				await frame.harness.commit(async (tx) => {
-					if (request.requestId) {
-						await tx.doc(Invocation, request.requestId, cloneJson(execution.metadata));
-						(await tx.doc(Binding, conversationId!)).requestId = request.requestId;
-					}
-					const runs = await tx.doc(Runs);
-					runs.runs[execution.executionId] ??= { conversationId: conversationId!, children: {} };
-				}, context);
-				if (execution.metadata.ownsThread && io)
-					await setActive(io, execution.metadata.interactionId, true);
-				let lastStatus = 0;
-				// Progress shows on the owned thread, or on the reply thread of the latest sent request.
-				let progress = execution.metadata.ownsThread ? io : undefined;
-				let progressRequest: string | undefined;
-				// A generation backing off before a durable retry, from Pi's `pi.live` generation.
-				let waiting = false;
-				const showStatus = async (text: string) => {
-					if (!progress) return;
-					shown.add(progress);
-					lastStatus = Date.now();
-					await progress.setStatus(text).catch(() => {});
-				};
-				const thinking = () => showStatus(waiting ? WAITING_STATUS : "Thinking…");
-				// Subagents show their activity on the lead's status ("researcher: Thinking…").
-				let childStatus: string | undefined;
-				frame.status = async (text) => {
-					if (waiting || text === childStatus) return;
-					childStatus = text;
-					await showStatus(text);
-				};
-				// A child that answered gives the status back to the lead: its own activity, or none when idle.
-				frame.clearStatus = async (label) => {
-					if (!childStatus?.startsWith(`${label}: `)) return;
-					childStatus = undefined;
-					if (waiting) return;
-					if ((await frame.harness.snapshot(LiveDoc, conversationId!, context))?.run)
-						await thinking();
-					else await progress?.setStatus(null).catch(() => {});
-				};
-				if (sending || (execution.metadata.ownsThread && io)) {
-					events = await watchEvents(frame.harness, conversationId!, context);
-					waiting = !!events.snapshot.generation?.retry;
-					events.start(async (batch) => {
-						const retry = batch.findLast(
-							(event) => event.type === "auto_retry_start" || event.type === "auto_retry_end",
-						);
-						if (retry) {
-							waiting = retry.type === "auto_retry_start";
-							await thinking();
-							return;
-						}
-						if (waiting || !progress || Date.now() - lastStatus < 750) return;
-						// A subagent call's details update; the child shows its own activity.
-						if (batch.every((event) => event.type === "tool_execution_update")) return;
-						const tool = batch.find((event) => event.type === "tool_execution_start");
-						const text =
-							tool?.type === "tool_execution_start"
-								? ((await conversation!.agent(context)).tools.find(
-										(each) => each.name === tool.toolName,
-									)?.description ?? "Using a tool…")
-								: "Thinking…";
-						await showStatus(text);
-					});
-					await thinking();
-				}
-				const content = [
-					originContext,
-					typeof request.input === "string" ? request.input : JSON.stringify(request.input ?? null),
-					request.structured
-						? "Return your final answer as a single JSON value, without Markdown fences or surrounding prose."
-						: "",
-				]
-					.filter(Boolean)
-					.join("\n\n");
-				// Persist admission intents before submit; re-opening drains the same durable request set.
-				const admit = async (
-					requestId: string,
-					content: string,
-					metadata: InvocationMetadata,
-					delivery: Delivery = "steer",
-					sent = false,
-				) => {
-					await frame.harness.commit(async (tx) => {
-						await tx.doc(Invocation, requestId, cloneJson(metadata));
-						const alias = await claimRequestAlias(
-							requestId,
-							async (alias) => (await tx.doc(RequestAlias, alias, requestId)).requestId,
-						);
-						(await tx.doc(Binding, conversationId!)).requestId ??= requestId;
-						const run = (await tx.doc(Runs)).runs[execution.executionId]!;
-						run.requests ??= {};
-						run.requests[requestId] ??= {
-							content: withRequestAlias(content, requestId, alias),
-							submissionId: null,
-							delivery,
-							...(sent ? { sent } : {}),
-						};
-					}, context);
-				};
-				if (request.requestId) await admit(request.requestId, content, execution.metadata);
-				const submissions = new Map<string, Submission>();
-				// Requests from the inbox, answered through `reply`; the rest are this call's own.
-				const sent = new Set<string>();
-				const unanswered = new Set<string>();
-				const submitPending = async () => {
-					const run = (await frame.harness.snapshot(Runs, context))!.runs[execution.executionId]!;
-					for (const [requestId, pending] of Object.entries(run.requests ?? {})) {
-						if (submissions.has(requestId)) continue;
-						if (pending.sent) {
-							sent.add(requestId);
-							const replyTo = (await frame.harness.snapshot(Invocation, requestId, context))
-								?.replyTo;
-							if (replyTo?.kind === "thread" && host.chat()) {
-								progress = await host.chat()!.resolve(replyTo);
-								progressRequest = requestId;
-								await thinking();
-							}
-						}
-						// Pi dedupes by request id, so a request re-admitted after a crash is submitted once.
-						const submission =
-							pending.submissionId !== null
-								? await frame.harness.submission(pending.submissionId as SubmissionId, context)
-								: pending.delivery === "write"
-									? await conversation!.submit(
-											{
-												type: "write",
-												requestId,
-												entry: {
-													kind: "fabrial.notification",
-													model: [
-														{ role: "user", content: pending.content, timestamp: Date.now() },
-													],
-												},
-											},
-											context,
-										)
-									: await conversation!.submit(
-											{
-												type: "input",
-												content: pending.content,
-												requestId,
-												whenBusy: pending.delivery ?? "steer",
-											},
-											context,
-										);
-						if (!submission) throw new Error(`Missing Pi submission ${requestId}`);
-						submissions.set(requestId, submission);
-						await frame.harness.commit(async (tx) => {
-							(await tx.doc(Runs)).runs[execution.executionId]!.requests![requestId]!.submissionId =
-								submission.id;
-						}, context);
-					}
-				};
-				// Sent input Pi gave up on: one error reply for a model error or no model, keyed by request id.
-				const settleUnanswered = async (requestId: string, reason: string, detail: Json) => {
-					if (progressRequest === requestId) {
-						await progress?.setStatus(null).catch(() => {});
-						progress = undefined;
-					}
-					const error =
-						typeof detail === "string"
-							? detail
-							: detail === null
-								? undefined
-								: JSON.stringify(detail);
-					if (!sentErrorReply(reason, error, "")) {
-						host.logger.info("Sent input unanswered", { requestId, reason });
-						return;
-					}
-					const fresh = newErrorId();
-					const errorId = await frame.harness.commit(async (tx) => {
-						const pending = (await tx.doc(Runs)).runs[execution.executionId]!.requests![requestId]!;
-						return (pending.errorId ??= fresh);
-					}, context);
-					const invocation = (await frame.harness.snapshot(Invocation, requestId, context)) as
-						| InvocationMetadata
-						| undefined;
-					// A stable intent and global dedupe key: a redelivered or restarted driver posts once.
-					if (invocation?.replyTo)
-						await startChild(
-							frame,
-							`fabrial:pi:error:${requestId}`,
-							EFFECT_WORKFLOW,
-							{ method: "post", args: [sentErrorReply(reason, error, errorId)!] },
-							invocation,
-							true,
-							context,
-						);
-					if (errorId === fresh)
-						host.logger.error("Sent input failed", { requestId, reason, errorId, error });
-				};
-				// Sent input for this conversation, admitted durably before its inbox row is pruned.
-				const drain = async (force = false) => {
-					if (!watcher?.due() && !force) return false;
-					const rows = await inbox.pending(request.session, request.agent);
-					if (!rows.length) return false;
-					if (!replying) await offer(true);
-					for (const row of rows)
-						await admit(row.request_id, row.content, row.metadata, row.delivery, true);
-					await submitPending();
-					await inbox.remove(rows.map((row) => row.request_id));
-					return true;
-				};
-				watcher = inbox.watch(request.session);
-				await submitPending();
-				await drain();
-				frame.harness.resume();
-				while (outcome === undefined) {
-					execution.signal.throwIfAborted();
-					if (storage.lost.signal.aborted) throw new LeaseLost("Pi Session ownership lost");
-					await drain();
-					if (io && execution.metadata.ownsThread) {
-						const routing = await io.getState();
-						if (
-							routing?.interactionId === execution.metadata.interactionId &&
-							routing.bufferedReplies.length
-						) {
-							const delivered = new Set<string>();
-							for (const reply of routing.bufferedReplies) {
-								const requestId = JSON.stringify([
-									"fabrial.pi.reply",
-									routing.interactionId,
-									reply.provider,
-									reply.messageId,
-								]);
-								const actor = await host.resolvePrincipal(reply.author.identity);
-								await admit(
-									requestId,
-									`${reply.author.name ?? reply.author.identity.subjectId}: ${reply.text}`,
-									{
-										...execution.metadata,
-										requestedBy: actor as InvocationMetadata["requestedBy"],
-										origin: {
-											provider: reply.provider,
-											threadId: reply.threadId,
-											messageId: reply.messageId,
-										},
-										triggerEvent: null,
-										ownerWorkflow: null,
-									},
-								);
-								await submitPending();
-								delivered.add(reply.messageId);
-							}
-							// Only acknowledge durably admitted submissions, preserving concurrent ingress.
-							await io.updateState((latest) =>
-								latest?.interactionId === routing.interactionId
-									? {
-											...latest,
-											bufferedReplies: latest.bufferedReplies.filter(
-												(reply) => !delivered.has(reply.messageId),
-											),
-											consumedReplyIds: [
-												...new Set([...(latest.consumedReplyIds ?? []), ...delivered]),
-											],
-										}
-									: latest,
-							);
-						}
-					}
-					let complete = true;
-					let queued = false;
-					let failed: string | undefined;
-					let answer: Json | undefined;
-					for (const [requestId, submission] of submissions) {
-						const status = await submission.status(context);
-						// A failed run leaves the input queued behind it in Pi's inbox: keep driving that.
-						if (status.status === "unanswered") {
-							if (!sent.has(requestId)) failed ??= status.reason;
-							else if (!unanswered.has(requestId)) {
-								unanswered.add(requestId);
-								await settleUnanswered(requestId, status.reason, (status.detail ?? null) as Json);
-							}
-							continue;
-						}
-						if (status.status !== "done") {
-							complete = false;
-							queued ||= status.status === "queued";
-							continue;
-						}
-						// Sent input is answered through `reply`; a call returns its own answer.
-						if (status.type === "input" && !sent.has(requestId)) {
-							const entry = await conversation.commit((tx) => tx.entry(status.answer), context);
-							answer =
-								entry?.model
-									?.flatMap((message) =>
-										message.role === "assistant"
-											? message.content
-													.filter((block) => block.type === "text")
-													.map((block) => block.text)
-											: [],
-									)
-									.join("\n") ?? "";
-						}
-					}
-					// Background children keep the driver: their reports arrive as follow-ups the lead answers, and
-					// a call settles only once the lead has answered the last of them.
-					if (
-						complete &&
-						!failed &&
-						((await backgroundPending(frame.harness, context)) ||
-							(await frame.harness.snapshot(LiveDoc, conversationId!, context))?.run)
-					)
-						complete = false;
-					if (complete) {
-						// Input sent while this run ended is ours to answer; its own driver may already be done.
-						if (await drain(true)) continue;
-						if (failed) throw new Error(`Pi run unanswered: ${failed}`);
-						answer =
-							(await reportedAnswer(
-								frame.harness,
-								execution.executionId,
-								conversationId!,
-								context,
-							)) ?? answer;
-						// A sent run answers through `reply`; nothing is returned to post.
-						outcome = sending ? null : (answer ?? "");
-						break;
-					}
-					// Pi places queued input only at a boundary of a run or with the next submission. After a
-					// failed run nothing is running, so an invisible write places what is still queued.
-					if (queued && !(await frame.harness.snapshot(LiveDoc, conversationId!, context))?.run)
-						await conversation.submit({ type: "write", entry: { kind: "fabrial.wake" } }, context);
-					const inspection = await frame.harness.inspect(context);
-					const live = inspection.tasks.filter((task) => !task.record.background);
-					const runners = live.filter((task) => task.state.kind === "running");
-					// Release the Session while every running task waits on a workflow, or on a subagent that does.
-					const parked = (id: number) => frame.children.has(id) || frame.waiting.has(id);
-					if (
-						runners.some((task) => frame.children.has(task.record.id)) &&
-						live.every(
-							(task) =>
-								task.state.kind === "waiting" ||
-								task.state.kind === "completing" ||
-								(task.state.kind === "running" && parked(task.record.id)),
-						)
-					) {
-						children = runners.flatMap((task) => frame.children.get(task.record.id) ?? []);
-						break;
-					}
-					await new Promise<void>((resolve) => setTimeout(resolve, 25));
-				}
-			} finally {
+		});
+		try {
+			for (;;) {
+				phase = "opening";
+				const session = await openSession(key, execution);
+				hosted = session;
+				phase = "open";
+				for (const each of late.splice(0))
+					session.handle(each.payload).then(() => each.done(), each.done);
 				try {
-					try {
-						if (execution.signal.aborted && frame.harness)
-							await cancelRun(
-								frame.harness,
-								execution.executionId,
-								execution.signal.reason?.message ?? "Agent cancelled",
-							);
-					} finally {
-						// A failed cleanup is retried by onSettled; it must not retain the Session lease.
-						watcher?.close();
-						try {
-							await events?.stop();
-						} finally {
-							try {
-								await frame.harness?.close(BACKGROUND_CONTEXT);
-							} finally {
-								await storage.close(BACKGROUND_CONTEXT);
-								if (execution.metadata.ownsThread && io) {
-									await setActive(io, execution.metadata.interactionId, false);
-									await io.setStatus(null).catch(() => {});
-								}
-								for (const surface of shown)
-									if (surface !== io || !execution.metadata.ownsThread)
-										await surface.setStatus(null).catch(() => {});
-							}
-						}
-					}
+					await session.idle;
 				} finally {
-					// Include routing-state/status cleanup in the shutdown join: Chat must
-					// stay connected until these operations release their durable locks.
-					active.delete(frame);
-					finish();
+					phase = "closing";
+					hosted = undefined;
+					await session.close();
 				}
+				if (!late.length) return null;
 			}
-			if (outcome !== undefined) return outcome;
-			const branches = Object.fromEntries(
-				children.map((child) => [
-					child.executionId,
-					{ kind: "execution" as const, executionId: child.executionId },
-				]),
-			);
-			const waitId = `fabrial:pi:children${cycle ? `#${cycle}` : ""}`;
-			cycle++;
-			const settled = await execution.waitForAny(waitId, branches);
-			if (settled.kind !== "execution")
-				throw new Error("Pi bridge expected an execution settlement");
-			const storageForResult = await acquire(options.sql, request.session, execution.signal);
-			const session = createSession(storageForResult);
-			try {
-				await session.commit(async (tx) => {
-					(await tx.doc(ChildResults)).results[settled.key] = cloneJson(
-						settled.result,
-					) as JsonObject;
-				}, BACKGROUND_CONTEXT);
-			} finally {
-				await session.close(BACKGROUND_CONTEXT);
-			}
+		} catch (error) {
+			for (const each of late.splice(0)) each.done(error);
+			throw error;
+		} finally {
+			phase = "returned";
 		}
 	}
 
-	async function cancelRun(harness: Harness, executionId: string, reason: string) {
+	interface SessionHost {
+		handle(input: SessionInput): Promise<void>;
+		/** Resolves when Pi has no work left but waits on workflows; rejects when the lease is lost. */
+		idle: Promise<void>;
+		close(): Promise<void>;
+	}
+
+	async function openSession(key: string, execution: DurableExecution): Promise<SessionHost> {
+		// A crashed owner's lease lasts until it expires, and `ctx.state` takes the lease briefly.
+		const storage = await acquire(options.sql, key, execution.signal);
+		const signal = AbortSignal.any([execution.signal, storage.lost.signal]);
+		const waiters = new Map<string, ((result: JsonObject) => void)[]>();
+		const runs = new Map<string, HostedRun>();
+		const conversations = new Map<
+			string,
+			{ conversation: Conversation; offered: readonly ToolRegistration[] }
+		>();
+		const latest = () => [...runs.values()].findLast((run) => run.started);
+		const frame: BridgeFrame = {
+			host,
+			execution,
+			evaluator,
+			harness: undefined as unknown as Harness,
+			session: key,
+			children: new Map(),
+			waiting: new Set(),
+			runOf: (conversationId, context) => runOf(frame, conversationId, context),
+			waitChild: (taskId, executionId, context) =>
+				awaitWithContext(
+					new Promise<JsonObject>((resolve) => {
+						waiters.set(executionId, [...(waiters.get(executionId) ?? []), resolve]);
+						// A result recorded before this waiter registered.
+						void frame.harness.snapshot(ChildResults, context).then(
+							(doc) => {
+								const result = doc?.results[executionId];
+								if (result) resolve(result);
+							},
+							() => {},
+						);
+					}),
+					context,
+				).finally(() => frame.children.delete(taskId)),
+			status: async (text) => latest()?.ui?.status(text),
+			clearStatus: async (label) => latest()?.ui?.clearStatus(label),
+		};
+		const context = withContextValue(BridgeKey, frame, withAbortSignal(signal, BACKGROUND_CONTEXT));
+		let queue: Promise<unknown> = Promise.resolve();
+		const serial = <T>(fn: () => Promise<T>): Promise<T> => {
+			const next = queue.then(fn);
+			queue = next.catch(() => {});
+			return next;
+		};
+		let inflight = 0;
+		let scheduled = false;
+		let closed = false;
+		let resolveIdle!: () => void;
+		let rejectIdle!: (error: unknown) => void;
+		const idle = new Promise<void>((resolve, reject) => {
+			resolveIdle = resolve;
+			rejectIdle = reject;
+		});
+		idle.catch(() => {});
+		const schedule = () => {
+			if (scheduled || closed) return;
+			scheduled = true;
+			setImmediate(() => {
+				scheduled = false;
+				if (!closed) serial(tick).catch(rejectIdle);
+			});
+		};
+		const onLost = () =>
+			rejectIdle(
+				execution.signal.aborted
+					? execution.signal.reason
+					: new LeaseLost("Pi Session ownership lost"),
+			);
+		signal.addEventListener("abort", onLost, { once: true });
+		let joined!: () => void;
+		active.set(
+			frame,
+			new Promise<void>((resolve) => {
+				joined = resolve;
+			}),
+		);
+		try {
+			frame.harness = await Harness.open(
+				storage,
+				{
+					models: options.models,
+					registry,
+					settings: { ...options.settings, extensions: [internal] },
+					onReport: (error) => host.logger.warn("Pi report", { error }),
+				},
+				context,
+			);
+		} catch (error) {
+			signal.removeEventListener("abort", onLost);
+			await storage.close(BACKGROUND_CONTEXT);
+			active.delete(frame);
+			joined();
+			throw error;
+		}
+		const harness = frame.harness;
+
+		async function conversationOf(agentName: string) {
+			const known = conversations.get(agentName);
+			if (known) return known;
+			if (!agents.has(agentName))
+				throw new Error(
+					`Agent ${agentName} is not installed; defineAgent must be evaluated before app.start()`,
+				);
+			const ids = await harness.snapshot(Conversations, context);
+			const id = ids?.ids[agentName] as ConversationId | undefined;
+			let conversation = id ? await harness.conversation(id, context) : undefined;
+			if (!conversation) {
+				conversation = await harness.createConversation(
+					{ ownership: { kind: "ownerless" } },
+					context,
+				);
+				const created = conversation.id;
+				await harness.commit(async (tx) => {
+					(await tx.doc(Conversations)).ids[agentName] = created;
+				}, context);
+			}
+			conversationAgents.set(conversation.id, agentName);
+			await conversation.configure(configs.get(agentName)!, context);
+			const entry = { conversation, offered: (await conversation.agent(context)).tools };
+			conversations.set(agentName, entry);
+			return entry;
+		}
+
+		async function attach(id: string, agentName: string, call?: HostedRun["call"]) {
+			const { conversation } = await conversationOf(agentName);
+			const run: HostedRun = {
+				id,
+				agent: agentName,
+				conversation,
+				call,
+				submissions: new Map(),
+				sent: new Set(),
+				unanswered: new Set(),
+				started: false,
+				replying: false,
+			};
+			runs.set(id, run);
+			return run;
+		}
+
+		async function createRun(
+			id: string,
+			agentName: string,
+			call?: { requestId: string; caller: string; detached: boolean; metadata: InvocationMetadata },
+		) {
+			const run = await attach(id, agentName, call);
+			await harness.commit(async (tx) => {
+				(await tx.doc(Runs)).runs[id] ??= {
+					conversationId: run.conversation.id,
+					agent: agentName,
+					children: {},
+					...(call
+						? { call: { requestId: call.requestId, caller: call.caller, detached: call.detached } }
+						: {}),
+				};
+			}, context);
+			return run;
+		}
+
+		// Persist admission intents before submit; re-opening submits the same durable request set.
+		async function admit(
+			run: HostedRun,
+			requestId: string,
+			content: string,
+			metadata: InvocationMetadata,
+			delivery: Delivery,
+			sent: boolean,
+		) {
+			await harness.commit(async (tx) => {
+				await tx.doc(Invocation, requestId, cloneJson(metadata));
+				const alias = await claimRequestAlias(
+					requestId,
+					async (alias) => (await tx.doc(RequestAlias, alias, requestId)).requestId,
+				);
+				(await tx.doc(Binding, run.conversation.id)).requestId ??= requestId;
+				const record = (await tx.doc(Runs)).runs[run.id]!;
+				record.requests ??= {};
+				record.requests[requestId] ??= {
+					content: withRequestAlias(content, requestId, alias),
+					submissionId: null,
+					delivery,
+					...(sent ? { sent } : {}),
+				};
+			}, context);
+		}
+
+		const admitted = async (requestId: string) =>
+			Object.values((await harness.snapshot(Runs, context))?.runs ?? {}).some(
+				(run) => run.requests?.[requestId],
+			);
+		const current = (agentName: string) =>
+			[...runs.values()].find((run) => run.agent === agentName);
+
+		async function apply(input: SessionInput) {
+			switch (input.kind) {
+				case "input": {
+					// Pi dedupes by request id too; this keeps a redelivery from opening an empty run.
+					if (await admitted(input.requestId)) return;
+					const run =
+						current(input.agent) ?? (await createRun(`send:${input.requestId}`, input.agent));
+					await admit(run, input.requestId, input.content, input.metadata, input.delivery, true);
+					if (run.started) await submitPending(run);
+					return;
+				}
+				case "call": {
+					if (await admitted(input.requestId)) return;
+					const run = await createRun(input.requestId, input.agent, input);
+					await admit(run, input.requestId, input.content, input.metadata, "steer", false);
+					return;
+				}
+				case "replies": {
+					for (const run of runs.values())
+						if (run.started && run.io && run.call?.metadata.interactionId === input.interactionId)
+							await drainReplies(run);
+					return;
+				}
+				case "child": {
+					const result = cloneJson(input.result) as unknown as JsonObject;
+					await harness.commit(async (tx) => {
+						(await tx.doc(ChildResults)).results[input.executionId] ??= result;
+					}, context);
+					for (const resolve of waiters.get(input.executionId) ?? []) resolve(result);
+					waiters.delete(input.executionId);
+					return;
+				}
+				case "cancel": {
+					// Durable records, not hosted runs: a run whose agent is gone is cancelled too.
+					const records = (await harness.snapshot(Runs, context))?.runs ?? {};
+					for (const [id, record] of Object.entries(records)) {
+						if (record.done || record.call?.caller !== input.caller || record.call.detached)
+							continue;
+						await cancelRun(harness, id, input.reason);
+						const run = runs.get(id);
+						if (run) await finish(run, undefined);
+						else
+							await harness.commit(async (tx) => {
+								(await tx.doc(Runs)).runs[id]!.done = true;
+							}, context);
+					}
+				}
+			}
+		}
+
+		// Tools are not filtered by who is talking: a conversation can have many participants, and a tool that needs
+		// permission asks its own approvers. Only unregistered workflows drop out, and `reply` is offered only to runs
+		// that answer sent input.
+		async function offer(run: HostedRun, withReply: boolean) {
+			const { offered } = await conversationOf(run.agent);
+			await run.conversation.configure(
+				{ tools: offered.filter((tool) => (tool === reply ? withReply : registered(tool))) },
+				context,
+			);
+			run.replying = withReply;
+		}
+
+		async function activate(run: HostedRun) {
+			run.started = true;
+			const record = (await harness.snapshot(Runs, context))!.runs[run.id]!;
+			const sent = Object.values(record.requests ?? {}).some((request) => request.sent);
+			await offer(run, !run.call || sent);
+			if (run.call) {
+				const requestId = run.call.requestId;
+				await harness.commit(async (tx) => {
+					(await tx.doc(Binding, run.conversation.id)).requestId = requestId;
+				}, context);
+				if (run.call.metadata.ownsThread) {
+					run.io = await thread({ metadata: run.call.metadata } as DurableExecution);
+					if (run.io) await setActive(run.io, run.call.metadata.interactionId, true);
+				}
+			}
+			if (!run.call || run.io) run.ui = await progressOf(run, harness, context);
+		}
+
+		async function submitPending(run: HostedRun) {
+			const record = (await harness.snapshot(Runs, context))!.runs[run.id]!;
+			for (const [requestId, pending] of Object.entries(record.requests ?? {})) {
+				if (run.submissions.has(requestId)) continue;
+				if (pending.sent) {
+					run.sent.add(requestId);
+					if (!run.replying) await offer(run, true);
+					await run.ui?.follow(requestId);
+				}
+				// Pi dedupes by request id, so a request re-admitted after a crash is submitted once.
+				const submission =
+					pending.submissionId !== null
+						? await harness.submission(pending.submissionId as SubmissionId, context)
+						: pending.delivery === "write"
+							? await run.conversation.submit(
+									{
+										type: "write",
+										requestId,
+										entry: {
+											kind: "fabrial.notification",
+											model: [{ role: "user", content: pending.content, timestamp: Date.now() }],
+										},
+									},
+									context,
+								)
+							: await run.conversation.submit(
+									{
+										type: "input",
+										content: pending.content,
+										requestId,
+										whenBusy: pending.delivery ?? "steer",
+									},
+									context,
+								);
+				if (!submission) throw new Error(`Missing Pi submission ${requestId}`);
+				run.submissions.set(requestId, submission);
+				if (pending.submissionId === null)
+					await harness.commit(async (tx) => {
+						(await tx.doc(Runs)).runs[run.id]!.requests![requestId]!.submissionId = submission.id;
+					}, context);
+			}
+		}
+
+		/**
+		 * Replies in a thread a call owns steer its run, admitted before they leave the thread's buffer. Returns how
+		 * many it admitted.
+		 */
+		async function drainReplies(run: HostedRun): Promise<number> {
+			const metadata = run.call!.metadata;
+			const routing = await run.io!.getState();
+			if (routing?.interactionId !== metadata.interactionId || !routing.bufferedReplies.length)
+				return 0;
+			const delivered = new Set<string>();
+			for (const message of routing.bufferedReplies) {
+				const requestId = JSON.stringify([
+					"fabrial.pi.reply",
+					routing.interactionId,
+					message.provider,
+					message.messageId,
+				]);
+				const actor = await host.resolvePrincipal(message.author.identity);
+				await admit(
+					run,
+					requestId,
+					`${message.author.name ?? message.author.identity.subjectId}: ${message.text}`,
+					{
+						...metadata,
+						requestedBy: actor as InvocationMetadata["requestedBy"],
+						origin: {
+							provider: message.provider,
+							threadId: message.threadId,
+							messageId: message.messageId,
+						},
+						triggerEvent: null,
+						ownerWorkflow: null,
+					},
+					"steer",
+					false,
+				);
+				delivered.add(message.messageId);
+			}
+			await submitPending(run);
+			// Only acknowledge durably admitted submissions, preserving concurrent ingress.
+			await run.io!.updateState((latest) =>
+				latest?.interactionId === routing.interactionId
+					? {
+							...latest,
+							bufferedReplies: latest.bufferedReplies.filter(
+								(message) => !delivered.has(message.messageId),
+							),
+							consumedReplyIds: [...new Set([...(latest.consumedReplyIds ?? []), ...delivered])],
+						}
+					: latest,
+			);
+			return delivered.size;
+		}
+
+		// Sent input Pi gave up on: one error reply for a model error or no model, keyed by request id.
+		async function settleUnanswered(
+			run: HostedRun,
+			requestId: string,
+			reason: string,
+			detail: Json,
+		) {
+			await run.ui?.unfollow(requestId);
+			const error =
+				typeof detail === "string" ? detail : detail === null ? undefined : JSON.stringify(detail);
+			if (!sentErrorReply(reason, error, "")) {
+				host.logger.info("Sent input unanswered", { requestId, reason });
+				return;
+			}
+			const fresh = newErrorId();
+			const errorId = await harness.commit(async (tx) => {
+				const pending = (await tx.doc(Runs)).runs[run.id]!.requests![requestId]!;
+				return (pending.errorId ??= fresh);
+			}, context);
+			const invocation = (await harness.snapshot(Invocation, requestId, context)) as
+				| InvocationMetadata
+				| undefined;
+			// A stable intent and global dedupe key: a redelivered or restarted Session posts once.
+			if (invocation?.replyTo)
+				await startChild(
+					frame,
+					run.id,
+					`fabrial:pi:error:${requestId}`,
+					EFFECT_WORKFLOW,
+					{ method: "post", args: [sentErrorReply(reason, error, errorId)!] },
+					invocation,
+					true,
+					context,
+				);
+			if (errorId === fresh)
+				host.logger.error("Sent input failed", { requestId, reason, errorId, error });
+		}
+
+		/** Settle a run: a call's answer becomes the event its caller waits for. */
+		async function finish(run: HostedRun, result: JsonObject | undefined) {
+			// Emitted before the run is marked done, so a crash in between emits again (deduped by request id).
+			if (run.call && result)
+				await execution.emit(
+					AGENT_SETTLED_EVENT,
+					{ requestId: run.call.requestId, ...result },
+					{ id: run.call.requestId },
+				);
+			await harness.commit(async (tx) => {
+				(await tx.doc(Runs)).runs[run.id]!.done = true;
+			}, context);
+			runs.delete(run.id);
+			await run.ui?.stop();
+			if (run.io && run.call) {
+				await setActive(run.io, run.call.metadata.interactionId, false);
+				await run.io.setStatus(null).catch(() => {});
+			}
+		}
+
+		async function evaluate(run: HostedRun) {
+			let complete = true;
+			let queued = false;
+			let failed: string | undefined;
+			let answer: Json | undefined;
+			for (const [requestId, submission] of run.submissions) {
+				const status = await submission.status(context);
+				// A failed run leaves the input queued behind it in Pi's inbox: keep running that.
+				if (status.status === "unanswered") {
+					if (!run.sent.has(requestId)) failed ??= status.reason;
+					else if (!run.unanswered.has(requestId)) {
+						run.unanswered.add(requestId);
+						await settleUnanswered(run, requestId, status.reason, (status.detail ?? null) as Json);
+					}
+					continue;
+				}
+				if (status.status !== "done") {
+					complete = false;
+					queued ||= status.status === "queued";
+					continue;
+				}
+				// Sent input is answered through `reply`; a call returns its own answer.
+				if (status.type === "input" && !run.sent.has(requestId)) {
+					const entry = await run.conversation.commit((tx) => tx.entry(status.answer), context);
+					answer =
+						entry?.model
+							?.flatMap((message) =>
+								message.role === "assistant"
+									? message.content
+											.filter((block) => block.type === "text")
+											.map((block) => block.text)
+									: [],
+							)
+							.join("\n") ?? "";
+				}
+			}
+			const live = async () => (await harness.snapshot(LiveDoc, run.conversation.id, context))?.run;
+			// Background children keep the run: their reports arrive as follow-ups the lead answers, and a call settles
+			// only once the lead has answered the last of them.
+			if (complete && !failed && ((await backgroundPending(harness, context)) || (await live())))
+				complete = false;
+			// A reply buffered while the run was finishing, whose signal found it busy, steers it still.
+			if (complete && !failed && run.io && (await drainReplies(run))) complete = false;
+			if (complete) {
+				if (failed) return finish(run, { status: "failed", error: `Pi run unanswered: ${failed}` });
+				answer = (await reportedAnswer(harness, run.id, run.conversation.id, context)) ?? answer;
+				return finish(run, { status: "completed", output: run.call ? (answer ?? "") : null });
+			}
+			// Pi places queued input only at a boundary of a run or with the next submission. After a failed run nothing
+			// is running, so an invisible write places what is still queued.
+			if (queued && !(await live()))
+				await run.conversation.submit({ type: "write", entry: { kind: "fabrial.wake" } }, context);
+		}
+
+		/** No work, or every running task waits on a workflow (or on a subagent that does): the Session can close. */
+		async function closeable() {
+			if (inflight || [...runs.values()].some((run) => !run.started)) return false;
+			const inspection = await harness.inspect(context);
+			const live = inspection.tasks.filter((task) => !task.record.background);
+			if (!live.length && !inspection.submissions.length)
+				return !(await backgroundPending(harness, context));
+			const runners = live.filter((task) => task.state.kind === "running");
+			const parked = (id: number) => frame.children.has(id) || frame.waiting.has(id);
+			return (
+				runners.some((task) => frame.children.has(task.record.id)) &&
+				live.every(
+					(task) =>
+						task.state.kind === "waiting" ||
+						task.state.kind === "completing" ||
+						(task.state.kind === "running" && parked(task.record.id)),
+				)
+			);
+		}
+
+		async function tick() {
+			const before = runs.size;
+			// A Map iterates safely while runs finish.
+			for (const run of runs.values()) {
+				// One run per conversation at a time, in arrival order.
+				if (!runs.has(run.id) || current(run.agent) !== run) continue;
+				const fresh = !run.started;
+				if (fresh) await activate(run);
+				await submitPending(run);
+				// Replies buffered before the run started steer it after its own input.
+				if (fresh && run.io) await drainReplies(run);
+				await evaluate(run);
+			}
+			if (runs.size !== before) return schedule();
+			if (!scheduled && (await closeable())) resolveIdle();
+		}
+
+		storage.onCommit = schedule;
+		try {
+			for (const [id, record] of Object.entries(
+				(await harness.snapshot(Runs, context))?.runs ?? {},
+			)) {
+				if (record.done || !record.agent) continue;
+				const invocation = record.call
+					? ((await harness.snapshot(Invocation, record.call.requestId, context)) as
+							| InvocationMetadata
+							| undefined)
+					: undefined;
+				await attach(
+					id,
+					record.agent,
+					record.call && invocation
+						? { requestId: record.call.requestId, metadata: invocation }
+						: undefined,
+				);
+			}
+			harness.resume();
+		} catch (error) {
+			rejectIdle(error);
+		}
+		schedule();
+		return {
+			idle,
+			async handle(input) {
+				inflight++;
+				try {
+					await serial(() => apply(input));
+				} finally {
+					inflight--;
+					schedule();
+				}
+			},
+			async close() {
+				closed = true;
+				signal.removeEventListener("abort", onLost);
+				try {
+					await queue;
+					for (const run of runs.values()) await run.ui?.stop();
+				} finally {
+					try {
+						await harness.close(BACKGROUND_CONTEXT);
+					} finally {
+						await storage.close(BACKGROUND_CONTEXT);
+						// Include status cleanup in the shutdown join: Chat must stay connected until it is done.
+						active.delete(frame);
+						joined();
+					}
+				}
+			},
+		};
+	}
+
+	/** The run a conversation's tool acts for: the run of its current request, else the conversation's latest. */
+	async function runOf(
+		frame: BridgeFrame,
+		conversationId: ConversationId,
+		context: Context,
+	): Promise<{ id: string; agent: string }> {
+		const requestId = await currentRequest(frame, conversationId, context);
+		const records = Object.entries((await frame.harness.snapshot(Runs, context))?.runs ?? {});
+		const found =
+			records.find(([, run]) => run.requests?.[requestId]) ??
+			records.findLast(([, run]) => run.conversationId === conversationId) ??
+			records.findLast(([, run]) => !run.done);
+		if (!found) throw new Error("Missing Pi bridge run binding");
+		return { id: found[0], agent: found[1].agent ?? agentNameOf(conversationId) };
+	}
+
+	/**
+	 * Progress of a run: on the thread a call owns, or on the reply thread of the latest sent request. Shows "Thinking…",
+	 * tool activity, a subagent's activity, and "Waiting for the model provider…" while a generation backs off.
+	 */
+	async function progressOf(run: HostedRun, harness: Harness, context: Context) {
+		let progress = run.io;
+		let progressRequest: string | undefined;
+		let lastStatus = 0;
+		let waiting = false;
+		let childStatus: string | undefined;
+		const shown = new Set<ThreadIO>();
+		const showStatus = async (text: string) => {
+			if (!progress) return;
+			shown.add(progress);
+			lastStatus = Date.now();
+			await progress.setStatus(text).catch(() => {});
+		};
+		const thinking = () => showStatus(waiting ? WAITING_STATUS : "Thinking…");
+		const events = await watchEvents(harness, run.conversation.id, context);
+		waiting = !!events.snapshot.generation?.retry;
+		events.start(async (batch) => {
+			const retry = batch.findLast(
+				(event) => event.type === "auto_retry_start" || event.type === "auto_retry_end",
+			);
+			if (retry) {
+				waiting = retry.type === "auto_retry_start";
+				await thinking();
+				return;
+			}
+			if (waiting || !progress || Date.now() - lastStatus < 750) return;
+			// A subagent call's details update; the child shows its own activity.
+			if (batch.every((event) => event.type === "tool_execution_update")) return;
+			const tool = batch.find((event) => event.type === "tool_execution_start");
+			const text =
+				tool?.type === "tool_execution_start"
+					? ((await run.conversation.agent(context)).tools.find(
+							(each) => each.name === tool.toolName,
+						)?.description ?? "Using a tool…")
+					: "Thinking…";
+			await showStatus(text);
+		});
+		await thinking();
+		return {
+			async follow(requestId: string) {
+				const replyTo = (await harness.snapshot(Invocation, requestId, context))?.replyTo;
+				if (replyTo?.kind !== "thread" || !host.chat()) return;
+				progress = await host.chat()!.resolve(replyTo);
+				progressRequest = requestId;
+				await thinking();
+			},
+			async unfollow(requestId: string) {
+				if (progressRequest !== requestId) return;
+				await progress?.setStatus(null).catch(() => {});
+				progress = undefined;
+			},
+			async status(text: string) {
+				if (waiting || text === childStatus) return;
+				childStatus = text;
+				await showStatus(text);
+			},
+			// A child that answered gives the status back to the lead: its own activity, or none when idle.
+			async clearStatus(label: string) {
+				if (!childStatus?.startsWith(`${label}: `)) return;
+				childStatus = undefined;
+				if (waiting) return;
+				if ((await harness.snapshot(LiveDoc, run.conversation.id, context))?.run) await thinking();
+				else await progress?.setStatus(null).catch(() => {});
+			},
+			async stop() {
+				await events.stop();
+				for (const surface of shown)
+					if (surface !== run.io) await surface.setStatus(null).catch(() => {});
+				shown.clear();
+			},
+		};
+	}
+
+	async function cancelRun(harness: Harness, runId: string, reason: string) {
 		const context = BACKGROUND_CONTEXT;
-		const run = (await harness.snapshot(Runs, context))?.runs[executionId];
+		const run = (await harness.snapshot(Runs, context))?.runs[runId];
 		if (!run) return;
 		// Even a start whose receipt was lost has a durable cancellation relationship.
 		for (const key of run.intents ?? []) {
@@ -922,7 +1223,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		for (const child of Object.values(run.children))
 			if (!child.detached) await host.runtime.cancel(child.executionId, reason);
 		// Cancelling the interaction reaches past the background boundary to the children this run started.
-		await abortBackground(harness, executionId, context);
+		await abortBackground(harness, runId, context);
 		const inspection = await harness.inspect(context);
 		const requests = new Set(Object.keys(run.requests ?? {}));
 		const ids = new Set<number>();
@@ -937,35 +1238,12 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			await harness.abortTask(live.run.taskId, context);
 	}
 
-	const workflow: RuntimeWorkflow = {
-		name: RUN_WORKFLOW,
+	const session: RuntimeWorkflow = {
+		name: SESSION_WORKFLOW,
 		triggers: [],
-		mutex: (input) => (input as JsonObject).session as string,
-		handler: drive,
-		onSettled: async (executionId, metadata, result) => {
-			if (result.status !== "cancelled") return;
-			const storage = await acquire(
-				options.sql,
-				typeof metadata.piSession === "string" ? metadata.piSession : sessionKey(metadata),
-				new AbortController().signal,
-			);
-			const harness = await Harness.open(
-				storage,
-				{
-					models: options.models,
-					registry,
-					settings: { ...options.settings, extensions: [internal] },
-				},
-				BACKGROUND_CONTEXT,
-			);
-			try {
-				await cancelRun(harness, executionId, result.reason);
-			} finally {
-				await harness.close(BACKGROUND_CONTEXT);
-			}
-		},
+		handler: hostSession,
 	};
-	// Effects run in a stable child execution, never in the Session's replaceable driver.
+	// Effects run in a stable child execution, never in the Session's replaceable execution.
 	const effect: RuntimeWorkflow = {
 		name: EFFECT_WORKFLOW,
 		triggers: [],
@@ -1053,35 +1331,23 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		},
 	};
 	const port: AgentPort = {
-		workflows: () => [workflow, effect],
+		workflows: () => [session, effect],
 		async send(execution, id, agent, request) {
-			await execution.step(`fabrial:pi:enqueue:${id}`, async () => {
-				await inbox.enqueue({
-					request_id: request.requestId,
-					session_key: request.session,
-					agent: agent.name,
-					content: request.content,
-					delivery: request.delivery,
-					metadata: request.metadata,
-				});
+			const input: SessionInput = {
+				kind: "input",
+				agent: agent.name,
+				requestId: request.requestId,
+				content: request.content,
+				delivery: request.delivery,
+				metadata: request.metadata,
+			};
+			await execution.signalWithStart(`fabrial:pi:deliver:${id}`, {
+				workflow: SESSION_WORKFLOW,
+				key: request.session,
+				signal: { name: "input", id: request.requestId, payload: input as unknown as Json },
+				input: { session: request.session },
+				metadata: sessionMetadata(request.session),
 			});
-			// Every send ensures a driver; one queued behind a busy Session finds its input already taken.
-			await execution.start(
-				`fabrial:pi:deliver:${id}`,
-				RUN_WORKFLOW,
-				{ agent: agent.name, session: request.session, mode: "send" },
-				{
-					metadata: {
-						...execution.metadata,
-						ownsThread: false,
-						ownerWorkflow: null,
-						triggerEvent: null,
-						piSession: request.session,
-					},
-					dedupeKey: JSON.stringify(["fabrial.pi.send", request.requestId]),
-					mutex: request.session,
-				},
-			);
 			return { requestId: request.requestId, session: request.session };
 		},
 		async run(execution, id, agent: AgentRef, request) {
@@ -1089,19 +1355,55 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			// the first workflow post receipt; never promote a provisional ThreadIO.ref.
 			const metadata = execution.metadata;
 			const key = sessionKey(metadata);
-			const answer = await execution.invoke(
-				id,
-				RUN_WORKFLOW,
-				{
-					agent: agent.name,
-					mode: "call",
-					requestId: `${execution.executionId}:${id}`,
-					input: request.input,
-					structured: !!request.output,
-					session: key,
-				},
-				{ mutex: key, metadata: { ...metadata, piSession: key }, detached: request.detached },
-			);
+			const requestId = `${execution.executionId}:${id}`;
+			// Taken before the input is sent, so the answer is never emitted before the wait.
+			const cursor = await execution.cursor(`fabrial:pi:cursor:${id}`);
+			const content = await execution.step(`fabrial:pi:origin:${id}`, async () => {
+				// A cancelled caller finds the Session it may have reached (see `settled`).
+				await options.sql`INSERT INTO fabrial_pi.sessions (key) VALUES (${key}) ON CONFLICT DO NOTHING`;
+				const sections = metadata.origin
+					? await Promise.all(
+							host.plugins.map(async (plugin) =>
+								plugin.context?.(metadata.origin!, host.clients()),
+							),
+						)
+					: [];
+				return [
+					sections.filter(Boolean).join("\n\n"),
+					typeof request.input === "string" ? request.input : JSON.stringify(request.input ?? null),
+					request.output
+						? "Return your final answer as a single JSON value, without Markdown fences or surrounding prose."
+						: "",
+				]
+					.filter(Boolean)
+					.join("\n\n");
+			});
+			const input: SessionInput = {
+				kind: "call",
+				agent: agent.name,
+				requestId,
+				content,
+				metadata: cloneJson({ ...metadata, piSession: key }),
+				caller: execution.executionId,
+				detached: !!request.detached,
+			};
+			await execution.signalWithStart(`fabrial:pi:call:${id}`, {
+				workflow: SESSION_WORKFLOW,
+				key,
+				signal: { name: "input", id: requestId, payload: input as unknown as Json },
+				input: { session: key },
+				metadata: sessionMetadata(key),
+			});
+			const settled = await execution.waitForEvent(`fabrial:pi:settled:${id}`, {
+				event: AGENT_SETTLED_EVENT,
+				filter: { requestId: [requestId] },
+				after: cursor,
+			});
+			if (settled?.payload.status !== "completed") {
+				const error = settled?.payload.error ?? "Agent run did not settle";
+				throw new Error(typeof error === "string" ? error : JSON.stringify(error));
+			}
+			const answer = settled.payload.output ?? null;
 			if (!request.output) return answer;
 			return execution.step(`fabrial:pi:output:${id}`, async () =>
 				parseSchema(
@@ -1109,6 +1411,48 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					JSON.parse(typeof answer === "string" ? answer : JSON.stringify(answer)),
 					`agent ${agent.name} output`,
 				),
+			);
+		},
+		async settled(executionId, metadata, result) {
+			if (metadata.piSession && metadata.piChild === null) return;
+			// A workflow a tool started reports to its Session, which resumes the tool waiting on it.
+			if (typeof metadata.piChild === "string")
+				await signalSession(
+					metadata.piChild,
+					`fabrial.child:${executionId}`,
+					{ kind: "child", executionId, result },
+					metadata,
+				);
+			if (result.status !== "cancelled") return;
+			// A cancelled caller cancels its calls (unless detached) in the Session they reached.
+			let key: string;
+			try {
+				key = sessionKey(metadata);
+			} catch {
+				return;
+			}
+			const [known] = await options.sql`SELECT 1 FROM fabrial_pi.sessions WHERE key = ${key}`;
+			if (known)
+				await signalSession(
+					key,
+					`fabrial.cancel:${executionId}`,
+					{ kind: "cancel", caller: executionId, reason: result.reason },
+					metadata,
+				);
+		},
+		async reply(thread, interactionId, dedupeId) {
+			const key = threadSession(thread.provider, thread.threadId);
+			await signalSession(
+				key,
+				`fabrial.reply:${dedupeId}`,
+				{ kind: "replies", interactionId },
+				{
+					interactionId,
+					origin: null,
+					replyTo: null,
+					requestedBy: null,
+					ownsThread: false,
+				},
 			);
 		},
 	};
@@ -1151,10 +1495,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		agents: port,
 		state,
 		evaluator,
-		workflows: [workflow, effect],
+		workflows: [session, effect],
 		async start() {
 			await PostgresStorage.migrate(options.sql);
-			await inbox.start();
 			for (const plugin of host.plugins)
 				if (plugin.toolkit) {
 					const built = plugin.toolkit(host.clients());
@@ -1184,7 +1527,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			// handlers rather than joining their finally blocks. Join the entire
 			// cleanup, not just Harness.close, before core shuts down Chat.
 			await Promise.all(active.values());
-			await inbox.stop();
 		},
 	};
 }

@@ -652,7 +652,6 @@ it("support channel: two threads share one conversation, reply posts to the aske
 	expect(calls.some((c) => String(c.args.text).includes("never posted"))).toBe(false);
 	const sessions = await sql`SELECT key FROM fabrial_pi.sessions WHERE key LIKE '%C_HELP%'`;
 	expect(sessions.map((row) => row.key)).toEqual(["slack:channel:C_HELP"]);
-	expect(await sql`SELECT 1 FROM fabrial.inbox`).toHaveLength(0);
 });
 
 it("dev thread: the agent opens a PR, follows it, answers a review in the Slack thread, and stops at merge", async () => {

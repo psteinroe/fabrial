@@ -325,6 +325,7 @@ async function background(
 			: await sourceOf(bridge, api, subagent, previous, context);
 		if (typeof source === "string") return error(source);
 		const requestId = await currentRequest(bridge, api.conversationId, context);
+		const run = (await bridge.runOf(api.conversationId, context)).id;
 		const created = await api.commit(async (tx) => {
 			const work = await tx.doc(SubagentWork);
 			if (work.calls[api.taskId] !== undefined) return work.calls[api.taskId]!;
@@ -365,7 +366,7 @@ async function background(
 				lead: api.conversationId,
 				child: child.id,
 				name: child.name,
-				run: bridge.execution.executionId,
+				run,
 				report: null,
 			};
 			work.slots[api.conversationId]![id] = child.name;

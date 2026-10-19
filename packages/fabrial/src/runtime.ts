@@ -180,6 +180,8 @@ export interface RuntimeEvent {
 
 /** Event emitted by core when any Fabrial execution reaches a terminal state. */
 export const EXECUTION_SETTLED_EVENT = "fabrial.execution.settled";
+/** Emitted by an agent Session when a `ctx.agent` call's run settles; `requestId` names the call. */
+export const AGENT_SETTLED_EVENT = "fabrial.agent.settled";
 
 export interface DurableRuntime {
 	/** Optional clock, primarily for deterministic tests. Defaults to Date.now in core. */
@@ -286,7 +288,7 @@ export interface AgentRunOptions {
 
 /** Port implemented by the agents module. Core calls it from `ctx.agent`. */
 export interface AgentPort {
-	/** Internal workflows the agent bridge needs (e.g. the Session-owning agent run). */
+	/** Internal workflows the agent bridge needs (e.g. the execution hosting a Session). */
 	workflows(): RuntimeWorkflow[];
 	run(
 		execution: DurableExecution,
@@ -301,6 +303,14 @@ export interface AgentPort {
 		agent: AgentRef,
 		request: import("./send.ts").SendRequest,
 	): Promise<import("./send.ts").SendReceipt>;
+	/** Called for every terminal settlement: completions resume tools, cancellations cancel calls. */
+	settled?(
+		executionId: string,
+		metadata: InvocationMetadata,
+		result: ExecutionResult,
+	): Promise<void>;
+	/** A reply was buffered in a thread whose interaction an agent call drives: steer it. */
+	reply?(thread: ThreadRef, interactionId: string, dedupeId: string): Promise<void>;
 }
 
 /** Minimal shape core needs from `f.defineAgent`. */

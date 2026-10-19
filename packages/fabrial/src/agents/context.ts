@@ -1,7 +1,7 @@
 import { defineTool as piTool, LiveDoc } from "@earendil-works/pi-durable";
 import type { TSchema } from "@earendil-works/pi-ai";
 import type { Context } from "@earendil-works/chord";
-import { createContextKey, awaitWithContext } from "@earendil-works/chord/context";
+import { createContextKey } from "@earendil-works/chord/context";
 import type {
 	ConversationId,
 	Harness,
@@ -49,14 +49,16 @@ export interface BridgeFrame {
 	execution: DurableExecution;
 	evaluator: Evaluator;
 	harness: Harness;
-	/** The Pi Session key this driver holds. */
+	/** The Pi Session key this execution hosts. */
 	session: string;
-	/** The agent whose conversation this driver runs. */
-	agent: string;
-	thread?: ThreadIO;
+	/** Tasks waiting on a workflow, by task id; while every running task waits, the Session closes. */
 	children: Map<number, { executionId: string; detached: boolean }>;
-	/** Subagent calls waiting for their child's answer; they do not keep the driver from releasing the Session. */
+	/** Subagent calls waiting for their child's answer; they do not keep the Session open. */
 	waiting: Set<number>;
+	/** The run a conversation's current request belongs to, and the agent whose conversation runs it. */
+	runOf(conversationId: ConversationId, context: Context): Promise<{ id: string; agent: string }>;
+	/** Resolves with a workflow's result once its completion signal arrives; frees the task's slot in `children`. */
+	waitChild(taskId: number, executionId: string, context: Context): Promise<JsonObject>;
 	/** Shows a status on the lead's progress surface, if it has one. */
 	status?: (text: string) => Promise<void>;
 	/** Clears a child's activity shown with `status` under `label`, once the child answered. */
@@ -89,10 +91,11 @@ export async function fields(
 	const bridge = frame(context);
 	const requestId = await currentRequest(bridge, conversationId, context);
 	const invocation = (await bridge.harness.snapshot(Invocation, requestId, context))!;
+	const run = await bridge.runOf(conversationId, context);
 	// Tools, and the workflows they start, subscribe this conversation by default.
 	const metadata: InvocationMetadata = {
 		...(invocation as InvocationMetadata),
-		conversation: { session: bridge.session, agent: bridge.agent } satisfies ConversationRef,
+		conversation: { session: bridge.session, agent: run.agent } satisfies ConversationRef,
 	};
 	const prefix = `fabrial:pi:${conversationId}:${api?.taskId ?? "section"}`;
 	const ids = new Map<string, number>();
@@ -104,20 +107,27 @@ export async function fields(
 		return count ? `${id}#${count}` : id;
 	};
 	const childResult = async (child: string): Promise<Json> => {
-		const result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
-		if (result) {
-			if (result.status !== "completed")
-				throw new Error(JSON.stringify(result.error ?? result.reason ?? result.status));
-			return result.output ?? null;
+		let result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
+		if (!result) {
+			await registerChild(
+				bridge,
+				run.id,
+				api!.taskId,
+				{ executionId: child, detached: false },
+				context,
+			);
+			result = await bridge.waitChild(api!.taskId, child, context);
 		}
-		await registerChild(bridge, api!.taskId, { executionId: child, detached: false }, context);
-		return awaitWithContext(new Promise<never>(() => {}), context);
+		if (result.status !== "completed")
+			throw new Error(JSON.stringify(result.error ?? result.reason ?? result.status));
+		return result.output ?? null;
 	};
 	const operation = async (id: string, method: string, args: Json[]): Promise<Json> => {
 		if (!api) throw new Error("Prompt sections cannot perform managed external operations");
 		const key = `${prefix}:${operationId(id)}`;
 		const child = await startChild(
 			bridge,
+			run.id,
 			key,
 			EFFECT_WORKFLOW,
 			{ method, args },
@@ -137,6 +147,7 @@ export async function fields(
 		const key = operationId(id);
 		return startChild(
 			bridge,
+			run.id,
 			`${prefix}:${key}`,
 			registered.name,
 			parsed,
@@ -150,22 +161,23 @@ export async function fields(
 		requestedBy: metadata.requestedBy,
 		clients: bridge.host.clients(),
 		interaction: metadata,
-		thread: bridge.thread
-			? {
-					post: (id, message) =>
-						operation(id, "post", [cloneJson(message) as Json]) as unknown as ReturnType<
-							ThreadIO["post"]
-						>,
-					update: async (id, message, content) => {
-						await operation(id, "update", [
-							cloneJson(message) as unknown as Json,
-							cloneJson(content) as Json,
-						]);
-					},
-					history: (id, options) =>
-						operation(id, "history", [options ?? {}]) as ReturnType<ThreadIO["history"]>,
-				}
-			: undefined,
+		thread:
+			metadata.replyTo && bridge.host.chat()
+				? {
+						post: (id, message) =>
+							operation(id, "post", [cloneJson(message) as Json]) as unknown as ReturnType<
+								ThreadIO["post"]
+							>,
+						update: async (id, message, content) => {
+							await operation(id, "update", [
+								cloneJson(message) as unknown as Json,
+								cloneJson(content) as Json,
+							]);
+						},
+						history: (id, options) =>
+							operation(id, "history", [options ?? {}]) as ReturnType<ThreadIO["history"]>,
+					}
+				: undefined,
 		start,
 		invoke: async (id, workflow, input) => {
 			if (!api) throw new Error("Prompt sections cannot invoke workflows");
@@ -273,6 +285,7 @@ export async function currentRequest(
 /** Persist the cancellation relationship BEFORE starting. A lost start receipt reconciles by global key. */
 export async function startChild(
 	bridge: BridgeFrame,
+	run: string,
 	key: string,
 	workflow: string,
 	input: Json,
@@ -281,24 +294,27 @@ export async function startChild(
 	context: Context,
 ): Promise<string> {
 	const dedupeKey = JSON.stringify(["fabrial.pi.child", bridge.session, key]);
+	const { piChild: _piChild, ...inherited } = cloneJson(metadata);
 	const intent = await bridge.harness.commit(async (tx) => {
 		const saved = await tx.doc(ChildIntents, key, {
 			workflow,
 			input: cloneJson(input ?? null),
+			// `piChild` makes the settlement of a child the Session waits for a signal to it.
 			metadata: {
-				...cloneJson(metadata),
+				...inherited,
 				ownsThread: false,
 				triggerEvent: null,
 				ownerWorkflow: null,
+				...(detached ? {} : { piChild: bridge.session }),
 			},
 			dedupeKey,
 			detached,
 			executionId: null,
 		});
-		const run = (await tx.doc(Runs)).runs[bridge.execution.executionId];
-		if (!run) throw new Error("Missing Pi bridge run binding");
-		run.intents ??= [];
-		if (!run.intents.includes(key)) run.intents.push(key);
+		const record = (await tx.doc(Runs)).runs[run];
+		if (!record) throw new Error("Missing Pi bridge run binding");
+		record.intents ??= [];
+		if (!record.intents.includes(key)) record.intents.push(key);
 		return cloneJson(saved) as ChildIntent;
 	}, context);
 	if (intent.executionId) return intent.executionId;
@@ -314,15 +330,16 @@ export async function startChild(
 
 export async function registerChild(
 	bridge: BridgeFrame,
+	run: string,
 	taskId: number,
 	child: { executionId: string; detached: boolean },
 	context: Context,
 ): Promise<void> {
 	bridge.children.set(taskId, child);
 	await bridge.harness.commit(async (tx) => {
-		const run = (await tx.doc(Runs)).runs[bridge.execution.executionId];
-		if (!run) throw new Error("Missing Pi bridge run binding");
-		run.children[String(taskId)] = child;
+		const record = (await tx.doc(Runs)).runs[run];
+		if (!record) throw new Error("Missing Pi bridge run binding");
+		record.children[String(taskId)] = child;
 	}, context);
 }
 
@@ -395,8 +412,10 @@ export function replyTool(): ToolRegistration {
 			if (!target) return error(request ? `Unknown request ${request}` : "No request to reply to");
 			if (!target.replyTo) return error("This request has no reply destination");
 			const key = `fabrial:pi:${api.conversationId}:${api.taskId}:reply`;
+			const run = (await bridge.runOf(api.conversationId, context)).id;
 			const child = await startChild(
 				bridge,
+				run,
 				key,
 				EFFECT_WORKFLOW,
 				{ method: "post", args: [text] },
@@ -404,13 +423,20 @@ export function replyTool(): ToolRegistration {
 				false,
 				context,
 			);
-			const result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
-			if (result)
-				return result.status === "completed"
-					? { content: [{ type: "text" as const, text: "Posted." }] }
-					: error(JSON.stringify(result.error ?? result.reason ?? result.status));
-			await registerChild(bridge, api.taskId, { executionId: child, detached: false }, context);
-			return awaitWithContext(new Promise<never>(() => {}), context);
+			let result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
+			if (!result) {
+				await registerChild(
+					bridge,
+					run,
+					api.taskId,
+					{ executionId: child, detached: false },
+					context,
+				);
+				result = await bridge.waitChild(api.taskId, child, context);
+			}
+			return result.status === "completed"
+				? { content: [{ type: "text" as const, text: "Posted." }] }
+				: error(JSON.stringify(result.error ?? result.reason ?? result.status));
 		},
 	});
 }

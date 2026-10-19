@@ -3,7 +3,7 @@ import { createDirectory, identityKey } from "./directory.ts";
 import { boundedTimeout, filtersOverlap, matchesFilter } from "./internal.ts";
 import { clearInteraction, hasIngress, rememberIngress } from "./routing.ts";
 import type { Json } from "./json.ts";
-import { EXECUTION_SETTLED_EVENT } from "./runtime.ts";
+import { AGENT_SETTLED_EVENT, EXECUTION_SETTLED_EVENT } from "./runtime.ts";
 import type { ExecutionResult, InvocationMetadata, RuntimeWorkflow } from "./runtime.ts";
 import { createContext } from "./context.ts";
 import { APPROVAL_CLOSED_EVENT, CLEANUP_WORKFLOW, PRESENTATION_EVENT, cleanup } from "./cleanup.ts";
@@ -191,6 +191,9 @@ export function buildApp(config: CoreConfig): App {
 						},
 					},
 				);
+				// A reply in a thread an agent call drives steers that call's run in its Session.
+				if (state.agentActive)
+					await agents?.agents.reply?.(ref, state.interactionId, options.dedupeId);
 				return "reply";
 			}
 			const invocation: InvocationMetadata = {
@@ -305,6 +308,7 @@ export function buildApp(config: CoreConfig): App {
 		metadata: InvocationMetadata,
 		result: ExecutionResult,
 	) {
+		await agents?.agents.settled?.(executionId, metadata, result);
 		if (metadata.ownsThread && metadata.replyTo?.kind === "thread" && chat) {
 			const io = await chat.port.thread(metadata.replyTo);
 			const state = await io.getState();
@@ -419,6 +423,7 @@ export function buildApp(config: CoreConfig): App {
 			{ name: APPROVAL_CLOSED_EVENT, filterable: ["approvalId"] },
 			{ name: PRESENTATION_EVENT, filterable: ["presentationId"] },
 			{ name: EXECUTION_SETTLED_EVENT, filterable: ["executionId"] },
+			{ name: AGENT_SETTLED_EVENT, filterable: ["requestId"] },
 		],
 	});
 	return {

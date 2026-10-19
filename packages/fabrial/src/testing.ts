@@ -129,6 +129,15 @@ export class MemoryRuntime implements DurableRuntime {
 	private readonly keys = new Map<string, string>();
 	private readonly queue = new Set<string>();
 	private readonly settlements = new Set<string>();
+	/** Settlement hooks started while a batch runs: like Conductor, they don't wait for running executions. */
+	private readonly hooks = new Set<Promise<void>>();
+	/** Wakes a drain waiting for running executions when work is queued. */
+	private wake: (() => void) | undefined;
+	private hookFailure: unknown;
+	private enqueue(id: string): void {
+		this.queue.add(id);
+		this.wake?.();
+	}
 	private clock: number;
 	private nextId = 1;
 	private flushing?: Promise<void>;
@@ -191,7 +200,7 @@ export class MemoryRuntime implements DurableRuntime {
 					),
 				)
 			)
-				this.queue.add(run.id);
+				this.enqueue(run.id);
 		for (const workflow of this.workflows.values()) {
 			const matching = workflow.triggers.filter(
 				(t) =>
@@ -255,7 +264,7 @@ export class MemoryRuntime implements DurableRuntime {
 		// Like Conductor, keyed starts ignore the workflow mutex: the key serializes them.
 		if (options.key === undefined) run.mutex = definition.mutex?.(input, options.metadata);
 		this.runs.set(id, run);
-		this.queue.add(id);
+		this.enqueue(id);
 		if (invocationKey !== undefined) this.invocationKeys.set(invocationKey, id);
 		return id;
 	}
@@ -336,7 +345,7 @@ export class MemoryRuntime implements DurableRuntime {
 					),
 				)
 			)
-				this.queue.add(run.id);
+				this.enqueue(run.id);
 		await this.flush();
 	}
 	async flush(): Promise<void> {
@@ -349,31 +358,48 @@ export class MemoryRuntime implements DurableRuntime {
 			this.flushing = undefined;
 		}
 	}
+	/** Runs queued executions as they become runnable, without waiting for the ones already running (like workers). */
 	private async drain() {
-		while (this.queue.size || this.settlements.size) {
+		const running = new Map<string, Promise<void>>();
+		const concurrency = new Map<string, number>();
+		for (;;) {
+			if (this.hookFailure !== undefined) {
+				const failure = this.hookFailure;
+				this.hookFailure = undefined;
+				throw failure;
+			}
 			for (const id of this.settlements) {
 				const run = this.runs.get(id)!;
 				await run.workflow.onSettled?.(id, clone(run.metadata), clone(run.result!));
 				this.settlements.delete(id);
 			}
-			const batch: Run[] = [];
-			const concurrency = new Map<string, number>();
 			for (const id of this.queue) {
 				const run = this.runs.get(id)!;
 				if (run.result) {
 					this.queue.delete(id);
 					continue;
 				}
-				if (run.mutex && this.mutexes.has(run.mutex)) continue;
+				if (running.has(id) || (run.mutex && this.mutexes.has(run.mutex))) continue;
 				const active = concurrency.get(run.workflow.name) ?? 0;
 				if (active >= (run.workflow.concurrency ?? Infinity)) continue;
 				concurrency.set(run.workflow.name, active + 1);
 				this.queue.delete(id);
 				if (run.mutex) this.mutexes.set(run.mutex, id);
-				batch.push(run);
+				running.set(
+					id,
+					this.attempt(run).finally(() => {
+						running.delete(id);
+						concurrency.set(run.workflow.name, concurrency.get(run.workflow.name)! - 1);
+					}),
+				);
 			}
-			if (!batch.length) break;
-			await Promise.all(batch.map((run) => this.attempt(run)));
+			if (!running.size && !this.hooks.size && !this.settlements.size) {
+				// Queued work that cannot run yet (a held mutex) waits for the next flush, as before.
+				break;
+			}
+			const woken = new Promise<void>((resolve) => (this.wake = resolve));
+			await Promise.race([...running.values(), ...this.hooks, woken]);
+			this.wake = undefined;
 		}
 	}
 	private async settle(run: Run, result: ExecutionResult) {
@@ -383,7 +409,19 @@ export class MemoryRuntime implements DurableRuntime {
 		run.status = "settled";
 		run.waits.clear();
 		this.queue.delete(run.id);
-		this.settlements.add(run.id);
+		if (this.flushing) {
+			const hook = (async () => {
+				try {
+					await run.workflow.onSettled?.(run.id, clone(run.metadata), clone(run.result!));
+				} catch (error) {
+					// Redelivered by the next flush, which this one fails.
+					this.settlements.add(run.id);
+					this.hookFailure ??= error;
+				}
+			})().finally(() => this.hooks.delete(hook));
+			this.hooks.add(hook);
+			this.wake?.();
+		} else this.settlements.add(run.id);
 		if (run.key !== undefined) {
 			const key = JSON.stringify([run.workflow.name, run.key]);
 			if (this.keys.get(key) === run.id) this.keys.delete(key);
@@ -397,7 +435,7 @@ export class MemoryRuntime implements DurableRuntime {
 					),
 				)
 			)
-				this.queue.add(waiting.id);
+				this.enqueue(waiting.id);
 	}
 	private async attempt(run: Run) {
 		run.status = "running";
@@ -413,7 +451,7 @@ export class MemoryRuntime implements DurableRuntime {
 			// Listened-for signals that arrived while the handler returned re-queue it, not as an attempt.
 			if (!run.controller.signal.aborted && inbox.pending()) {
 				run.status = "pending";
-				this.queue.add(run.id);
+				this.enqueue(run.id);
 				return;
 			}
 			await this.settle(
@@ -432,7 +470,7 @@ export class MemoryRuntime implements DurableRuntime {
 				});
 			else if (++run.attempts < (run.workflow.retries?.maxAttempts ?? 1)) {
 				run.status = "pending";
-				this.queue.add(run.id);
+				this.enqueue(run.id);
 			} else
 				await this.settle(run, {
 					status: "failed",

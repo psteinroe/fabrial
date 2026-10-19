@@ -26,7 +26,7 @@ import {
 	type ExternalIdentity,
 	type JsonObject,
 } from "../../../src/index.ts";
-import { Inbox, pi, PostgresStorage } from "../../../src/agents/index.ts";
+import { pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { Conversations, Invocation, Runs } from "../../../src/agents/documents.ts";
 import { WAITING_STATUS } from "../../../src/agents/errors.ts";
 import type { Logger } from "../../../src/app.ts";
@@ -224,8 +224,6 @@ it("lands messages from different threads in one channel conversation; reply tar
 	expect(statuses.at(-1)).toBeNull();
 	const requests = await submitted(session);
 	expect(requests).toHaveLength(2);
-	// Admitted input is pruned from the inbox.
-	expect(await sql`SELECT 1 FROM fabrial.inbox WHERE session_key = ${session}`).toHaveLength(0);
 	const invocation = await t.read(session, (s) =>
 		s.snapshot(Invocation, requests[1]!, BACKGROUND_CONTEXT),
 	);
@@ -257,14 +255,14 @@ it("steers a busy run with a second message and drops a redelivered event", asyn
 			return fauxAssistantMessage("done");
 		},
 	]);
-	const other = await t.launch();
 	await t.chat.receive(t.message("m1", "t1"));
 	const flushing = t.runtime.flush();
 	try {
 		await started;
-		expect(await other.chat.receive(t.message("m2", "t2", "also this"))).toBe("new");
-		expect(await other.chat.receive(t.message("m2", "t2", "also this"))).toBe("ignored");
-		void other.runtime.flush();
+		// The second message reaches the busy Session's execution as a signal.
+		expect(await t.chat.receive(t.message("m2", "t2", "also this"))).toBe("new");
+		expect(await t.chat.receive(t.message("m2", "t2", "also this"))).toBe("ignored");
+		void t.runtime.flush();
 		await expect
 			.poll(async () => (await submitted(`chat:channel:${t.channel}`)).length, { timeout: 10_000 })
 			.toBe(2);
@@ -273,7 +271,6 @@ it("steers a busy run with a second message and drops a redelivered event", asyn
 	}
 	await flushing;
 	await t.settle();
-	await other.settle();
 	expect(steered).toContain("also this");
 	expect(t.faux.state.callCount).toBe(2);
 	const session = `chat:channel:${t.channel}`;
@@ -318,11 +315,8 @@ it("maps notification priorities to write, followUp, and steer; written entries 
 			return fauxAssistantMessage("after normal");
 		},
 	]);
-	const notify = (
-		input: { text: string; priority: "urgent" | "normal" | "low" },
-		runtime = t.runtime,
-	) =>
-		runtime.invoke(t.notify.name, input, {
+	const notify = (input: { text: string; priority: "urgent" | "normal" | "low" }) =>
+		t.runtime.invoke(t.notify.name, input, {
 			metadata: {
 				interactionId: randomUUID(),
 				origin: { provider: "github" },
@@ -334,14 +328,13 @@ it("maps notification priorities to write, followUp, and steer; written entries 
 	await notify({ text: "low: a label was added", priority: "low" });
 	await t.settle();
 	expect(t.faux.state.callCount).toBe(0);
-	const other = await t.launch();
 	await notify({ text: "normal: CI passed", priority: "normal" });
 	const flushing = t.runtime.flush();
 	try {
 		await started;
-		await notify({ text: "normal: new commit", priority: "normal" }, other.runtime);
-		await notify({ text: "urgent: changes requested", priority: "urgent" }, other.runtime);
-		void other.runtime.flush();
+		await notify({ text: "normal: new commit", priority: "normal" });
+		await notify({ text: "urgent: changes requested", priority: "urgent" });
+		void t.runtime.flush();
 		await expect
 			.poll(async () => (await submitted(`app:ops-${t.channel}`)).length, { timeout: 10_000 })
 			.toBe(4);
@@ -350,7 +343,6 @@ it("maps notification priorities to write, followUp, and steer; written entries 
 	}
 	await flushing;
 	await t.settle();
-	await other.settle();
 	expect(seen).toHaveLength(3);
 	// The low-priority write did not wake the agent but is in the context of the next run.
 	expect(seen[0]).toContain("low: a label was added");
@@ -368,35 +360,6 @@ it("maps notification priorities to write, followUp, and steer; written entries 
 			.sort((a, b) => a.localeCompare(b));
 	});
 	expect(deliveries).toEqual(["followUp", "followUp", "steer", "write"]);
-});
-
-it("inbox notifies watchers of a Session and prunes admitted input", async () => {
-	const inbox = new Inbox(sql);
-	await inbox.start();
-	const session = `app:inbox-${randomUUID()}`;
-	const watcher = inbox.watch(session);
-	try {
-		// A new watcher reads once; then only a notification (or the slow fallback) makes it due.
-		expect(watcher.due()).toBe(true);
-		expect(watcher.due()).toBe(false);
-		const row = {
-			request_id: randomUUID(),
-			session_key: session,
-			agent: "a",
-			content: "hi",
-			delivery: "steer" as const,
-			metadata: {} as never,
-		};
-		await inbox.enqueue(row);
-		await expect.poll(() => watcher.due(), { timeout: 1_000, interval: 10 }).toBe(true);
-		await inbox.enqueue(row);
-		expect(await inbox.pending(session, "a")).toHaveLength(1);
-		await inbox.remove([row.request_id]);
-		expect(await inbox.pending(session, "a")).toEqual([]);
-	} finally {
-		watcher.close();
-		await inbox.stop();
-	}
 });
 
 it("a tool sends to another conversation through the same send path", async () => {
@@ -493,7 +456,6 @@ it.each(["notification", "message"] as const)(
 		expect(seen).toHaveLength(1);
 		expect(seen[0]).toContain("late steer");
 		expect(t.faux.state.callCount).toBe(4);
-		expect(await sql`SELECT 1 FROM fabrial.inbox WHERE session_key = ${session}`).toHaveLength(0);
 	},
 );
 
@@ -554,7 +516,6 @@ it.each(["notification", "message"] as const)(
 		expect(seen).toHaveLength(1);
 		expect(seen[0]).toContain("queued steer");
 		expect(t.faux.state.callCount).toBe(2);
-		expect(await sql`SELECT 1 FROM fabrial.inbox WHERE session_key = ${session}`).toHaveLength(0);
 	},
 );
 
@@ -575,7 +536,6 @@ it("an urgent notification during a tool call steers the running run and is answ
 			},
 		}),
 	]);
-	const other = await t.launch();
 	let steered = "";
 	t.respond([
 		fauxAssistantMessage(fauxToolCall("deploy", {}), { stopReason: "toolUse" }),
@@ -587,8 +547,8 @@ it("an urgent notification during a tool call steers the running run and is answ
 		},
 		fauxAssistantMessage("done"),
 	]);
-	const notify = (text: string, priority: "urgent" | "normal", runtime = t.runtime) =>
-		runtime.invoke(
+	const notify = (text: string, priority: "urgent" | "normal") =>
+		t.runtime.invoke(
 			t.notify.name,
 			{ text, priority },
 			{
@@ -606,15 +566,14 @@ it("an urgent notification during a tool call steers the running run and is answ
 	const session = `app:ops-${t.channel}`;
 	try {
 		await started;
-		await notify("error rate is up", "urgent", other.runtime);
-		void other.runtime.flush();
+		await notify("error rate is up", "urgent");
+		void t.runtime.flush();
 		await expect.poll(async () => (await submitted(session)).length, { timeout: 10_000 }).toBe(2);
 	} finally {
 		release();
 	}
 	await flushing;
 	await t.settle();
-	await other.settle();
 	expect(steered).toContain("deployed");
 	expect(steered).toContain("error rate is up");
 	expect(steered).toContain('priority=\\"urgent\\"');
@@ -743,7 +702,7 @@ it("an aborted sent run posts no reply and the conversation stays usable", async
 	await t.chat.receive(t.message("m1", "t1"));
 	void t.runtime.flush();
 	await blocking;
-	for (const driver of t.runtime.executions("fabrial.pi.run"))
+	for (const driver of t.runtime.executions("fabrial.session"))
 		if (driver.status !== "settled") await t.runtime.cancel(driver.executionId, "Stopped");
 	await t.settle();
 	expect(await t.posts("t1")).toEqual([]);
@@ -767,7 +726,7 @@ it("a driver redelivered after starting the error reply does not post it twice",
 		},
 	};
 	const t = await setup(undefined, { logger });
-	const driver = t.runtime.workflows.get("fabrial.pi.run")!;
+	const driver = t.runtime.workflows.get("fabrial.session")!;
 	driver.retries = { maxAttempts: 2 };
 	t.respond([fauxAssistantMessage("", { stopReason: "error", errorMessage: "no such model" })]);
 	await t.chat.receive(t.message("m1", "t1"));
@@ -776,7 +735,7 @@ it("a driver redelivered after starting the error reply does not post it twice",
 	const posts = (await t.posts("t1")).map((post) => post.content as string);
 	expect(posts).toHaveLength(1);
 	expect(posts[0]).toMatch(FAILED);
-	expect(t.runtime.executions("fabrial.pi.run").map((e) => e.result?.status)).toEqual([
+	expect(t.runtime.executions("fabrial.session").map((e) => e.result?.status)).toEqual([
 		"completed",
 	]);
 });

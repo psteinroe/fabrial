@@ -128,6 +128,12 @@ export const Runs = defineDoc({
 			string,
 			{
 				conversationId: number;
+				/** The agent whose conversation runs; missing on runs of the removed per-request drivers. */
+				agent?: string;
+				/** A `ctx.agent` call: its request, the calling execution, and whether it outlives it. */
+				call?: { requestId: string; caller: string; detached: boolean };
+				/** Settled: its call's answer was emitted, or it was cancelled. */
+				done?: boolean;
 				children: Record<string, { executionId: string; detached: boolean }>;
 				intents?: string[];
 				requests?: Record<
@@ -136,7 +142,7 @@ export const Runs = defineDoc({
 						content: string;
 						submissionId: number | null;
 						delivery?: import("../send.ts").Delivery;
-						/** Sent through the inbox, so answered through `reply`. */
+						/** Sent with `ctx.send` or a follow, so answered through `reply`. */
 						sent?: boolean;
 						/** Id of the error reply of sent input that ended unanswered, assigned once. */
 						errorId?: string;

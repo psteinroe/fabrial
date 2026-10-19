@@ -86,7 +86,10 @@ function fixture() {
 			triggers: [],
 			handler: (_input, execution) => integration.agents.run(execution, "agent", agent, { input }),
 		};
-		runtime.register({ workflows: [workflow, ...integration.workflows, ...others], events: [] });
+		runtime.register({
+			workflows: hooked(integration, [workflow, ...integration.workflows, ...others]),
+			events: [],
+		});
 		await integration.start();
 		await runtime.start();
 		const id = await runtime.invoke(workflow.name, null, { metadata });
@@ -367,19 +370,19 @@ it("aborting the lead aborts the child through Pi ownership", async () => {
 	await f.runtime.cancel(id, "Stopped");
 	expect(await settled).toMatchObject({ status: "cancelled" });
 	expect(aborted).toBe(true);
-	// Cancelling marks the lead's run for abort; Pi's cascade marks the child's tasks through ownership.
-	const live = [
+	// The `cancel` signal aborts the lead's run in its Session; Pi's cascade aborts the child's tasks through ownership.
+	const tasks = [
 		...new Map(
 			(await f.writes()).flatMap((write) =>
 				write.type === "task" ? [[write.value.id, write.value] as const] : [],
 			),
 		).values(),
-	].filter((task) => task.state.status !== "terminal");
-	expect(live.map((task) => task.kind)).toEqual(
+	];
+	expect(tasks.map((task) => task.kind)).toEqual(
 		expect.arrayContaining(["pi.generation", "pi.tool"]),
 	);
-	expect(new Set(live.map((task) => task.conversationId)).size).toBe(2);
-	expect(live.every((task) => task.abortRequested)).toBe(true);
+	expect(new Set(tasks.map((task) => task.conversationId)).size).toBe(2);
+	expect(tasks.every((task) => task.state.status === "terminal" || task.abortRequested)).toBe(true);
 	await f.integration.stop();
 });
 
@@ -417,8 +420,7 @@ it("a child's workflow tool acts for the lead's request; the Session is released
 			handler: async (_input, execution) => {
 				seen.push(execution.metadata);
 				// The driver released the Session while the child waits on this workflow.
-				const storage = await PostgresStorage.open(sql, sessionKey(f.metadata));
-				await storage.close(BACKGROUND_CONTEXT);
+				await leaseFreed(sessionKey(f.metadata));
 				return "approved and ran";
 			},
 		},
@@ -694,7 +696,7 @@ it("a background child's report survives the Session being released and the driv
 		return say(`unexpected: ${text}`);
 	});
 	(f.host.workflows as unknown as (typeof approve)[]).push(approve);
-	f.integration.workflows.find((workflow) => workflow.name === "fabrial.pi.run")!.retries = {
+	f.integration.workflows.find((workflow) => workflow.name === "fabrial.session")!.retries = {
 		maxAttempts: 3,
 	};
 	let released = false;
@@ -704,8 +706,7 @@ it("a background child's report survives the Session being released and the driv
 			triggers: [],
 			handler: async () => {
 				// The driver released the Session while the background child waits on this workflow.
-				const storage = await PostgresStorage.open(sql, sessionKey(f.metadata));
-				await storage.close(BACKGROUND_CONTEXT);
+				await leaseFreed(sessionKey(f.metadata));
 				released = true;
 				return "approved and ran";
 			},
@@ -765,7 +766,7 @@ it("limits.concurrent counts a running background child durably across driver at
 		if (text.startsWith("<subagent")) return say("Final");
 		return say(`unexpected: ${text}`);
 	});
-	f.integration.workflows.find((workflow) => workflow.name === "fabrial.pi.run")!.retries = {
+	f.integration.workflows.find((workflow) => workflow.name === "fabrial.session")!.retries = {
 		maxAttempts: 3,
 	};
 	const { settled } = await f.call(lead, "Go");
@@ -807,12 +808,10 @@ it("cancelling the interaction aborts its background children", async () => {
 	const tasks = await latestTasks(f);
 	const reporter = tasks.find((task) => task.kind === "fabrial.subagent-reporter")!;
 	expect(reporter.abortRequested || reporter.state.status === "terminal").toBe(true);
-	// The child's work is marked for abort through the background boundary.
-	const child = tasks.filter(
-		(task) => task.conversationId !== reporter.conversationId && task.state.status !== "terminal",
-	);
+	// The child's work is aborted through the background boundary.
+	const child = tasks.filter((task) => task.conversationId !== reporter.conversationId);
 	expect(child.length).toBeGreaterThan(0);
-	expect(child.every((task) => task.abortRequested)).toBe(true);
+	expect(child.every((task) => task.state.status === "terminal" || task.abortRequested)).toBe(true);
 	await f.integration.stop();
 });
 
@@ -1109,13 +1108,13 @@ it("a background child waiting for approval releases the Session: a new message 
 		await expect
 			.poll(async () => (await runtime.flush(), !!approve), { timeout: 10_000 })
 			.toBe(true);
-		// Every live task waits on the approval: no driver runs and the Session lease is free.
+		// Every live task waits on the approval: the Session's execution returned and its lease is free.
 		await expect
 			.poll(async () => {
 				await runtime.flush();
 				return runtime
 					.executions()
-					.filter((each) => each.workflow === "fabrial.pi.run" && each.status !== "suspended")
+					.filter((each) => each.workflow === "fabrial.session" && each.status !== "settled")
 					.map((each) => each.status);
 			})
 			.toEqual([]);
@@ -1186,3 +1185,25 @@ it("a child's answer frees its concurrency slot as it settles, and its status li
 		).not.toBeUndefined();
 	await f.integration.stop();
 });
+
+/** Waits until no execution hosts the Session: it closes once every live task waits on a workflow. */
+async function leaseFreed(key: string) {
+	await expect
+		.poll(
+			async () => (await sql`SELECT owner FROM fabrial_pi.sessions WHERE key = ${key}`)[0]?.owner,
+			{ timeout: 10_000, interval: 20 },
+		)
+		.toBeNull();
+}
+
+/** Core calls the agent port on every settlement; these fixtures register workflows with the runtime directly. */
+function hooked(integration: { agents: { settled?: AgentSettled } }, workflows: RuntimeWorkflow[]) {
+	return workflows.map((workflow) => ({
+		...workflow,
+		onSettled: async (...args: Parameters<AgentSettled>) => {
+			await workflow.onSettled?.(...args);
+			await integration.agents.settled?.(...args);
+		},
+	}));
+}
+type AgentSettled = NonNullable<import("../../../src/runtime.ts").AgentPort["settled"]>;

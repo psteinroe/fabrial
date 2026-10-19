@@ -92,7 +92,10 @@ function runtimeRegister(
 	workflow: RuntimeWorkflow,
 	others: RuntimeWorkflow[] = [],
 ) {
-	f.runtime.register({ workflows: [workflow, ...f.integration.workflows, ...others], events: [] });
+	f.runtime.register({
+		workflows: hooked(f.integration, [workflow, ...f.integration.workflows, ...others]),
+		events: [],
+	});
 }
 
 it("runs durable structured answers, memoizes submissions, and continues one agent conversation", async () => {
@@ -377,21 +380,26 @@ it.each([[false], [true]])(
 		await f.runtime.flush();
 		expect(f.runtime.executions(child.name)[0]?.status).toBe("suspended");
 		await f.runtime.cancel(id, "User stopped");
-		// Cancellation queues onSettled; flush delivers the bridge's persisted-child cleanup.
+		// The cancelled caller signals `cancel` to the Session its call reached.
 		await f.runtime.flush();
 		expect(f.runtime.result(id)?.status).toBe("cancelled");
 		if (detached) {
+			// The run outlives its caller: the workflow tool finishes and the agent answers.
 			expect(f.runtime.executions(child.name)[0]?.status).toBe("suspended");
-			expect(f.runtime.executions("fabrial.pi.run")[0]?.status).toBe("suspended");
 			await f.runtime.advanceBy(86_400_000);
-			expect(f.runtime.executions("fabrial.pi.run")[0]?.result).toEqual({
-				status: "completed",
-				output: "approved",
-			});
+			await expect
+				.poll(async () => (await f.runtime.flush(), f.faux.state.callCount), { timeout: 10_000 })
+				.toBe(2);
 		} else {
 			expect(f.runtime.executions(child.name)[0]?.result?.status).toBe("cancelled");
-			expect(f.runtime.executions("fabrial.pi.run")[0]?.result?.status).toBe("cancelled");
+			expect(f.faux.state.callCount).toBe(1);
 		}
+		expect(f.runtime.executions("fabrial.session").every((each) => each.status === "settled")).toBe(
+			true,
+		);
+		const [lease] =
+			await sql`SELECT owner FROM fabrial_pi.sessions WHERE key = ${sessionKey(f.metadata)}`;
+		expect(lease?.owner).toBeNull();
 		await f.integration.stop();
 	},
 );
@@ -692,7 +700,7 @@ it("does not promote an unposted channel locator to a Pi Session key", async () 
 		status: "failed",
 		error: expect.stringContaining("ctx.thread.post"),
 	});
-	expect(f.runtime.executions("fabrial.pi.run")).toHaveLength(0);
+	expect(f.runtime.executions("fabrial.session")).toHaveLength(0);
 	expect(f.chat.threads.size).toBe(0);
 	await f.integration.stop();
 });
@@ -734,12 +742,23 @@ it("replays a workflow state update after a lost runtime receipt without applyin
 
 it("delayed cancellation reconciles lost start receipts and leaves a newer conversation run intact", async () => {
 	const f = fixture();
+	// Runs until the Session's cancellation reaches it.
 	const childWorkflow: RuntimeWorkflow = {
 		name: randomUUID(),
 		triggers: [],
-		handler: async () => null,
+		handler: (_input, execution) =>
+			new Promise((_resolve, reject) =>
+				execution.signal.addEventListener("abort", () => reject(execution.signal.reason), {
+					once: true,
+				}),
+			),
 	};
-	f.runtime.register({ workflows: [childWorkflow], events: [] });
+	f.runtime.register({
+		workflows: hooked(f.integration, [childWorkflow, ...f.integration.workflows]),
+		events: [],
+	});
+	await f.integration.start();
+	await f.runtime.start();
 	const key = "fabrial:pi:lost-start";
 	const dedupeKey = JSON.stringify([sessionKey(f.metadata), key]);
 	const child = await f.runtime.invoke(childWorkflow.name, null, {
@@ -794,30 +813,33 @@ it("delayed cancellation reconciles lost start receipts and leaves a newer conve
 		runs.runs.old = {
 			conversationId: conversation.id,
 			children: {},
+			call: { requestId: oldRequest, caller: "old", detached: false },
 			intents: [key],
 			requests: { [oldRequest]: { content: "old", submissionId: old.id } },
 		};
 		return { task, submission: submission.id, old: old.id };
 	}, BACKGROUND_CONTEXT);
 	await harness.close(BACKGROUND_CONTEXT);
-	await f.integration.workflows.find((workflow) => workflow.name === "fabrial.pi.run")!.onSettled!(
-		"old",
-		f.metadata,
-		{ status: "cancelled", reason: "late cancellation" },
-	);
+	// The caller "old" settled cancelled: the Session receives a `cancel` signal for its call.
+	await f.integration.agents.settled!("old", f.metadata, {
+		status: "cancelled",
+		reason: "late cancellation",
+	});
+	await f.runtime.flush();
 	expect(f.runtime.executions(childWorkflow.name)).toHaveLength(1);
 	expect(f.runtime.result(child)).toMatchObject({ status: "cancelled" });
 	const reopened = await PostgresStorage.open(sql, sessionKey(f.metadata));
 	const session = createSession(reopened);
 	try {
+		// The Session went on to run the newer request (it has no model here), but never aborted it.
 		expect((await reopened.task(current.task, BACKGROUND_CONTEXT))?.abortRequested).toBe(false);
-		expect((await reopened.submission(current.submission, BACKGROUND_CONTEXT))?.status).toBe(
-			"placed",
-		);
+		expect(await reopened.submission(current.submission, BACKGROUND_CONTEXT)).not.toMatchObject({
+			reason: expect.stringMatching(/abort/i),
+		});
 		expect((await reopened.submission(current.old, BACKGROUND_CONTEXT))?.status).toBe("unanswered");
-		expect(
-			(await session.snapshot(LiveDoc, conversation.id, BACKGROUND_CONTEXT))?.run?.taskId,
-		).toBe(current.task);
+		expect(await session.snapshot(Runs, BACKGROUND_CONTEXT)).toMatchObject({
+			runs: { old: { done: true } },
+		});
 	} finally {
 		await session.close(BACKGROUND_CONTEXT);
 	}
@@ -900,3 +922,15 @@ it("does not install agents from an unrelated Fabrial catalog", async () => {
 	await f.integration.start();
 	await f.integration.stop();
 });
+
+/** Core calls the agent port on every settlement; these fixtures register workflows with the runtime directly. */
+function hooked(integration: { agents: { settled?: AgentSettled } }, workflows: RuntimeWorkflow[]) {
+	return workflows.map((workflow) => ({
+		...workflow,
+		onSettled: async (...args: Parameters<AgentSettled>) => {
+			await workflow.onSettled?.(...args);
+			await integration.agents.settled?.(...args);
+		},
+	}));
+}
+type AgentSettled = NonNullable<import("../../../src/runtime.ts").AgentPort["settled"]>;

@@ -71,7 +71,10 @@ async function fixture(workflows: FabrialHost["workflows"] = []) {
 			workflows,
 			clients: () => ({}),
 			directory: { isMember: vi.fn(async () => false) },
+			chat: () => ({}),
 		} as unknown as FabrialHost,
+		session: "app:operations",
+		runOf: async () => ({ id: "a", agent: "agent" }),
 		execution: {
 			executionId: "a",
 			metadata: {
@@ -82,8 +85,7 @@ async function fixture(workflows: FabrialHost["workflows"] = []) {
 			},
 			start,
 		} as unknown as DurableExecution,
-		thread: {} as BridgeFrame["thread"],
-	} as BridgeFrame;
+	} as unknown as BridgeFrame;
 	const context = withContextValue(BridgeKey, bridge, BACKGROUND_CONTEXT);
 	const api = { taskId: 42, conversationId: conversation.id } as ToolExecutionApi;
 	return { harness, bridge, context, api, start, metadata, conversation };

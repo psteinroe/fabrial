@@ -15,6 +15,8 @@ export class PostgresStorage extends MemoryStorage {
 	private timer: ReturnType<typeof setInterval> | undefined;
 	private closing = false;
 	private tail: Promise<unknown> = Promise.resolve();
+	/** Called after every applied commit that writes, so a host can reconsider the Session's work. */
+	onCommit: (() => void) | undefined;
 
 	private constructor(
 		private readonly sql: Sql,
@@ -110,7 +112,9 @@ export class PostgresStorage extends MemoryStorage {
 				this.lost.abort(error);
 				throw error;
 			}
-			return prepared.apply();
+			const seq = prepared.apply();
+			if (writes.length) this.onCommit?.();
+			return seq;
 		});
 		this.tail = operation.catch(() => {});
 		return operation;

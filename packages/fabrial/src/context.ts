@@ -341,8 +341,10 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 			? parseSchema(registered.definition.input, input, `${workflow.name} input`)
 			: input;
 	};
+	// An agent Session awaits only the workflows its tools start, not their children.
+	const { piChild: _piChild, ...inherited } = metadata;
 	const childMetadata = (ownsThread: boolean): Partial<InvocationMetadata> => ({
-		...metadata,
+		...inherited,
 		ownsThread,
 		ownerWorkflow: null,
 		triggerEvent: null,
