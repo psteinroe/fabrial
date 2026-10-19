@@ -676,7 +676,7 @@ ctx.onSignal("input", (input) =>
 
 - **Steering is native Pi.** A signal submits to Pi in process (`steer`, `followUp`, or `write`); Pi places it at its next turn boundary. Ownership never moves, and nothing is handed over, polled, or stored outside Pi and Conductor.
 - **Cancelling** is a signal: the execution aborts the run in Pi (owned and background work included) and keeps hosting the Session.
-- **Ending.** The execution closes the Session when Pi reports no active work (this Pi build has no `Harness.wake()`: `harness.inspect()` plus the release rule, re-checked after every storage commit), including while every live task waits durably on a workflow such as an approval; the workflow's completion is another signal. Conductor re-queues an execution that received signals while finishing, so no input is lost.
+- **Ending.** The execution closes the Session when Pi reports no active work (this Pi build has no `Harness.wake()`: `harness.inspect()` plus the release rule, re-checked after every storage commit), including while only waits on workflows such as approvals remain; the workflow's completion is another signal. A short managed effect like a thread post (a final reply) keeps the Session open, and a run ends only after its final replies posted. Conductor re-queues an execution that received signals while finishing, so no input is lost.
 - **Dedupe.** Signal ids are request ids derived from the source event; Conductor stores a signal once and Pi submits a request id once.
 - **Leases.** The Session's lease and fencing stay. `storage.lost` closes the harness, so a stalled owner whose lease was taken over can't send a duplicate model request.
 
