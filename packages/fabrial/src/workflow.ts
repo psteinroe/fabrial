@@ -6,7 +6,7 @@ import type { AgentRef, AgentRunOptions, InvocationMetadata } from "./runtime.ts
 import type { Schema } from "./schema.ts";
 import type { SendOptions, SendReceipt } from "./send.ts";
 import type { ResourceRef } from "./plugin.ts";
-import type { SubscribeOptions, SubscriptionReceipt, UnsubscribeReceipt } from "./subscriptions.ts";
+import type { FollowOptions, FollowReceipt, UnfollowReceipt } from "./follows.ts";
 import type { JsonObject as StateValue } from "./json.ts";
 import type { StateDefinition, WorkflowStateHandle } from "./state.ts";
 import type { Awaitable, Thread } from "./thread.ts";
@@ -34,20 +34,17 @@ export interface WorkflowContext<TClients = Record<string, unknown>> {
 	 */
 	send(id: string, agent: AgentRef, options: SendOptions): Promise<SendReceipt>;
 	/**
-	 * Route a resource's events (e.g. `github.pullRequest({ repo, number })`) into a conversation: by
-	 * default the calling agent's, replying where the current request replies. Re-subscribing updates it.
+	 * Follow a resource (e.g. `github.pullRequest("acme/app#42")`) in a conversation: its events arrive as
+	 * notifications until `unfollow`. From a workflow, pass `to: { agent, session }`; final replies to the
+	 * notifications post to this execution's thread (or `to.home`). Following again replaces the options.
 	 */
-	subscribe(
+	follow(id: string, resource: ResourceRef<any>, options?: FollowOptions): Promise<FollowReceipt>;
+	/** Stop following a resource (default: the calling agent's conversation). */
+	unfollow(
 		id: string,
 		resource: ResourceRef<any>,
-		options?: SubscribeOptions,
-	): Promise<SubscriptionReceipt>;
-	/** Remove the subscription of a resource for a conversation (default: the calling agent's). */
-	unsubscribe(
-		id: string,
-		resource: ResourceRef<any>,
-		options?: Pick<SubscribeOptions, "to">,
-	): Promise<UnsubscribeReceipt>;
+		options?: Pick<FollowOptions, "to">,
+	): Promise<UnfollowReceipt>;
 	evaluate<Q extends Record<string, EvaluateQuestion>>(
 		id: string,
 		request: EvaluateRequest<Q>,

@@ -46,20 +46,7 @@ export {
 	type SentRequest,
 	type SessionOption,
 } from "./send.ts";
-export {
-	matchResources,
-	selectDeliveries,
-	type ConversationRef,
-	type Delivery as SubscriptionDelivery,
-	type PriorityOption,
-	type ResourceMatch,
-	type SubscribeOptions,
-	type SubscriptionPolicy,
-	type SubscriptionPolicyDefinition,
-	type SubscriptionReceipt,
-	type SubscriptionRecord,
-	type UnsubscribeReceipt,
-} from "./subscriptions.ts";
+export type { ConversationRef, FollowOptions, FollowReceipt, UnfollowReceipt } from "./follows.ts";
 export type * from "./state.ts";
 export type * from "./thread.ts";
 export * from "./trigger.ts";

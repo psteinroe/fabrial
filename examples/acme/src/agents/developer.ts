@@ -4,16 +4,10 @@ import { z } from "zod";
 import { f } from "../fabrial.ts";
 import { supportModel } from "./support.ts";
 
-/** Changes requested on a PR steer the agent even mid-run; everything else waits for its turn. */
-export const prReviewPolicy = f.defineSubscriptionPolicy({
-	name: "acme-pr-review",
-	priority: (event) =>
-		event.kind === "review" && event.attributes.state === "changes_requested"
-			? "urgent"
-			: undefined,
-});
-
-/** Open a pull request and follow it in this conversation until it is merged or closed. */
+/**
+ * Open a pull request and follow it in this conversation. Reviews arrive as notifications (changes requested
+ * steers the agent even mid-run); final replies to them post in the Slack thread the request came from.
+ */
 export const openPullRequest = f.defineTool({
 	name: "open_pull_request",
 	description: "Open a pull request on acme/app from a pushed branch and follow its reviews.",
@@ -27,11 +21,7 @@ export const openPullRequest = f.defineTool({
 			base: "main",
 			body,
 		});
-		await ctx.subscribe("watch-pr", github.pullRequest({ repo: "acme/app", number: data.number }), {
-			preset: "review",
-			policy: prReviewPolicy,
-			until: "merged-or-closed",
-		});
+		await ctx.follow("follow-pr", github.pullRequest({ repo: "acme/app", number: data.number }));
 		return `Opened ${data.html_url}; reviews will arrive here.`;
 	},
 });
@@ -61,11 +51,11 @@ export const developerAgent = f.defineAgent({
 	description: "Makes code changes, opens pull requests, and follows their reviews.",
 	model: supportModel,
 	instructions:
-		"You make code changes for the team. Your final answer is posted in the conversation. When a pull request you follow gets a review, address it and say what you changed.",
+		"You make code changes for the team. Your final answer is posted in the conversation. When a pull request you follow gets a review, address it, answer the reviewer on GitHub with github_reply_to_review, and say what you changed. When it is merged or closed, unfollow it. Use no_reply for notifications that need nothing from you.",
 	tools: [openPullRequest],
 	toolkits: ["github"],
 	// The `acme_researcher` tool: in the foreground for a quick lookup, in the background for longer digging.
 	subagents: [researcherAgent],
-	// One conversation per #dev thread; it follows the pull requests it opens.
+	// One conversation per #dev thread; it follows the pull requests it opens until it unfollows them.
 	triggers: [slack.message({ channel: "C_DEV" })],
 });

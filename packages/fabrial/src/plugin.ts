@@ -5,6 +5,7 @@ import type { AgentObservers, Instructions, ToolDefinition } from "./agent.ts";
 import type { WorkflowMiddleware } from "./workflow.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { InputPriority } from "./send.ts";
+import type { ThreadRef } from "./thread.ts";
 
 /** Context passed to a plugin's HTTP route handlers. */
 export interface RouteContext<TEvents extends Record<string, EventDefinition<any>>, TClients> {
@@ -66,7 +67,7 @@ export interface PluginDefinition<
 		agent?: AgentObservers;
 	};
 	identity?: IdentityCapability<TClients>;
-	/** Resource kinds apps can subscribe conversations to (`ctx.subscribe`), keyed by kind name. */
+	/** Resource kinds conversations can follow (`ctx.follow`), keyed by kind name. */
 	resources?: Record<string, ResourceKind<any>>;
 	/** Validate definition-time options and acquire owned resources at app.start(), never in the factory. */
 	init?: () => Promise<void> | void;
@@ -143,52 +144,40 @@ export interface PluginEvent {
 	payload: JsonObject;
 }
 
-/** Scalar details of a notification: rendered as attributes and seen by filters and priority functions. */
+/** Scalar details of a notification, rendered as attributes: the ids the plugin's tools need. */
 export type NotificationAttributes = Record<string, string | number | boolean | null>;
 
 /** How a resource event reads to an agent. */
 export interface ResourceNotification {
-	/** What happened, in the plugin's vocabulary (`review`, `comment`, `merged`); presets select kinds. */
+	/** What happened, in the plugin's vocabulary (`review`, `comment`, `merged`); follows select kinds. */
 	kind: string;
 	/** Text the agent sees. */
 	summary: string;
-	/** Default priority; an app's subscription priority wins. */
+	/** Default priority (`normal` when unset); a follow's `priority` overrides it per kind. */
 	priority?: InputPriority;
 	attributes?: NotificationAttributes;
 }
 
-/** A rendered resource event, as filters, priority functions, and end conditions see it. */
-export interface ResourceEvent extends ResourceNotification {
-	/** Full event name, e.g. `github.pullRequestReviewed`. */
-	event: string;
-	/** Resource key, e.g. `github:acme/app#123`. */
-	resource: string;
-	payload: JsonObject;
-	attributes: NotificationAttributes;
-}
-
 /**
- * A kind of resource a conversation can follow (a GitHub pull request, a Linear issue). Fabrial stores
- * subscriptions by resource key and asks the kind which events belong to which resources.
+ * A kind of resource a conversation can follow (a GitHub pull request). Follow records live in the
+ * resource's thread state, so the kind maps references and events to threads.
  */
 export interface ResourceKind<TRef extends JsonObject = JsonObject> {
+	/** Key of a resource, unique within the plugin; Fabrial prefixes the plugin id (`github:acme/app#42`). */
+	key(ref: TRef): string;
+	/** The thread whose Chat SDK state holds the resource's follow records. */
+	thread(ref: TRef): ThreadRef;
 	/** Event keys of this plugin that can belong to resources of this kind. */
 	events: readonly string[];
-	/** Key of a resource, unique within the plugin; Fabrial prefixes the plugin id (`github:acme/app#123`). */
-	key(ref: TRef): string;
-	/** Keys of the resources an event belongs to, unprefixed like `key`. */
-	match(event: PluginEvent): readonly string[];
-	/** Render an event as a notification; `undefined` delivers nothing. */
-	notify(event: PluginEvent): ResourceNotification | undefined;
-	/** Named sets of notification kinds a subscription receives. The first is the default. */
-	presets: Record<string, readonly string[]>;
-	/** Named end conditions: a matching event is delivered, then the subscription is removed. */
-	until?: Record<string, (event: ResourceEvent) => boolean>;
+	/** Threads of the resources an event belongs to (a review belongs to its pull request's thread). */
+	threads(event: PluginEvent): readonly ThreadRef[];
 	/**
-	 * Which events count before the app's own filter, e.g. comments only from collaborators. Not a
-	 * permission: it keeps untrusted input out of the conversation.
+	 * Render an event as a notification; `undefined` delivers nothing. Drop untrusted authors here: not a
+	 * permission, it keeps outside input from steering the agent.
 	 */
-	filter?: (event: ResourceEvent) => boolean;
+	notify(event: PluginEvent): ResourceNotification | undefined;
+	/** Notification kinds a follow receives by default; a follow with `events: "all"` receives every kind. */
+	defaults: readonly string[];
 }
 
 /** A serializable reference to one resource, built by a plugin helper such as `github.pullRequest()`. */
@@ -201,7 +190,7 @@ export interface ResourceRef<TRef extends JsonObject = JsonObject> {
 	readonly ref: TRef;
 }
 
-/** Build a resource reference. Plugins wrap this in typed helpers, e.g. `github.pullRequest({ repo, number })`. */
+/** Build a resource reference. Plugins wrap this in typed helpers, e.g. `github.pullRequest("acme/app#42")`. */
 export function resource<TRef extends JsonObject>(
 	provider: string,
 	type: string,

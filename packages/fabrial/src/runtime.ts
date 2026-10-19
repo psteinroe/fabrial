@@ -248,6 +248,20 @@ export interface Follow extends JsonObject {
 	agent: string;
 }
 
+/**
+ * A conversation following a resource thread (`ctx.follow`): the plugin's events for the thread reach it as
+ * notifications, whose final replies go to `replyTo` (the conversation's home).
+ */
+export type ResourceFollow = Follow & {
+	/** Resource key, e.g. `github:acme/app#42`. */
+	resource: string;
+	replyTo: (Surface & JsonObject) | null;
+	/** Priority per notification kind, overriding the plugin's default. */
+	priority?: Record<string, import("./send.ts").InputPriority>;
+	/** Every notification kind, not only the plugin's defaults. */
+	events?: "all";
+};
+
 /** Fabrial's state of a thread: ingress receipts, follows, and the progress status message. */
 export type ThreadRoutingState = JsonObject & {
 	/**
@@ -263,6 +277,8 @@ export type ThreadRoutingState = JsonObject & {
 	statusMessageId?: string | null;
 	/** Conversations following this thread, whatever their session kind: its messages reach them. */
 	follows?: Follow[];
+	/** Conversations following the resource of this thread (a pull request): its events notify them. */
+	resourceFollows?: ResourceFollow[];
 };
 
 /** Port implemented by the chat module. */

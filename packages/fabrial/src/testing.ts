@@ -31,8 +31,6 @@ import type {
 	WaitForAnyResult,
 } from "./runtime.ts";
 import { parseSchema } from "./schema.ts";
-import { MemorySubscriptions, type SubscriptionStore } from "./subscriptions.ts";
-export { MemorySubscriptions } from "./subscriptions.ts";
 import type { ChatMessage, MessageRef, OutboundMessage, Surface, ThreadRef } from "./thread.ts";
 
 const clone = <T>(value: T): T => structuredClone(value);
@@ -929,15 +927,10 @@ export function testApp<const P extends readonly import("./plugin.ts").AnyPlugin
 		agents?: AgentIntegration;
 		/** `f.app({ agents })`: agents whose triggers receive events. */
 		routedAgents?: import("./instance.ts").AppConfig["agents"];
-		/** Store of dynamic subscriptions. Default: in memory. */
-		subscriptionStore?: SubscriptionStore;
 	},
 ): import("./app.ts").App<import("./instance.ts").ClientsOf<P>> {
-	const { workflows, routedAgents, logger, subscriptionStore, ...overrides } = config;
-	return internal(instance).app(
-		{ workflows, agents: routedAgents, logger },
-		{ ...overrides, subscriptionStore: subscriptionStore ?? new MemorySubscriptions() },
-	) as never;
+	const { workflows, routedAgents, logger, ...overrides } = config;
+	return internal(instance).app({ workflows, agents: routedAgents, logger }, overrides) as never;
 }
 
 function internal(instance: object): import("./instance.ts").InternalInstance {

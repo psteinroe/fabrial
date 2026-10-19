@@ -651,11 +651,24 @@ it("support channel: two threads share one conversation, the final reply posts t
 	expect(sessions.map((row) => row.key)).toEqual(["slack:channel:C_HELP"]);
 });
 
-it("dev thread: the agent opens a PR, follows it, answers a review in the Slack thread, and stops at merge", async () => {
-	vi.spyOn(app.host.clients().github, "request").mockResolvedValue({
-		data: { id: 1, name: "Alice", login: "alice" },
-	} as never);
-	const create = vi.spyOn(app.host.clients().github.rest.pulls, "create").mockResolvedValue({
+it("dev thread: the agent opens a PR and follows it; a requested change is answered on GitHub and in the Slack home; it unfollows after the merge", async () => {
+	const github = () => app.host.clients().github;
+	const mockGitHub = () => {
+		vi.spyOn(github(), "request").mockResolvedValue({
+			data: { id: 1, name: "Alice", login: "alice" },
+		} as never);
+		vi.spyOn(github().rest.pulls, "getReview").mockResolvedValue({
+			data: {
+				user: { login: "alice" },
+				html_url: "https://github.com/acme/app/pull/42#pullrequestreview-7",
+			},
+		} as never);
+		return vi.spyOn(github().rest.issues, "createComment").mockResolvedValue({
+			data: { html_url: "https://github.com/acme/app/pull/42#issuecomment-1" },
+		} as never);
+	};
+	mockGitHub();
+	const create = vi.spyOn(github().rest.pulls, "create").mockResolvedValue({
 		data: { number: 42, html_url: "https://github.com/acme/app/pull/42" },
 	} as never);
 	let notification = "";
@@ -664,9 +677,15 @@ it("dev thread: the agent opens a PR, follows it, answers a review in the Slack 
 		reply.text("Opened acme/app#42."),
 		(context) => {
 			notification = JSON.stringify(context.messages);
-			return reply.text("Addressing the requested changes.");
+			return reply.toolCall("github_reply_to_review", {
+				pr: "acme/app#42",
+				review: 7,
+				body: "Added a regression test.",
+			});
 		},
-		reply.text("merged"),
+		reply.text("Addressed the review on #42."),
+		reply.toolCall("github_unfollow_pull_request", { pr: "acme/app#42" }),
+		reply.text("#42 is merged; I stopped following it."),
 	]);
 	const ts = "1700000300.000001";
 	const response = await slackRequest({
@@ -687,11 +706,30 @@ it("dev thread: the agent opens a PR, follows it, answers a review in the Slack 
 		calls.filter((c) => c.method === "chat.postMessage" && c.args.channel === "C_DEV");
 	await expect.poll(() => replies().length, poll).toBe(1);
 	expect(create).toHaveBeenCalledOnce();
-	await expect
-		.poll(async () => (await sql`SELECT resource_key FROM fabrial.subscriptions`).length, poll)
-		.toBe(1);
-	// The first run's answer is its second model call; the review's run makes the third.
+	// The follow is a record in the PR thread's Chat SDK state; notifications reply to the Slack home.
+	const follows = async () =>
+		(
+			await (
+				await app.host
+					.chat()!
+					.thread({ kind: "thread", provider: "github", threadId: "github:acme/app:42" })
+			).getState()
+		)?.resourceFollows ?? [];
+	await expect.poll(follows, poll).toEqual([
+		{
+			session: `slack:slack:C_DEV:${ts}`,
+			agent: "acme-developer",
+			resource: "github:acme/app#42",
+			replyTo: { kind: "thread", provider: "slack", threadId: `slack:C_DEV:${ts}` },
+		},
+	]);
 	await expect.poll(() => faux.calls, poll).toBe(2);
+
+	// Restart between the follow and the review: the record lives in Postgres-backed thread state.
+	await app.stop();
+	app = newApp();
+	await app.start();
+	const comment = mockGitHub();
 
 	const pr = {
 		id: 42,
@@ -735,28 +773,36 @@ it("dev thread: the agent opens a PR, follows it, answers a review in the Slack 
 	};
 	await webhook("pull_request_review", "review-42", review);
 	await webhook("pull_request_review", "review-42", review);
+	// The agent answers the reviewer on GitHub, and its final reply posts in the Slack home.
 	await expect.poll(() => replies().length, poll).toBe(2);
 	expect(replies()[1]!.args).toMatchObject({
 		thread_ts: ts,
-		text: expect.stringContaining("Addressing the requested changes."),
+		text: expect.stringContaining("Addressed the review on #42."),
 	});
-	expect(notification).toContain('priority=\\"urgent\\"');
+	expect(comment).toHaveBeenCalledOnce();
+	expect(comment.mock.calls[0]![0]).toEqual({
+		owner: "acme",
+		repo: "app",
+		issue_number: 42,
+		body: "> In reply to @alice's [review](https://github.com/acme/app/pull/42#pullrequestreview-7)\n\nAdded a regression test.",
+	});
+	expect(notification).toContain('kind=\\"review\\" priority=\\"urgent\\" pr=\\"acme/app#42\\"');
+	expect(notification).toContain('review=\\"7\\"');
 	expect(notification).toContain("Please add a regression test");
 
+	// The merge is delivered like any event; the agent unfollows, and its reply goes home too.
 	await webhook("pull_request", "merge-42", {
 		action: "closed",
 		sender: alice,
 		pull_request: { ...pr, merged: true },
 	});
-	await expect
-		.poll(async () => (await sql`SELECT 1 FROM fabrial.subscriptions`).length, poll)
-		.toBe(0);
-	// The merge notification's final reply goes to the home thread too.
 	await expect.poll(() => replies().length, poll).toBe(3);
 	expect(replies()[2]!.args).toMatchObject({
 		thread_ts: ts,
-		text: expect.stringContaining("merged"),
+		text: expect.stringContaining("#42 is merged; I stopped following it."),
 	});
+	expect(await follows()).toEqual([]);
+	expect(faux.calls).toBe(6);
 });
 
 it("dev thread: the developer asks its researcher in the foreground and the background, and replies with both", async () => {

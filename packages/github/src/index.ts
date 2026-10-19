@@ -16,9 +16,9 @@ import {
 	type InputPriority,
 	type JsonObject,
 	type PluginEvent,
-	type ResourceEvent,
 	type ResourceKind,
 	type ResourceNotification,
+	type ThreadRef,
 	type ToolDefinition,
 } from "fabrial";
 import { z } from "zod";
@@ -276,12 +276,19 @@ function pullRequestEventOf(
 	return undefined;
 }
 
-/** A pull request a conversation can follow with `ctx.subscribe`. */
+/** A pull request a conversation can follow with `ctx.follow`. */
 export interface PullRequestRef {
 	[key: string]: string | number;
 	/** `owner/name`. */
 	repo: string;
 	number: number;
+}
+
+/** Parse `owner/name#number`, the form notifications render (`pr="acme/app#42"`). */
+export function parsePullRequest(pr: string): PullRequestRef {
+	const match = /^([^/\s#]+\/[^/\s#]+)#(\d+)$/.exec(pr.trim());
+	if (!match) throw new Error(`Expected a pull request as owner/name#number, got "${pr}"`);
+	return { repo: match[1]!, number: Number(match[2]) };
 }
 
 const TRUSTED = ["OWNER", "MEMBER", "COLLABORATOR"];
@@ -295,9 +302,10 @@ const PULL_REQUEST_EVENTS: readonly EventKey[] = [
 	"checkSuiteCompleted",
 	"checkRunCompleted",
 ];
-const REVIEW_KINDS = ["commit", "review", "comment", "merged", "closed", "reopened"];
+/** What a follow receives by default; `events: "all"` adds `label` and `check`. */
+const DEFAULT_KINDS = ["commit", "review", "comment", "merged", "closed", "reopened"];
 
-/** Fields of the pull request and check events, as resource kinds read them. */
+/** Fields of the pull request and check events, as the resource kind reads them. */
 type PullRequestFields = GitHubPullRequestEvent &
 	Partial<
 		GitHubPullRequestClosed &
@@ -308,10 +316,19 @@ type PullRequestFields = GitHubPullRequestEvent &
 			GitHubCheckCompleted
 	>;
 
-function notifyPullRequest({ name, payload }: PluginEvent): ResourceNotification | undefined {
+/**
+ * Render a pull request event. Comments and reviews count only from people with write access or from this
+ * app's own bot (whose own comments are `low`: seen on the next run, they don't wake the agent).
+ */
+function notifyPullRequest(
+	{ name, payload }: PluginEvent,
+	botUserId: string | undefined,
+): ResourceNotification | undefined {
 	const p = payload as unknown as PullRequestFields;
 	const pr = `${p.repo}#${p.number}`;
-	const by = { actor: p.actorLogin, actorId: p.actorId, actorType: p.actorType };
+	const by = { pr, actor: p.actorLogin, actorType: p.actorType };
+	const own = p.actorType === "Bot" && botUserId !== undefined && p.actorId === botUserId;
+	const trusted = p.actorType === "Bot" ? own : TRUSTED.includes(String(p.association));
 	switch (name as EventKey) {
 		case "pullRequestClosed":
 			return p.merged
@@ -324,7 +341,7 @@ function notifyPullRequest({ name, payload }: PluginEvent): ResourceNotification
 				kind: "label",
 				summary: `${by.actor} ${p.labeled ? "added" : "removed"} the label "${p.label}" on ${pr}.`,
 				priority: "low",
-				attributes: { ...by, label: p.label ?? null, labeled: p.labeled ?? null },
+				attributes: { ...by, label: p.label ?? null },
 			};
 		case "pullRequestSynchronized":
 			return {
@@ -333,6 +350,7 @@ function notifyPullRequest({ name, payload }: PluginEvent): ResourceNotification
 				attributes: { ...by, sha: p.headSha ?? null },
 			};
 		case "pullRequestReviewed": {
+			if (!trusted) return undefined;
 			const verb =
 				p.state === "approved"
 					? "approved"
@@ -342,14 +360,17 @@ function notifyPullRequest({ name, payload }: PluginEvent): ResourceNotification
 			return {
 				kind: "review",
 				summary: `${by.actor} ${verb} ${pr}${p.body ? `:\n\n${p.body}` : "."}`,
-				attributes: { ...by, state: p.state ?? null, association: p.association ?? null },
+				priority: own ? "low" : p.state === "changes_requested" ? "urgent" : "normal",
+				attributes: { ...by, review: p.reviewId ?? null, state: p.state ?? null },
 			};
 		}
 		case "pullRequestCommented":
+			if (!trusted) return undefined;
 			return {
 				kind: "comment",
 				summary: `${by.actor} commented on ${pr}${p.path ? ` (${p.path})` : ""}:\n\n${p.body}`,
-				attributes: { ...by, association: p.association ?? null, inline: p.inline ?? null },
+				priority: own ? "low" : "normal",
+				attributes: { ...by, comment: p.commentId ?? null, inline: p.inline ?? null },
 			};
 		case "checkSuiteCompleted":
 		case "checkRunCompleted": {
@@ -366,59 +387,110 @@ function notifyPullRequest({ name, payload }: PluginEvent): ResourceNotification
 	}
 }
 
-/** Comments and reviews count only from people with write access, or from this app's own bot. */
-function trustedPullRequestEvent(botUserId: string | undefined) {
-	return (event: ResourceEvent) => {
-		if (event.kind !== "comment" && event.kind !== "review") return true;
-		const { actorType, actorId, association } = event.attributes;
-		if (actorType === "Bot") return botUserId !== undefined && actorId === botUserId;
-		return TRUSTED.includes(String(association));
-	};
-}
-
-function pullRequestKind(botUserId: string | undefined): ResourceKind<PullRequestRef> {
+function pullRequestKind(
+	botUserId: string | undefined,
+	threadOf: (repo: string, number: number) => ThreadRef,
+): ResourceKind<PullRequestRef> {
 	return {
-		events: PULL_REQUEST_EVENTS,
 		key: ({ repo, number }) => `${repo}#${number}`,
-		match: ({ payload }) => {
+		thread: ({ repo, number }) => threadOf(repo, number),
+		events: PULL_REQUEST_EVENTS,
+		threads: ({ payload }) => {
 			const p = payload as unknown as PullRequestFields;
-			return (p.pullRequests ?? [p.number]).map((number) => `${p.repo}#${number}`);
+			return (p.pullRequests ?? [p.number]).map((number) => threadOf(p.repo, number));
 		},
-		notify: notifyPullRequest,
-		presets: { review: REVIEW_KINDS, working: [...REVIEW_KINDS, "label", "check"] },
-		until: { "merged-or-closed": (event) => event.kind === "merged" || event.kind === "closed" },
-		filter: trustedPullRequestEvent(botUserId),
+		notify: (event) => notifyPullRequest(event, botUserId),
+		defaults: DEFAULT_KINDS,
 	};
 }
 
-const pullRequestInput = z.object({
-	repo: z.string().describe("Repository as owner/name"),
-	number: z.number().int().positive().describe("Pull request number"),
-});
-const subscribeTool: ToolDefinition<
-	z.infer<typeof pullRequestInput> & { preset?: "review" | "working" }
-> = {
-	name: "github_subscribe_pull_request",
+type Tool<T> = ToolDefinition<T, { github: GitHubClient }>;
+const prInput = z.string().describe("Pull request as owner/name#number, e.g. acme/app#42");
+const target = (pr: string) => {
+	const { repo, number } = parsePullRequest(pr);
+	const [owner, name] = repo.split("/") as [string, string];
+	return { owner, repo: name, number };
+};
+const followTool: Tool<{ pr: string; events?: "default" | "all" }> = {
+	name: "github_follow_pull_request",
 	description:
-		"Follow a GitHub pull request in this conversation until it is merged or closed: new commits, reviews, and comments from collaborators arrive as notifications (preset `working` also adds labels and CI results).",
-	input: pullRequestInput.extend({ preset: z.enum(["review", "working"]).optional() }),
-	async run({ repo, number, preset }, ctx) {
-		const receipt = await ctx.subscribe("subscribe", pullRequest({ repo, number }), {
-			preset: preset ?? "review",
-			until: "merged-or-closed",
-		});
-		return `Subscribed to ${receipt.resource}.`;
+		"Follow a GitHub pull request in this conversation until you unfollow it: new commits, reviews, comments from collaborators, merge, and close arrive as notifications (`events: all` also adds labels and CI results).",
+	input: z.object({ pr: prInput, events: z.enum(["default", "all"]).optional() }),
+	async run({ pr, events }, ctx) {
+		const receipt = await ctx.follow("follow", pullRequest(pr), { events });
+		return `Following ${receipt.resource}.`;
 	},
 };
-const unsubscribeTool: ToolDefinition<z.infer<typeof pullRequestInput>> = {
-	name: "github_unsubscribe_pull_request",
-	description: "Stop following a GitHub pull request in this conversation.",
-	input: pullRequestInput,
-	async run({ repo, number }, ctx) {
-		const receipt = await ctx.unsubscribe("unsubscribe", pullRequest({ repo, number }));
+const unfollowTool: Tool<{ pr: string }> = {
+	name: "github_unfollow_pull_request",
+	description:
+		"Stop following a GitHub pull request in this conversation, e.g. after it is merged.",
+	input: z.object({ pr: prInput }),
+	async run({ pr }, ctx) {
+		const receipt = await ctx.unfollow("unfollow", pullRequest(pr));
 		return receipt.removed
-			? `Unsubscribed from ${receipt.resource}.`
-			: `Not subscribed to ${receipt.resource}.`;
+			? `Stopped following ${receipt.resource}.`
+			: `Not following ${receipt.resource}.`;
+	},
+};
+const commentTool: Tool<{ pr: string; body: string }> = {
+	name: "github_comment",
+	description: "Comment on a GitHub pull request's conversation.",
+	input: z.object({ pr: prInput, body: z.string().min(1).describe("Markdown") }),
+	async run({ pr, body }, ctx) {
+		const { owner, repo, number } = target(pr);
+		const { data } = await ctx.clients.github.rest.issues.createComment({
+			owner,
+			repo,
+			issue_number: number,
+			body,
+		});
+		return `Commented: ${data.html_url}`;
+	},
+};
+const replyToReviewTool: Tool<{ pr: string; review?: number; comment?: number; body: string }> = {
+	name: "github_reply_to_review",
+	description:
+		"Answer a review on a GitHub pull request: pass `comment` to reply in the thread of an inline review comment, or `review` to answer the review as a whole (a pull request comment that links it). Use the ids from the notification.",
+	input: z.object({
+		pr: prInput,
+		review: z.number().int().positive().optional().describe("Review id (`review` attribute)"),
+		comment: z
+			.number()
+			.int()
+			.positive()
+			.optional()
+			.describe("Inline review comment id (`comment` attribute with `inline`)"),
+		body: z.string().min(1).describe("Markdown"),
+	}),
+	async run({ pr, review, comment, body }, ctx) {
+		const { owner, repo, number } = target(pr);
+		const github = ctx.clients.github;
+		if (comment !== undefined) {
+			const { data } = await github.rest.pulls.createReplyForReviewComment({
+				owner,
+				repo,
+				pull_number: number,
+				comment_id: comment,
+				body,
+			});
+			return `Replied: ${data.html_url}`;
+		}
+		if (review === undefined) throw new Error("Pass `review` or `comment`");
+		// GitHub has no reply to a review itself: answer in the conversation, linking the review.
+		const { data: reviewed } = await github.rest.pulls.getReview({
+			owner,
+			repo,
+			pull_number: number,
+			review_id: review,
+		});
+		const { data } = await github.rest.issues.createComment({
+			owner,
+			repo,
+			issue_number: number,
+			body: `> In reply to @${reviewed.user?.login ?? "ghost"}'s [review](${reviewed.html_url})\n\n${body}`,
+		});
+		return `Replied: ${data.html_url}`;
 	},
 };
 
@@ -532,9 +604,17 @@ const createPlugin = definePlugin<
 		resources: {
 			pullRequest: pullRequestKind(
 				options.botUserId === undefined ? undefined : String(options.botUserId),
+				(repo, number) => {
+					const [owner, name] = repo.split("/") as [string, string];
+					return {
+						kind: "thread",
+						provider: "github",
+						threadId: adapter().encodeThreadId({ owner, repo: name, prNumber: number, type: "pr" }),
+					};
+				},
 			),
 		},
-		toolkit: () => ({ tools: [subscribeTool, unsubscribeTool] }),
+		toolkit: () => ({ tools: [followTool, unfollowTool, commentTool, replyToReviewTool] }),
 		identity: {
 			async lookup(subject, clients) {
 				if (subject.provider !== "github" || subject.installationId !== installationId)
@@ -647,9 +727,10 @@ const HANDLED = [
 	"check_run",
 ];
 
-/** A pull request to follow: `ctx.subscribe("watch", github.pullRequest({ repo, number }), …)`. */
-export function pullRequest(ref: PullRequestRef) {
-	return resource<PullRequestRef>("github", "pullRequest", { repo: ref.repo, number: ref.number });
+/** A pull request to follow: `ctx.follow("watch", github.pullRequest("acme/app#42"))`. */
+export function pullRequest(ref: PullRequestRef | string) {
+	const { repo, number } = typeof ref === "string" ? parsePullRequest(ref) : ref;
+	return resource<PullRequestRef>("github", "pullRequest", { repo, number });
 }
 
 export interface GitHubFilter {

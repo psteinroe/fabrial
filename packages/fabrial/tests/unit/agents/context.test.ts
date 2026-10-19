@@ -13,8 +13,8 @@ it("exposes Fabrial's tool context, not Pi's tool API", () => {
 		| "start"
 		| "evaluate"
 		| "send"
-		| "subscribe"
-		| "unsubscribe"
+		| "follow"
+		| "unfollow"
 		| "signal"
 	>();
 });

@@ -18,7 +18,7 @@ import type {
 import { createContext } from "./context.ts";
 import { APPROVAL_CLOSED_EVENT, CLEANUP_WORKFLOW, PRESENTATION_EVENT, cleanup } from "./cleanup.ts";
 import type { TriggerSpec } from "./trigger.ts";
-import { deliveryWorkflow } from "./subscriptions.ts";
+import { notifyFollowers } from "./follows.ts";
 
 const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -123,6 +123,70 @@ export function buildApp(config: CoreConfig): App {
 		await port.deliver(agent, request);
 		return request;
 	};
+	const routeEvent: FabrialHost["ingest"] = async (event, payload, options) => {
+		const { selected, observers } = select([event], payload);
+		if (selected?.agent) {
+			// An agent's trigger: the event goes to a conversation; observers still run.
+			const metadata: InvocationMetadata = {
+				interactionId:
+					options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID()),
+				origin: (options.origin ?? {
+					provider: event.split(".")[0]!,
+				}) as InvocationMetadata["origin"],
+				replyTo: (options.replyTo ??
+					selected.agent.definition.home ??
+					selected.spec.replyTo ??
+					null) as InvocationMetadata["replyTo"],
+				requestedBy: options.requestedBy
+					? ((await directory.resolveIdentity(
+							options.requestedBy,
+						)) as InvocationMetadata["requestedBy"])
+					: null,
+				ownerWorkflow: null,
+				triggerEvent: event,
+			};
+			if (observers.length)
+				await runtime.emit(event, payload, { id: options.id, metadata, owner: undefined });
+			const session = conversationSession(
+				selected.agent.definition.session,
+				payload,
+				metadata.replyTo,
+				metadata.interactionId,
+			);
+			const request = await deliver(
+				selected.agent,
+				{ session, agent: selected.agent.name },
+				payload,
+				metadata,
+			);
+			await follow(host, request.follow, { session, agent: selected.agent.name });
+			return { owner: `agent:${selected.agent.name}`, observers };
+		}
+		const metadata: InvocationMetadata = {
+			interactionId:
+				options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID()),
+			origin: (options.origin ?? {
+				provider: event.split(".")[0]!,
+			}) as InvocationMetadata["origin"],
+			replyTo: (options.replyTo ?? selected?.spec.replyTo ?? null) as InvocationMetadata["replyTo"],
+			requestedBy: options.requestedBy
+				? ((await directory.resolveIdentity(
+						options.requestedBy,
+					)) as InvocationMetadata["requestedBy"])
+				: null,
+			ownerWorkflow: selected?.workflow!.name ?? null,
+			triggerEvent: event,
+		};
+		await runtime.emit(event, payload, {
+			id: options.id,
+			metadata,
+			owner: selected?.workflow!.name,
+			dispatchOwner: selected
+				? { workflow: selected.workflow!.name, event: selected.spec.event }
+				: undefined,
+		});
+		return { owner: selected?.workflow!.name, observers };
+	};
 	const host: FabrialHost = {
 		definitionScope: config.definitionScope,
 		plugins: config.plugins,
@@ -131,74 +195,26 @@ export function buildApp(config: CoreConfig): App {
 		directory,
 		logger: config.logger ?? silentLogger,
 		clients,
-		subscriptions: config.subscriptionStore,
 		chat: () => chat?.port,
 		resolvePrincipal: (identity) => directory.resolveIdentity(identity),
 		async ingest(event, payload, options) {
-			const { selected, observers } = select([event], payload);
-			if (selected?.agent) {
-				// An agent's trigger: the event goes to a conversation; observers still run.
-				const metadata: InvocationMetadata = {
-					interactionId:
-						options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID()),
-					origin: (options.origin ?? {
-						provider: event.split(".")[0]!,
-					}) as InvocationMetadata["origin"],
-					replyTo: (options.replyTo ??
-						selected.agent.definition.home ??
-						selected.spec.replyTo ??
-						null) as InvocationMetadata["replyTo"],
-					requestedBy: options.requestedBy
-						? ((await directory.resolveIdentity(
-								options.requestedBy,
-							)) as InvocationMetadata["requestedBy"])
-						: null,
-					ownerWorkflow: null,
-					triggerEvent: event,
-				};
-				if (observers.length)
-					await runtime.emit(event, payload, { id: options.id, metadata, owner: undefined });
-				const session = conversationSession(
-					selected.agent.definition.session,
-					payload,
-					metadata.replyTo,
-					metadata.interactionId,
-				);
-				const request = await deliver(
-					selected.agent,
-					{ session, agent: selected.agent.name },
-					payload,
-					metadata,
-				);
-				await follow(host, request.follow, { session, agent: selected.agent.name });
-				return { owner: `agent:${selected.agent.name}`, observers };
-			}
-			const metadata: InvocationMetadata = {
-				interactionId:
-					options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID()),
+			const interactionId =
+				options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID());
+			const routed = await routeEvent(event, payload, { ...options, interactionId });
+			// Conversations following the event's resource threads get a notification; triggers still run.
+			await notifyFollowers(host, agents?.agents, event, payload, {
+				interactionId,
 				origin: (options.origin ?? {
 					provider: event.split(".")[0]!,
 				}) as InvocationMetadata["origin"],
-				replyTo: (options.replyTo ??
-					selected?.spec.replyTo ??
-					null) as InvocationMetadata["replyTo"],
+				replyTo: null,
 				requestedBy: options.requestedBy
 					? ((await directory.resolveIdentity(
 							options.requestedBy,
 						)) as InvocationMetadata["requestedBy"])
 					: null,
-				ownerWorkflow: selected?.workflow!.name ?? null,
-				triggerEvent: event,
-			};
-			await runtime.emit(event, payload, {
-				id: options.id,
-				metadata,
-				owner: selected?.workflow!.name,
-				dispatchOwner: selected
-					? { workflow: selected.workflow!.name, event: selected.spec.event }
-					: undefined,
 			});
-			return { owner: selected?.workflow!.name, observers };
+			return routed;
 		},
 		async receiveMessage(message, options) {
 			if (message.author.isBot) return "ignored";
@@ -388,8 +404,6 @@ export function buildApp(config: CoreConfig): App {
 	}));
 	const extraWorkflows = new Map((agents?.agents.workflows() ?? []).map((w) => [w.name, w]));
 	for (const workflow of agents?.workflows ?? []) extraWorkflows.set(workflow.name, workflow);
-	const delivery = deliveryWorkflow(host, () => agents?.agents);
-	if (delivery) extraWorkflows.set(delivery.name, delivery);
 	extraWorkflows.set(CLEANUP_WORKFLOW, {
 		name: CLEANUP_WORKFLOW,
 		triggers: [],
@@ -487,7 +501,6 @@ export function buildApp(config: CoreConfig): App {
 				}
 			for (const plugin of config.plugins) await plugin.init?.();
 			await config.resources?.open();
-			await config.subscriptionStore?.start?.();
 			chat = config.chat?.connect(host);
 			await chat?.start?.();
 			await agents?.start();

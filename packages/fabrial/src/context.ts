@@ -6,13 +6,7 @@ import type { Json, JsonObject } from "./json.ts";
 import type { DurableExecution, InvocationMetadata, ThreadIO, WaitBranch } from "./runtime.ts";
 import { parseSchema } from "./schema.ts";
 import { follow, prepareSend } from "./send.ts";
-import {
-	prepareSubscribe,
-	prepareUnsubscribe,
-	storedOptions,
-	type SubscriptionReceipt,
-	type UnsubscribeReceipt,
-} from "./subscriptions.ts";
+import { followResource, storedFollowOptions, unfollowResource } from "./follows.ts";
 import type { Awaitable, MessageRef, OutboundMessage, Thread, Surface } from "./thread.ts";
 import type { AnyWorkflow, WorkflowContext } from "./workflow.ts";
 
@@ -225,43 +219,14 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 			});
 			return agents.agents.send(execution, key, agent, request);
 		},
-		subscribe: async (id, resource, opts) => {
-			const store = host.subscriptions;
-			if (!store) throw new Error("Subscriptions need a subscription store");
-			const key = op(id);
-			return execution.step(key, async (): Promise<SubscriptionReceipt> => {
-				const saved = await store.upsert(
-					await prepareSubscribe(
-						host,
-						metadata,
-						surfaces(),
-						`${execution.executionId}:${key}`,
-						resource,
-						storedOptions(opts),
-					),
-				);
-				return {
-					subscriptionId: saved.id,
-					resource: saved.resource,
-					session: saved.session,
-					agent: saved.agent,
-				};
-			});
-		},
-		unsubscribe: async (id, resource, opts) => {
-			const store = host.subscriptions;
-			if (!store) throw new Error("Subscriptions need a subscription store");
-			return execution.step(op(id), async (): Promise<UnsubscribeReceipt> => {
-				const target = await prepareUnsubscribe(
-					host,
-					metadata,
-					surfaces(),
-					resource,
-					storedOptions(opts),
-				);
-				return { removed: await store.remove(target), ...target };
-			});
-		},
+		follow: (id, resource, opts) =>
+			execution.step(op(id), () =>
+				followResource(host, metadata, surfaces(), resource, storedFollowOptions(opts)),
+			),
+		unfollow: (id, resource, opts) =>
+			execution.step(op(id), () =>
+				unfollowResource(host, metadata, surfaces(), resource, storedFollowOptions(opts)),
+			),
 		evaluate: async (id, request) => {
 			if (!agents) throw new Error("Agent integration required");
 			return (await execution.step(

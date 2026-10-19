@@ -25,8 +25,6 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 	readonly logger: Logger;
 	/** Live clients of all plugins (built once per app; plugin `clients()` must be cheap and stateless). */
 	clients(): TClients;
-	/** Dynamic subscriptions (`fabrial.subscriptions`); absent without a store. */
-	readonly subscriptions?: import("./subscriptions.ts").SubscriptionStore;
 	/** Chat port, after app.start() connects chat. */
 	chat(): ChatPort | undefined;
 
@@ -112,8 +110,6 @@ export interface CoreConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[
 	chat?: ChatIntegration;
 	/** Agents, state, and evaluation. Required for `ctx.agent`, `ctx.state`, `ctx.evaluate`. */
 	agents?: AgentIntegration;
-	/** Store of dynamic subscriptions; started after `resources` open. */
-	subscriptionStore?: import("./subscriptions.ts").SubscriptionStore;
 	/** Owned resources (database pools): opened after plugin `init`, closed last on stop. */
 	resources?: { open(): Promise<void> | void; close(): Promise<void> };
 	plugins: P;

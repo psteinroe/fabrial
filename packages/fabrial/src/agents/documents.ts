@@ -136,7 +136,7 @@ export const Runs = defineDoc({
 						content: string;
 						submissionId: number | null;
 						delivery?: import("../send.ts").Delivery;
-						/** Sent with `ctx.send` or a subscription, so its answer posts to its reply thread. */
+						/** Sent with `ctx.send` or a followed resource, so its answer posts to its reply thread. */
 						sent?: boolean;
 					}
 				>;

@@ -20,11 +20,6 @@ import { defineState, type StateDefinition, type StateScope } from "./state.ts";
 import type { Schema } from "./schema.ts";
 import type { TriggerSpec } from "./trigger.ts";
 import {
-	defineSubscriptionPolicy,
-	type SubscriptionPolicy,
-	type SubscriptionPolicyDefinition,
-} from "./subscriptions.ts";
-import {
 	defineWorkflow,
 	type AnyWorkflow,
 	type Workflow,
@@ -95,14 +90,6 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 			migrate?: (old: unknown, fromVersion: number) => T;
 		},
 	): StateDefinition<T>;
-	/**
-	 * Filter and priority functions for `ctx.subscribe({ policy })`. Subscriptions store the name, so
-	 * define policies at module level, like agents.
-	 */
-	defineSubscriptionPolicy(
-		this: void,
-		definition: SubscriptionPolicyDefinition,
-	): SubscriptionPolicy;
 	defineGroup(
 		this: void,
 		definition: Parameters<typeof defineGroup<ClientsOf<P>>>[0],
@@ -113,7 +100,7 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 /** Internal app construction for `fabrial/testing`. Not part of the public API. */
 export const INTERNAL = Symbol.for("fabrial.internal");
 export type InternalOverrides = ProductionOverrides &
-	Partial<Pick<CoreConfig, "runtime" | "chat" | "agents" | "subscriptionStore">>;
+	Partial<Pick<CoreConfig, "runtime" | "chat" | "agents">>;
 export interface InternalInstance {
 	app(config: AppConfig, overrides: InternalOverrides): App;
 }
@@ -124,9 +111,9 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 ): Fabrial<P> {
 	const plugins = Object.freeze([...config.plugins]) as unknown as P;
 	const build = (appConfig: AppConfig, overrides: InternalOverrides = {}): App => {
-		const { runtime, chat, agents, subscriptionStore, ...settings } = overrides;
+		const { runtime, chat, agents, ...settings } = overrides;
 		const integrations = runtime
-			? { runtime, chat, agents, subscriptionStore }
+			? { runtime, chat, agents }
 			: production({ database: config.database, models: config.models ?? {} }, settings);
 		return buildApp({
 			...integrations,
@@ -147,7 +134,6 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 		defineToolkit,
 		defineState,
 		defineGroup,
-		defineSubscriptionPolicy: (definition) => defineSubscriptionPolicy(definition, instance),
 		app: (appConfig) => build(appConfig) as App<ClientsOf<P>>,
 		[INTERNAL]: { app: build },
 	};

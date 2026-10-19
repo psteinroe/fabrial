@@ -5,7 +5,7 @@ import type { AgentRef, InvocationMetadata } from "./runtime.ts";
 import type { Schema } from "./schema.ts";
 import type { AgentSession, SendOptions, SendReceipt } from "./send.ts";
 import type { ResourceRef } from "./plugin.ts";
-import type { SubscribeOptions, SubscriptionReceipt, UnsubscribeReceipt } from "./subscriptions.ts";
+import type { FollowOptions, FollowReceipt, UnfollowReceipt } from "./follows.ts";
 import type { StateDefinition, ToolStateHandle } from "./state.ts";
 import type { ChatMessage, MessageRef, OutboundMessage, Surface } from "./thread.ts";
 import type { TriggerPayload, TriggerSpec } from "./trigger.ts";
@@ -56,17 +56,16 @@ export interface ToolContext<
 	): Promise<EvaluateResult<Q>>;
 	/** Send input to a conversation and return, as in workflows; `replyTo` defaults to this request's. */
 	send(id: string, agent: AgentRef, options: SendOptions): Promise<SendReceipt>;
-	/** Subscribe a conversation to a resource, as in workflows; default: this agent's conversation. */
-	subscribe(
+	/**
+	 * Follow a resource in this agent's conversation, as in workflows: its events arrive as notifications,
+	 * whose final replies post where this request replies (the conversation's home).
+	 */
+	follow(id: string, resource: ResourceRef<any>, options?: FollowOptions): Promise<FollowReceipt>;
+	unfollow(
 		id: string,
 		resource: ResourceRef<any>,
-		options?: SubscribeOptions,
-	): Promise<SubscriptionReceipt>;
-	unsubscribe(
-		id: string,
-		resource: ResourceRef<any>,
-		options?: Pick<SubscribeOptions, "to">,
-	): Promise<UnsubscribeReceipt>;
+		options?: Pick<FollowOptions, "to">,
+	): Promise<UnfollowReceipt>;
 	/** Aborted when the agent run is cancelled or the call is interrupted. */
 	readonly signal: AbortSignal;
 }

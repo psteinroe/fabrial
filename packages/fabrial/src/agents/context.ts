@@ -10,11 +10,11 @@ import type {
 } from "@earendil-works/pi-durable";
 import type { SendReceipt } from "../send.ts";
 import {
-	storedOptions,
+	storedFollowOptions,
 	type ConversationRef,
-	type SubscriptionReceipt,
-	type UnsubscribeReceipt,
-} from "../subscriptions.ts";
+	type FollowReceipt,
+	type UnfollowReceipt,
+} from "../follows.ts";
 import {
 	parseSchema,
 	type AnyWorkflow,
@@ -93,7 +93,7 @@ export async function fields(
 	const requestId = await currentRequest(bridge, conversationId, context);
 	const invocation = (await bridge.harness.snapshot(Invocation, requestId, context))!;
 	const run = await bridge.runOf(conversationId, context);
-	// Tools, and the workflows they start, subscribe this conversation by default.
+	// Tools, and the workflows they start, follow in this conversation by default.
 	const metadata: InvocationMetadata = {
 		...(invocation as InvocationMetadata),
 		conversation: { session: bridge.session, agent: run.agent } satisfies ConversationRef,
@@ -195,19 +195,19 @@ export async function fields(
 				cloneJson({ ...options, home }) as unknown as Json,
 			])) as SendReceipt;
 		},
-		subscribe: async (id, resource, options) => {
-			if (!api) throw new Error("Prompt sections cannot subscribe");
-			return (await operation(id, "subscribe", [
+		follow: async (id, resource, options) => {
+			if (!api) throw new Error("Prompt sections cannot follow");
+			return (await operation(id, "follow", [
 				cloneJson(resource) as unknown as Json,
-				storedOptions(options),
-			])) as SubscriptionReceipt;
+				storedFollowOptions(options),
+			])) as FollowReceipt;
 		},
-		unsubscribe: async (id, resource, options) => {
-			if (!api) throw new Error("Prompt sections cannot unsubscribe");
-			return (await operation(id, "unsubscribe", [
+		unfollow: async (id, resource, options) => {
+			if (!api) throw new Error("Prompt sections cannot unfollow");
+			return (await operation(id, "unfollow", [
 				cloneJson(resource) as unknown as Json,
-				storedOptions(options),
-			])) as UnsubscribeReceipt;
+				storedFollowOptions(options),
+			])) as UnfollowReceipt;
 		},
 		evaluate: async (id, request) => {
 			if (!api) throw new Error("Prompt sections cannot evaluate models");
