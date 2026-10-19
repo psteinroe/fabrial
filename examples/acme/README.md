@@ -117,12 +117,14 @@ native subscription: durable event cursors retain pre-registration decisions.
   its runtime receipt. A production repair needs business-level idempotency or
   reconciliation. No extra execution/approval tables are introduced here.
 
-## Support channel subscription
+## Support channel
 
-`src/subscriptions.ts` declares `supportChannel`: every message in `#help` (`C_HELP`) goes to `acme-support` in one conversation for the whole channel (`session: "channel"`). Each asker's final reply posts automatically in the asker's thread. The integration test covers two threads sharing that conversation, each answer going to its asker's thread, and a restart after ingress.
+`acme-support` has a trigger on every message in `#help` (`C_HELP`) with `session: "channel"`: one conversation for the whole channel, listed in `f.app({ workflows, agents })`. Each asker's final reply posts automatically in the asker's thread, and the conversation follows each thread. The integration test covers two threads sharing that conversation, each answer going to its asker's thread, and a restart after ingress.
 
-## Following a pull request from Slack
+`general-assistant` is the router for mentions elsewhere: bug reports are handed to `bugIntake`; everything else goes to `acme-support` with `ctx.send` (one conversation per thread), whose final reply posts in the thread. Later replies there go straight to the agent.
 
-`src/agents/developer.ts` defines `acme-developer`. `devThreads` in `src/subscriptions.ts` sends every `#dev` (`C_DEV`) thread to it, one conversation per thread. Its `open_pull_request` tool opens a PR with `ctx.clients.github` and calls `ctx.subscribe` with the `review` preset, `until: "merged-or-closed"`, and the `acme-pr-review` policy, which makes changes-requested reviews `urgent`. The e2e test runs the whole flow: Slack message, PR opened, signed review webhook (delivered twice), the agent's final reply in the original Slack thread, and the merge webhook removing the subscription.
+## Developer agent
+
+`src/agents/developer.ts` defines `acme-developer`. Its trigger sends every `#dev` (`C_DEV`) message to it, one conversation per thread. Its `open_pull_request` tool opens a PR with `ctx.clients.github` and calls `ctx.subscribe` with the `review` preset, `until: "merged-or-closed"`, and the `acme-pr-review` policy, which makes changes-requested reviews `urgent`. The e2e test runs the whole flow: Slack message, PR opened, signed review webhook (delivered twice), the agent's final reply in the original Slack thread, and the merge webhook removing the subscription.
 
 `acme-developer` also has a subagent, `acme-researcher`, offered as the `acme_researcher` tool. The researcher has only the read-only `search_code` tool, so delegated investigation cannot change anything. The developer calls it in the foreground for a quick lookup and waits for its answer, or with `background: true` for longer digging: the tool returns at once and the answer arrives later as a `<subagent>` input whose answer the developer posts in the thread. The e2e test makes one call of each in a `#dev` thread.

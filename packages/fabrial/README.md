@@ -313,16 +313,38 @@ Limitations:
 
 Live plugin clients are built once per app, as specified by `FabrialHost.clients`; they must not capture invocation identity. Core does not add a reaction acknowledgement to buffered replies because `ChatPort` has no reaction operation. Thread routing state is a read/write port, not a transaction or CAS: ingress for a given thread must be serialized by the state adapter, including across webhook replicas. The test runtime does not emulate missing Conductor capabilities or schedule cron timers.
 
-## Send and subscriptions
+## Conversations: triggers, following, and send
 
-`ctx.agent` **calls** an agent: it submits and waits for the answer. `ctx.send` **sends**: it submits and returns. The conversation is `[session, agent]`. An idle conversation starts a run. A busy one gets the input by kind and priority.
+Agents receive events, like workflows. A trigger on an agent delivers the event to one of its conversations, keyed by `[session, agent]`; list such agents in `f.app({ workflows, agents })`.
+
+```ts
+export const support = f.defineAgent({
+	name: "support",
+	description: "Answers customer questions in #help.",
+	triggers: [slack.mentioned({ channel: "C_HELP" })],
+	session: "thread", // default; "channel", or (event) => key (namespaced as `app:<key>`)
+	home: slack.channel("C_BUGS"), // for triggers whose events have no thread
+});
+export const app = f.app({ workflows, agents: [support] });
+```
+
+Session keys come from the event: `<provider>:<threadId>` for `"thread"`, `<provider>:channel:<channelId>` for `"channel"`, the app's key otherwise. An event without a thread (a Sentry issue) starts a `"thread"` conversation keyed by the event; its first final reply creates a thread in the `home` channel, which the conversation follows.
+
+An incoming chat message is routed in this order:
+
+1. **Followers.** An agent follows every thread it receives a message from, so every later message there reaches the same conversation, mention or not: it steers a running run or starts the next one. `"thread"` conversations are found by their key (a lookup in `fabrial_pi.conversations`); other sessions leave a follow record `{ session, agent }` in the thread's Chat SDK state. A message naming one agent (`@agent-name`) goes only to that agent, which then follows the thread too.
+2. **Triggers.** Otherwise the most specific matching trigger wins, an agent's or a workflow's. Equal specificity on overlapping filters fails `app.start()`; `observe: true` workflow triggers run alongside.
+3. Otherwise the message is ignored.
+
+A workflow still holding a thread's interaction (`waitForReply`, `ctx.handoff`) receives its replies first, until it settles.
+
+`ctx.agent` **calls** an agent: it submits and waits for the answer. `ctx.send` **sends**: it submits and returns. An idle conversation starts a run. A busy one gets the input by kind and priority. The conversation is found as if the agent's trigger had matched the input: by the input's thread, or `home`; for other input, relative to the sender's thread. The thread is followed afterwards, so a routing workflow picks an agent once and later replies go straight to it.
 
 ```ts
 await ctx.send("deliver", supportAgent, {
-	session: "channel", // "thread" (default) | "channel" | a custom key such as `ticket:${id}`
 	input: message, // a ChatMessage, a string, or JSON
-	kind: "message", // or "notification" with priority "urgent" | "normal" | "low"
-	replyTo: ctx.thread, // default: this execution's thread; null for none
+	home: slack.channel("C_BUGS"), // where the conversation lives when the input has no thread
+	// Overrides: session (the agent's by default), kind/priority, replyTo (the input's thread by default).
 });
 ```
 
@@ -339,17 +361,7 @@ The agent's final answer to sent input posts automatically to the input's `reply
 
 **Errors.** Transient model errors are retried durably for about 5 minutes in production (`MODEL_RETRY`: up to 9 retries, 2 s doubling to a 60 s cap). If sent input still ends with a model error, or no model is configured, the driver posts one error reply where its final reply would have gone ("I couldn't reach the model provider…" when the retries ran out, otherwise "I hit an error…"), with an error id that is also logged next to the provider's error text. Redeliveries and restarts don't post it twice. Aborted, reset, or stale input gets no reply. `createIntegrationApp({ modelRetries })` turns retries on: `true` for the production policy, or a policy such as `{ baseDelayMs: 5, maxRetries: 1 }` for fast tests.
 
-Static subscriptions route a trigger's events into a conversation. They compete for trigger ownership like workflows, but never hold the thread, so every message in the channel or thread is delivered:
-
-```ts
-export const supportChannel = f.subscribe({
-	name: "support-channel",
-	source: slack.message({ channel: "C_SUPPORT" }),
-	agent: supportAgent,
-	session: "channel", // or (event) => `customer:${event.channelId}`
-});
-export const app = f.app({ workflows, subscriptions: [supportChannel] });
-```
+Static subscriptions (`f.subscribe`) still compile a trigger to a workflow that sends each event; agent triggers replace them.
 
 ### Dynamic subscriptions
 

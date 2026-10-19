@@ -29,8 +29,8 @@ export const generalAssistant = f.defineWorkflow({
 			});
 		}
 		// Explicit safe fallback on classifier error: the support agent's writes still need human approval.
-		const answer = await ctx.agent<string>("assistant", supportAgent, { input: message.text });
-		await ctx.thread!.post("answer", answer);
-		return { status: "answered" };
+		// The support agent answers in this thread, and later replies here go straight to it.
+		await ctx.send("assistant", supportAgent, { input: message, session: "thread" });
+		return { status: "sent" };
 	},
 });

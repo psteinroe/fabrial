@@ -12,7 +12,7 @@ import { slack } from "@fabrial/slack";
 import type { Adapter } from "chat";
 import postgres, { type Sql } from "postgres";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { subscriptions, workflows } from "../../src/app.ts";
+import { agents, workflows } from "../../src/app.ts";
 import { routingModel } from "../../src/workflows/general-assistant.ts";
 import { f } from "../../src/fabrial.ts";
 import { bob, engineeringTriage, weeklyRotationForTest } from "./rotation.ts";
@@ -135,7 +135,7 @@ afterEach(async () => {
 });
 
 function newApp() {
-	const instance = createIntegrationApp(f, { workflows, subscriptions, models, logger });
+	const instance = createIntegrationApp(f, { workflows, agents, models, logger });
 	const adapter = instance.host.plugins.find((p) => p.id === "linear")!.chat!.adapter() as Adapter;
 	vi.spyOn(adapter, "initialize").mockImplementation(async (sdk) => {
 		Object.assign(adapter, {

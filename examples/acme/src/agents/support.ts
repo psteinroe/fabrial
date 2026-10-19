@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { slack } from "@fabrial/slack";
 import { f } from "../fabrial.ts";
 import { runSql } from "../workflows/run-sql.ts";
 
@@ -31,4 +32,7 @@ export const supportAgent = f.defineAgent({
 		"Help support investigate customer issues. Read before proposing repairs. Use run_sql for writes; never bypass its human approval. Report declined or cancelled requests honestly. Return your answer without posting it.",
 	tools: [readOnlyQuery, runSql],
 	state: [Findings],
+	// One conversation for the whole help channel, steered by whoever writes there.
+	triggers: [slack.message({ channel: "C_HELP" })],
+	session: "channel",
 });

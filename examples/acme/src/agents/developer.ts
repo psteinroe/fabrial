@@ -1,4 +1,5 @@
 import { github } from "@fabrial/github";
+import { slack } from "@fabrial/slack";
 import { z } from "zod";
 import { f } from "../fabrial.ts";
 import { supportModel } from "./support.ts";
@@ -65,4 +66,6 @@ export const developerAgent = f.defineAgent({
 	toolkits: ["github"],
 	// The `acme_researcher` tool: in the foreground for a quick lookup, in the background for longer digging.
 	subagents: [researcherAgent],
+	// One conversation per #dev thread; it follows the pull requests it opens.
+	triggers: [slack.message({ channel: "C_DEV" })],
 });
