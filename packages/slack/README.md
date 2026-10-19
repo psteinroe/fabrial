@@ -27,3 +27,7 @@ const app = f.app({ runtime, chat, workflows: [workflow] });
 ```
 
 `userGroup` resolves through a structurally typed group context containing a Slack WebClient. It works with any catalog that includes Slack and fails explicitly if the live client is missing. Configure plugin values once in `createFabrial`; tests spy on `app.host.clients().slack`. The factory is side-effect free; credentials are checked at `app.start()`.
+
+## Toolkit
+
+Agents that list `"slack"` in `toolkits` get `slack_post({ channel, text })`: a message in a channel (by id) with the plugin's client. Final replies post to the conversation's home on their own; the tool is for writing somewhere else.

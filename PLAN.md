@@ -513,6 +513,7 @@ Capabilities (all optional except `id`):
 | `hooks.workflow`    | Middleware around **every** workflow run/resume.                                                                                      |
 | `hooks.agent`       | Observers on **every** agent: `onModelResponse`, `onToolCall`.                                                                        |
 | `identity`          | External identity → principal.                                                                                                        |
+| `resources`         | Things conversations can follow (`ctx.follow`): the resource's thread, which events belong to it, notification rendering, defaults.   |
 | `init` / `shutdown` | Lifecycle. Factories must have no side effects.                                                                                       |
 
 - Credentials are plugin options. There is no provider/account split, accounts table, or secret store yet.
@@ -619,13 +620,13 @@ await ctx.unfollow("unwatch-pr", github.pullRequest({ repo: "acme/app", number: 
 ```
 
 - From a tool, the calling agent's conversation follows. From a workflow, pass `to: { agent, session }`.
-- The follow is a record (`[session, agent]`) in the resource thread's Chat SDK state. A follow lasts until `unfollow`; merge and close events are delivered like any other, and the agent decides. Plugins give agents `github_follow_pull_request` / `github_unfollow_pull_request` in their toolkit.
+- The follow is a record (`{ session, agent, resource, replyTo, priority?, events? }`) in the resource thread's Chat SDK state, kept apart from the thread's message follows: chat messages on that thread don't reach it. `replyTo` is the conversation's home (the current request's reply thread; `to.home` from a workflow). A follow lasts until `unfollow`; merge and close events are delivered like any other, and the agent decides. Plugins give agents `github_follow_pull_request` / `github_unfollow_pull_request` in their toolkit.
 - Plugins map events to their thread (a review belongs to its PR's thread), decide which events a follow receives by default (GitHub: reviews, comments, new commits, merge and close; `events: "all"` adds labels and CI), and drop untrusted authors (GitHub: author association `OWNER`, `MEMBER`, `COLLABORATOR`, or the app's own bot). The filter is not a permission: it keeps outside input from steering the agent.
 - There is no handover: the conversation's home stays where it started.
 
 #### Writing elsewhere
 
-Posting anywhere other than the home thread uses explicit, typed tools from plugin toolkits: `github_comment({ pr, body })`, `github_reply_to_review({ review, body })`, `slack_post({ channel, text })`. Rendered inputs carry the ids those tools need (`<notification source="github" kind="review" pr="acme/app#42" review="991">`).
+Posting anywhere other than the home thread uses explicit, typed tools from plugin toolkits: `github_comment({ pr, body })`, `github_reply_to_review({ pr, review | comment, body })`, `slack_post({ channel, text })`. Rendered inputs carry the ids those tools need (`<notification source="github" kind="review" priority="urgent" pr="acme/app#42" review="991">`). GitHub has no reply to a review itself: with `review` the tool posts a PR comment linking the review; with an inline `comment` it replies in that comment's thread.
 
 #### Inputs
 
@@ -687,7 +688,7 @@ ctx.onSignal("input", (input) =>
 1. **Mention in #help.** Alice mentions the bot; the conversation's home is her thread, which it follows. Bob's unmentioned reply steers the run or starts the next one; answers post in the thread.
 2. **Every message in a channel** (`slack.message({ channel })`): the agent replies in each message's thread and follows it; irrelevant messages end in `no_reply`.
 3. **One conversation for #ops** (`session: "channel"`): messages from many threads reach one conversation; each is answered in its own thread, and each thread is followed.
-4. **Slack → PR → review on GitHub.** The agent opens a PR and follows it. A changes-requested review arrives as an urgent notification; the agent pushes a fix, answers on GitHub with `github_reply_to_review`, and its final reply ("Addressed the review on #42") posts in the Slack home. CI passing ends in `no_reply`; after the merge the agent unfollows.
+4. **Slack → PR → review on GitHub.** The agent opens a PR and follows it. A changes-requested review arrives as an urgent notification; the agent pushes a fix, answers on GitHub with `github_reply_to_review`, and its final reply ("Addressed the review on #42") posts in the Slack home. CI results arrive only with `events: "all"` (CI passing ends in `no_reply`); after the merge the agent unfollows.
 5. **Started on GitHub.** "@bot can you check this?" in a PR comment: the home is the PR, and replies post there.
 6. **Sentry issue** with `home: slack.channel("C_BUGS")`: the first reply creates a thread in #bugs, followed from then on.
 7. **Background subagent.** The lead replies "on it"; the child's report arrives as input, and the lead's answer posts to the same thread.
@@ -835,6 +836,7 @@ Recorded as open questions are resolved.
   	},
   });
   ```
+- **Following other things is `ctx.follow` / `ctx.unfollow`, with records in the resource thread's state** (replaces `ctx.subscribe`, the `fabrial.subscriptions` table, `f.defineSubscriptionPolicy`, presets, `until`, and the delivery observer workflow). Plugin ingress delivers notifications directly: it reads the follow records of the event's threads and signals each follower; request ids are `${event id}:${session}:${agent}`. Overrides are declarative (`priority` per kind, `events: "all"`); there are no app filter or priority functions. Resource follows are a list of their own in thread state (`resourceFollows`), so chat messages on a PR thread don't reach them and a comment arriving on both GitHub endpoints is delivered once. The app's own bot is trusted, but its comments and reviews are `low`, so an agent's own GitHub reply doesn't wake it.
 - **Runtimes are hidden behind Fabrial's API** (replaces thin adapters returning native Pi objects). App authors install one `fabrial` package and configure a database and model credentials; Conductor, Pi, and Chat SDK are internal modules. Tools use a Standard Schema `input` (converted to JSON Schema for the model) and return a string or JSON; toolkits replace Pi extensions and sections; hooks are Fabrial observers. There is no escape hatch (`ctx.raw`, `configure`) while Fabrial is in preview: what apps need becomes API. Plugin authors writing a chat provider still hand over a Chat SDK adapter, the one runtime type they see. Internally, per-request context still comes from a `fabrial.invocation` document that `ctx.agent` commits right before `submit()`, keyed by request ID.
 - **State is `defineState`, and app authors don't write Pi tasks.** `defineState({ name, scope, schema, initial, render })` with scopes `thread` and `agent`, backed by Pi documents. Thread state belongs to the thread's Session (workflows with that thread and conversations following it); a `ctx.agent` call's tools see the call Session's state. `ctx.state(S).get/update` works in workflows (durable ops with IDs) and in tools (committed with the tool result). Agents see the states listed in `defineAgent.state` through `render`. Durable or long-running tool work is a workflow in `tools`. Pi tasks and raw documents stay internal / advanced, with no `defineTask` adapter. This replaces exposing raw Pi (`ctx.pi`) and `ctx.agent` document options, both of which made the DX convoluted.
 - **The agent registry is derived, and nothing is selected by default.** There is no app-level toolkit list. Installed = Fabrial's internal toolkit + every plugin's `toolkit` + every toolkit referenced by an agent reachable from the registered workflows. Each agent gets exactly what its `toolkits` and `tools` list. On startup, Fabrial aborts pending agent work whose toolkit is no longer installed and logs it.

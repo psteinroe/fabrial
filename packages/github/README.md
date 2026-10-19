@@ -39,23 +39,27 @@ Lifecycle routes use core's `EmitOptions.replyTo` for the PR/issue thread and `r
 
 Both ingress paths reject payloads outside the configured App installation. PATs restrict repository owners to `owner`, or default to the token's authenticated user (resolved via GitHub API and cached; failures remain retryable). An explicit `owner` additionally restricts App repositories. The owner in `repository.full_name` and, when present, `repository.owner.login` must agree with that scope. A numeric PAT `installationId` also rejects conflicting payload installation IDs when present; string installation IDs remain identity namespaces.
 
-## Pull request subscriptions
+## Following pull requests
 
-`github.pullRequest({ repo, number })` is a resource for `ctx.subscribe`. The webhook events behind it are `pullRequestClosed` (`merged`), `pullRequestReopened`, `pullRequestLabeled`, `pullRequestSynchronized`, `pullRequestReviewed` (`state`, `association`), `pullRequestCommented` (`association`, `inline`, `path`), `checkSuiteCompleted`, and `checkRunCompleted` (`pullRequests`, `conclusion`). They render as notifications of the following kinds:
+`github.pullRequest("acme/app#42")` (or `{ repo, number }`) is a resource for `ctx.follow`; the follow record lives in the PR thread's Chat SDK state. The webhook events behind it are `pullRequestClosed` (`merged`), `pullRequestReopened`, `pullRequestLabeled`, `pullRequestSynchronized`, `pullRequestReviewed` (`state`, `association`), `pullRequestCommented` (`association`, `inline`, `path`), `checkSuiteCompleted`, and `checkRunCompleted` (`pullRequests`, `conclusion`). They render as notifications of the following kinds:
 
-| Kind       | Event                        | Default priority           |
-| ---------- | ---------------------------- | -------------------------- |
-| `commit`   | `synchronize`                | normal                     |
-| `review`   | review submitted             | normal                     |
-| `comment`  | PR comment or review comment | normal                     |
-| `merged`   | closed with `merged`         | normal                     |
-| `closed`   | closed without merge         | normal                     |
-| `reopened` | reopened                     | normal                     |
-| `label`    | labeled / unlabeled          | low                        |
-| `check`    | check suite / run completed  | low if passed, else normal |
+| Kind       | Event                        | Default priority                                           | Attributes                |
+| ---------- | ---------------------------- | ---------------------------------------------------------- | ------------------------- |
+| `commit`   | `synchronize`                | normal                                                     | `pr`, `sha`               |
+| `review`   | review submitted             | urgent if changes requested, low from own bot, else normal | `pr`, `review`, `state`   |
+| `comment`  | PR comment or review comment | low from own bot, else normal                              | `pr`, `comment`, `inline` |
+| `merged`   | closed with `merged`         | normal                                                     | `pr`                      |
+| `closed`   | closed without merge         | normal                                                     | `pr`                      |
+| `reopened` | reopened                     | normal                                                     | `pr`                      |
+| `label`    | labeled / unlabeled          | low                                                        | `pr`, `label`             |
+| `check`    | check suite / run completed  | low if passed, else normal                                 | `name`, `conclusion`      |
 
-- **Presets.** `review` delivers commits, reviews, comments, merge, close, and reopen. `working` adds labels and checks.
-- **End condition.** `merged-or-closed`.
-- **Filter.** Comments and reviews count only from `OWNER`, `MEMBER`, or `COLLABORATOR` author associations. Bot accounts count only when they are this app's own bot (`botUserId`).
-- **Toolkit.** Agents that list `"github"` in `toolkits` get `github_subscribe_pull_request({ repo, number, preset? })`, which follows the PR until it is merged or closed, and `github_unsubscribe_pull_request({ repo, number })`. Both act on the agent's own conversation.
-- **Exactly once.** PR comments reach subscriptions only through `/github/webhook`. Chat conversations on `/github/events` don't feed subscriptions, so a comment that arrives on both endpoints is still delivered to a subscription once.
+- **Defaults.** A follow receives commits, reviews, comments, merge, close, and reopen. `events: "all"` adds labels and checks. `priority: { review: "low" }` overrides the defaults per kind.
+- **Lifetime.** A follow lasts until `ctx.unfollow`; merge and close are delivered, and the agent decides.
+- **Filter.** Comments and reviews count only from `OWNER`, `MEMBER`, or `COLLABORATOR` author associations. Bot accounts count only when they are this app's own bot (`botUserId`); its own comments and reviews are `low`, so they don't wake the agent.
+- **Toolkit.** Agents that list `"github"` in `toolkits` get, all acting for the agent's own conversation or with the app's client:
+  - `github_follow_pull_request({ pr, events? })` and `github_unfollow_pull_request({ pr })`;
+  - `github_comment({ pr, body })`: a comment on the PR's conversation;
+  - `github_reply_to_review({ pr, review | comment, body })`: with `comment`, a reply in an inline review comment's thread; with `review`, a PR comment that links the review (GitHub has no reply to a review itself).
+  - `pr` is `owner/name#number`, the form notifications render.
+- **Exactly once.** PR comments reach followers only through `/github/webhook`. Chat conversations on `/github/events` don't read resource follows, so a comment that arrives on both endpoints is still delivered to a follower once.

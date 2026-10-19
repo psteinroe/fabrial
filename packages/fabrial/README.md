@@ -93,7 +93,7 @@ export const lead = f.defineAgent({
 - With `depth: 1` children get no subagent tools; a deeper `depth` passes the remaining levels down. More than `concurrent` children running at once in one conversation is a tool error the model can act on. Running children are counted from durable state (slots held by the call or the reporter task), so the limit holds across driver cycles and restarts. A slot frees in the commit that settles the child's answer, not when its holder task ends. A background child waiting on a workflow (e.g. an approval for days) does not hold the Session: when every live task waits on a workflow, the driver releases the lease and resumes when any of those workflows completes, and new messages and `ctx.agent` calls to the Session are processed meanwhile. A child's line on the lead's status clears as soon as it answers.
 - Background: `background: true` (or an `"always"` entry) returns the name at once (`Started researcher-1 in the background…`). The child is owned by a background anchor task, and a reporter task submits the task and later reports `<subagent name="researcher-1" status="done|failed">…</subagent>` to the lead as a `followUp`, once, across restarts. Calling with the name of a background child steers it while it works and gives it new input when idle; each answer is reported once. Background children stay in the background when continued.
 - `subagent_stop({ name })` aborts a child's current work (Pi `conversation.abort`); it reports nothing and stays usable. A prompt section lists the lead's children and whether each is working.
-- When the run ends: under `ctx.agent` the call settles only after the lead has answered its children's reports, and returns that last answer. Under `ctx.send` and subscriptions the driver keeps the Session while children work; reports arrive as follow-ups, and the lead's answer to each posts to the reply thread of the request that started the child. The run ends only once those answers posted. Child activity shows on the lead's status meanwhile.
+- When the run ends: under `ctx.agent` the call settles only after the lead has answered its children's reports, and returns that last answer. Under `ctx.send` and followed resources the driver keeps the Session while children work; reports arrive as follow-ups, and the lead's answer to each posts to the reply thread of the request that started the child. The run ends only once those answers posted. Child activity shows on the lead's status meanwhile.
 - Aborts: aborting the lead's Pi run stops at the background boundary. Cancelling the run (its calling workflow, or a stop in the thread) aborts the background children that run started or continued.
 
 ### `ctx.evaluate`
@@ -361,33 +361,20 @@ The agent's final answer to sent input posts automatically to the input's `reply
 
 **Errors.** Transient model errors are retried durably for about 5 minutes in production (`MODEL_RETRY`: up to 9 retries, 2 s doubling to a 60 s cap). If sent input still ends with a model error, or no model is configured, the driver posts one error reply where its final reply would have gone ("I couldn't reach the model provider…" when the retries ran out, otherwise "I hit an error…"), with an error id that is also logged next to the provider's error text. Redeliveries and restarts don't post it twice. Aborted, reset, or stale input gets no reply. `createIntegrationApp({ modelRetries })` turns retries on: `true` for the production policy, or a policy such as `{ baseDelayMs: 5, maxRetries: 1 }` for fast tests.
 
-Static subscriptions (`f.subscribe`) are removed: agent triggers replace them.
+### Following other things
 
-### Dynamic subscriptions
-
-`ctx.subscribe` routes a resource's events into a conversation at runtime, from a workflow or a tool. Plugins describe their resources; GitHub provides `github.pullRequest({ repo, number })`:
+`ctx.follow` makes a conversation follow a resource besides its threads, from a workflow or a tool; `ctx.unfollow` stops it. A follow lasts until `unfollow`: merge and close events are delivered like any other, and the agent decides. GitHub provides `github.pullRequest("acme/app#42")` (or `{ repo, number }`):
 
 ```ts
-const prPolicy = f.defineSubscriptionPolicy({
-	name: "pr-review",
-	priority: (event) =>
-		event.kind === "review" && event.attributes.state === "changes_requested"
-			? "urgent"
-			: undefined,
+await ctx.follow("follow-pr", github.pullRequest("acme/app#42"), {
+	priority: { comment: "urgent" }, // per notification kind, over the plugin's default
+	events: "all", // also the kinds the plugin leaves out by default (GitHub: labels and CI)
 });
-
-await ctx.subscribe("watch-pr", github.pullRequest({ repo: "acme/app", number: pr.number }), {
-	preset: "review", // the resource kind's presets; default: its first
-	until: "merged-or-closed", // the event that meets it is delivered, then the record is removed
-	policy: prPolicy, // app filter and priority functions
-	priority: { label: "low" }, // declarative: one priority, or one per notification kind
-});
-await ctx.unsubscribe("unwatch-pr", github.pullRequest({ repo: "acme/app", number: pr.number }));
+await ctx.unfollow("unfollow-pr", github.pullRequest("acme/app#42"));
 ```
 
-- **Target.** From a tool, or a workflow an agent tool started, the default is the calling agent's conversation, and the final reply to a notification goes where the current request replies (e.g. the Slack thread). From other workflows, pass `to: { agent, session }`. `replyTo` overrides the reply surface. Re-subscribing the same resource from the same conversation updates the record.
-- **Storage.** Records live in `fabrial.subscriptions` (resource key such as `github:acme/app#123`, Session, agent, reply surface, preset, end condition, priority, policy name), created at `app.start()`.
-- **Policies.** Functions can't be stored, so `filter` and `priority` functions live in `f.defineSubscriptionPolicy` objects defined at module level. Subscriptions store the policy name. If a deploy removes a policy, delivery logs a warning and uses the plugin's defaults.
-- **Delivery.** An internal observer workflow runs on every resource event. It finds the records for the event's resources, then filters: the preset selects notification kinds, the plugin's filter keeps untrusted input out, and the policy filter applies after that. It sends each match as a `notification` through the `ctx.send` path. Priority comes from the policy first, then the declared priority, then the plugin's default, then `normal`. Request ids are `${event id}:${subscription id}`, and ingress dedupes provider redeliveries, so a redelivered webhook is not delivered twice. Subscriptions never own threads, so triggers on the same events still run.
-- **Plugin SPI.** A plugin adds `resources: { [kind]: { events, key(ref), match(event), notify(event), presets, until?, filter? } }` and a helper built on `resource(pluginId, kind, ref)`.
-- **Testing.** `testApp` uses an in-memory store by default (`subscriptionStore` overrides it). `MemorySubscriptions` is exported from `fabrial/testing`.
+- **Target.** From a tool, or a workflow an agent tool started, the calling agent's conversation follows, and final replies to its notifications go where the current request replies (the conversation's home, e.g. the Slack thread). From other workflows, pass `to: { agent, session, home? }`; `home` defaults to the workflow's thread. Following again replaces the record's options.
+- **Storage.** The follow is a record `{ session, agent, resource, replyTo, priority?, events? }` in `resourceFollows` of the resource thread's Chat SDK state (for GitHub, the PR's thread). There is no Fabrial table; the 30-day state TTL applies, refreshed on every write.
+- **Delivery.** When a plugin emits an event, ingress asks the plugin's resource kinds which threads it belongs to, reads their follow records, and delivers a `notification` to each follower with `signalWithStart`: the plugin renders it (and drops untrusted authors), the record's `events` selects kinds, and the priority is the record's override, then the plugin's default, then `normal`. Request ids are `${event id}:${session}:${agent}`, so a redelivered webhook is delivered once. Follows never own threads: triggers on the same events still run.
+- **Plugin SPI.** A plugin adds `resources: { [kind]: { key(ref), thread(ref), events, threads(event), notify(event), defaults } }` and a helper built on `resource(pluginId, kind, ref)`.
+- **Writing elsewhere** is a plugin tool: `github_comment`, `github_reply_to_review`, `slack_post`. Rendered notifications carry the ids those tools take (`pr="acme/app#42" review="991"`).
