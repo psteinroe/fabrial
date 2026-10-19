@@ -401,7 +401,7 @@ it("restarts Conductor, Pi and Chat during approval and completes exactly once",
 		await sql`SELECT id FROM pgconductor._private_executions WHERE task_key = 'run-sql'`;
 	expect(children).toHaveLength(1);
 });
-it("stops promptly while approval-card delivery is still in flight", async () => {
+it("stops promptly once an in-flight approval-card delivery finishes", async () => {
 	let reached!: () => void;
 	const delivering = new Promise<void>((resolve) => {
 		reached = resolve;
@@ -418,9 +418,18 @@ it("stops promptly while approval-card delivery is still in flight", async () =>
 	try {
 		await mention();
 		await delivering;
+		// Conductor's stop() waits for the running step instead of abandoning it mid-delivery.
+		const stopped = app.stop().then(() => "stopped");
 		await expect(
 			Promise.race([
-				app.stop().then(() => "stopped"),
+				stopped,
+				new Promise<string>((resolve) => setTimeout(() => resolve("waiting"), 300)),
+			]),
+		).resolves.toBe("waiting");
+		release();
+		await expect(
+			Promise.race([
+				stopped,
 				new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 2000)),
 			]),
 		).resolves.toBe("stopped");
