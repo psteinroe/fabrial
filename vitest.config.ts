@@ -15,6 +15,7 @@ export default defineConfig({
 				test: {
 					name: "integration",
 					include: ["packages/*/tests/integration/**/*.test.ts"],
+					globalSetup: ["./packages/fabrial/tests/conductor/global-setup.ts"],
 					testTimeout: 60_000,
 					hookTimeout: 120_000,
 				},

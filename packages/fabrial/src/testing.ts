@@ -34,6 +34,9 @@ import { conversationReference } from "./send.ts";
 import { parseSchema } from "./schema.ts";
 import type { ChatMessage, MessageRef, OutboundMessage, Surface, ThreadRef } from "./thread.ts";
 
+/** Conductor's test clock; pass it as `conductor(..., { clock })` over a single-connection pool. */
+export { createTestClock, type TestClock } from "pgconductor-js/testing";
+
 const clone = <T>(value: T): T => structuredClone(value);
 class Suspension extends Error {}
 class Cancellation extends Error {}

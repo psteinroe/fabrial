@@ -156,6 +156,11 @@ export interface ConductorConfig {
 	worker?: Partial<WorkerConfig>;
 	/** Polling fallback for execution branches, timers, and terminal notifications. */
 	pollIntervalMs?: number;
+	/**
+	 * Time source for workers (cron, sleeps, time windows) and `now()`. Tests pass
+	 * `createTestClock(sql)` from `fabrial/testing`, with `sql` a single-connection pool (`max: 1`).
+	 */
+	clock?: { now(): Date };
 }
 
 export function conductor(options: ConductorOptions, config: ConductorConfig = {}): DurableRuntime {
@@ -190,7 +195,7 @@ class ConductorRuntime implements DurableRuntime {
 	}
 
 	now(): number {
-		return Date.now();
+		return this.config.clock?.now().getTime() ?? Date.now();
 	}
 
 	register({ workflows, events }: { workflows: RuntimeWorkflow[]; events: RuntimeEvent[] }): void {
@@ -235,6 +240,7 @@ class ConductorRuntime implements DurableRuntime {
 			events: EventSchemas.fromSchema(this.eventDefinitions),
 			context: {},
 			logger: this.config.logger,
+			clock: this.config.clock,
 			telemetry: false,
 		});
 		// Dynamic catalogs cannot express Conductor's literal-name conditional types. This boundary
