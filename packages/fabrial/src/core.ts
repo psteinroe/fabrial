@@ -324,14 +324,7 @@ export function buildApp(config: CoreConfig): App {
 			const match = /^fabrial\.approval\.(approve|reject|cancel):(.+)$/.exec(action.actionId);
 			if (!match) return;
 			const actor = await directory.resolveIdentity(action.actor);
-			const io = await chat?.port.thread(action.thread);
-			const receivedAt = now();
-			let duplicate = false;
-			await io?.updateState((state) => {
-				duplicate = hasIngress(state, "action", action.dedupeId);
-				return duplicate ? state : rememberIngress(state, "action", action.dedupeId, receivedAt);
-			});
-			if (duplicate) return;
+			// No receipt in thread state: the emit's dedupe id makes a provider retry deliver it once.
 			await runtime.emit(
 				"fabrial.approval.decided",
 				{

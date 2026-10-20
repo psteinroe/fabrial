@@ -269,7 +269,7 @@ export type ThreadRoutingState = JsonObject & {
 	 * delivery isn't confirmed yet: a redelivery replays that route instead of routing again.
 	 */
 	ingestedDedupeIds?: {
-		kind: "message" | "action" | "cancellation";
+		kind: "message" | "cancellation";
 		id: string;
 		at: number;
 		pending?: { route: "follow" | "new"; conversations: Follow[] };

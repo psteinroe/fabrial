@@ -357,6 +357,30 @@ describe("approvals", () => {
 		);
 		expect(c.post.updates).toHaveLength(1);
 	});
+	it("delivers a click exactly once when its first emit fails and the provider retries", async () => {
+		const test = setup([approvalWorkflow()]);
+		await enter(test);
+		const c = await card(test);
+		const emit = test.runtime.emit.bind(test.runtime);
+		let failures = 1;
+		test.runtime.emit = async (...args) => {
+			if (args[0] === "fabrial.approval.decided" && failures-- > 0) throw new Error("emit failed");
+			return emit(...args);
+		};
+		await expect(
+			test.chat.click(c.post.ref, c.approve, alice.identities[0]!, { dedupeId: "click" }),
+		).rejects.toThrow("emit failed");
+		await test.runtime.flush();
+		expect(test.runtime.executions()[0]!.status).toBe("suspended");
+		for (let i = 0; i < 2; i++)
+			await test.chat.click(c.post.ref, c.approve, alice.identities[0]!, { dedupeId: "click" });
+		await test.runtime.flush();
+		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: "approved" });
+		expect(test.runtime.emitted.filter((e) => e.name === "fabrial.approval.decided")).toHaveLength(
+			1,
+		);
+		expect(c.post.updates).toHaveLength(1);
+	});
 	it("expires and renders cards without actions", async () => {
 		const test = setup([approvalWorkflow(100)]);
 		await enter(test);
@@ -1103,7 +1127,7 @@ describe("additional port and correlation guarantees", () => {
 });
 
 describe("ingress tombstones and reservation recovery", () => {
-	it("keeps the last 100 receipts across settlements, including actions", async () => {
+	it("keeps the last 100 receipts across settlements; actions dedupe in the runtime", async () => {
 		const test = setup([workflow(async () => {})]);
 		await test.app.start();
 		for (let i = 0; i < 101; i++) {
@@ -1120,32 +1144,22 @@ describe("ingress tombstones and reservation recovery", () => {
 		expect(test.runtime.executions("owner")).toHaveLength(101);
 		await test.runtime.advanceBy(10 * 60 * 1000);
 		const ref = { ...surface, messageId: "card" };
-		let actionEmissions = 0;
-		const emit = test.runtime.emit.bind(test.runtime);
-		test.runtime.emit = async (...args) => {
-			if (args[0] === "fabrial.approval.decided") actionEmissions++;
-			return emit(...args);
-		};
-		await test.chat.click(ref, "fabrial.approval.approve:a", alice.identities[0]!, {
-			dedupeId: "inbound-100",
-		});
-		await test.chat.click(ref, "fabrial.approval.approve:a", alice.identities[0]!, {
-			dedupeId: "inbound-100",
-		});
-		expect(actionEmissions).toBe(1);
+		const decided = () =>
+			test.runtime.emitted.filter((e) => e.name === "fabrial.approval.decided").length;
+		for (let i = 0; i < 2; i++)
+			await test.chat.click(ref, "fabrial.approval.approve:a", alice.identities[0]!, {
+				dedupeId: "inbound-100",
+			});
+		expect(decided()).toBe(1);
 		await test.chat.receive(message("next"));
 		await test.runtime.flush();
 		await test.chat.click(ref, "fabrial.approval.approve:a", alice.identities[0]!, {
 			dedupeId: "inbound-100",
 		});
-		expect(actionEmissions).toBe(1);
+		expect(decided()).toBe(1);
 		const state = await thread.getState();
 		expect(state?.ingestedDedupeIds).toHaveLength(100);
-		expect(state?.ingestedDedupeIds).toContainEqual({
-			kind: "action",
-			id: "inbound-100",
-			at: test.runtime.now(),
-		});
+		expect(state?.ingestedDedupeIds?.every((receipt) => receipt.kind === "message")).toBe(true);
 		state!.ingestedDedupeIds![0]!.id = "mutated snapshot";
 		expect((await thread.getState())?.ingestedDedupeIds?.[0]?.id).not.toBe("mutated snapshot");
 		await test.runtime.advanceBy(30 * 24 * 60 * 60 * 1000);
