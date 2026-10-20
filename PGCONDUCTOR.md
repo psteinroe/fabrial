@@ -2,7 +2,7 @@
 
 This is a handover for work in [`psteinroe/postgres-conductor`](https://github.com/psteinroe/postgres-conductor). [Fabrial](./PLAN.md) builds on Conductor, and its rule is that Conductor gaps are fixed in Conductor rather than worked around in Fabrial. This file lists what Fabrial still needs so that its Conductor adapter (`packages/fabrial/src/runtime/conductor`) uses only public Conductor APIs: no private access, no polling, no `SHIM(conductor#…)` markers.
 
-Checked against Conductor `main` @ `7472dd4` ("refactor: simplify settlement buffering and remove dead code (#81)"). Re-check each item before starting, because main moves.
+Checked against Conductor `main` @ `7e6688c`. Items 1, 2, 4, and 5 landed in #84, #85, and #82; the Node package in #83. Re-check each item before starting, because main moves.
 
 ## How Fabrial uses Conductor
 
@@ -62,25 +62,9 @@ const winner = await ctx.waitForAny(
 
 **Acceptance.** Cancelling or permanently failing the parent cancels linked children in every state (pending, running, suspended); unlinked `invoke` children keep running; a linked child that completed before the parent ended stays completed.
 
-### 3. Notify on settlement
+### 3. Notify on settlement (dropped)
 
-**Current.** Nothing tells another execution that an execution reached a terminal state outside of `invokeAndWait`. Fabrial's adapter polls for settled executions.
-
-**Needed.** An option on `ctx.invoke`, `conductor.invoke`, and `signalWithStart`:
-
-```ts
-await ctx.invoke("start-tool", tool, input, {
-	onSettled: {
-		task: "session",
-		key: sessionKey,
-		signal: { name: "child", id: `child:${requestId}` },
-	},
-});
-```
-
-When the execution reaches any terminal state, Conductor sends the signal with `signalWithStart` to the target in the same transaction as the settlement, with `payload: { executionId, outcome }` (the same outcome shape as item 1). It is delivered once per settlement.
-
-**Acceptance.** Completion, failure after the last retry, cancellation while pending, running, or suspended, and dead-lettering each send exactly one signal, including after a restart; the target is started if it isn't running.
+Not needed: `ctx.waitForResult` works for any execution id and wakes on every terminal state, so Fabrial reports outcomes with small executions of its own. A supervisor starts a workflow tool, waits for its result, and signals the Session; a watcher waits for a `ctx.agent` caller and signals a cancel when it ends cancelled or failed. Approval cleanup waits on an `{ execution }` branch. Conductor documents this as a recipe.
 
 ### 4. Public execution id
 
