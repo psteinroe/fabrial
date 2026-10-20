@@ -1626,7 +1626,10 @@ test("core approval accepts an authenticated click during card delivery, before 
 	expect(decision).toBe("approved");
 	expect(clicks).toBe(1);
 	expect(dm.posts).toHaveLength(1);
-	expect(dm.posts[0]!.content).toMatchObject({ card: { text: "Approved by Alice", actions: [] } });
+	// The separate cleanup workflow relabels the card after the decision.
+	await expect
+		.poll(() => dm.posts[0]!.content, poll)
+		.toMatchObject({ card: { text: "Approved by Alice", actions: [] } });
 	await app.stop();
 	runtimes = runtimes.filter((entry) => entry !== runtime);
 });

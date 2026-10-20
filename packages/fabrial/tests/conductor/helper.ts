@@ -26,6 +26,8 @@ export interface ConductorFixture {
 	readonly clock: TestClock;
 	/** Register and start a runtime on a fresh queue. Runtimes stop after each test. */
 	start(workflows: RuntimeWorkflow[], options?: StartOptions): Promise<TestRuntime>;
+	/** A runtime on a fresh queue for an app to register and start; it stops after each test. */
+	runtime(options?: Omit<StartOptions, "events">): DurableRuntime & { readonly queue: string };
 	/** A handle on an execution of any runtime on this database. */
 	execution(id: string): ExecutionHandle;
 }
@@ -144,12 +146,9 @@ export function useConductor(): ConductorFixture {
 		}
 	});
 
-	async function start(
-		workflows: RuntimeWorkflow[],
-		options: StartOptions = {},
-	): Promise<TestRuntime> {
+	function runtime(options: Omit<StartOptions, "events"> = {}) {
 		const queue = options.queue ?? `test_${++queues}`;
-		const runtime = conductor(
+		const created = conductor(
 			{ sql: ready(sql) },
 			{
 				logger: silent,
@@ -160,14 +159,26 @@ export function useConductor(): ConductorFixture {
 				clock: ready(clock),
 			},
 		);
-		runtime.register({ workflows, events: options.events ?? [] });
-		runtimes.push(runtime);
-		await runtime.start();
-		return Object.assign(runtime, {
-			queue,
+		// Apps stop their runtime too; the fixture's stop after the test must not stop it twice.
+		const stop = created.stop.bind(created);
+		let stopped: Promise<void> | undefined;
+		created.stop = () => (stopped ??= stop());
+		runtimes.push(created);
+		return Object.assign(created, { queue });
+	}
+
+	async function start(
+		workflows: RuntimeWorkflow[],
+		options: StartOptions = {},
+	): Promise<TestRuntime> {
+		const created = runtime(options);
+		const { queue } = created;
+		created.register({ workflows, events: options.events ?? [] });
+		await created.start();
+		return Object.assign(created, {
 			restart: async () => {
-				await runtime.stop();
-				runtimes.splice(runtimes.indexOf(runtime), 1);
+				await created.stop();
+				runtimes.splice(runtimes.indexOf(created), 1);
 				return start(workflows, { ...options, queue });
 			},
 		});
@@ -241,6 +252,7 @@ export function useConductor(): ConductorFixture {
 			return ready(clock);
 		},
 		start,
+		runtime,
 		execution,
 	};
 }
