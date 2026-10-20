@@ -43,9 +43,25 @@ export interface SendOptions {
 	priority?: InputPriority;
 }
 
+/**
+ * An opaque reference to a conversation, returned by `ctx.send`. `ctx.follow(…, { to })` takes it as is, so a sent
+ * conversation can follow a resource.
+ */
+export interface ConversationReference extends JsonObject {
+	kind: "fabrial.conversation";
+	session: string;
+	agent: string;
+}
+
+export const conversationReference = (agent: string, session: string): ConversationReference => ({
+	kind: "fabrial.conversation",
+	session,
+	agent,
+});
+
 export interface SendReceipt extends JsonObject {
 	requestId: string;
-	session: string;
+	conversation: ConversationReference;
 }
 
 /** Context of a request delivered by `ctx.send`, kept in its `fabrial.invocation` document. */

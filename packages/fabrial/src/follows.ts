@@ -18,6 +18,7 @@ import {
 	renderInput,
 	replySurface,
 	resolveSession,
+	type ConversationReference,
 	type InputPriority,
 	type SentRequest,
 	type SessionOption,
@@ -34,14 +35,22 @@ export interface FollowOptions {
 	 * started). Required from other workflows. `home` is where final replies to its notifications go
 	 * (default: this execution's thread).
 	 */
-	to?: { agent: AgentRef; session?: SessionOption; home?: Thread | Surface };
+	to?:
+		| { agent: AgentRef; session?: SessionOption; home?: Thread | Surface }
+		| (ConversationReference & { home?: Thread | Surface });
 }
 
 /** `FollowOptions` with references instead of definitions, for durable operations. */
 export type StoredFollowOptions = JsonObject & {
 	priority?: Partial<Record<string, InputPriority>>;
 	events?: "default" | "all";
-	to?: { agent: string; session?: string; home?: (Surface & JsonObject) | null };
+	to?: {
+		/** Set when `session` is a resolved key, from a `ConversationReference`. */
+		kind?: "fabrial.conversation";
+		agent: string;
+		session?: string;
+		home?: (Surface & JsonObject) | null;
+	};
 };
 
 export function storedFollowOptions(options: FollowOptions = {}): StoredFollowOptions {
@@ -50,7 +59,8 @@ export function storedFollowOptions(options: FollowOptions = {}): StoredFollowOp
 		JSON.stringify({
 			...rest,
 			to: to && {
-				agent: to.agent.name,
+				...("kind" in to ? { kind: to.kind } : {}),
+				agent: typeof to.agent === "string" ? to.agent : to.agent.name,
 				session: to.session,
 				home: to.home && ("post" in to.home ? to.home.ref : to.home),
 			},
@@ -96,6 +106,9 @@ async function target(
 	surface: Surfaces,
 	to: StoredFollowOptions["to"],
 ): Promise<ConversationRef> {
+	// A reference from `ctx.send` names its conversation already; resolving it again would re-prefix its key.
+	if (to?.kind === "fabrial.conversation" && to.session)
+		return { agent: to.agent, session: to.session };
 	if (to)
 		return { agent: to.agent, session: await resolveSession(to.session ?? "thread", surface) };
 	const conversation = metadata.conversation as ConversationRef | undefined;

@@ -137,6 +137,17 @@ describe("follows in an app", () => {
 				await ctx.follow("watch", pr);
 			},
 		});
+		// A conversation `ctx.send` reached follows the PR with the receipt's reference as is.
+		const sendAndWatch = f.defineWorkflow({
+			name: "send-and-watch",
+			async run(_input, ctx) {
+				const sent = await ctx.send("send", agent, { input: "Watch PR 5", session: "ops" });
+				const followed = await ctx.follow("watch", pr, { to: sent.conversation });
+				const removed = await ctx.unfollow("unwatch", pr, { to: sent.conversation });
+				await ctx.follow("again", pr, { to: sent.conversation });
+				return { sent: sent.conversation, followed, removed: removed.removed };
+			},
+		});
 		const observed = vi.fn();
 		const owner = f.defineWorkflow({
 			name: "review-owner",
@@ -151,7 +162,7 @@ describe("follows in an app", () => {
 			runtime,
 			chat: new FakeChat(),
 			agents,
-			workflows: [watch, unwatch, orphan, owner],
+			workflows: [watch, unwatch, orphan, owner, sendAndWatch],
 		});
 		await app.start();
 		const start = async (workflow: string, input: JsonObject | null = null) => {
@@ -221,6 +232,28 @@ describe("follows in an app", () => {
 		expect(await t.start("unwatch")).toMatchObject({ output: { removed: false } });
 		await t.send(webhooks.reopened(), "o1");
 		expect(t.agents.sent).toHaveLength(5);
+		await t.app.stop();
+	});
+
+	it("a send receipt's conversation follows a resource without re-resolving its session", async () => {
+		const t = await setup();
+		expect(await t.start("send-and-watch")).toMatchObject({
+			status: "completed",
+			output: {
+				sent: { kind: "fabrial.conversation", session: "app:ops", agent: "dev" },
+				followed: { resource: "github:acme/app#5", session: "app:ops", agent: "dev" },
+				removed: true,
+			},
+		});
+		expect(await t.records()).toEqual([
+			{ session: "app:ops", agent: "dev", resource: "github:acme/app#5", replyTo: null },
+		]);
+		await t.send(webhooks.review("changes_requested"), "r1");
+		// The notification reaches the conversation the send started.
+		expect(t.agents.sent.map((each) => [each.session, each.agent])).toEqual([
+			["app:ops", "dev"],
+			["app:ops", "dev"],
+		]);
 		await t.app.stop();
 	});
 

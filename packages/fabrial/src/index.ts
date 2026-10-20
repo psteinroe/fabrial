@@ -41,6 +41,7 @@ export {
 	type InputKind,
 	type InputPriority,
 	type SendOptions,
+	type ConversationReference,
 	type SendReceipt,
 	type SendRequest,
 	type SentRequest,

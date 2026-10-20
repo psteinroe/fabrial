@@ -84,6 +84,7 @@ import {
 	follow,
 	prepareSend,
 	threadSession,
+	conversationReference,
 	type ConversationKey,
 	type Delivery,
 	type SendOptions,
@@ -1408,7 +1409,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				sessionInput(agent, request),
 				request.metadata,
 			);
-			return { requestId: request.requestId, session: request.session };
+			return {
+				requestId: request.requestId,
+				conversation: conversationReference(agent.name, request.session),
+			};
 		},
 		async send(execution, id, agent, request) {
 			const input = sessionInput(agent, request);
@@ -1419,7 +1423,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				input: { session: request.session },
 				metadata: sessionMetadata(request.session),
 			});
-			return { requestId: request.requestId, session: request.session };
+			return {
+				requestId: request.requestId,
+				conversation: conversationReference(agent.name, request.session),
+			};
 		},
 		async run(execution, id, agent: AgentRef, request) {
 			// A call has its own Session, keyed by the workflow run: it never shares a transcript with a thread's

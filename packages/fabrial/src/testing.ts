@@ -30,6 +30,7 @@ import type {
 	WaitBranch,
 	WaitForAnyResult,
 } from "./runtime.ts";
+import { conversationReference } from "./send.ts";
 import { parseSchema } from "./schema.ts";
 import type { ChatMessage, MessageRef, OutboundMessage, Surface, ThreadRef } from "./thread.ts";
 
@@ -891,12 +892,18 @@ export function fakeAgents(
 					((execution, id, agent, request) =>
 						execution.step(`fabrial:fake:send:${id}`, () => {
 							sent.push({ ...request, agent: agent.name });
-							return { requestId: request.requestId, session: request.session };
+							return {
+								requestId: request.requestId,
+								conversation: conversationReference(agent.name, request.session),
+							};
 						})),
 				async deliver(agent, request) {
 					if (!sent.some((s) => s.requestId === request.requestId && s.agent === agent.name))
 						sent.push(clone({ ...request, agent: agent.name }));
-					return { requestId: request.requestId, session: request.session };
+					return {
+						requestId: request.requestId,
+						conversation: conversationReference(agent.name, request.session),
+					};
 				},
 			},
 			state: options.state ?? state,

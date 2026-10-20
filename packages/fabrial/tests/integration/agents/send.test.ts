@@ -378,7 +378,7 @@ it("a tool sends to another conversation through the same send path", async () =
 					session: `ops-${channel}`,
 					input: input.summary,
 				});
-				return receipt.session;
+				return receipt.conversation.session;
 			},
 		}),
 	]);
