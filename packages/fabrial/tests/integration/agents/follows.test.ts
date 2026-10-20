@@ -230,35 +230,64 @@ it("a chat conversation follows its PR: tool follow, restart, review wakes the a
 	await t.app.stop();
 });
 
-it("orchestrator: a channel lead starts a background worker per message; reports and a worker's follow answer in that message's thread", async () => {
+it("orchestrator: a channel lead starts a background worker per message; reports and a worker's follow answer in that message's thread, also when the message steers the busy lead", async () => {
 	const textOf = (message: { content: unknown } | undefined) =>
 		typeof message?.content === "string"
 			? message.content
 			: JSON.stringify((message?.content as { text?: string }[] | undefined)?.map((c) => c.text));
-	const which = (text: string) => (text.includes("second") ? "second" : "first");
-	const step = (context: { messages: { role: string; content: unknown }[] }) => {
+	const which = (text: string) =>
+		["fourth", "third", "second"].find((word) => text.includes(word)) ?? "first";
+	const gate = () => {
+		let open: () => void = () => {};
+		const opened = new Promise<void>((resolve) => (open = resolve));
+		return { open, opened };
+	};
+	// The lead's call for the third message waits, so the fourth message steers the busy run.
+	const leadBusy = gate();
+	const leadGate = gate();
+	// The third worker follows only after the fourth message joined the lead's run.
+	const fourthPlaced = gate();
+	const reported = new Set<string>();
+	const follow = (pr: string) =>
+		fauxAssistantMessage(fauxToolCall("github_follow_pull_request", { pr }), {
+			stopReason: "toolUse",
+		});
+	const step = async (context: { messages: { role: string; content: unknown }[] }) => {
 		const messages = context.messages.filter((each) => each.role !== "system");
 		const text = textOf(messages.at(-1));
-		const workerTask = messages.length === 1;
+		const task = textOf(messages[0]);
+		if (task.startsWith("Handle the")) {
+			const request = which(task);
+			if (messages.length > 1) return fauxAssistantMessage(`Worker done with ${request}.`);
+			if (request === "second") return follow("acme/app#5");
+			if (request === "third") {
+				await fourthPlaced.opened;
+				return follow("acme/app#6");
+			}
+			if (request === "fourth") return follow("acme/app#5");
+			return fauxAssistantMessage(`Worker done with ${request}.`);
+		}
 		if (text.includes("requested changes")) return fauxAssistantMessage("Lead handles the review.");
+		// The tool result that started a worker mentions its later `<subagent>` input.
+		if (text.includes("Started")) return fauxAssistantMessage("On it.");
+		for (const each of messages)
+			if (each.role === "user" && textOf(each).includes("<subagent"))
+				reported.add(which(textOf(each)));
 		if (text.includes("<subagent")) return fauxAssistantMessage(`Reported ${which(text)}.`);
-		if (text.includes("<message"))
+		if (text.includes("<message")) {
+			if (which(text) === "third") {
+				leadBusy.open();
+				await leadGate.opened;
+			}
+			if (which(text) === "fourth") fourthPlaced.open();
 			return fauxAssistantMessage(
 				fauxToolCall("worker", { task: `Handle the ${which(text)} request`, background: true }),
 				{ stopReason: "toolUse" },
 			);
-		if (text.includes("Started")) return fauxAssistantMessage("On it.");
-		if (workerTask && text.includes("second"))
-			return fauxAssistantMessage(
-				fauxToolCall("github_follow_pull_request", { pr: "acme/app#5" }),
-				{
-					stopReason: "toolUse",
-				},
-			);
-		if (workerTask) return fauxAssistantMessage("Worker done with first.");
-		return fauxAssistantMessage("Worker done with second.");
+		}
+		throw new Error(`Unexpected model call: ${text}`);
 	};
-	faux.setResponses(Array.from({ length: 12 }, () => step));
+	faux.setResponses(Array.from({ length: 30 }, () => step));
 	const ask = (thread: string, id: string, text: string) =>
 		chat.receive({
 			...message(`chat:${orchestrated}:${thread}`, id, text),
@@ -300,5 +329,49 @@ it("orchestrator: a channel lead starts a background worker per message; reports
 	await t.webhook(webhooks.review("changes_requested"), "orchestrated-review");
 	expect((await posts("t2")).at(-1)).toBe("Lead handles the review.");
 	expect(await posts("t1")).not.toContain("Lead handles the review.");
+
+	// The fourth message steers the lead while its call for the third waits; what the run starts after the steer acts
+	// for the fourth message, while the worker it started before keeps the third's.
+	const session = `chat:channel:${orchestrated}`;
+	await ask("t3", "m3", "The third request");
+	await leadBusy.opened;
+	const accepted = (await submitted(session)).length;
+	await ask("t4", "m4", "The fourth request");
+	await until("the fourth message to reach the busy lead", async () =>
+		(await submitted(session)).length > accepted ? true : undefined,
+	);
+	leadGate.open();
+	// Both reports may arrive in one run of the lead, which answers once: wait until the lead read both.
+	await until("both reports", async () =>
+		reported.has("third") && reported.has("fourth") ? true : undefined,
+	);
+	await t.settle();
+	// Both follows belong to the lead's conversation: the third worker's replies in the third message's thread...
+	expect(
+		(
+			(await (
+				await chat.thread({ kind: "thread", provider: "github", threadId: "github:acme/app:6" })
+			).getState()) as ThreadRoutingState | null
+		)?.resourceFollows,
+	).toEqual([
+		{
+			session,
+			agent: "lead",
+			resource: "github:acme/app#6",
+			replyTo: { kind: "thread", provider: "chat", threadId: `chat:${orchestrated}:t3` },
+		},
+	]);
+	// ...and the fourth worker's, started after the steer, in the steering message's thread.
+	expect(await records()).toEqual([
+		{
+			session,
+			agent: "lead",
+			resource: "github:acme/app#5",
+			replyTo: { kind: "thread", provider: "chat", threadId: `chat:${orchestrated}:t4` },
+		},
+	]);
+	await t.webhook(webhooks.review("changes_requested"), "orchestrated-review-2");
+	expect((await posts("t4")).at(-1)).toBe("Lead handles the review.");
+	expect(await posts("t3")).not.toContain("Lead handles the review.");
 	await t.app.stop();
 });

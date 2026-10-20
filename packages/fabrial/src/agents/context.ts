@@ -262,8 +262,10 @@ export async function fields(
 }
 
 /**
- * The request a conversation's current run acts for: the request of its first input, the lead request a background
- * child's input was sent for, or its binding (the lead request a foreground child was called for).
+ * The request a conversation's current run acts for: the request of its newest placed input (a steer joins the run,
+ * so what runs after it acts for it), the lead request a background child's input was sent for, or its binding (the
+ * lead request a foreground child was called for). Children record their lead request when started, so a lead's
+ * later steer leaves them acting for the request they were started for.
  */
 export async function currentRequest(
 	bridge: BridgeFrame,
@@ -274,18 +276,20 @@ export async function currentRequest(
 	if (!binding?.requestId)
 		throw new Error("This conversation has no Fabrial invocation/chat binding (forks are unbound)");
 	// The bridge commits this request's identity before submission and never serializes live clients.
+	// Pi appends each input to the run as it is placed, so the newest participating input is the last one.
 	const live = await bridge.harness.snapshot(LiveDoc, conversationId, context);
-	const inputId = live?.run?.inputs[0];
-	const submission = inputId ? await bridge.harness.submission(inputId, context) : undefined;
-	const requestId = (await submission?.status(context))?.requestId;
-	if (requestId && (await bridge.harness.snapshot(Invocation, requestId, context)))
-		return requestId;
-	// A background child's task acts for the lead request that sent it, recorded before it was submitted.
-	const reporter = /^fabrial\.subagent:(\d+)$/.exec(requestId ?? "")?.[1];
-	const sent = reporter
-		? (await bridge.harness.snapshot(SubagentWork, context))?.reporters[reporter]?.request
-		: undefined;
-	if (sent && (await bridge.harness.snapshot(Invocation, sent, context))) return sent;
+	for (const inputId of [...(live?.run?.inputs ?? [])].reverse()) {
+		const record = await (await bridge.harness.submission(inputId, context))?.status(context);
+		if (record?.status !== "placed" || !record.requestId) continue;
+		const { requestId } = record;
+		if (await bridge.harness.snapshot(Invocation, requestId, context)) return requestId;
+		// A background child's task acts for the lead request that sent it, recorded before it was submitted.
+		const reporter = /^fabrial\.subagent:(\d+)$/.exec(requestId)?.[1];
+		const sent = reporter
+			? (await bridge.harness.snapshot(SubagentWork, context))?.reporters[reporter]?.request
+			: undefined;
+		if (sent && (await bridge.harness.snapshot(Invocation, sent, context))) return sent;
+	}
 	if (!(await bridge.harness.snapshot(Invocation, binding.requestId, context)))
 		throw new Error(`Missing Fabrial invocation ${binding.requestId}`);
 	return binding.requestId;
