@@ -57,7 +57,7 @@ it("allows failed webhook ingress to be retried with the same platform id", asyn
 	const env = setup();
 	vi.mocked(env.host.receiveMessage)
 		.mockRejectedValueOnce(new Error("transient"))
-		.mockResolvedValue("new");
+		.mockResolvedValue("accepted");
 	vi.mocked(env.adapter.handleWebhook).mockImplementation(async (_request, options) => {
 		await env
 			.sdk()

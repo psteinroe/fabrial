@@ -31,14 +31,14 @@ describe("approvals", () => {
 		await eventually("the card update", () => c.post.updates.length > 0);
 		expect(c.post.updates).toHaveLength(1);
 	});
-	it("delivers a click exactly once when its first emit fails and the provider retries", async () => {
+	it("delivers a click exactly once when its ingress emit fails and the provider retries", async () => {
 		const test = setup([approvalWorkflow()]);
 		const owner = await enter(test);
 		const c = await card(test);
 		const emit = test.runtime.emit.bind(test.runtime);
 		let failures = 1;
 		test.runtime.emit = async (...args) => {
-			if (args[0] === "fabrial.approval.decided" && failures-- > 0) throw new Error("emit failed");
+			if (args[0] === "fabrial.ingress" && failures-- > 0) throw new Error("emit failed");
 			return emit(...args);
 		};
 		await expect(

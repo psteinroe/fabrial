@@ -284,9 +284,11 @@ async function finalReply(text: string) {
 	await expect
 		.poll(async () => {
 			const state = await thread.getState();
+			const [routing] =
+				await sql`SELECT count(*)::int AS count FROM pgconductor._private_executions WHERE task_key = 'fabrial.route' AND completed_at IS NULL`;
 			return {
 				follows: state?.follows?.map((each) => each.agent),
-				pending: state?.ingestedDedupeIds?.some((receipt) => receipt.pending) ?? false,
+				pending: routing!.count > 0,
 			};
 		}, poll)
 		.toEqual({ follows: ["acme-support"], pending: false });

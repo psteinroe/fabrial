@@ -115,5 +115,20 @@ export function useAgents() {
 		return rows.map((row) => row.id);
 	}
 
-	return { db, sql, launch, idle, open, all };
+	/**
+	 * How the router routed the ingress `id` on `queue` (a message's dedupe id defaults to its message id),
+	 * once it finished: `follow`, `new` or `ignored`.
+	 */
+	async function routed(queue: string, id: string) {
+		return until(`ingress ${id} to be routed`, async () => {
+			const [row] = await sql()<{ route: string | null }[]>`
+				select result->'output'->>'route' as route from pgconductor._private_executions
+				where queue = ${queue} and task_key = 'fabrial.route' and payload->'payload'->>'id' = ${id}
+					and completed_at is not null
+			`;
+			return row?.route ?? undefined;
+		});
+	}
+
+	return { db, sql, launch, idle, open, all, routed };
 }

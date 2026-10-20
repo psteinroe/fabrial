@@ -14,7 +14,7 @@ function plugin() {
 const kind = github(options).resources!.pullRequest as ResourceKind<any>;
 const prThread = { kind: "thread", provider: "github", threadId: "github:acme/app:5" };
 
-/** The event a webhook emits. */
+/** The plugin event a webhook's ingress event carries. */
 async function emitted(hook: { event: string; payload: unknown }) {
 	const runtime = new StubRuntime();
 	const app = testApp(createFabrial({ plugins: [plugin()] }), {
@@ -25,8 +25,13 @@ async function emitted(hook: { event: string; payload: unknown }) {
 	await app.start();
 	expect((await app.fetch(deliver(hook, "d"))).status).toBe(200);
 	await app.stop();
-	const event = runtime.emitted.find((e) => e.name.startsWith("github."));
-	return event && { name: event.name.slice("github.".length), payload: event.payload };
+	const ingress = runtime.emitted.find((e) => e.name === "fabrial.ingress")?.payload as
+		| { events: string[]; payload: JsonObject }
+		| undefined;
+	const name = ingress?.events.find((event) => event.startsWith("github."));
+	return name === undefined
+		? undefined
+		: { name: name.slice("github.".length), payload: ingress!.payload };
 }
 const notified = async (hook: { event: string; payload: unknown }) =>
 	kind.notify((await emitted(hook))!);
@@ -176,8 +181,10 @@ describe("follows in an app", () => {
 					metadata: { interactionId: workflow, origin: null, replyTo: null, requestedBy: null },
 				}),
 			);
+		// Ingress dedupes deliveries across the database: scope this test's delivery ids to it.
+		const scope = crypto.randomUUID();
 		const send = async (hook: { event: string; payload: unknown }, delivery: string) => {
-			expect((await app.fetch(deliver(hook, delivery))).status).toBe(200);
+			expect((await app.fetch(deliver(hook, `${scope}:${delivery}`))).status).toBe(200);
 			await t.idle();
 		};
 		const records = async () =>

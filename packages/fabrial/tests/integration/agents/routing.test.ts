@@ -25,7 +25,7 @@ import { pi } from "../../../src/agents/index.ts";
 import { FakeChat } from "../../../src/testing.ts";
 import { useAgents } from "./setup.ts";
 
-const { sql, launch, idle } = useAgents();
+const { sql, launch, idle, routed } = useAgents();
 
 const chat = definePlugin({ id: "chat", events: chatEvents() });
 const gh = definePlugin({ id: "gh", events: chatEvents() });
@@ -94,11 +94,16 @@ async function setup(
 			sentAt: new Date().toISOString(),
 		};
 	};
-	/** Receive a message as the chat integration does: a mention is both a message and a mention. */
-	const receive = (m: ChatMessage) =>
-		fake.receive(m, {
+	/**
+	 * Receive a message as the chat integration does (a mention is both a message and a mention), and wait
+	 * for the router's decision.
+	 */
+	const receive = async (m: ChatMessage) =>
+		(await fake.receive(m, {
 			events: [`${m.provider}.message`, ...(m.isMention ? [`${m.provider}.mentioned`] : [])],
-		});
+		})) === "ignored"
+			? "ignored"
+			: routed(runtime.queue, m.messageId);
 	const posts = async (thread: string, provider = "chat") =>
 		(
 			await fake.thread({ kind: "thread", provider, threadId: threadId(thread, provider) })
@@ -145,8 +150,9 @@ it("use case 1: a mention in #help starts a conversation that follows its thread
 	expect(await t.receive(t.message("m2", "t1", "and for annual plans?", { author: "bob" }))).toBe(
 		"follow",
 	);
+	// A redelivery is deduped by its ingress event: it routes once, so the model is called once more.
 	expect(await t.receive(t.message("m2", "t1", "and for annual plans?", { author: "bob" }))).toBe(
-		"ignored",
+		"follow",
 	);
 	await t.settle();
 	expect(t.faux.state.callCount).toBe(2);
@@ -154,7 +160,7 @@ it("use case 1: a mention in #help starts a conversation that follows its thread
 	expect(seen[1]).toContain('from=\\"bob\\"');
 	expect(await t.posts("t1")).toEqual(["Answer 1", "Answer 2"]);
 	// An unmentioned message in another thread reaches nobody.
-	expect(await t.receive(t.message("m3", "t2", "hello?"))).toBe("new");
+	expect(await t.receive(t.message("m3", "t2", "hello?"))).toBe("ignored");
 	await t.settle();
 	expect(t.faux.state.callCount).toBe(2);
 	expect(await t.posts("t2")).toEqual([]);

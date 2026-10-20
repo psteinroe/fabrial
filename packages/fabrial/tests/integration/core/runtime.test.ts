@@ -11,7 +11,6 @@ const metadata: InvocationMetadata = {
 	replyTo: null,
 	requestedBy: null,
 };
-const surface = { kind: "thread", provider: "chat", threadId: "channel:general:thread" } as const;
 const events = ["ping", "observer", "owned"].map((name) => ({ name, filterable: [] }));
 const waiter = (handler: RuntimeWorkflow["handler"]): RuntimeWorkflow => ({
 	name: "waiter",
@@ -156,34 +155,4 @@ it("does not let a late event beat an absolute expired deadline", async () => {
 	await runtime.emit("ping", {}, { metadata });
 	await db.clock.advance(6_000);
 	expect(await execution.output()).toBeNull();
-});
-
-it("suppresses a canonical owner's competing observer emission, even when it arrives first", async () => {
-	const runs: InvocationMetadata[] = [];
-	const runtime = await db.start(
-		[
-			{
-				name: "owner",
-				triggers: [
-					{ event: "observer", role: "observer" },
-					{ event: "owned", role: "owner" },
-				],
-				handler: async (_input, execution) => {
-					runs.push(execution.metadata);
-					return "ok";
-				},
-			},
-		],
-		{ events },
-	);
-	const options = {
-		metadata: { ...metadata, replyTo: surface as InvocationMetadata["replyTo"] },
-		dispatchId: "dispatch",
-		dispatchOwner: { workflow: "owner", event: "owned" },
-	};
-	await runtime.emit("observer", {}, options);
-	await runtime.emit("owned", {}, { ...options, owner: "owner" });
-	await until("the owner", async () => runs[0]);
-	expect(runs).toHaveLength(1);
-	expect(runs[0]!.replyTo).toEqual(surface);
 });

@@ -25,7 +25,7 @@ import { deliver, outsider, webhooks } from "../../../../github/tests/webhooks.t
 import { until } from "../../conductor/helper.ts";
 import { useAgents } from "./setup.ts";
 
-const { sql, launch: start, idle } = useAgents();
+const { sql, launch: start, idle, routed } = useAgents();
 
 const chatPlugin = definePlugin({
 	id: "chat",
@@ -155,9 +155,8 @@ it("a chat conversation follows its PR: tool follow, restart, review wakes the a
 		fauxAssistantMessage("Merged; done."),
 	]);
 	let t = await launch();
-	expect(await chat.receive(message(threadId, "m1", "Fix the flaky test and open a PR"))).toBe(
-		"new",
-	);
+	await chat.receive(message(threadId, "m1", "Fix the flaky test and open a PR"));
+	expect(await routed(t.runtime.queue, "m1")).toBe("new");
 	await t.settle();
 	expect(faux.state.callCount).toBe(2);
 	// The tool wrote a follow record in the PR thread's state for the calling conversation, replying home.
@@ -190,7 +189,8 @@ it("a chat conversation follows its PR: tool follow, restart, review wakes the a
 
 	// An urgent review steers the busy run: it joins the run's next model call, with no run of its own.
 	const waiting = new Promise<void>((resolve) => (started = resolve));
-	expect(await chat.receive(message(threadId, "m2", "Wait for CI"))).toBe("follow");
+	await chat.receive(message(threadId, "m2", "Wait for CI"));
+	expect(await routed(t.runtime.queue, "m2")).toBe("follow");
 	// The run blocks in its tool until the release below.
 	await waiting;
 	expect(faux.state.callCount).toBe(4);

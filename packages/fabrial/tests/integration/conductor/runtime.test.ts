@@ -422,112 +422,22 @@ for (const kind of ["event", "timer"] as const) {
 	);
 }
 
-test("dispatchOwner wins concurrent owner/observer emissions on the same workflow, including observer-first insertion", async () => {
-	const seen: { input: Json; metadata: InvocationMetadata }[] = [];
-	const withThread: InvocationMetadata = {
-		...metadata,
-		replyTo: { kind: "thread", provider: "test", threadId: "thread" },
-	};
-	const definitions = [
-		workflow(
-			"mixed",
-			async (input, ctx) => {
-				seen.push({ input, metadata: ctx.metadata });
-				return null;
-			},
-			{
-				triggers: [
-					{ event: "test.event", role: "owner" },
-					{ event: "test.other", role: "observer" },
-				],
-			},
-		),
-	];
-	const first = await setup(definitions);
-	for (let i = 0; i < 12; i++) {
-		const options = {
-			metadata: withThread,
-			id: `delivery-${i}`,
-			dispatchId: `ingress-${i}`,
-			dispatchOwner: { workflow: "mixed", event: "test.event" },
-		};
-		await Promise.all([
-			first.emit("test.other", { key: `observer-${i}` }, options),
-			first.emit("test.event", { key: `owner-${i}` }, { ...options, owner: "mixed" }),
-		]);
-	}
-	// Force the old bug: observer routing completes before the owner even emits.
-	const options = {
-		metadata: withThread,
-		id: "delayed",
-		dispatchId: "delayed",
-		dispatchOwner: { workflow: "mixed", event: "test.event" },
-	};
-	await first.emit("test.other", { key: "observer-delayed" }, options);
-	await expect
-		.poll(async () => {
-			const [row] = await sql<
-				{ done: boolean }[]
-			>`select completed_at is not null as done from pgconductor._private_executions
-			where task_key = 'fabrial.route:mixed' and payload -> 'payload' ->> 'key' = 'observer-delayed'`;
-			return row?.done;
-		}, poll)
-		.toBe(true);
-	await first.emit("test.event", { key: "owner-delayed" }, { ...options, owner: "mixed" });
-	await expect.poll(() => seen.length, poll).toBe(13);
-	expect(seen.every((entry) => (entry.input as { key: string }).key.startsWith("owner-"))).toBe(
-		true,
-	);
-	for (const entry of seen) expect(entry.metadata).toEqual(withThread);
-	// Handler bodies are replayable: wait for native settlement before restarting.
-	await expect
-		.poll(async () => {
-			const [row] = await sql<
-				{ count: number }[]
-			>`select count(*)::int as count from pgconductor._private_executions
-			where task_key = 'mixed' and completed_at is not null`;
-			return row?.count;
-		}, poll)
-		.toBe(13);
-	await first.stop();
-	runtimes = runtimes.filter((entry) => entry !== first);
-	const second = await setup(definitions);
-	await second.emit("test.other", { key: "observer-redelivery" }, { ...options, id: "again" });
-	await second.emit(
-		"test.event",
-		{ key: "owner-redelivery" },
-		{ ...options, id: "again", owner: "mixed" },
-	);
-	await expect
-		.poll(async () => {
-			const [row] = await sql<
-				{ count: number }[]
-			>`select count(*)::int as count from pgconductor._private_executions where task_key = 'fabrial.route:mixed' and completed_at is not null`;
-			return row?.count;
-		}, poll)
-		.toBe(28);
-	expect(seen).toHaveLength(13);
-});
-
-test("owner routing, observers, overlapping subscriptions, clean payload and concurrent emit dedupe", async () => {
+test("event triggers start each matching workflow with the event's payload and metadata; concurrent emits dedupe", async () => {
 	const seen: { workflow: string; input: Json; metadata: InvocationMetadata }[] = [];
 	const handler: RuntimeWorkflow["handler"] = async (input, ctx) => {
 		seen.push({ workflow: ctx.workflow, input, metadata: ctx.metadata });
 		return null;
 	};
 	const runtime = await setup([
-		workflow("owner", handler, {
-			triggers: [
-				{ event: "test.event", role: "owner" },
-				{ event: "test.event", role: "owner", filter: { key: ["yes"] } },
-			],
+		workflow("overlapping", handler, {
+			triggers: [{ event: "test.event", filter: { key: ["yes", "no"] } }],
 		}),
-		workflow("wrong-owner", handler, { triggers: [{ event: "test.event", role: "owner" }] }),
-		workflow("observer", handler, { triggers: [{ event: "test.event", role: "observer" }] }),
+		workflow("other", handler, { triggers: [{ event: "test.event" }] }),
+		workflow("filtered", handler, { triggers: [{ event: "test.event", filter: { key: ["no"] } }] }),
 	]);
 	await Promise.all(
 		Array.from({ length: 8 }, () =>
-			runtime.emit("test.event", { key: "yes" }, { metadata, owner: "owner", id: "delivery" }),
+			runtime.emit("test.event", { key: "yes" }, { metadata, id: "delivery" }),
 		),
 	);
 	await expect.poll(() => seen.length, poll).toBe(2);
@@ -539,20 +449,22 @@ test("owner routing, observers, overlapping subscriptions, clean payload and con
 			return row?.count;
 		}, poll)
 		.toBe(1);
-	await runtime.emit("test.event", { key: "yes" }, { metadata, owner: "owner", id: "delivery" });
-	expect(seen.find((entry) => entry.workflow === "owner")).toEqual({
-		workflow: "owner",
-		input: { key: "yes" },
-		metadata,
-	});
-	expect(seen.find((entry) => entry.workflow === "observer")?.metadata).toEqual({
-		...metadata,
-	});
-	await runtime.emit("test.event", { key: "yes" }, { metadata, id: "no-owner" });
-	await expect.poll(() => seen.length, poll).toBe(3);
-	expect(seen.at(-1)?.workflow).toBe("observer");
+	await runtime.emit("test.event", { key: "yes" }, { metadata, id: "delivery" });
+	for (const workflow of ["overlapping", "other"])
+		expect(seen.find((entry) => entry.workflow === workflow)).toEqual({
+			workflow,
+			input: { key: "yes" },
+			metadata,
+		});
+	await runtime.emit("test.event", { key: "no" }, { metadata, id: "other-delivery" });
+	await expect.poll(() => seen.length, poll).toBe(5);
+	expect(
+		seen
+			.slice(2)
+			.map((entry) => entry.workflow)
+			.sort(),
+	).toEqual(["filtered", "other", "overlapping"]);
 });
-
 test("invoke/start/emit inherit metadata; overrides affect only the child; starts and client invocations dedupe after completion", async () => {
 	const seen: InvocationMetadata[] = [];
 	let starts = 0;
@@ -600,7 +512,7 @@ test("invoke/start/emit inherit metadata; overrides affect only the child; start
 				emitted.push(ctx.metadata);
 				return null;
 			},
-			{ triggers: [{ event: "test.other", role: "observer" }] },
+			{ triggers: [{ event: "test.other" }] },
 		),
 	]);
 	const ids = await Promise.all(
@@ -835,7 +747,7 @@ test("retry exhaustion and suspended cancellation emit terminal notifications th
 				seen.push(input);
 				return null;
 			},
-			{ triggers: [{ event: EXECUTION_SETTLED_EVENT, role: "observer" }] },
+			{ triggers: [{ event: EXECUTION_SETTLED_EVENT }] },
 		),
 	]);
 	const failed = await runtime.invoke("failure", {}, { metadata });
@@ -890,7 +802,7 @@ test("cron registers native schedules and executes through the metadata wrapper"
 	void runtime;
 	const rows = await sql<
 		{ id: string }[]
-	>`select id from pgconductor._private_executions where task_key = 'fabrial.route:cron' and cron_expression = '* * * * *'`;
+	>`select id from pgconductor._private_executions where task_key = 'cron' and cron_expression = '* * * * *'`;
 	expect(rows.length).toBeGreaterThan(0);
 	await sql`update pgconductor._private_executions set run_at = now() where id = ${rows[0]!.id}::uuid`;
 	await expect.poll(() => seen, poll).toBeDefined();
@@ -900,35 +812,6 @@ test("cron registers native schedules and executes through the metadata wrapper"
 		origin: null,
 		requestedBy: null,
 	});
-});
-
-test("an observer match on the named owner does not gain thread ownership when its owner filter misses", async () => {
-	const seen: InvocationMetadata[] = [];
-	const runtime = await setup([
-		workflow(
-			"mixed",
-			async (_input, ctx) => {
-				seen.push(ctx.metadata);
-				return null;
-			},
-			{
-				triggers: [
-					{ event: "test.event", role: "owner", filter: { key: ["owner"] } },
-					{ event: "test.event", role: "observer" },
-				],
-			},
-		),
-	]);
-	const withThread: InvocationMetadata = {
-		...metadata,
-		replyTo: { kind: "thread", provider: "test", threadId: "thread" },
-	};
-	await runtime.emit("test.event", { key: "observer" }, { metadata: withThread, owner: "mixed" });
-	await expect.poll(() => seen.length, poll).toBe(1);
-	expect(seen[0]).toEqual({ ...withThread, replyTo: null });
-	await runtime.emit("test.event", { key: "owner" }, { metadata: withThread, owner: "mixed" });
-	await expect.poll(() => seen.length, poll).toBe(2);
-	expect(seen[1]).toEqual(withThread);
 });
 
 test("waitForAny races concurrent events, replays a single winner, and excludes pre-wait events", async () => {
@@ -1220,10 +1103,7 @@ test("emit dedupe is event-scoped and retains the first payload across restart",
 				return null;
 			},
 			{
-				triggers: [
-					{ event: "test.event", role: "observer" },
-					{ event: "test.other", role: "observer" },
-				],
+				triggers: [{ event: "test.event" }, { event: "test.other" }],
 			},
 		),
 	];
@@ -1245,75 +1125,6 @@ test("emit dedupe is event-scoped and retains the first payload across restart",
 	expect(rows).toHaveLength(2);
 	expect(rows[0]?.payload.payload.key).toBe("first");
 	expect(rows[0]?.metadata).toEqual(metadata);
-});
-
-test("dispatchId dedupes a workflow across event categories and restart without merging event receipts", async () => {
-	const seen: { workflow: string; input: Json }[] = [];
-	const definitions = ["observer", "other-observer"].map((name) =>
-		workflow(
-			name,
-			async (input, ctx) => {
-				seen.push({ workflow: ctx.workflow, input });
-				return null;
-			},
-			{
-				triggers: [
-					{ event: "test.event", role: "observer" },
-					{ event: "test.other", role: "observer" },
-				],
-			},
-		),
-	);
-	const first = await setup(definitions);
-	await Promise.all([
-		first.emit("test.event", { key: "one" }, { metadata, id: "delivery", dispatchId: "ingress" }),
-		first.emit("test.other", { key: "two" }, { metadata, id: "delivery", dispatchId: "ingress" }),
-	]);
-	await expect.poll(() => seen.length, poll).toBe(2);
-	await expect
-		.poll(async () => {
-			const [row] = await sql<{ count: number }[]>`
-			select count(*)::int as count from pgconductor._private_executions
-			where task_key like 'fabrial.route:%' and completed_at is not null
-		`;
-			return row?.count;
-		}, poll)
-		.toBe(4);
-	await expect
-		.poll(async () => {
-			const [row] = await sql<{ count: number }[]>`
-			select count(*)::int as count from pgconductor._private_executions
-			where task_key = any(${definitions.map((definition) => definition.name)}) and completed_at is not null
-		`;
-			return row?.count;
-		}, poll)
-		.toBe(2);
-	const original = [...seen];
-	await first.stop();
-	runtimes = runtimes.filter((entry) => entry !== first);
-	const second = await setup(definitions);
-	// A distinct receipt in the same ingress still must not start either workflow again.
-	await second.emit(
-		"test.event",
-		{ key: "three" },
-		{ metadata, id: "another", dispatchId: "ingress" },
-	);
-	await expect
-		.poll(async () => {
-			const [row] = await sql<{ count: number }[]>`
-			select count(*)::int as count from pgconductor._private_executions
-			where task_key like 'fabrial.route:%' and completed_at is not null
-		`;
-			return row?.count;
-		}, poll)
-		.toBe(6);
-	expect(seen).toEqual(original);
-	const receipts = await sql<{ id: string }[]>`
-		select id from pgconductor._private_executions where task_key = 'pgconductor.event-dispatch'
-	`;
-	expect(receipts).toHaveLength(3);
-	await second.emit("test.other", {}, { metadata, dispatchId: "next-ingress" });
-	await expect.poll(() => seen.length, poll).toBe(4);
 });
 
 test("failed settlement hooks cannot starve healthy deliveries beyond the first monitor batch", async () => {

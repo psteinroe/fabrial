@@ -135,6 +135,13 @@ export function useCoreApp() {
 			...config,
 			logger,
 		});
+		const routes = async () =>
+			(
+				await db.sql<{ id: string }[]>`
+					select id from pgconductor._private_executions
+					where queue = ${runtime.queue} and task_key = 'fabrial.route'
+					order by created_at, id`
+			).map((row) => row.id);
 		/** Executions of `name` in the order they first ran. */
 		const ids = (name: string) => [
 			...new Set(attempts.filter((a) => a.workflow === name).map((a) => a.executionId)),
@@ -147,6 +154,13 @@ export function useCoreApp() {
 			/** The `index`th execution of `name`, once it ran. */
 			execution: async (name = "owner", index = 0) =>
 				db.execution(await until(`${name} #${index} to run`, async () => ids(name)[index])),
+			/** Executions of the router, oldest first: it runs without middleware, so it isn't recorded. */
+			routes,
+			/** The `index`th routing decision, once the router finished it. */
+			route: async (index = 0) =>
+				(await db
+					.execution(await until(`route #${index} to run`, async () => (await routes())[index]))
+					.output()) as { route: string; owner: { workflow: string } | null },
 			/** Invocation metadata of the first execution of `name`. */
 			metadataOf: (name: string) => attempts.find((a) => a.workflow === name)?.metadata,
 		};

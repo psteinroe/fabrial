@@ -1,3 +1,5 @@
+import type { AnyWorkflow } from "../../../src/workflow.ts";
+import { until } from "../../conductor/helper.ts";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
@@ -101,10 +103,10 @@ describe("follow records", () => {
 		triggers: [trigger({ event: "chat.message", filter: { channelId: ["general"] } })],
 	});
 	const ref = { kind: "thread", provider: "chat", threadId: "chat:general:t1" } as const;
-	const start = (agents: ReturnType<typeof fakeAgents>) => {
+	const start = (agents: ReturnType<typeof fakeAgents>, workflows: AnyWorkflow[] = []) => {
 		const runtime = db.runtime();
 		const chat = new FakeChat(() => runtime.now!());
-		const app = testApp(f, { workflows: [], routedAgents: [agent], agents, runtime, chat });
+		const app = testApp(f, { workflows, routedAgents: [agent], agents, runtime, chat });
 		return { app, chat };
 	};
 
@@ -112,15 +114,15 @@ describe("follow records", () => {
 		const agents = fakeAgents();
 		const { app, chat } = start(agents);
 		await app.start();
-		expect(await chat.receive(message("m1", ref.threadId))).toBe("new");
-		const session = agents.sent[0]!.session;
+		expect(await chat.receive(message("m1", ref.threadId))).toBe("accepted");
+		const session = (await until("the delivery", async () => agents.sent[0]))!.session;
 		expect(session).toBe("chat:chat:general:t1");
 		const thread = await chat.thread(ref);
+		await until("the follow record", async () => (await thread.getState())?.follows);
 		expect((await thread.getState())?.follows).toEqual([{ session, agent: "support" }]);
 		// The follow record, not the trigger, routes the next message: it needs no mention or channel match.
-		expect(await chat.receive({ ...message("m2", ref.threadId), channelId: "other" })).toBe(
-			"follow",
-		);
+		await chat.receive({ ...message("m2", ref.threadId), channelId: "other" });
+		await until("the second delivery", async () => agents.sent[1]);
 		expect(agents.sent.map((each) => [each.session, each.agent])).toEqual([
 			[session, "support"],
 			[session, "support"],
@@ -142,10 +144,15 @@ describe("follow records", () => {
 		const { app, chat } = start(agents);
 		await app.start();
 		await chat.receive(message("m1", ref.threadId));
+		const thread = await chat.thread(ref);
+		await until("the follow record", async () => (await thread.getState())?.follows);
 		// Bob never wrote in the thread; he may stop it all the same. A redelivered stop is dropped.
 		const bob = { provider: "chat", installationId: "w", subjectId: "B" };
 		await chat.cancel(ref, bob, "stop-1");
 		await chat.cancel(ref, bob, "stop-1");
+		await until("the stop", async () => stops[0]);
+		await chat.receive(message("m2", ref.threadId));
+		await until("the next delivery", async () => agents.sent[1]);
 		expect(stops).toEqual([
 			[
 				{ session: "chat:chat:general:t1", agent: "support" },
@@ -156,32 +163,72 @@ describe("follow records", () => {
 		await app.stop();
 	});
 
-	it("processes a redelivery after a failed delivery, exactly once", async () => {
+	it("retries a partial delivery: the router resumes after the signals it sent", async () => {
 		const agents = fakeAgents();
 		const connect = agents.connect.bind(agents);
-		let failures = 1;
+		const attempts: string[] = [];
 		agents.connect = (host) => {
 			const connected = connect(host);
 			const deliver = connected.agents.deliver!.bind(connected.agents);
 			connected.agents.deliver = async (target, request) => {
-				if (failures-- > 0) throw new Error("agents unavailable");
+				attempts.push(request.session);
+				// The second conversation's first delivery fails, after the first one was signalled.
+				if (attempts.length === 2) throw new Error("agents unavailable");
 				return deliver(target, request);
 			};
 			return connected;
 		};
 		const { app, chat } = start(agents);
 		await app.start();
-		await expect(chat.receive(message("m1", ref.threadId))).rejects.toThrow("agents unavailable");
 		const thread = await chat.thread(ref);
-		expect((await thread.getState())?.ingestedDedupeIds?.[0]?.pending).toMatchObject({
-			route: "new",
+		await thread.updateState(() => ({
+			follows: [
+				{ session: "app:one", agent: "support" },
+				{ session: "app:two", agent: "support" },
+			],
+		}));
+		await chat.receive(message("m1", ref.threadId));
+		await chat.receive(message("m1", ref.threadId));
+		await until("the failed delivery", async () => attempts[1]);
+		// Conductor retries the router after its backoff, scheduled once the failed attempt is released.
+		await until("the router's retry to be scheduled", async () => {
+			const [row] = await db.sql<{ id: string }[]>`
+				select id from pgconductor._private_executions
+				where task_key = 'fabrial.route' and last_error is not null and locked_at is null`;
+			return row?.id;
 		});
-		// The provider redelivers: the pending route is replayed, then confirmed.
-		expect(await chat.receive(message("m1", ref.threadId))).toBe("new");
-		expect(await chat.receive(message("m1", ref.threadId))).toBe("ignored");
-		expect(agents.sent).toHaveLength(1);
-		expect((await thread.getState())?.ingestedDedupeIds).toEqual([
-			{ kind: "message", id: "m1", at: expect.any(Number) },
+		await db.clock.advance("1m");
+		await until("the retried delivery", async () => agents.sent[1]);
+		expect(agents.sent.map((each) => each.session)).toEqual(["app:one", "app:two"]);
+		expect(attempts).toEqual(["app:one", "app:two", "app:two"]);
+		await app.stop();
+	});
+
+	it("observers receive messages in a followed thread; the followers steer", async () => {
+		const agents = fakeAgents();
+		const seen: unknown[] = [];
+		const observer = f.defineWorkflow({
+			name: "observer",
+			triggers: [trigger({ event: "chat.message", observe: true })],
+			run: async (input, ctx) => {
+				seen.push([(input as ChatMessage).messageId, ctx.thread]);
+			},
+		});
+		const { app, chat } = start(agents, [observer]);
+		await app.start();
+		await chat.receive(message("m1", ref.threadId));
+		await until("the first delivery", async () => agents.sent[0]);
+		await until(
+			"the follow record",
+			async () => (await (await chat.thread(ref)).getState())?.follows,
+		);
+		await chat.receive({ ...message("m2", ref.threadId), channelId: "other" });
+		await until("the observer in the followed thread", async () => seen[1]);
+		await until("the second delivery", async () => agents.sent[1]);
+		// Observers run without the thread, once per message.
+		expect(seen).toEqual([
+			["m1", undefined],
+			["m2", undefined],
 		]);
 		await app.stop();
 	});

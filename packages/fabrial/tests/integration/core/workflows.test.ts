@@ -44,7 +44,7 @@ describe("routing and lifecycle", () => {
 		const test = setup([broad, specific, observer]);
 		await test.app.start();
 		await test.chat.receive(message("initial"));
-		expect(await test.chat.receive(message("initial"))).toBe("ignored");
+		expect(await test.chat.receive(message("initial"))).toBe("accepted");
 		await (await test.execution("specific")).output();
 		await (await test.execution("observer")).output();
 		expect(seen.sort()).toEqual(["observer", "specific"]);
@@ -90,22 +90,36 @@ describe("routing and lifecycle", () => {
 		expect(await (await test.app.fetch(new Request("https://test/chat"))).text()).toBe("chat");
 		expect((await test.app.fetch(new Request("https://test/missing"))).status).toBe(404);
 	});
-	it("ignores bot messages and clears finished interactions", async () => {
+	it("ignores bot messages and leaves no receipts", async () => {
 		const test = setup([workflow(async () => {})]);
 		await test.app.start();
 		const bot = message("bot");
 		bot.author.isBot = true;
 		expect(await test.chat.receive(bot)).toBe("ignored");
-		await test.chat.receive(message("human"));
+		expect(await test.chat.receive(message("human"))).toBe("accepted");
 		await (await test.execution()).output();
 		expect(test.ids("owner")).toHaveLength(1);
+		expect(await test.routes()).toHaveLength(1);
+		// A handled thread is subscribed; routing stores nothing in it.
 		const thread = await test.chat.thread(surface);
-		await eventually("the settled receipt", async () =>
-			Boolean((await thread.getState())?.ingestedDedupeIds?.every((receipt) => !receipt.pending)),
-		);
-		expect((await thread.getState())?.ingestedDedupeIds).toEqual([
-			{ kind: "message", id: "human", at: expect.any(Number) },
+		expect(thread.subscribed).toBe(true);
+		expect(await thread.getState()).toBeNull();
+	});
+	it("ignores a message nothing handles: no state, no subscription", async () => {
+		const test = setup([
+			defineWorkflow({
+				name: "owner",
+				triggers: [trigger({ event: "chat.mentioned" })],
+				run: async () => {},
+			}),
 		]);
+		await test.app.start();
+		expect(await test.chat.receive(message("unhandled"))).toBe("accepted");
+		expect(await test.route()).toMatchObject({ route: "ignored", owner: null });
+		const thread = await test.chat.thread(surface);
+		expect(thread.subscribed).toBe(false);
+		expect(await thread.getState()).toBeNull();
+		expect(test.ids("owner")).toEqual([]);
 	});
 });
 
@@ -469,7 +483,7 @@ describe("multi-category chat ingress", () => {
 		expect(test.ids("specific")).toHaveLength(1);
 		expect(test.ids("observer")).toHaveLength(1);
 	});
-	it("detects dynamic cross-category ownership ties before emitting", async () => {
+	it("fails the route of a dynamic cross-category ownership tie without starting anything", async () => {
 		const a = workflow(async () => {});
 		const b = defineWorkflow({
 			name: "other",
@@ -478,13 +492,15 @@ describe("multi-category chat ingress", () => {
 		});
 		const test = setup([a, b]);
 		await test.app.start();
-		await expect(
-			test.chat.receive(message("tie"), { events: [event, "chat.mentioned"] }),
-		).rejects.toThrow("Ambiguous owner");
-		// Nothing was emitted, so redelivering the same message is still new and still ambiguous.
-		await expect(
-			test.chat.receive(message("tie"), { events: [event, "chat.mentioned"] }),
-		).rejects.toThrow("Ambiguous owner");
+		expect(await test.chat.receive(message("tie"), { events: [event, "chat.mentioned"] })).toBe(
+			"accepted",
+		);
+		const route = await until("the route", async () => (await test.routes())[0]);
+		await until("the tie", async () => {
+			const [row] = await db.sql<{ last_error: string | null }[]>`
+				select last_error from pgconductor._private_executions where id = ${route}::uuid`;
+			return row?.last_error?.includes("Ambiguous owner") ? true : undefined;
+		});
 		expect([...test.ids("owner"), ...test.ids("other")]).toEqual([]);
 	});
 	it("dedupes all categories across redelivery after completion", async () => {
@@ -569,88 +585,48 @@ describe("lazy channel threads", () => {
 	});
 });
 
-describe("ingress tombstones and reservation recovery", () => {
-	/** Stored `fabrial.approval.decided` events: an engine fact no workflow observes here. */
-	const decided = async () => {
+describe("ingress dedupe", () => {
+	/** Stored events of `name`: an engine fact no workflow observes here. */
+	const emitted = async (name: string) => {
 		const [row] = await db.sql<{ count: number }[]>`
 			select count(*)::int as count from pgconductor._private_executions
-			where task_key = 'pgconductor.event-dispatch' and payload ->> 'eventKey' = 'fabrial.approval.decided'
+			where task_key = 'pgconductor.event-dispatch' and payload ->> 'eventKey' = ${name}
 		`;
 		return row!.count;
 	};
 
-	it("keeps the last 100 receipts across settlements; actions dedupe in the runtime", async () => {
-		const test = setup([workflow(async () => {})]);
-		await test.app.start();
-		const thread = await test.chat.thread(surface);
-		const settled = async () =>
-			Boolean((await thread.getState())?.ingestedDedupeIds?.every((receipt) => !receipt.pending));
-		await test.chat.receive(message("inbound-0"));
-		await (await test.execution("owner", 0)).output();
-		await eventually("the first receipt to settle", settled);
-		// Fill the window with the receipts ingress writes, rather than running 99 more executions.
-		await thread.updateState((state) => ({
-			...state,
-			ingestedDedupeIds: [
-				...state!.ingestedDedupeIds!,
-				...Array.from({ length: 99 }, (_, i) => ({
-					kind: "message" as const,
-					id: `inbound-${i + 1}`,
-					at: state!.ingestedDedupeIds![0]!.at,
-				})),
+	it("routes a redelivered multi-category message once; actions dedupe the same way", async () => {
+		const observer = defineWorkflow({
+			name: "observer",
+			triggers: [
+				trigger({ event, observe: true }),
+				trigger({ event: "chat.mentioned", observe: true }),
 			],
-		}));
-		await test.chat.receive(message("inbound-100"));
-		await (await test.execution("owner", 1)).output();
-		await eventually("the newest receipt to settle", settled);
-		expect((await thread.getState())?.ingestedDedupeIds).toHaveLength(100);
-		expect((await thread.getState())?.ingestedDedupeIds?.[0]?.id).toBe("inbound-1");
-		expect(await test.chat.receive(message("inbound-100"))).toBe("ignored");
-		// Beyond the bounded window the runtime still dedupes; the orphaned slot must expire.
-		expect(await test.chat.receive(message("inbound-0"))).toBe("new");
-		await db.clock.advance("10m");
+			run: async () => {},
+		});
+		const test = setup([workflow(async () => {}), observer]);
+		await test.app.start();
+		for (let i = 0; i < 2; i++)
+			expect(await test.chat.receive(message("multi"), { events: [event, "chat.mentioned"] })).toBe(
+				"accepted",
+			);
+		expect(await test.route()).toMatchObject({ route: "new", owner: { workflow: "owner" } });
+		await (await test.execution()).output();
+		await (await test.execution("observer")).output();
+		// Redelivered after routing finished: still the one ingress event.
+		await test.chat.receive(message("multi"), { events: [event, "chat.mentioned"] });
+		expect(await emitted("fabrial.ingress")).toBe(1);
+		expect(await test.routes()).toHaveLength(1);
+		expect(test.ids("owner")).toHaveLength(1);
+		expect(test.ids("observer")).toHaveLength(1);
 		const ref = { ...surface, messageId: "card" };
 		for (let i = 0; i < 2; i++)
 			await test.chat.click(ref, "fabrial.approval.approve:a", alice.identities[0]!, {
-				dedupeId: "inbound-100",
+				dedupeId: "click",
 			});
-		expect(await decided()).toBe(1);
-		await test.chat.receive(message("next"));
-		await (await test.execution("owner", 2)).output();
-		await test.chat.click(ref, "fabrial.approval.approve:a", alice.identities[0]!, {
-			dedupeId: "inbound-100",
-		});
-		expect(await decided()).toBe(1);
-		// The redelivered inbound-0 started nothing: the owners ran for inbound-0, inbound-100 and next.
-		expect(test.ids("owner")).toHaveLength(3);
-		const state = await thread.getState();
-		expect(state?.ingestedDedupeIds).toHaveLength(100);
-		expect(state?.ingestedDedupeIds?.every((receipt) => receipt.kind === "message")).toBe(true);
-		state!.ingestedDedupeIds![0]!.id = "mutated snapshot";
-		expect((await thread.getState())?.ingestedDedupeIds?.[0]?.id).not.toBe("mutated snapshot");
-		await db.clock.advance("30d");
-		expect(await thread.getState()).toBeNull();
-	});
-	it("uses the final updater decision when a lock retry sees an ingress tombstone", async () => {
-		const test = setup([workflow(async () => {})]);
-		await test.app.start();
-		const thread = await test.chat.thread(surface);
-		const update = thread.updateState.bind(thread);
-		let retried = false;
-		thread.updateState = async (fn) => {
-			if (retried) return update(fn);
-			retried = true;
-			const speculative = fn(null);
-			await update(() => speculative);
-			return update(fn);
-		};
-		// The retry sees the pending receipt of its own attempt and dispatches its route once.
-		expect(await test.chat.receive(message("retry"))).toBe("new");
-		await (await test.execution()).output();
-		expect(test.ids("owner")).toHaveLength(1);
-		expect((await thread.getState())?.ingestedDedupeIds).toEqual([
-			{ kind: "message", id: "retry", at: expect.any(Number) },
-		]);
+		await test.route(1);
+		expect(await emitted("fabrial.approval.decided")).toBe(1);
+		expect(await test.routes()).toHaveLength(2);
 	});
 });
 

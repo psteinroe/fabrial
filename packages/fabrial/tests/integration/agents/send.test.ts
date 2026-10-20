@@ -193,9 +193,9 @@ it("lands messages from different threads in one channel conversation; each fina
 			return fauxAssistantMessage("Answer two");
 		},
 	]);
-	expect(await t.chat.receive(t.message("m1", "t1", "first <question>"))).toBe("new");
+	expect(await t.chat.receive(t.message("m1", "t1", "first <question>"))).toBe("accepted");
 	await t.settle();
-	expect(await t.chat.receive(t.message("m2", "t2", "second"))).toBe("new");
+	expect(await t.chat.receive(t.message("m2", "t2", "second"))).toBe("accepted");
 	await t.settle();
 	// One conversation saw both messages, attributed and escaped.
 	expect(second).toContain("first &lt;question&gt;");
@@ -249,8 +249,9 @@ it("steers a busy run with a second message, replies in the newest input's threa
 	try {
 		await started;
 		// The second message reaches the busy Session's execution as a signal.
-		expect(await t.chat.receive(t.message("m2", "t2", "also this"))).toBe("new");
-		expect(await t.chat.receive(t.message("m2", "t2", "also this"))).toBe("ignored");
+		expect(await t.chat.receive(t.message("m2", "t2", "also this"))).toBe("accepted");
+		// A redelivery is accepted again; the ingress emit dedupes it.
+		expect(await t.chat.receive(t.message("m2", "t2", "also this"))).toBe("accepted");
 		await expect
 			.poll(async () => (await submitted(`chat:channel:${t.channel}`)).length, { timeout: 10_000 })
 			.toBe(2);
@@ -388,7 +389,7 @@ it.each(["notification", "message"] as const)(
 			async () => {
 				// Steer while this final answer is in flight; answer only once the driver admitted it.
 				if (kind === "message")
-					expect(await other.chat.receive(t.message("m2", "t2", "late steer"))).toBe("new");
+					expect(await other.chat.receive(t.message("m2", "t2", "late steer"))).toBe("accepted");
 				else
 					await other.runtime.invoke(
 						t.notify.name,
@@ -455,7 +456,7 @@ it.each(["notification", "message"] as const)(
 			async () => {
 				// The steer queues behind this generation, which then fails: Pi leaves it in its inbox.
 				if (kind === "message")
-					expect(await other.chat.receive(t.message("m2", "t2", "queued steer"))).toBe("new");
+					expect(await other.chat.receive(t.message("m2", "t2", "queued steer"))).toBe("accepted");
 				else
 					await other.runtime.invoke(
 						t.notify.name,
@@ -500,8 +501,9 @@ it.each(["notification", "message"] as const)(
 		expect(t.faux.state.callCount).toBe(2);
 		if (kind === "message") {
 			// The failed input got the error reply in its thread; the queued one its answer in its own.
+			// "overloaded" is transient and tests retry nothing, so the retry budget ran out.
 			const [failure] = (await t.posts("t1")).map((post) => post.content as string);
-			expect(failure).toMatch(FAILED);
+			expect(failure).toMatch(UNREACHABLE);
 			const answers = [
 				...(await t.posts("t2")),
 				...(
@@ -823,7 +825,7 @@ it(
 		// The crashed attempt is retried after Conductor's backoff.
 		await t.settle(RETRY_MS);
 		expect(crashed).toBe(true);
-		expect(await t.chat.receive(t.message("m1", "t1"))).toBe("ignored");
+		expect(await t.chat.receive(t.message("m1", "t1"))).toBe("accepted");
 		// The same input signalled again, as a redelivered Conductor signal would be.
 		const [request] = await submitted(`chat:channel:${t.channel}`);
 		const input = signals.mock.calls.find(([start]) => start.signal.id === request)![0].signal

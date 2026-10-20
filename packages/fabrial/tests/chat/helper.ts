@@ -53,7 +53,7 @@ export function setup(state: StateAdapter = createMemoryState()) {
 		clients: () => ({}),
 		chat: () => connection.port,
 		ingest: vi.fn(),
-		receiveMessage: vi.fn(async () => "new" as const),
+		receiveMessage: vi.fn(async () => "accepted" as const),
 		receiveAction: vi.fn(),
 		receiveCancellation: vi.fn(),
 		resolvePrincipal: vi.fn(),

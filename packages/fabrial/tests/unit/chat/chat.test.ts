@@ -54,36 +54,40 @@ describe("inbound Chat SDK dispatch", () => {
 			isDM: true,
 			events: ["dm", "mentioned"],
 		},
-	])("normalizes $name and subscribes new work", async ({ thread, mention, isDM, events }) => {
-		const env = setup();
-		await env.connection.port.thread({ ...ref, threadId: thread });
-		await env.sdk().processMessage(env.adapter, thread, message("root-1", "hello", mention));
-		expect(env.host.receiveMessage).toHaveBeenCalledExactlyOnceWith(
-			{
-				provider: "slack",
-				threadId: thread,
-				channelId: isDM ? "D1" : "C1",
-				messageId: "root-1",
-				text: "hello",
-				author: { identity: actor, name: "Alice", isBot: false },
-				isDM,
-				isMention: mention,
-				isNewThread: true,
-				sentAt: "2026-01-01T00:00:00.000Z",
-			},
-			{
-				events: events.map((event) => `slack.${event}`),
-				dedupeId: JSON.stringify(["slack", isDM ? "D1" : "C1", "root-1"]),
-			},
-		);
-		expect(await env.state.isSubscribed(thread)).toBe(true);
-	});
+	])(
+		"normalizes $name and leaves subscribing to routing",
+		async ({ thread, mention, isDM, events }) => {
+			const env = setup();
+			await env.connection.port.thread({ ...ref, threadId: thread });
+			await env.sdk().processMessage(env.adapter, thread, message("root-1", "hello", mention));
+			expect(env.host.receiveMessage).toHaveBeenCalledExactlyOnceWith(
+				{
+					provider: "slack",
+					threadId: thread,
+					channelId: isDM ? "D1" : "C1",
+					messageId: "root-1",
+					text: "hello",
+					author: { identity: actor, name: "Alice", isBot: false },
+					isDM,
+					isMention: mention,
+					isNewThread: true,
+					sentAt: "2026-01-01T00:00:00.000Z",
+				},
+				{
+					events: events.map((event) => `slack.${event}`),
+					dedupeId: JSON.stringify(["slack", isDM ? "D1" : "C1", "root-1"]),
+				},
+			);
+			// Ingress only stores the message; the routing workflow subscribes threads it handles.
+			expect(await env.state.isSubscribed(thread)).toBe(false);
+		},
+	);
 
 	it("routes subscribed replies and subscribed mentions once, retaining classification", async () => {
 		const env = setup();
 		await env.connection.port.thread(ref);
 		await env.state.subscribe(ref.threadId);
-		vi.mocked(env.host.receiveMessage).mockResolvedValue("follow");
+		vi.mocked(env.host.receiveMessage).mockResolvedValue("accepted");
 		await env.sdk().processMessage(env.adapter, ref.threadId, message("reply-1", "followup"));
 		await env.sdk().processMessage(env.adapter, ref.threadId, message("reply-2", "mention", true));
 		expect(env.host.receiveMessage).toHaveBeenCalledTimes(2);
@@ -340,7 +344,7 @@ it("maps application signal aborts with authenticated reasons, never impersonati
 			Object.defineProperty(thread, "signal", { value: controller.signal });
 			vi.mocked(env.host.receiveMessage).mockImplementation(async () => {
 				controller.abort(authenticated ? { actor, dedupeId: "application-stop" } : undefined);
-				return "new";
+				return "accepted";
 			});
 			await receive(thread, message(`abort-${authenticated}`, "hello"));
 			expect(env.host.receiveCancellation).toHaveBeenCalledTimes(authenticated ? 1 : 0);
