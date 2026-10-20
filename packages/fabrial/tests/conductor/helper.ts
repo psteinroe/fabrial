@@ -20,7 +20,10 @@ import { createTestClock, type TestClock } from "../../src/testing.ts";
 export interface ConductorFixture {
 	/** The test file's database. */
 	readonly url: string;
-	/** Single-connection pool (`max: 1`) shared with every runtime, so all of them see the clock. */
+	/**
+	 * Single-connection pool (`max: 1`) shared with every runtime, so all of them see the clock. Replaced
+	 * after a test whose runtimes don't stop in time, so the next test doesn't queue behind them.
+	 */
 	readonly sql: postgres.Sql;
 	/** Database time for `sql`; reset to real time after each test. */
 	readonly clock: TestClock;
@@ -65,6 +68,8 @@ export interface ExecutionHandle {
 /** Below the integration `testTimeout`, so a stuck wait reports what it waited for. */
 const WAIT_MS = 40_000;
 const POLL_MS = 20;
+/** How long the runtimes of a finished test may take to stop before the fixture abandons them. */
+const STOP_MS = 20_000;
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
 const testWorker = { pollIntervalMs: POLL_MS, flushIntervalMs: POLL_MS, fetchBatchSize: 10 };
 
@@ -130,23 +135,30 @@ export function useConductor(): ConductorFixture {
 		const location = new URL(inject("fabrialDatabaseUrl"));
 		location.pathname = `/${database}`;
 		url = location.toString();
-		// Fake time is a session setting: the clock only holds for queries on this one connection.
-		sql = postgres(url, { max: 1, onnotice: () => {} });
-		clock = createTestClock(sql);
-		// Inspection only: getExecution reads any task's execution by id.
-		inspector = Conductor.create({
-			sql,
-			tasks: TaskSchemas.fromSchema([]),
-			context: {},
-			logger: silent,
-			telemetry: false,
-		}) as unknown as Conductor;
+		connect();
 	});
 	beforeEach(({ signal }) => {
 		current = signal;
 	});
-	afterEach(async () => {
-		for (const runtime of runtimes.splice(0).reverse()) await runtime.stop();
+	afterEach(async ({ signal }) => {
+		const stopping = runtimes.splice(0).reverse();
+		// A timed-out test body keeps running, and so do its runtimes' workers: cut them off the
+		// connection first, or their queries queue the next tests behind them.
+		if (signal.aborted) await reconnect();
+		const stopped = (async () => {
+			for (const runtime of stopping) await runtime.stop();
+			return true;
+		})();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const late = new Promise<false>((resolve) => (timer = setTimeout(resolve, STOP_MS, false)));
+		// Off the old connection, their stops may fail; this test failed already.
+		const done = await Promise.race([signal.aborted ? stopped.catch(() => true) : stopped, late]);
+		clearTimeout(timer);
+		if (!done) {
+			// Still stopping: abandon them on the old connection, where their work fails.
+			stopped.catch(() => {});
+			await reconnect();
+		}
 		// Emits share Conductor's internal dispatch queue, which keeps receipts to dedupe ingress: forget
 		// this test's events, or the next test's `message("initial")` is a duplicate.
 		if (sql)
@@ -162,6 +174,26 @@ export function useConductor(): ConductorFixture {
 			await admin.end();
 		}
 	});
+
+	function connect() {
+		// Fake time is a session setting: the clock only holds for queries on this one connection.
+		sql = postgres(ready(url), { max: 1, onnotice: () => {} });
+		clock = createTestClock(sql);
+		// Inspection only: getExecution reads any task's execution by id.
+		inspector = Conductor.create({
+			sql,
+			tasks: TaskSchemas.fromSchema([]),
+			context: {},
+			logger: silent,
+			telemetry: false,
+		}) as unknown as Conductor;
+	}
+	/** Replace the file's connection; queries still running or queued on the old one fail. */
+	async function reconnect() {
+		const old = ready(sql);
+		connect();
+		await old.end({ timeout: 0 });
+	}
 
 	function runtime(options: Omit<StartOptions, "events"> = {}) {
 		const queue = options.queue ?? `test_${++queues}`;
