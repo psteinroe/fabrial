@@ -497,6 +497,80 @@ it("notifies onToolCall after a tool settles and logs observers that throw", asy
 	await f.integration.stop();
 });
 
+it("attributes observer calls to each Session's own agent while two Sessions interleave", async () => {
+	const calls: ToolCall[] = [];
+	const f = fixture([
+		{ id: "records", hooks: { agent: { onToolCall: (call) => void calls.push(call) } } },
+	]);
+	const model = `${f.faux.provider.id}/${f.faux.getModel().id}`;
+	let entered!: () => void;
+	const inside = new Promise<void>((resolve) => (entered = resolve));
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => (release = resolve));
+	const waiting = defineAgent({
+		name: randomUUID(),
+		description: "Waits.",
+		model,
+		tools: [
+			defineTool({
+				name: "wait",
+				description: "Wait",
+				input: z.object({}),
+				run: async () => {
+					entered();
+					await gate;
+					return "waited";
+				},
+			}),
+		],
+	});
+	const other = defineAgent({
+		name: randomUUID(),
+		description: "Looks up.",
+		model,
+		tools: [
+			defineTool({
+				name: "lookup",
+				description: "Look up a key",
+				input: z.object({ key: z.string() }),
+				run: async ({ key }) => `value of ${key}`,
+			}),
+		],
+	});
+	f.faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+		fauxAssistantMessage(fauxToolCall("lookup", { key: "b" }), { stopReason: "toolUse" }),
+		fauxAssistantMessage("b done"),
+		fauxAssistantMessage("a done"),
+	]);
+	const run = (agent: typeof waiting, input: string): RuntimeWorkflow => ({
+		name: randomUUID(),
+		triggers: [],
+		handler: (_input, execution) => f.integration.agents.run(execution, "agent", agent, { input }),
+	});
+	const [a, b] = [run(waiting, "Wait"), run(other, "Look up b")];
+	runtimeRegister(f, a, [b]);
+	await f.integration.start();
+	await f.runtime.start();
+	const first = await f.runtime.invoke(a.name, null, { metadata: f.metadata });
+	const flushed = f.runtime.flush();
+	await inside;
+	// Each Session numbers its conversations from the start, so both leads share a conversation id.
+	const second = await f.runtime.invoke(b.name, null, { metadata: f.metadata });
+	await expect
+		.poll(() => f.runtime.result(second), { timeout: 30_000 })
+		.toEqual({ status: "completed", output: "b done" });
+	release();
+	await flushed;
+	await f.runtime.flush();
+	expect(f.runtime.result(first)).toEqual({ status: "completed", output: "a done" });
+	expect(calls.map((call) => [call.name, call.agent])).toEqual([
+		["lookup", other.name],
+		["wait", waiting.name],
+	]);
+	await f.integration.stop();
+});
+
 it("returns input that fails the tool schema to the model without running the tool", async () => {
 	const f = fixture();
 	let runs = 0;

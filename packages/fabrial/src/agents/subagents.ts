@@ -27,8 +27,6 @@ import { newErrorId } from "./errors.ts";
 export interface SubagentDeps {
 	/** The Pi agent of a child running `agent` with `depth` subagent levels left below it. */
 	childAgent(agent: Agent, depth: number): AgentChange;
-	/** Records the agent a conversation runs, for observers. */
-	named(conversationId: number, agent: string): void;
 	logger: Logger;
 	/** The call working on each named foreground child. */
 	busy: Map<string, number>;
@@ -218,7 +216,6 @@ export function subagentTool(
 					return error(`${name} is still working on another task; wait for its answer.`);
 				named = `${scope}:${name}`;
 				deps.busy.set(named, api.taskId);
-				deps.named(child, subagent.agent.name);
 				await api.details({ conversationId: child, name }, context);
 				return await run(bridge, api, child, name, subagent, args.task, deps, context);
 			} finally {
@@ -380,7 +377,6 @@ async function background(
 		reporter = created;
 	}
 	const started = (await bridge.harness.snapshot(SubagentWork, context))!.reporters[reporter]!;
-	deps.named(started.child, subagent.agent.name);
 	await api.details({ conversationId: started.child, name: started.name }, context);
 	const text = previous?.background
 		? `Sent the task to ${started.name}. Its answer arrives later as input <subagent name="${started.name}">.`
@@ -436,7 +432,6 @@ const reporterTask = (deps: SubagentDeps) =>
 		phases: {
 			deliver: async (reporter, runtime, context) => {
 				const { child, name, agent, task } = reporter.input;
-				deps.named(child, agent);
 				const handle = (await runtime.conversation(child as ConversationId, context))!;
 				// Steers a busy child; starts a run on an idle one.
 				const submission = await handle.submit(

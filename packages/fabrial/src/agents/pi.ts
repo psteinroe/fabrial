@@ -22,6 +22,7 @@ import {
 	type ConversationId,
 	type Extension,
 	type HarnessSettings,
+	type HookApi,
 	type ToolRegistration,
 	LiveDoc,
 	type EntryId,
@@ -95,6 +96,7 @@ import {
 	Binding,
 	ChildResults,
 	Conversations,
+	Subagent,
 	Invocation,
 	Runs,
 	SubagentWork,
@@ -199,11 +201,7 @@ const THINKING: Record<ThinkingLevel, "off" | "low" | "medium" | "high"> = {
 };
 
 /** Fabrial observers as Pi hooks on the built-in generation and tool tasks. */
-function observerHooks(
-	observers: AgentObservers[],
-	agentName: (conversationId: number) => string,
-	host: FabrialHost,
-) {
+function observerHooks(observers: AgentObservers[], host: FabrialHost) {
 	const notify = async (run: (observer: AgentObservers) => void | Promise<void> | undefined) => {
 		for (const observer of observers)
 			try {
@@ -214,10 +212,11 @@ function observerHooks(
 	};
 	return [
 		hook(GenerationTask, {
-			async afterResponse(message, api) {
+			async afterResponse(message, api, context) {
+				const agent = await agentOf(api, api.conversationId, context);
 				await notify((observer) =>
 					observer.onModelResponse?.({
-						agent: agentName(api.conversationId),
+						agent,
 						model: { provider: message.provider, modelId: message.model },
 						text: message.content
 							.flatMap((block) => (block.type === "text" ? [block.text] : []))
@@ -243,10 +242,11 @@ function observerHooks(
 			},
 		}),
 		hook(ToolTask, {
-			async afterTool(call, result, api) {
+			async afterTool(call, result, api, context) {
+				const agent = await agentOf(api, api.conversationId, context);
 				await notify((observer) =>
 					observer.onToolCall?.({
-						agent: agentName(api.conversationId),
+						agent,
 						callId: call.id,
 						name: call.name,
 						arguments: call.arguments as JsonObject,
@@ -260,6 +260,18 @@ function observerHooks(
 			},
 		}),
 	];
+}
+
+/** The agent a conversation runs, from the Session's own documents: a child's `Subagent` doc, else the lead's entry. */
+async function agentOf(
+	reader: Pick<HookApi, "snapshot">,
+	conversationId: ConversationId,
+	context: Context,
+): Promise<string> {
+	const child = (await reader.snapshot(Subagent, conversationId, context))?.agent;
+	if (child) return child;
+	const ids = (await reader.snapshot(Conversations, context))?.ids ?? {};
+	return Object.keys(ids).find((name) => ids[name] === conversationId) ?? "unknown";
 }
 
 export interface PiOptions {
@@ -285,7 +297,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	const noReply = noReplyTool();
 	const subagentDeps: SubagentDeps = {
 		childAgent,
-		named: (conversationId, agent) => conversationAgents.set(conversationId, agent),
 		logger: host.logger,
 		busy: new Map(),
 	};
@@ -294,16 +305,12 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		tools: [noReply],
 		// Background subagent tasks resume after a restart wherever a Session is opened.
 		tasks: subagentTasks(subagentDeps),
-		hooks: observers.length ? observerHooks(observers, agentNameOf, host) : [],
+		hooks: observers.length ? observerHooks(observers, host) : [],
 	});
 	registry.install(internal);
 	const pluginToolkits = new Map<string, Extension>();
 	const appToolkits = new Map<string, { toolkit: Toolkit; extension: Extension }>();
 	const workflowTools = new WeakMap<ToolRegistration, AnyWorkflow>();
-	const conversationAgents = new Map<number, string>();
-	function agentNameOf(conversationId: number): string {
-		return conversationAgents.get(conversationId) ?? "unknown";
-	}
 	/** Each agent's extensions without, and its subagent tools as, an extension. */
 	const extensionsOf = new Map<string, { base: Extension[]; subagents?: Extension }>();
 	/** Workflow tools drop out until their workflow is registered. */
@@ -665,7 +672,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					(await tx.doc(Conversations)).ids[agentName] = created;
 				}, context);
 			}
-			conversationAgents.set(conversation.id, agentName);
 			await conversation.configure(configs.get(agentName)!, context);
 			const entry = { conversation, offered: (await conversation.agent(context)).tools };
 			conversations.set(agentName, entry);
@@ -1178,7 +1184,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			records.findLast(([, run]) => run.conversationId === conversationId) ??
 			records.findLast(([, run]) => !run.done);
 		if (!found) throw new Error("Missing Pi bridge run binding");
-		return { id: found[0], agent: found[1].agent ?? agentNameOf(conversationId) };
+		return {
+			id: found[0],
+			agent: found[1].agent ?? (await agentOf(frame.harness, conversationId, context)),
+		};
 	}
 
 	/**

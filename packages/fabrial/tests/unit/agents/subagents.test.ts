@@ -70,7 +70,6 @@ it("rejects duplicate names, collisions with tools, workflows, and no_reply, and
 
 const deps = (): SubagentDeps => ({
 	childAgent: () => ({}),
-	named: () => {},
 	logger: { warn() {}, error() {}, debug() {}, info() {} },
 	busy: new Map(),
 });
