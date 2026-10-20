@@ -21,11 +21,9 @@ import {
 } from "./send.ts";
 import type { AnyWorkflow, ExecutionInfo, WorkflowContext } from "./workflow.ts";
 import type { Json, JsonObject } from "./json.ts";
-import { EXECUTION_SETTLED_EVENT } from "./runtime.ts";
 import type {
 	AgentRef,
 	DurableExecution,
-	ExecutionResult,
 	Follow,
 	InvocationMetadata,
 	RuntimeWorkflow,
@@ -422,17 +420,6 @@ export function buildApp(config: CoreConfig): App {
 		},
 	};
 	agents = config.agents?.connect(host);
-	async function settled(
-		executionId: string,
-		metadata: InvocationMetadata,
-		result: ExecutionResult,
-	) {
-		await runtime.emit(
-			EXECUTION_SETTLED_EVENT,
-			{ executionId, result: result as unknown as Json },
-			{ id: executionId, metadata },
-		);
-	}
 	const middleware = config.plugins.flatMap((p) => p.hooks?.workflow ?? []);
 	/** Plugin middleware around one attempt; the innermost `next` hands its context to the handler. */
 	const wrap = (
@@ -457,7 +444,6 @@ export function buildApp(config: CoreConfig): App {
 		})),
 		concurrency: workflow.definition.concurrency,
 		retries: workflow.definition.retries,
-		onSettled: settled,
 		async attempt(execution, next) {
 			const metadata = execution.metadata;
 			const context = await createContext({ host, execution, metadata, agents, now });
@@ -484,10 +470,6 @@ export function buildApp(config: CoreConfig): App {
 	for (const workflow of extraWorkflows.values())
 		workflows.push({
 			...workflow,
-			onSettled: async (id, metadata, result) => {
-				await workflow.onSettled?.(id, metadata, result);
-				await settled(id, metadata, result);
-			},
 			attempt: async (execution, next) => {
 				const context = await createContext({
 					host,
@@ -508,7 +490,7 @@ export function buildApp(config: CoreConfig): App {
 			},
 			handler: (input, execution) => workflow.handler(input, execution),
 		});
-	// Routing is plumbing: no workflow context, plugin middleware or settlement event.
+	// Routing is plumbing: no workflow context or plugin middleware.
 	workflows.push({
 		name: ROUTE_WORKFLOW,
 		triggers: [{ event: INGRESS_EVENT }],
@@ -526,7 +508,6 @@ export function buildApp(config: CoreConfig): App {
 			),
 			{ name: INGRESS_EVENT, filterable: [] },
 			{ name: APPROVAL_DECIDED_EVENT, filterable: ["approvalId"] },
-			{ name: EXECUTION_SETTLED_EVENT, filterable: ["executionId"] },
 		],
 	});
 	return {

@@ -239,7 +239,6 @@ export function useConductor(): ConductorFixture {
 			{ sql: ready(sql) },
 			{
 				logger: silent,
-				pollIntervalMs: POLL_MS * 5,
 				...options.config,
 				worker: { concurrency: 8, ...testWorker, ...options.config?.worker },
 				queue,
@@ -284,9 +283,7 @@ export function useConductor(): ConductorFixture {
 				))
 				or exists (
 					select 1 from pgconductor._private_custom_event_subscriptions s
-					where s.execution_id = e.id and (${step ?? null}::text is null or s.step_key = ${step ?? null}
-						-- PHASE2: Fabrial's custom race keys its subscriptions per branch until task 9.
-						or starts_with(s.step_key, ${`__fabrial:any:${step}:`}))
+					where s.execution_id = e.id and (${step ?? null}::text is null or s.step_key = ${step ?? null})
 				)
 			) as waiting
 			from pgconductor._private_executions e where e.id = ${id}::uuid

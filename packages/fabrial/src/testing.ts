@@ -471,7 +471,6 @@ export function createTestApp<const P extends readonly import("./plugin.ts").Any
 			logger: silent,
 			queue,
 			clock,
-			pollIntervalMs: 100,
 			worker: { concurrency: 8, pollIntervalMs: 20, flushIntervalMs: 20, fetchBatchSize: 10 },
 		},
 	);
@@ -703,7 +702,6 @@ export function createIntegrationApp<const P extends readonly import("./plugin.t
 					flushIntervalMs: poll,
 					fetchBatchSize: 10,
 				},
-				pollIntervalMs: poll * 2,
 			},
 		},
 	) as never;

@@ -120,7 +120,6 @@ async function launch(name: string, workflows: Parameters<typeof testApp>[1]["wo
 		{
 			logger,
 			worker: { pollIntervalMs: 20, flushIntervalMs: 20, concurrency: 8, fetchBatchSize: 10 },
-			pollIntervalMs: 50,
 		},
 	);
 	const faux = fauxProvider();
@@ -196,9 +195,9 @@ async function execution(id: string) {
 	return row;
 }
 async function output(id: string): Promise<Json> {
-	const [row] = await sql<{ result: { result: Json } }[]>`
-		select result from pgconductor._private_steps where execution_id = ${id}::uuid and key = '__fabrial:output'`;
-	return row?.result.result ?? null;
+	const [row] = await sql<{ result: { output: Json } | null }[]>`
+		select result from pgconductor._private_executions where id = ${id}::uuid`;
+	return row?.result?.output ?? null;
 }
 /** Request ids Pi accepted in a Session, in order, read from its commit log without taking the lease. */
 async function submitted(key: string): Promise<string[]> {
@@ -397,6 +396,51 @@ for (const from of ["the same", "another"] as const)
 		await expect.poll(() => execution(next), poll).toMatchObject({ done: true, cancelled: false });
 		expect(await output(next)).toBe("fresh");
 	});
+
+it("a crashed owner's lease delays the Session until it expires; Conductor retries the opening", async () => {
+	let waits = 0;
+	const slow = gate();
+	const wait = f.defineTool({
+		name: "wait",
+		description: "Waits.",
+		input: z.object({}),
+		idempotent: true,
+		run: async (_input, ctx) => {
+			if (++waits === 1) await slow.pass(ctx.signal);
+			return "waited";
+		},
+	});
+	const lead = f.defineAgent({
+		name: `lead-${short()}`,
+		description: "Answers.",
+		model,
+		tools: [wait],
+	});
+	const ask = f.defineWorkflow({
+		name: `ask-${short()}`,
+		input: z.string(),
+		run: (input, ctx) => ctx.agent("answer", lead, { input }),
+	});
+	script = ({ context }) => (lastText(context) === "waited" ? say("all done") : use("wait", {}));
+	const a = await launch("a", [ask]);
+	const caller = await a.runtime.invoke(ask.name, "Go", { metadata: metadataOf() });
+	await slow.entered;
+	await a.stop();
+	// A crashed owner: it holds the lease and never renews or releases it.
+	const key = callSession(caller, "answer");
+	const crashed = await PostgresStorage.open(sql, key, { leaseMs: 1_000 });
+	clearInterval((crashed as unknown as { timer: ReturnType<typeof setInterval> }).timer);
+	await launch("b", [ask]);
+	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
+	expect(await output(caller)).toBe("all done");
+	// The opening failed while the lease was held, and Conductor's retry took the expired lease.
+	const [session] = await sql<{ attempts: number; last_error: string | null }[]>`
+		select attempts, last_error from pgconductor._private_executions
+		where task_key = ${SESSION} and payload -> 'input' ->> 'session' = ${key}`;
+	expect(session!.last_error).toContain("already has an owner");
+	await expect(crashed.commit([], BACKGROUND_CONTEXT)).rejects.toThrow();
+	expect(await lease(key)).toBeNull();
+});
 
 it("a run resumes on a fresh instance after its host stops mid-run; each model request is sent once", async () => {
 	let lookups = 0;

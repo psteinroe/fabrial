@@ -3,7 +3,6 @@ import postgres from "postgres";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import {
 	createFabrial,
-	EXECUTION_SETTLED_EVENT,
 	defineEvent,
 	defineUser,
 	definePlugin,
@@ -14,16 +13,12 @@ import {
 	type Json,
 	type RuntimeWorkflow,
 	type WaitBranch,
-	type EventCursor,
 } from "../../../src/index.ts";
+import type { EventFilter } from "../../../src/events.ts";
 import { FakeChat, testApp } from "../../../src/testing.ts";
 import { z } from "zod";
 import type { AnyTask, Conductor } from "pgconductor-js";
-import {
-	conductor,
-	ExecutionError,
-	type ConductorExecution,
-} from "../../../src/runtime/conductor/index.ts";
+import { conductor, ExecutionError } from "../../../src/runtime/conductor/index.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
 let container: StartedPostgreSqlContainer;
@@ -87,7 +82,6 @@ async function setup(
 			concurrency: options.concurrency ?? 8,
 			fetchBatchSize: 10,
 		},
-		pollIntervalMs: 100,
 	});
 	runtime.register({
 		workflows,
@@ -99,6 +93,20 @@ async function setup(
 	runtimes.push(runtime);
 	await runtime.start();
 	return runtime;
+}
+/** Suspend until one matching event, or null after `timeoutMs`: subscribe, then wait (native). */
+async function waitForEvent(
+	ctx: DurableExecution,
+	id: string,
+	options: { event: string; filter?: EventFilter; timeoutMs?: number },
+): Promise<{ name: string; payload: Json } | null> {
+	const event = await ctx.subscribe(`${id}:subscribe`, options);
+	const winner = await ctx.waitForAny(
+		id,
+		{ event },
+		options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : undefined,
+	);
+	return winner.kind === "event" ? winner.event : null;
 }
 async function completed(id: string): Promise<boolean> {
 	const [row] = await sql<
@@ -125,7 +133,7 @@ async function terminal(id: string): Promise<{ cancelled: boolean; failed: boole
 	return row ?? { cancelled: false, failed: false };
 }
 
-test("step and sleep replay from the top, preserving metadata and native raw handles", async () => {
+test("step and sleep replay from the top, preserving metadata", async () => {
 	let attempts = 0;
 	let effects = 0;
 	const seen: InvocationMetadata[] = [];
@@ -133,7 +141,6 @@ test("step and sleep replay from the top, preserving metadata and native raw han
 		workflow("replay", async (input, ctx) => {
 			attempts++;
 			seen.push(ctx.metadata);
-			expect((ctx as DurableExecution & { raw: unknown }).raw).toBeDefined();
 			expect(ctx.executionId).toBeTruthy();
 			expect(ctx.workflow).toBe("replay");
 			expect(ctx.signal).toBeInstanceOf(AbortSignal);
@@ -160,18 +167,18 @@ test("event wait suspends, filters payload fields, resumes and returns a clean e
 			await ctx.step("effect", () => {
 				effects++;
 			});
-			const event = await ctx.waitForEvent("wait", {
+			const event = await waitForEvent(ctx, "wait", {
 				event: "test.event",
 				filter: { key: ["yes"], amount: [{ numeric: [">", 2] }] },
-				deadline: await ctx.step("deadline", () => Date.now() + 5_000),
+				timeoutMs: 5_000,
 			});
 			received.push(event);
 			return event;
 		}),
 		workflow("timeout", async (_input, ctx) => {
-			const result = await ctx.waitForEvent("wait", {
+			const result = await waitForEvent(ctx, "wait", {
 				event: "test.other",
-				deadline: await ctx.step("deadline", () => Date.now() + 30),
+				timeoutMs: 30,
 			});
 			received.push(result);
 			return result;
@@ -182,249 +189,12 @@ test("event wait suspends, filters payload fields, resumes and returns a clean e
 	await runtime.emit("test.event", { key: "no", amount: 4 }, { metadata });
 	await runtime.emit("test.event", { key: "yes", amount: 4 }, { metadata });
 	await expect.poll(() => completed(id), poll).toBe(true);
-	expect(received).toEqual([
-		{ name: "test.event", payload: { key: "yes", amount: 4 }, cursor: expect.any(String) },
-	]);
+	expect(received).toEqual([{ name: "test.event", payload: { key: "yes", amount: 4 } }]);
 	expect(effects).toBe(1);
 	const timeout = await runtime.invoke("timeout", {}, { metadata });
 	await expect.poll(() => completed(timeout), poll).toBe(true);
 	expect(received.at(-1)).toBeNull();
 });
-
-test("SHIM(conductor#1): pre-registration replies after a memoized cursor are buffered; chained cursors lose nothing", async () => {
-	const cursors: EventCursor[] = [];
-	const received: Json[] = [];
-	let effects = 0;
-	const runtime = await setup([
-		workflow("approval", async (_input, ctx) => {
-			await ctx.step("stale", () => ctx.emit("test.event", { key: "approval", amount: 0 }));
-			const after = await ctx.cursor("before-card");
-			cursors.push(after);
-			const deadline = await ctx.step("deadline", () => Date.now() + 5_000);
-			await ctx.step("post-card", async () => {
-				effects++;
-				// Two fast clicks arrive while posting the card, before either wait registers.
-				await Promise.all(
-					[1, 2].map((amount) => ctx.emit("test.event", { key: "approval", amount })),
-				);
-				await ctx.emit("test.event", { key: "different-approval", amount: 3 });
-			});
-			const first = await ctx.waitForEvent("first", {
-				event: "test.event",
-				filter: { key: ["approval"] },
-				after,
-				deadline,
-			});
-			expect(first).not.toBeNull();
-			const second = await ctx.waitForEvent("second", {
-				event: "test.event",
-				filter: { key: ["approval"] },
-				after: first!.cursor,
-				deadline,
-			});
-			expect(second).not.toBeNull();
-			received.push([first, second]);
-			await ctx.sleep("replay", 20);
-			return [first, second];
-		}),
-	]);
-	const id = await runtime.invoke("approval", null, { metadata });
-	await expect.poll(() => completed(id), poll).toBe(true);
-	expect(effects).toBe(1);
-	expect(new Set(cursors).size).toBe(1);
-	expect(received[1]).toEqual(received[0]);
-	const events = received[0] as { payload: { amount: number }; cursor: string }[];
-	expect(events.map((event) => event.payload.amount).sort((a, b) => a - b)).toEqual([1, 2]);
-	expect(BigInt(events[0]!.cursor.split(":")[1]!)).toBeLessThan(
-		BigInt(events[1]!.cursor.split(":")[1]!),
-	);
-});
-
-test("cursor waits ignore pre-cursor events, even when retained and correlated", async () => {
-	let received: Json | undefined;
-	const runtime = await setup([
-		workflow("stale", async (_input, ctx) => {
-			await ctx.step("old-click", () => ctx.emit("test.event", { key: "approval" }));
-			const after = await ctx.cursor("before-card");
-			received = await ctx.waitForEvent("decision", {
-				event: "test.event",
-				filter: { key: ["approval"] },
-				after,
-				deadline: await ctx.step("deadline", () => Date.now() + 200),
-			});
-			return received;
-		}),
-	]);
-	const id = await runtime.invoke("stale", null, { metadata });
-	await expect.poll(() => completed(id), poll).toBe(true);
-	expect(received).toBeNull();
-});
-
-test("receipt retention supports correlated waits at 30 days and survives restart", async () => {
-	let received: Json | undefined;
-	const definition = workflow("retained", async (_input, ctx) => {
-		const after = await ctx.cursor("before-card");
-		await ctx.waitForEvent("gate", { event: "test.other" });
-		received = await ctx.waitForEvent("approval", {
-			event: "test.event",
-			filter: { key: ["approval"] },
-			after,
-			deadline: await ctx.step("deadline", () => Date.now() + 1_000),
-		});
-		return received;
-	});
-	const first = await setup([definition]);
-	const id = await first.invoke("retained", null, { metadata });
-	await waiting(id);
-	await first.emit("test.event", { key: "approval" }, { metadata, id: "click" });
-	await sql`update pgconductor._private_executions set created_at = now() - interval '30 days'
-		where task_key = 'pgconductor.event-dispatch' and payload ->> 'eventKey' = 'test.event'`;
-	await first.stop();
-	runtimes = runtimes.filter((entry) => entry !== first);
-	const second = await setup([definition]);
-	await second.emit("test.other", {}, { metadata });
-	await expect.poll(() => completed(id), poll).toBe(true);
-	expect(received).toEqual({
-		name: "test.event",
-		payload: { key: "approval" },
-		cursor: expect.any(String),
-	});
-});
-
-test("cursor capture waits for concurrent emitter commit, not just sequence allocation", async () => {
-	const received: Json[] = [];
-	const runtime = await setup([
-		workflow("capture", async (_input, ctx) => {
-			const after = await ctx.cursor("capture");
-			received.push(
-				await ctx.waitForEvent("wait", {
-					event: "test.event",
-					after,
-					deadline: await ctx.step("deadline", () => Date.now() + 150),
-				}),
-			);
-			return null;
-		}),
-	]);
-	// Block an emit AFTER it allocates its position but BEFORE its receipt commits.
-	await sql.unsafe(`create function public.delay_receipt() returns trigger language plpgsql as $$
-		begin
-			if new.task_key = 'pgconductor.event-dispatch' then perform pg_advisory_xact_lock(724831, 2); end if;
-			return new;
-		end $$;
-		create trigger delay_receipt before insert on pgconductor._private_executions
-		for each row execute function public.delay_receipt()`);
-	let unblock!: () => void;
-	let held!: () => void;
-	const ready = new Promise<void>((resolve) => {
-		held = resolve;
-	});
-	const blocking = sql.begin(async (transaction) => {
-		await transaction`select pg_advisory_xact_lock(724831, 2)`;
-		held();
-		await new Promise<void>((resolve) => {
-			unblock = resolve;
-		});
-	});
-	await ready;
-	let id: string | undefined;
-	const emitting = runtime.emit("test.event", { key: "before-cursor" }, { metadata });
-	try {
-		await expect
-			.poll(async () => {
-				const [row] = await sql<{ waiting: boolean }[]>`select exists(select 1 from pg_locks
-				where locktype = 'advisory' and classid = 724831 and objid = 2 and not granted) as waiting`;
-				return row?.waiting;
-			}, poll)
-			.toBe(true);
-		id = await runtime.invoke("capture", null, { metadata });
-		await expect
-			.poll(async () => {
-				const [row] = await sql<{ waiting: boolean }[]>`select exists(select 1 from pg_locks
-				where locktype = 'advisory' and classid = 724831 and objid = 1 and not granted) as waiting`;
-				return row?.waiting;
-			}, poll)
-			.toBe(true);
-	} finally {
-		unblock();
-		await blocking;
-		await emitting;
-	}
-	await expect.poll(() => completed(id!), poll).toBe(true);
-	// The delayed emit committed before capture completed: it must be excluded.
-	expect(received).toEqual([null]);
-});
-
-for (const timely of [true, false]) {
-	test(`buffered event emitted ${timely ? "before" : "after"} deadline competes deterministically with expired timer`, async () => {
-		let received: Json | undefined;
-		const runtime = await setup([
-			workflow("deadline-race", async (_input, ctx) => {
-				const after = await ctx.cursor("before-card");
-				const emit = () =>
-					ctx.step("side-effect", () => ctx.emit("test.event", { key: "approval" }));
-				// Order the emit and the deadline by steps, not by how fast they run: the timer has expired by
-				// the wait either way, and the event is stored before (timely) or after the deadline.
-				if (timely) await emit();
-				const deadline = await ctx.step("deadline", () => Date.now() + 150);
-				await ctx.step("expire", async () => {
-					await sql`select pg_sleep(0.2)`;
-				});
-				if (!timely) await emit();
-				received = await ctx.waitForEvent("decision", { event: "test.event", after, deadline });
-				return received;
-			}),
-		]);
-		const id = await runtime.invoke("deadline-race", null, { metadata });
-		await expect.poll(() => completed(id), poll).toBe(true);
-		expect(received).toEqual(
-			timely
-				? { name: "test.event", payload: { key: "approval" }, cursor: expect.any(String) }
-				: null,
-		);
-	});
-}
-
-for (const kind of ["event", "timer"] as const) {
-	// Real time: the deadline is wall-clock and the replays come from 100 ms polls, so a loaded machine
-	// can replay fewer than three times before it expires. A retry reruns the window; it cannot pass a
-	// deadline that drifted.
-	test(
-		`absolute ${kind} deadline does not drift earlier across polling replays`,
-		{ retry: 2 },
-		async () => {
-			let began = 0;
-			let ended = 0;
-			let attempts = 0;
-			const runtime = await setup([
-				workflow("deadline", async (_input, ctx) => {
-					attempts++;
-					began = await ctx.step("began", () => Date.now());
-					const at = began + 600;
-					if (kind === "event")
-						expect(
-							await ctx.waitForEvent("wait", { event: "test.event", deadline: at }),
-						).toBeNull();
-					else
-						expect(
-							await ctx.waitForAny(
-								"wait",
-								{ event: await ctx.subscribe("event", { event: "test.event" }) },
-								{ timeoutMs: Math.max(0, at - Date.now()) },
-							),
-						).toEqual({ key: "timeout", kind: "timeout" });
-					ended = Date.now();
-					return null;
-				}),
-			]);
-			const id = await runtime.invoke("deadline", null, { metadata });
-			await expect.poll(() => completed(id), poll).toBe(true);
-			// The cursor wait replays on every poll; the native race resumes once.
-			expect(attempts).toBeGreaterThan(kind === "event" ? 2 : 1);
-			expect(ended - began).toBeGreaterThanOrEqual(590);
-		},
-	);
-}
 
 test("event triggers start each matching workflow with the event's payload and metadata; concurrent emits dedupe", async () => {
 	const seen: { workflow: string; input: Json; metadata: InvocationMetadata }[] = [];
@@ -469,7 +239,7 @@ test("event triggers start each matching workflow with the event's payload and m
 			.sort(),
 	).toEqual(["filtered", "other", "overlapping"]);
 });
-test("invoke/start/emit inherit metadata; overrides affect only the child; starts and client invocations dedupe after completion", async () => {
+test("invoke/start/emit inherit metadata; overrides affect only the child; starts dedupe after completion", async () => {
 	const seen: InvocationMetadata[] = [];
 	let starts = 0;
 	let invokes = 0;
@@ -519,12 +289,7 @@ test("invoke/start/emit inherit metadata; overrides affect only the child; start
 			{ triggers: [{ event: "test.other" }] },
 		),
 	]);
-	const ids = await Promise.all(
-		Array.from({ length: 5 }, () =>
-			runtime.invoke("parent", {}, { metadata, dedupeKey: "parent" }),
-		),
-	);
-	expect(new Set(ids).size).toBe(1);
+	const ids = [await runtime.invoke("parent", {}, { metadata })];
 	await expect.poll(() => completed(ids[0]!), poll).toBe(true);
 	await expect.poll(() => starts, poll).toBe(3);
 	expect(invokes).toBeGreaterThan(1);
@@ -537,7 +302,6 @@ test("invoke/start/emit inherit metadata; overrides affect only the child; start
 		...metadata,
 		interactionId: "emit-override",
 	});
-	expect(await runtime.invoke("parent", {}, { metadata, dedupeKey: "parent" })).toBe(ids[0]);
 	expect(await completed(childId!)).toBe(true);
 	// Native metadata is replayed on every attempt, including the resume after a sleep.
 	expect(resumed.length).toBeGreaterThanOrEqual(2);
@@ -554,7 +318,7 @@ for (const winner of ["first", "second", "child", "timer"] as const) {
 		let childId: string | undefined;
 		const runtime = await setup([
 			workflow("child", async (_input, ctx) => {
-				await ctx.waitForEvent("done", { event: "test.other", filter: { key: ["child"] } });
+				await waitForEvent(ctx, "done", { event: "test.other", filter: { key: ["child"] } });
 				return 42;
 			}),
 			workflow("race", async (_input, ctx) => {
@@ -613,7 +377,7 @@ for (const detached of [false, true]) {
 		const runtime = await setup([
 			workflow("child", async (_input, ctx) => {
 				childId = ctx.executionId;
-				await ctx.waitForEvent("wait", { event: "test.event" });
+				await waitForEvent(ctx, "wait", { event: "test.event" });
 				return "survived";
 			}),
 			workflow("parent", async (_input, ctx) => ctx.invoke("child", "child", {}, { detached })),
@@ -639,7 +403,7 @@ test("cancel via execution, distinguish failed/cancelled child results, timeout,
 	let timedOutChild: string | undefined;
 	const runtime = await setup([
 		workflow("suspended", async (_input, ctx) => {
-			await ctx.waitForEvent("wait", { event: "test.event" });
+			await waitForEvent(ctx, "wait", { event: "test.event" });
 			return null;
 		}),
 		workflow(
@@ -651,7 +415,7 @@ test("cancel via execution, distinguish failed/cancelled child results, timeout,
 		),
 		workflow("cancel-call", async (_input, ctx) => {
 			const child = await ctx.start("independent", "suspended", {});
-			await ctx.cancel(child, "deliberate");
+			await runtime.cancel(child, "deliberate");
 			return ctx.waitForAny("result", { child: { execution: child } });
 		}),
 		workflow("failure-call", async (_input, ctx) => {
@@ -664,7 +428,7 @@ test("cancel via execution, distinguish failed/cancelled child results, timeout,
 		}),
 		workflow("timed-out", async (_input, ctx) => {
 			timedOutChild = ctx.executionId;
-			await ctx.waitForEvent("wait", { event: "test.event" });
+			await waitForEvent(ctx, "wait", { event: "test.event" });
 			return null;
 		}),
 		workflow("timeout-call", async (_input, ctx) => {
@@ -677,16 +441,16 @@ test("cancel via execution, distinguish failed/cancelled child results, timeout,
 		}),
 		workflow("starter", async (_input, ctx) => {
 			await ctx.start("child", "suspended", {}, { dedupeKey: "independent" });
-			await ctx.waitForEvent("wait", { event: "test.other" });
+			await waitForEvent(ctx, "wait", { event: "test.other" });
 			return null;
 		}),
 	]);
 	const cancelled = await runtime.invoke("cancel-call", {}, { metadata });
 	await expect.poll(() => completed(cancelled), poll).toBe(true);
 	const [receipt] = await sql<
-		{ result: { result: { result: { status: string; reason: string } } } }[]
-	>`select result from pgconductor._private_steps where execution_id = ${cancelled}::uuid and key = '__fabrial:output'`;
-	expect(receipt?.result.result.result).toEqual({ status: "cancelled", reason: "deliberate" });
+		{ result: { output: { result: { status: string; reason: string } } } }[]
+	>`select result from pgconductor._private_executions where id = ${cancelled}::uuid`;
+	expect(receipt?.result.output.result).toEqual({ status: "cancelled", reason: "deliberate" });
 	const failed = await runtime.invoke("failure-call", {}, { metadata });
 	await expect.poll(() => completed(failed), poll).toBe(true);
 	expect(caught).toBeInstanceOf(ExecutionError);
@@ -715,7 +479,7 @@ test("restart preserves native wait subscriptions and memoized effects", async (
 		await ctx.step("once", () => {
 			effects++;
 		});
-		result = await ctx.waitForEvent("wait", { event: "test.event", filter: { key: ["restart"] } });
+		result = await waitForEvent(ctx, "wait", { event: "test.event", filter: { key: ["restart"] } });
 		return result;
 	});
 	const first = await setup([definition], { queue: "restart" });
@@ -730,67 +494,6 @@ test("restart preserves native wait subscriptions and memoized effects", async (
 	expect(result).toEqual({
 		name: "test.event",
 		payload: { key: "restart" },
-		cursor: expect.any(String),
-	});
-});
-
-test("retry exhaustion and suspended cancellation emit terminal notifications the core cannot see", async () => {
-	const seen: Json[] = [];
-	let attempts = 0;
-	const runtime = await setup([
-		workflow(
-			"failure",
-			async () => {
-				attempts++;
-				throw new Error("exhausted");
-			},
-			{ retries: { maxAttempts: 2 } },
-		),
-		workflow("suspended", async (_input, ctx) => {
-			await ctx.sleep("long", 60_000);
-			return null;
-		}),
-		workflow(
-			"settled",
-			async (input) => {
-				seen.push(input);
-				return null;
-			},
-			{ triggers: [{ event: EXECUTION_SETTLED_EVENT }] },
-		),
-	]);
-	const failed = await runtime.invoke("failure", {}, { metadata });
-	await expect.poll(() => attempts, poll).toBe(1);
-	await expect
-		.poll(async () => {
-			const [row] = await sql<
-				{ unlocked: boolean }[]
-			>`select locked_by is null and attempts = 1 as unlocked from pgconductor._private_executions where id = ${failed}::uuid`;
-			return row?.unlocked;
-		}, poll)
-		.toBe(true);
-	// Conductor's first retry is 15 seconds. Advance only its due time, not the retry implementation.
-	await sql`update pgconductor._private_executions set run_at = now() where id = ${failed}::uuid`;
-	await expect.poll(() => terminal(failed), poll).toEqual({ failed: true, cancelled: false });
-	expect(attempts).toBe(2);
-	const cancelled = await runtime.invoke("suspended", {}, { metadata });
-	await expect
-		.poll(async () => {
-			const [row] = await sql<
-				{ count: number }[]
-			>`select count(*)::int as count from pgconductor._private_steps where execution_id = ${cancelled}::uuid and key = 'long'`;
-			return row?.count;
-		}, poll)
-		.toBe(1);
-	await runtime.cancel(cancelled, "cancelled while asleep");
-	await expect.poll(() => seen.length, poll).toBe(2);
-	expect(seen).toContainEqual({
-		executionId: failed,
-		result: { status: "failed", error: "exhausted" },
-	});
-	expect(seen).toContainEqual({
-		executionId: cancelled,
-		result: { status: "cancelled", reason: "cancelled while asleep" },
 	});
 });
 
@@ -829,7 +532,7 @@ test("waitForAny races concurrent events, replays a single winner, and excludes 
 	const runtime = await setup([
 		workflow("race", async (_input, ctx) => {
 			releaseId = ctx.executionId;
-			await ctx.waitForEvent("gate", { event: "test.other" });
+			await waitForEvent(ctx, "gate", { event: "test.other" });
 			const result = await ctx.waitForAny("race", {
 				first: await ctx.subscribe("first", {
 					event: "test.event",
@@ -863,41 +566,6 @@ test("waitForAny races concurrent events, replays a single winner, and excludes 
 	expect(["first-new", "second"]).toContain(event.payload.key);
 });
 
-test("waitForAny resumes across restart and can wait on the execution-settled event", async () => {
-	let result: Json | undefined;
-	const definition = workflow("restart-race", async (input, ctx) => {
-		const settled = await ctx.subscribe("settled", {
-			event: EXECUTION_SETTLED_EVENT,
-			filter: { executionId: [input as string] },
-		});
-		result = await ctx.waitForAny("race", { settled }, { timeoutMs: 10_000 });
-		return result;
-	});
-	const first = await setup([definition]);
-	const id = await first.invoke("restart-race", crypto.randomUUID(), { metadata });
-	await waiting(id);
-	const [row] = await sql<
-		{ payload: { input: string } }[]
-	>`select payload from pgconductor._private_executions where id = ${id}::uuid`;
-	await first.stop();
-	runtimes = runtimes.filter((runtime) => runtime !== first);
-	const second = await setup([definition]);
-	await second.emit(
-		EXECUTION_SETTLED_EVENT,
-		{ executionId: row!.payload.input, result: { status: "completed", output: "done" } },
-		{ metadata },
-	);
-	await expect.poll(() => completed(id), poll).toBe(true);
-	expect(result).toEqual({
-		key: "settled",
-		kind: "event",
-		event: {
-			name: EXECUTION_SETTLED_EVENT,
-			payload: { executionId: row!.payload.input, result: { status: "completed", output: "done" } },
-		},
-	});
-});
-
 test("structured cancellation is recursive, removes waits, and reports cancelled execution branches", async () => {
 	let childId: string | undefined;
 	let grandchildId: string | undefined;
@@ -905,7 +573,7 @@ test("structured cancellation is recursive, removes waits, and reports cancelled
 	const runtime = await setup([
 		workflow("grandchild", async (_input, ctx) => {
 			grandchildId = ctx.executionId;
-			await ctx.waitForEvent("wait", { event: "test.event" });
+			await waitForEvent(ctx, "wait", { event: "test.event" });
 			return null;
 		}),
 		workflow("child", async (_input, ctx) => {
@@ -963,7 +631,7 @@ test("a permanently failed parent cancels its attached child, not its detached o
 	const runtime = await setup([
 		workflow("child", async (input, ctx) => {
 			children[input as string] = ctx.executionId;
-			await ctx.waitForEvent("wait", { event: "test.event", filter: { key: [input as string] } });
+			await waitForEvent(ctx, "wait", { event: "test.event", filter: { key: [input as string] } });
 			return null;
 		}),
 		workflow(
@@ -974,13 +642,10 @@ test("a permanently failed parent cancels its attached child, not its detached o
 					"attached",
 					{
 						child: {
-							// The attached call's child, started without waiting through the raw context.
-							execution: await (ctx as ConductorExecution).raw.invoke(
-								"attached",
-								{ name: "child" } as never,
-								{ input: "attached" } as never,
-								{ cancelWithParent: true },
-							),
+							// The attached call's child, started without waiting.
+							execution: await ctx.start("attached", "child", "attached", {
+								cancelWithParent: true,
+							}),
 						},
 					},
 					{ timeoutMs: 200 },
@@ -1006,7 +671,7 @@ test("detached invoke timeout leaves the child running", async () => {
 	const runtime = await setup([
 		workflow("child", async (_input, ctx) => {
 			childId = ctx.executionId;
-			await ctx.waitForEvent("wait", { event: "test.event" });
+			await waitForEvent(ctx, "wait", { event: "test.event" });
 			return 5;
 		}),
 		workflow("parent", async (_input, ctx) => {
@@ -1026,63 +691,6 @@ test("detached invoke timeout leaves the child running", async () => {
 	expect(await terminal(childId!)).toEqual({ failed: false, cancelled: false });
 	await runtime.emit("test.event", {}, { metadata });
 	await expect.poll(() => completed(childId!), poll).toBe(true);
-});
-
-test("terminal hooks survive restart, retry errors, and are never called for suspension", async () => {
-	const seen: { id: string; metadata: InvocationMetadata; result: Json }[] = [];
-	let rejectHook = true;
-	const onSettled: RuntimeWorkflow["onSettled"] = async (id, metadata, result) => {
-		if (rejectHook) throw new Error("temporarily unavailable");
-		seen.push({ id, metadata, result });
-	};
-	const definitions = [
-		workflow(
-			"success",
-			async (_input, ctx) => {
-				await ctx.waitForEvent("wait", { event: "test.event" });
-				return 9;
-			},
-			{ onSettled },
-		),
-		workflow(
-			"failure",
-			async () => {
-				throw new Error("failed");
-			},
-			{ retries: { maxAttempts: 1 }, onSettled },
-		),
-	];
-	const first = await setup(definitions);
-	const success = await first.invoke("success", {}, { metadata });
-	await waiting(success);
-	expect(seen).toEqual([]);
-	await first.emit("test.event", {}, { metadata });
-	await expect.poll(() => completed(success), poll).toBe(true);
-	const failure = await first.invoke("failure", {}, { metadata });
-	await expect.poll(() => terminal(failure), poll).toEqual({ failed: true, cancelled: false });
-	await first.stop();
-	runtimes = runtimes.filter((runtime) => runtime !== first);
-	rejectHook = false;
-	await setup(definitions);
-	await expect.poll(() => seen.length, poll).toBe(2);
-	expect(seen).toContainEqual({
-		id: success,
-		metadata,
-		result: { status: "completed", output: 9 },
-	});
-	expect(seen).toContainEqual({
-		id: failure,
-		metadata,
-		result: { status: "failed", error: "failed" },
-	});
-	await expect
-		.poll(async () => {
-			const [row] = await sql<
-				{ count: number }[]
-			>`select count(*)::int as count from pgconductor._private_steps where key = '__fabrial:settled'`;
-			return row?.count;
-		}, poll)
-		.toBe(2);
 });
 
 test("connectionString pools run workflows; injected pools stay usable after stop", async () => {
@@ -1132,39 +740,6 @@ test("emit dedupe is event-scoped and retains the first payload across restart",
 	expect(rows[0]?.metadata).toEqual(metadata);
 });
 
-test("failed settlement hooks cannot starve healthy deliveries beyond the first monitor batch", async () => {
-	let healthyId: string | undefined;
-	const calls = new Map<string, number>();
-	const delivered: string[] = [];
-	const runtime = await setup([
-		workflow("settle", async () => null, {
-			onSettled: async (id) => {
-				calls.set(id, (calls.get(id) ?? 0) + 1);
-				if (id !== healthyId) throw new Error("poison receipt");
-				delivered.push(id);
-			},
-		}),
-	]);
-	const ids = await Promise.all(
-		Array.from({ length: 105 }, () => runtime.invoke("settle", {}, { metadata })),
-	);
-	await expect
-		.poll(async () => (await Promise.all(ids.map(completed))).every(Boolean), poll)
-		.toBe(true);
-	healthyId = [...ids].sort().at(-1);
-	await expect.poll(() => delivered, poll).toEqual([healthyId]);
-	await expect
-		.poll(
-			() => Math.min(...ids.filter((id) => id !== healthyId).map((id) => calls.get(id) ?? 0)),
-			poll,
-		)
-		.toBeGreaterThanOrEqual(2);
-	const receipts = await sql<{ execution_id: string }[]>`
-		select execution_id from pgconductor._private_steps where key = '__fabrial:settled'
-	`;
-	expect(receipts.map((row) => row.execution_id)).toEqual([healthyId]);
-});
-
 test("running cancellation aborts the native signal and preserves the caller's reason in terminal results", async () => {
 	let signal: AbortSignal | undefined;
 	let result: Json | undefined;
@@ -1208,7 +783,6 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 		{
 			logger,
 			worker: { pollIntervalMs: 20, flushIntervalMs: 20, concurrency: 8 },
-			pollIntervalMs: 50,
 		},
 	);
 	runtimes.push(runtime);
@@ -1254,13 +828,12 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 			});
 			await ctx.thread!.post("ack", "working");
 			const output = await ctx.invoke("child", child, input.key);
-			// Native runtime operations are internal; this test captures them from the runtime port.
-			const execution = executions.get(ctx.executionId) as ConductorExecution;
-			expect(execution.raw).toBeDefined();
-			const event = await execution.waitForEvent("reply", {
+			// Runtime operations are internal; this test captures them from the runtime port.
+			const execution = executions.get(ctx.executionId)!;
+			const event = await waitForEvent(execution, "reply", {
 				event: "test.reply",
 				filter: { key: ["reply"] },
-				deadline: await ctx.step("deadline", () => Date.now() + 5_000),
+				timeoutMs: 5_000,
 			});
 			return { output, event };
 		},
@@ -1292,13 +865,13 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 			const [row] = await sql<{ count: number }[]>`
 				select count(*)::int as count from pgconductor._private_custom_event_subscriptions s
 				join pgconductor._private_executions e on e.id = s.execution_id
-				where s.execution_id = ${parentId!}::uuid and s.step_key like '__fabrial:any:reply:%' and e.locked_by is null`;
+				where s.execution_id = ${parentId!}::uuid and s.step_key = 'reply:subscribe' and e.locked_by is null`;
 			return row?.count;
 		}, poll)
 		.toBe(1);
 	const thread = await chat.thread(surface);
 	expect(thread.posts).toHaveLength(1);
-	// With no after cursor this wait intentionally starts at registration.
+	// The wait starts at its subscription: earlier events do not match.
 	await app.emit("test.reply", { key: "wrong" });
 	await app.emit("test.reply", { key: "reply" }, { id: "reply" });
 	await expect.poll(() => completed(parentId!), poll).toBe(true);
@@ -1307,22 +880,13 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 	expect(childEffects).toBe(1);
 	expect(attempts.get(parent.name)).toBeGreaterThanOrEqual(2);
 	expect(attempts.get(child.name)).toBe(1);
-	const [row] = await sql<{ result: { result: Json } }[]>`
-		select result from pgconductor._private_steps where execution_id = ${parentId!}::uuid and key = '__fabrial:output'
+	const [row] = await sql<{ result: { output: Json } }[]>`
+		select result from pgconductor._private_executions where id = ${parentId!}::uuid
 	`;
-	expect(row?.result.result).toEqual({
+	expect(row?.result.output).toEqual({
 		output: "go:child",
-		event: { name: "test.reply", payload: { key: "reply" }, cursor: expect.any(String) },
+		event: { name: "test.reply", payload: { key: "reply" } },
 	});
-	await expect
-		.poll(async () => {
-			const settlements = await sql<{ payload: { payload: { executionId: string } } }[]>`
-			select payload from pgconductor._private_executions
-			where task_key = 'pgconductor.event-dispatch' and payload ->> 'eventKey' = ${EXECUTION_SETTLED_EVENT}
-		`;
-			return settlements.map((row) => row.payload.payload.executionId);
-		}, poll)
-		.toContain(parentId);
 	await app.emit("test.begin", { key: "go" }, { id: "delivery", replyTo: surface });
 	const rows = await sql<
 		{ id: string }[]
@@ -1344,7 +908,7 @@ test("start reconnects to its completed child after losing the memoized submissi
 		}),
 		workflow("starter", async (_input, ctx) => {
 			children.push(await ctx.start("submission", "child", {}));
-			await ctx.waitForEvent("gate", { event: "test.other" });
+			await waitForEvent(ctx, "gate", { event: "test.other" });
 			return null;
 		}),
 	];
@@ -1375,7 +939,6 @@ test("core approval accepts an authenticated click during card delivery, before 
 		{
 			logger,
 			worker: { pollIntervalMs: 20, flushIntervalMs: 20, concurrency: 8 },
-			pollIntervalMs: 50,
 		},
 	);
 	runtimes.push(runtime);
@@ -1544,9 +1107,9 @@ function session(received: Json[]): RuntimeWorkflow {
 }
 const input = (id: string, payload: Json = id) => ({ name: "input", id, payload });
 async function output(id: string): Promise<Json> {
-	const [row] = await sql<{ result: { result: Json } }[]>`
-		select result from pgconductor._private_steps where execution_id = ${id}::uuid and key = '__fabrial:output'`;
-	return row?.result.result ?? null;
+	const [row] = await sql<{ result: { output: Json } }[]>`
+		select result from pgconductor._private_executions where id = ${id}::uuid`;
+	return row?.result.output ?? null;
 }
 
 test("a running handler receives signals from outside; stored signals arrive first, in order, deduped by id", async () => {

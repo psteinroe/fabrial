@@ -181,22 +181,11 @@ export function sessionKey(metadata: InvocationMetadata): string {
 }
 
 /**
- * Takes the Session lease, retrying while another owner holds it. Two uses remain, both unavoidable: the Session's
- * execution opening after a crashed owner (its lease lasts until it expires) or while `ctx.state` holds the lease
- * briefly; and `ctx.state` from a workflow, which waits until the hosting execution releases the Session (it does
- * once every live task waits on a workflow, while it suspends).
+ * Waits for a `ctx.state` update while the Session has an owner (its hosting execution, until it suspends, or a
+ * crashed owner, until the lease expires). Conductor owns the wait: a durable sleep frees the worker and costs
+ * no attempt, unlike a retry, which an app workflow has only a few of.
  */
-async function acquire(sql: Sql, key: string, signal: AbortSignal): Promise<PostgresStorage> {
-	for (;;) {
-		signal.throwIfAborted();
-		try {
-			return await PostgresStorage.open(sql, key);
-		} catch (error) {
-			if (!(error instanceof SessionBusy)) throw error;
-			await new Promise<void>((resolve) => setTimeout(resolve, 100));
-		}
-	}
-}
+const STATE_BUSY_MS = [100, 250, 500, 1_000, 2_000, 5_000] as const;
 
 const THINKING: Record<ThinkingLevel, "off" | "low" | "medium" | "high"> = {
 	off: "off",
@@ -591,8 +580,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	}
 
 	async function openSession(key: string, execution: DurableExecution): Promise<SessionHost> {
-		// A crashed owner's lease lasts until it expires, and `ctx.state` takes the lease briefly.
-		const storage = await acquire(options.sql, key, execution.signal);
+		// A crashed owner's lease lasts until it expires, and `ctx.state` takes the lease briefly: SessionBusy
+		// fails the attempt, and Conductor retries it with backoff (the Session workflow's attempts cover a lease).
+		const storage = await PostgresStorage.open(options.sql, key);
 		const signal = AbortSignal.any([execution.signal, storage.lost.signal]);
 		const runs = new Map<string, HostedRun>();
 		const conversations = new Map<
@@ -1333,6 +1323,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	const session: RuntimeWorkflow = {
 		name: SESSION_WORKFLOW,
 		triggers: [],
+		// Retries back off 15s, 30s, 1m, …: the first attempts outlast a crashed owner's 30s lease.
+		retries: { maxAttempts: 10 },
 		handler: hostSession,
 	};
 	// Effects run in a stable child execution, never in the Session's replaceable execution.
@@ -1513,32 +1505,42 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	};
 	const state: StatePort = {
 		get: (execution, id, definition) => state.update(execution, id, definition, () => {}),
-		update: (execution, id, definition, change) =>
-			execution.step(id, async () => {
-				const storage = await acquire(
-					options.sql,
-					sessionKey(execution.metadata),
-					execution.signal,
+		update: async (execution, id, definition, change) => {
+			for (let n = 0; ; n++) {
+				const result = (await execution.step(n ? `${id}:busy:${n}` : id, async () => {
+					let storage: PostgresStorage;
+					try {
+						storage = await PostgresStorage.open(options.sql, sessionKey(execution.metadata));
+					} catch (error) {
+						if (error instanceof SessionBusy) return { busy: true };
+						throw error;
+					}
+					const context = withAbortSignal(execution.signal, BACKGROUND_CONTEXT);
+					const session = createSession(storage);
+					try {
+						const value = await session.commit(async (tx) => {
+							const receipt = await tx.doc(
+								WorkflowReceipts,
+								JSON.stringify([execution.executionId, id]),
+								"",
+							);
+							if (receipt.value !== null) return cloneJson(receipt.value) as JsonObject;
+							const value = await applyState(tx, definition, undefined, [change]);
+							receipt.value = cloneJson(value);
+							return value;
+						}, context);
+						return { value } as Json;
+					} finally {
+						await session.close(BACKGROUND_CONTEXT);
+					}
+				})) as { busy: true } | { value: ReturnType<typeof definition.initial> };
+				if ("value" in result) return result.value;
+				await execution.sleep(
+					`${id}:wait:${n}`,
+					STATE_BUSY_MS[Math.min(n, STATE_BUSY_MS.length - 1)]!,
 				);
-				const context = withAbortSignal(execution.signal, BACKGROUND_CONTEXT);
-				const session = createSession(storage);
-				try {
-					return await session.commit(async (tx) => {
-						const receipt = await tx.doc(
-							WorkflowReceipts,
-							JSON.stringify([execution.executionId, id]),
-							"",
-						);
-						if (receipt.value !== null)
-							return cloneJson(receipt.value) as ReturnType<typeof definition.initial>;
-						const value = await applyState(tx, definition, undefined, [change]);
-						receipt.value = cloneJson(value);
-						return value;
-					}, context);
-				} finally {
-					await session.close(BACKGROUND_CONTEXT);
-				}
-			}),
+			}
+		},
 	};
 	return {
 		agents: port,

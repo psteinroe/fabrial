@@ -2,11 +2,11 @@
  * Ports between Fabrial core and its runtimes. Core implements the workflow context, approvals, replies,
  * routing, and identity on top of these; adapters implement them:
  *
- * - `DurableRuntime` → `runtime/conductor` (PG Conductor), `fabrial/testing` (in memory)
+ * - `DurableRuntime` → `runtime/conductor` (PG Conductor; a thin mapping onto its public API)
  * - `ChatPort`       → `chat` (Chat SDK)
  * - `AgentPort`, `StatePort`, `Evaluator` → `agents` (Pi Durable, pi-ai)
  *
- * Method names and shapes mirror PGCONDUCTOR.md so that SHIMs can be deleted as Conductor lands features.
+ * Every durable operation maps onto the Conductor call of the same name (README, "Boundary").
  */
 import type { EventFilter, Origin } from "./events.ts";
 import type { ExternalIdentity, Principal } from "./identity.ts";
@@ -26,14 +26,6 @@ export interface InvocationMetadata extends JsonObject {
 }
 
 export type DurationInput = string | number;
-
-/**
- * Opaque, durable position in the event stream (Conductor item 1). Events emitted after a cursor satisfy
- * waits that pass it as `after`, even if they were emitted before the wait registered. Every consumed
- * event returns its own cursor, so successive waits can continue exactly after the last consumed event.
- * PHASE2(task 12): no Fabrial code uses cursors since `ctx.agent` became a child execution; only adapter tests do.
- */
-export type EventCursor = string;
 
 /**
  * A one-shot event subscription (Conductor `ctx.subscribe`): it holds the first matching event emitted
@@ -122,17 +114,6 @@ export interface DurableExecution {
 	/** Memoized step: `fn` runs at most once to completion per id (at-least-once on crash). */
 	step<T extends Json | void>(id: string, fn: () => Promise<T> | T): Promise<T>;
 	sleep(id: string, ms: number): Promise<void>;
-	/** Memoized: the current event-stream position, for later `after` waits (take it before side effects). */
-	cursor(id: string): Promise<EventCursor>;
-	/**
-	 * Wait for one matching event emitted after `after` (or after registration when omitted), until the
-	 * absolute `deadline` (epoch ms). Returns null on timeout (Conductor item 1).
-	 * PHASE2(task 12): unused by Fabrial (adapter tests only); everything subscribes.
-	 */
-	waitForEvent(
-		id: string,
-		options: { event: string; filter?: EventFilter; after?: EventCursor; deadline?: number },
-	): Promise<{ name: string; payload: JsonObject; cursor: EventCursor } | null>;
 	/** Subscribe to one matching event without suspending; wait on it with `waitForAny`. */
 	subscribe(id: string, options: { event: string; filter?: EventFilter }): Promise<Subscription>;
 	/**
@@ -190,13 +171,12 @@ export interface DurableExecution {
 		id: string,
 		options: SignalWithStartOptions & { metadata?: Partial<InvocationMetadata> },
 	): Promise<string>;
-	/** Emit an event from inside an execution (not memoized; wrap in `step` if needed). */
+	/** Emit an event from inside an execution; `id` dedupes like `DurableRuntime.emit` (not memoized). */
 	emit(
 		event: string,
 		payload: JsonObject,
 		options?: { id?: string; metadata?: Partial<InvocationMetadata> },
 	): Promise<void>;
-	cancel(executionId: string, reason?: string): Promise<boolean>;
 }
 
 /**
@@ -225,14 +205,8 @@ export interface RuntimeWorkflow {
 		execution: DurableExecution,
 		next: (attempt: unknown) => Promise<void>,
 	) => Promise<void>;
+	/** Its return value is the execution's native result (`getExecution`, result waits). */
 	handler: (input: Json, execution: DurableExecution, attempt?: unknown) => Promise<Json | void>;
-	/** Runtime calls this after terminal settlement (success, failure, cancellation), never suspension.
-	 * Must be retried after restart on delivery failure; implementations must be idempotent. */
-	onSettled?: (
-		executionId: string,
-		metadata: InvocationMetadata,
-		result: ExecutionResult,
-	) => Promise<void>;
 }
 
 export interface RuntimeEvent {
@@ -241,27 +215,21 @@ export interface RuntimeEvent {
 	filterable: readonly string[];
 }
 
-/** Event emitted by core when any Fabrial execution reaches a terminal state. */
-export const EXECUTION_SETTLED_EVENT = "fabrial.execution.settled";
-
 export interface DurableRuntime {
 	/** Optional clock, primarily for deterministic tests. Defaults to Date.now in core. */
 	now?(): number;
 	register(definition: { workflows: RuntimeWorkflow[]; events: RuntimeEvent[] }): void;
 	/**
-	 * Emit an event. `id` dedupes redeliveries per event name, for as long as Conductor retains the
-	 * event's dispatch (about one to two days).
+	 * Emit an event (Conductor `emit`). `id` is its native dedupe key: it dedupes redeliveries per event
+	 * name across the whole database, for as long as Conductor retains the event's dispatch (one day).
 	 */
 	emit(
 		event: string,
 		payload: JsonObject,
 		options: { id?: string; metadata: InvocationMetadata },
 	): Promise<void>;
-	invoke(
-		workflow: string,
-		input: Json,
-		options: { metadata: InvocationMetadata; dedupeKey?: string },
-	): Promise<string>;
+	/** Start an execution from outside any execution (tests, scripts). Not deduped; apps route through events. */
+	invoke(workflow: string, input: Json, options: { metadata: InvocationMetadata }): Promise<string>;
 	cancel(executionId: string, reason?: string): Promise<boolean>;
 	/** An execution of this runtime: its workflow and, once settled, its result. Null if unknown or removed. */
 	getExecution(
@@ -271,7 +239,7 @@ export interface DurableRuntime {
 	signalWithStart(
 		options: SignalWithStartOptions & { metadata: InvocationMetadata },
 	): Promise<string>;
-	/** Store a signal for an execution. False if it is settled or unknown. */
+	/** Store a signal for an execution (tests, scripts). False if it is settled or unknown. */
 	signal(executionId: string, signal: RuntimeSignal): Promise<boolean>;
 	start(): Promise<void>;
 	stop(): Promise<void>;

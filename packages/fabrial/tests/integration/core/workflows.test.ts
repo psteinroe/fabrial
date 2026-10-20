@@ -16,7 +16,7 @@ import {
 	workflow,
 } from "./setup.ts";
 
-const { db, setup, enter, eventually } = useCoreApp();
+const { db, setup, enter } = useCoreApp();
 
 describe("routing and lifecycle", () => {
 	it("selects specificity, merges triggers, runs observers without a thread and dedupes ingress", async () => {
@@ -737,13 +737,5 @@ describe("agent port workflows", () => {
 		const id = await test.runtime.invoke("agent-run", {}, { metadata });
 		expect(await db.execution(id).output()).toBe("agent-result");
 		expect(seen).toEqual(["agent-run"]);
-		// Terminal settlement is an engine event no app workflow waits on here.
-		const settlements = () => db.sql<{ id: string }[]>`
-			select id from pgconductor._private_executions
-			where task_key = 'pgconductor.event-dispatch' and payload ->> 'eventKey' = 'fabrial.execution.settled'
-				and payload -> 'payload' ->> 'executionId' = ${id}
-		`;
-		await eventually("the settlement event", async () => (await settlements()).length > 0);
-		expect(await settlements()).toHaveLength(1);
 	});
 });
