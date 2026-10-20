@@ -444,8 +444,7 @@ describe("native approval waits", () => {
 			select id, failed_at is not null as failed from pgconductor._private_executions
 			where queue = ${queue} and task_key = 'fabrial.cleanup' order by created_at`;
 
-	// PHASE2(task 9, unresolved): the late card's cleanup does not relabel it within the test's wait.
-	it.skip("decides on a click before every card is posted and labels the later cards with it", async () => {
+	it("decides on a click before every card is posted and labels the later cards with it", async () => {
 		const test = setup([approvalWorkflow()]);
 		const bobDM = await test.chat.openDM(bob.identities[0]!);
 		const post = bobDM.post.bind(bobDM);

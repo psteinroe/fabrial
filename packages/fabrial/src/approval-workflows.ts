@@ -90,7 +90,6 @@ export function approvalDecisionWorkflow(now: () => number): RuntimeWorkflow {
 						{
 							requestExecutionId: data.approvalId,
 							decisionId: execution.executionId,
-							callerId: data.callerId,
 							title: data.title,
 							...card,
 						} satisfies CleanupInput as unknown as Json,

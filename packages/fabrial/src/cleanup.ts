@@ -14,10 +14,8 @@ export type CardDestination =
 
 export interface CleanupInput {
 	requestExecutionId: string;
-	/** The decision execution: its result labels the card. */
+	/** The decision execution: its result labels the card. It settles when the caller does at the latest. */
 	decisionId: string;
-	/** The execution that requested the approval: settling first cancels the card. */
-	callerId: string;
 	destination: CardDestination;
 	/** Card content, with its actions. */
 	card: Json;
@@ -28,8 +26,8 @@ export interface CleanupInput {
 export const CLEANUP_ATTEMPTS = 3;
 
 /**
- * One independent execution per approval card: posts it, waits for the decision or the caller to
- * settle, and relabels it without actions. It survives cancellation of the caller and restarts.
+ * One independent execution per approval card: posts it, waits for the decision, and relabels it
+ * without actions. It survives cancellation of the caller and restarts.
  */
 export async function cleanup(
 	input: Json,
@@ -55,14 +53,11 @@ export async function cleanup(
 			warn("Approval card delivery failed", error);
 			throw error;
 		})) as unknown as MessageRef;
-	// The decision settles before a caller waiting on it can, so a valid decision is never "Cancelled".
-	const winner = await execution.waitForAny("closed", {
-		decision: { execution: data.decisionId },
-		caller: { execution: data.callerId },
-	});
+	// Only the decision: a card posted after both it and the caller settled must show the decision.
+	const result = await execution.waitForResult("closed", data.decisionId);
 	const label =
-		winner.key === "decision" && winner.kind === "execution" && winner.result.status === "completed"
-			? (winner.result.output as unknown as DecisionResult).label
+		result.status === "completed"
+			? (result.output as unknown as DecisionResult).label
 			: "Cancelled";
 	await execution
 		.step("update", async () => {
