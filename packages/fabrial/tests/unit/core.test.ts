@@ -19,8 +19,8 @@ import type {
 	JsonObject,
 	WorkflowContext,
 } from "../../src/index.ts";
-import { FakeChat, fakeAgents, MemoryRuntime, testApp } from "fabrial/testing";
-const { defineState } = createFabrial({ plugins: [] });
+import { FakeChat, MemoryRuntime, testApp } from "fabrial/testing";
+import { StubRuntime } from "./stub-runtime.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
 const identity = (subjectId: string): ExternalIdentity => ({
@@ -55,11 +55,13 @@ const plugin = definePlugin({
 		message: defineEvent({ payload: z.record(z.string(), z.json()), filterable: ["channelId"] }),
 	},
 });
+// Definition, routing-table and identity checks that run no workflow; executions are covered on real
+// Conductor in tests/integration/core.
 function setup(
 	workflows: AnyWorkflow[],
 	extra: Partial<import("../../src/app.ts").CoreConfig> = {},
+	runtime: StubRuntime | MemoryRuntime = new StubRuntime(),
 ) {
-	const runtime = new MemoryRuntime();
 	const chat = new FakeChat(() => runtime.now());
 	const config = {
 		runtime,
@@ -84,21 +86,10 @@ const metadata: InvocationMetadata = {
 	requestedBy: null,
 };
 
-async function enter(test: ReturnType<typeof setup>) {
+async function enter(test: ReturnType<typeof setup> & { runtime: MemoryRuntime }) {
 	await test.app.start();
 	await test.chat.receive(message("initial"));
 	await test.runtime.flush();
-}
-async function card(test: ReturnType<typeof setup>) {
-	const dm = await test.chat.openDM(alice.identities[0]!);
-	const post = dm.posts[0]!;
-	if (typeof post.content !== "object" || !("card" in post.content))
-		throw new Error("Missing card");
-	return {
-		post,
-		approve: post.content.card.actions![0]!.id,
-		reject: post.content.card.actions![1]!.id,
-	};
 }
 const approvalWorkflow = (timeout: string | number = "24h", requesterControls = true) =>
 	workflow(async (_input, ctx) => {
@@ -111,50 +102,23 @@ const approvalWorkflow = (timeout: string | number = "24h", requesterControls = 
 		});
 		return decision.status;
 	});
+const memory = (workflows: AnyWorkflow[]) => {
+	const test = setup(workflows, {}, new MemoryRuntime());
+	return { ...test, runtime: test.runtime as MemoryRuntime };
+};
+async function card(test: ReturnType<typeof memory>) {
+	const dm = await test.chat.openDM(alice.identities[0]!);
+	const post = dm.posts[0]!;
+	if (typeof post.content !== "object" || !("card" in post.content))
+		throw new Error("Missing card");
+	return {
+		post,
+		approve: post.content.card.actions![0]!.id,
+		reject: post.content.card.actions![1]!.id,
+	};
+}
 
-describe("routing and lifecycle", () => {
-	it("selects specificity, merges triggers, runs observers without a thread and dedupes ingress", async () => {
-		const seen: string[] = [];
-		const broad = workflow(async () => {
-			seen.push("broad");
-		});
-		const specific = defineWorkflow({
-			name: "specific",
-			triggers: [
-				trigger({ event, filter: { channelId: ["general"] } }),
-				trigger({ event, filter: { channelId: ["general"] } }),
-			],
-			run: async (_input, ctx) => {
-				expect(ctx.thread).toBeDefined();
-				seen.push("specific");
-			},
-		});
-		const observer = defineWorkflow({
-			name: "observer",
-			triggers: [trigger({ event, observe: true })],
-			run: async (_input, ctx) => {
-				expect(ctx.thread).toBeUndefined();
-				seen.push("observer");
-			},
-		});
-		const test = setup([broad, specific, observer]);
-		await enter(test);
-		await test.chat.receive(message("initial"));
-		await test.runtime.flush();
-		expect(seen.sort()).toEqual(["observer", "specific"]);
-	});
-	it("honors explicit specificity", async () => {
-		const a = workflow(async () => "broad");
-		const b = defineWorkflow({
-			name: "explicit",
-			triggers: [trigger({ event, specificity: 10 })],
-			run: async () => "explicit",
-		});
-		const test = setup([a, b]);
-		await enter(test);
-		expect(test.runtime.executions("explicit")).toHaveLength(1);
-		expect(test.runtime.executions("owner")).toHaveLength(0);
-	});
+describe("routing table", () => {
 	it.each([
 		[{}, {}],
 		[{ channelId: ["general"] }, { channelId: [{ prefix: "gen" }] }],
@@ -183,366 +147,27 @@ describe("routing and lifecycle", () => {
 			});
 		await expect(setup([make("a", "a"), make("b", "b")]).app.start()).resolves.toBeUndefined();
 	});
-	it("dispatches plugin and chat routes, prefixes route emits, and returns 404", async () => {
-		const routes = definePlugin({
-			id: "source",
-			events: { ping: defineEvent({ payload: z.object({ value: z.string() }) }) },
-			routes: {
-				"POST /ping": async (_request, ctx) => {
-					await ctx.emit("ping", { value: "ok" }, { id: "ping" });
-					return new Response("ok");
-				},
-			},
-		});
-		const test = setup([], { plugins: [routes] });
-		test.chat.routes["GET /chat"] = async () => new Response("chat");
-		await test.app.start();
-		expect(
-			await (await test.app.fetch(new Request("https://test/ping", { method: "POST" }))).text(),
-		).toBe("ok");
-		expect(test.runtime.emitted[0]!.name).toBe("source.ping");
-		expect(await (await test.app.fetch(new Request("https://test/chat"))).text()).toBe("chat");
-		expect((await test.app.fetch(new Request("https://test/missing"))).status).toBe(404);
-	});
-	it("ignores bot messages and clears finished interactions", async () => {
-		const test = setup([workflow(async () => {})]);
-		await test.app.start();
-		const bot = message("bot");
-		bot.author.isBot = true;
-		expect(await test.chat.receive(bot)).toBe("ignored");
-		await test.chat.receive(message("human"));
-		await test.runtime.flush();
-		expect(test.runtime.emitted.filter((e) => e.name === "fabrial.execution.settled")).toHaveLength(
-			1,
-		);
-	});
-});
-
-describe("durability and context", () => {
-	it("suffixes repeated ids and memoizes effects across replay", async () => {
-		let effects = 0;
-		const test = setup([
-			workflow(async (_input, ctx) => {
-				for (let i = 0; i < 3; i++) await ctx.step("x", () => ++effects);
-				const ref = await ctx.thread!.post("post", "hello");
-				await ctx.thread!.update("update", ref, "updated");
-				await ctx.sleep("sleep", "1h");
-				return effects;
-			}),
-		]);
-		await enter(test);
-		const id = test.runtime.executions()[0]!.executionId;
-		await test.runtime.advanceBy(3600000);
-		expect(effects).toBe(3);
-		expect(test.runtime.stepIds(id)).toEqual(expect.arrayContaining(["x", "x#1", "x#2"]));
-		const posts = (await test.chat.thread(surface)).posts;
-		expect(posts).toHaveLength(1);
-		expect(posts[0]!.updates).toEqual(["updated"]);
-	});
-	it("rejects empty operation ids", async () => {
-		const test = setup([workflow(async (_i, ctx) => ctx.step("", () => 1))]);
-		await enter(test);
-		expect(test.runtime.executions()[0]!.result).toMatchObject({
-			status: "failed",
-			error: expect.stringContaining("explicit id"),
-		});
-	});
-	it("runs middleware in plugin order on every resume", async () => {
-		const seen: string[] = [];
-		const p = (id: string) =>
-			definePlugin({
-				id,
-				hooks: {
-					workflow: [
-						async (_execution, ctx, next) => {
-							seen.push(`${id}:before`);
-							try {
-								return await next(ctx);
-							} finally {
-								seen.push(`${id}:after`);
-							}
-						},
-					],
-				},
-			});
-		const test = setup(
-			[
-				workflow(async (_i, ctx) => {
-					await ctx.sleep("pause", 1);
-				}),
-			],
-			{ plugins: [p("a"), p("b")] },
-		);
-		await enter(test);
-		await test.runtime.advanceBy(1);
-		expect(seen).toEqual([
-			"a:before",
-			"b:before",
-			"b:after",
-			"a:after",
-			"a:before",
-			"b:before",
-			"b:after",
-			"a:after",
-		]);
-	});
-	it("memoizes evaluation, agents, and shared state", async () => {
-		let evaluations = 0;
-		const agents = fakeAgents({
-			evaluate: async (request) => {
-				evaluations++;
-				return { stopReason: "stop", model: request.model, answers: {} };
-			},
-		});
-		const counter = defineState({
-			name: "count",
-			scope: "thread",
-			schema: z.object({ count: z.number() }),
-			initial: () => ({ count: 0 }),
-		});
-		const test = setup(
-			[
-				workflow(async (_i, ctx) => {
-					await ctx.state(counter).update("count", (draft) => {
-						draft.count++;
-					});
-					await ctx.evaluate("evaluate", {
-						model: "test/test",
-						state: {},
-						questions: {},
-					});
-					const answer = await ctx.agent(
-						"agent",
-						{ kind: "fabrial.agent", name: "echo" },
-						{ input: "echo" },
-					);
-					await ctx.sleep("sleep", 10);
-					return { answer, count: (await ctx.state(counter).get("read")).count };
-				}),
-			],
-			{ agents },
-		);
-		await enter(test);
-		await test.runtime.advanceBy(10);
-		expect(evaluations).toBe(1);
-		expect(test.runtime.executions()[0]!.result).toMatchObject({
-			output: { answer: "echo", count: 1 },
-		});
-	});
-	it("loads bounded history durably", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				const history = await ctx.thread!.history("history", { limit: 1 });
-				return { history: history.length };
-			}),
-		]);
-		await enter(test);
-		await test.runtime.flush();
-		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: { history: 1 } });
-	});
-});
-
-describe("approvals", () => {
-	it.each(["approved", "rejected"])("handles %s and duplicate clicks", async (status) => {
-		const test = setup([approvalWorkflow()]);
-		await enter(test);
-		const c = await card(test);
-		const action = status === "approved" ? c.approve : c.reject;
-		await test.chat.click(c.post.ref, action, alice.identities[0]!, { dedupeId: "click" });
-		await test.chat.click(c.post.ref, action, alice.identities[0]!, { dedupeId: "click" });
-		await test.runtime.flush();
-		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: status });
-		expect(test.runtime.emitted.filter((e) => e.name === "fabrial.approval.decided")).toHaveLength(
-			1,
-		);
-		expect(c.post.updates).toHaveLength(1);
-	});
-	it("delivers a click exactly once when its first emit fails and the provider retries", async () => {
-		const test = setup([approvalWorkflow()]);
-		await enter(test);
-		const c = await card(test);
-		const emit = test.runtime.emit.bind(test.runtime);
-		let failures = 1;
-		test.runtime.emit = async (...args) => {
-			if (args[0] === "fabrial.approval.decided" && failures-- > 0) throw new Error("emit failed");
-			return emit(...args);
-		};
-		await expect(
-			test.chat.click(c.post.ref, c.approve, alice.identities[0]!, { dedupeId: "click" }),
-		).rejects.toThrow("emit failed");
-		await test.runtime.flush();
-		expect(test.runtime.executions()[0]!.status).toBe("suspended");
-		for (let i = 0; i < 2; i++)
-			await test.chat.click(c.post.ref, c.approve, alice.identities[0]!, { dedupeId: "click" });
-		await test.runtime.flush();
-		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: "approved" });
-		expect(test.runtime.emitted.filter((e) => e.name === "fabrial.approval.decided")).toHaveLength(
-			1,
-		);
-		expect(c.post.updates).toHaveLength(1);
-	});
-	it("expires and renders cards without actions", async () => {
-		const test = setup([approvalWorkflow(100)]);
-		await enter(test);
-		const c = await card(test);
-		await test.runtime.advanceBy(100);
-		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: "expired" });
-		expect(c.post.content).toMatchObject({ card: { text: "Expired", actions: [] } });
-	});
-	it("rejects non-approvers ephemerally and continues waiting with a new wait id", async () => {
-		const test = setup([approvalWorkflow()]);
-		await enter(test);
-		const c = await card(test);
-		await test.chat.click(c.post.ref, c.approve, outsider.identities[0]!);
-		await test.runtime.flush();
-		expect(test.chat.ephemeral).toHaveLength(1);
-		expect(test.runtime.executions()[0]!.status).toBe("suspended");
-		await test.chat.click(c.post.ref, c.approve, bob.identities[0]!);
-		await test.runtime.flush();
-		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: "approved" });
-	});
-	it("requires assigned approvers to still be members", async () => {
-		let members = [alice, bob];
-		const rotation = defineGroup({ id: "rotation", resolve: () => members });
-		const test = setup([
-			workflow(
-				async (_i, ctx) =>
-					(
-						await ctx.waitForApproval("a", {
-							title: "Approval",
-							details: "x",
-							approvers: rotation,
-							timeout: 100,
-						})
-					).status,
-			),
-		]);
-		await enter(test);
-		const c = await card(test);
-		members = [bob];
-		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
-		await test.runtime.flush();
-		expect(test.chat.ephemeral).toHaveLength(1);
-		await test.runtime.advanceBy(100);
-		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: "expired" });
-	});
-	it("allows only the requester to cancel using the status control", async () => {
-		const test = setup([approvalWorkflow()]);
-		await enter(test);
-		const post = (await test.chat.thread(surface)).posts[0]!;
-		const action = (post.content as { card: { actions: { id: string }[] } }).card.actions[0]!.id;
-		await test.chat.click(post.ref, action, bob.identities[0]!);
-		await test.runtime.flush();
-		expect(test.chat.ephemeral).toHaveLength(1);
-		await test.chat.click(post.ref, action, alice.identities[0]!);
-		await test.runtime.flush();
-		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: "cancelled" });
-	});
-	it("disables requester controls", async () => {
-		const test = setup([approvalWorkflow(100, false)]);
-		await enter(test);
-		expect((await test.chat.thread(surface)).posts[0]!.content).toMatchObject({
-			card: { actions: [] },
-		});
-	});
-	it("cancellation of a suspended workflow updates pending cards", async () => {
-		const test = setup([approvalWorkflow()]);
-		await enter(test);
-		const c = await card(test);
-		await test.runtime.cancel(test.runtime.executions()[0]!.executionId);
-		await test.runtime.flush();
-		expect(c.post.content).toMatchObject({ card: { text: "Cancelled", actions: [] } });
-	});
-	it("asserts approval timeouts below 30 days", async () => {
-		const test = setup([approvalWorkflow("30d")]);
-		await enter(test);
-		expect(test.runtime.executions()[0]!.result).toMatchObject({
-			status: "failed",
-			error: expect.stringContaining("30 days"),
-		});
-	});
-});
-
-describe("children and identity", () => {
-	it("invokes children with metadata, validates schemas, and starts independently", async () => {
-		const child = defineWorkflow({
-			name: "child",
-			input: z.object({ value: z.number() }),
-			run: async (input, ctx) => {
-				expect(ctx.actor?.id).toBe("alice");
-				return input.value * 2;
-			},
-		});
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				const result = await ctx.invoke("child", child, { value: 3 });
-				const executionId = await ctx.start("background", child, { value: 4 });
-				return { result, executionId };
-			}),
-			child,
-		]);
-		await enter(test);
-		expect(test.runtime.executions("child")).toHaveLength(2);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: { result: 6 } });
-	});
-	it.each(["invoke", "start"] as const)("validates %s input before starting", async (method) => {
-		const child = defineWorkflow({
-			name: "child",
-			input: z.object({ value: z.number() }),
+	it("preserves cron replyTo in the registered runtime contract", () => {
+		const cron = defineWorkflow({
+			name: "cron",
+			cron: [{ schedule: "0 * * * *", replyTo: surface }],
 			run: async () => {},
 		});
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx[method]("call", child, { value: "bad" } as never);
-			}),
-			child,
+		const test = setup([cron]);
+		expect((test.runtime as StubRuntime).workflows.get("cron")!.cron).toEqual([
+			{ schedule: "0 * * * *", name: "cron", replyTo: surface },
 		]);
-		await enter(test);
-		expect(test.runtime.executions("child")).toHaveLength(0);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-			status: "failed",
-			error: expect.stringContaining("Invalid child input"),
-		});
 	});
-	it.each([false, true])("structured cancellation, detached=%s", async (detached) => {
-		const child = defineWorkflow({
-			name: "child",
-			input: z.object({}),
-			run: async (_i, ctx) => {
-				await ctx.sleep("sleep", 100);
-				return "done";
-			},
-		});
-		const test = setup([
-			workflow(async (_i, ctx) => ctx.invoke("invoke", child, {}, { detached })),
-			child,
-		]);
-		await enter(test);
-		await test.runtime.cancel(test.runtime.executions("owner")[0]!.executionId);
-		const childId = test.runtime.executions("child")[0]!.executionId;
-		if (detached) {
-			expect(test.runtime.result(childId)).toBeUndefined();
-			await test.runtime.advanceBy(100);
-			expect(test.runtime.result(childId)).toMatchObject({ status: "completed" });
-		} else expect(test.runtime.result(childId)).toMatchObject({ status: "cancelled" });
-	});
-	it("invokes another workflow without a permission check", async () => {
-		const other = defineWorkflow({
-			name: "other",
-			input: z.object({}),
-			run: async () => "secret",
-		});
-		const test = setup([workflow(async (_i, ctx) => ctx.invoke("other", other, {})), other]);
-		await enter(test);
-		expect(test.runtime.executions("other")).toHaveLength(1);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "secret" });
-	});
+});
+
+describe("identity", () => {
 	it("resolves known and unknown identities, static/dynamic groups and names", async () => {
 		const lookup = definePlugin({
 			id: "chat",
 			identity: { lookup: async () => ({ name: "Provider name" }) },
 		});
-		const test = setup([], { plugins: [lookup] });
+		const runtime = new StubRuntime(Date.parse("2026-01-05T00:00:00Z"));
+		const test = setup([], { plugins: [lookup] }, runtime);
 		expect(await test.app.host.resolvePrincipal(identity("A"))).toMatchObject({
 			id: "alice",
 			known: true,
@@ -563,559 +188,11 @@ describe("children and identity", () => {
 			resolve: ({ now }) => [weeklyRotation([alice, bob], { start: "2026-01-05", now })],
 		});
 		expect((await test.app.host.directory.members(rotation))[0]!.id).toBe("alice");
-		await test.runtime.advanceBy(7 * 86400000);
+		runtime.time += 7 * 86400000;
 		expect((await test.app.host.directory.members(rotation))[0]!.id).toBe("bob");
 		expect(weeklyRotation([alice, bob], { start: "2026-01-05", now: new Date("2025-12-29") })).toBe(
 			bob,
 		);
-	});
-	it("memoizes child start ids and enforces a strict mutex", async () => {
-		const runtime = new MemoryRuntime();
-		let active = 0;
-		let max = 0;
-		runtime.register({
-			events: [],
-			workflows: [
-				{
-					name: "locked",
-					triggers: [],
-					mutex: () => "key",
-					handler: async (_input, execution) => {
-						await execution.step("work", async () => {
-							active++;
-							max = Math.max(max, active);
-							await Promise.resolve();
-							active--;
-						});
-					},
-				},
-			],
-		});
-		await runtime.start();
-		await Promise.all(Array.from({ length: 3 }, () => runtime.invoke("locked", {}, { metadata })));
-		await runtime.flush();
-		expect(max).toBe(1);
-		expect(runtime.executions().every((e) => e.result?.status === "completed")).toBe(true);
-	});
-});
-
-describe("multi-category chat ingress", () => {
-	it("selects one owner across categories and merges observers, including the owner", async () => {
-		const seen: { workflow: string; thread: boolean }[] = [];
-		const broad = workflow(async () => {
-			seen.push({ workflow: "broad", thread: true });
-		});
-		const specific = defineWorkflow({
-			name: "specific",
-			triggers: [
-				trigger({ event: "chat.mentioned", specificity: 2 }),
-				trigger({ event, observe: true }),
-			],
-			run: async (_i, ctx) => {
-				seen.push({ workflow: "specific", thread: !!ctx.thread });
-				await ctx.sleep("pause", 10);
-			},
-		});
-		const observer = defineWorkflow({
-			name: "observer",
-			triggers: [
-				trigger({ event, observe: true }),
-				trigger({ event: "chat.mentioned", observe: true }),
-			],
-			run: async (_i, ctx) => {
-				seen.push({ workflow: "observer", thread: !!ctx.thread });
-			},
-		});
-		const test = setup([broad, specific, observer]);
-		await test.app.start();
-		await test.chat.receive(message("multi"), { events: [event, "chat.mentioned"] });
-		await test.runtime.flush();
-		expect(seen).toEqual(
-			expect.arrayContaining([
-				{ workflow: "specific", thread: true },
-				{ workflow: "observer", thread: false },
-			]),
-		);
-		expect(seen).toHaveLength(2);
-		expect(test.runtime.executions("specific")).toHaveLength(1);
-		expect(test.runtime.executions("observer")).toHaveLength(1);
-	});
-	it("detects dynamic cross-category ownership ties before emitting", async () => {
-		const a = workflow(async () => {});
-		const b = defineWorkflow({
-			name: "other",
-			triggers: [trigger({ event: "chat.mentioned" })],
-			run: async () => {},
-		});
-		const test = setup([a, b]);
-		await test.app.start();
-		await expect(
-			test.chat.receive(message("tie"), { events: [event, "chat.mentioned"] }),
-		).rejects.toThrow("Ambiguous owner");
-		expect(test.runtime.emitted).toHaveLength(0);
-	});
-	it("dedupes all categories across redelivery after completion", async () => {
-		const observer = defineWorkflow({
-			name: "observer",
-			triggers: [
-				trigger({ event, observe: true }),
-				trigger({ event: "chat.mentioned", observe: true }),
-			],
-			run: async () => {},
-		});
-		const test = setup([workflow(async () => {}), observer]);
-		await test.app.start();
-		for (let i = 0; i < 2; i++) {
-			await test.chat.receive(message("multi"), { events: [event, "chat.mentioned"] });
-			await test.runtime.flush();
-		}
-		expect(test.runtime.executions("owner")).toHaveLength(1);
-		expect(test.runtime.executions("observer")).toHaveLength(1);
-	});
-});
-
-describe("lazy channel threads and cancellation ingress", () => {
-	it("rebinds first-post receipts on replay, transfers real refs to children, and clears state", async () => {
-		const child = defineWorkflow({
-			name: "child",
-			input: z.object({}),
-			run: async (_i, ctx) => {
-				await ctx.thread!.post("child", "child");
-				return ctx.thread!.ref.threadId;
-			},
-		});
-		const owner = defineWorkflow({
-			name: "owner",
-			triggers: [
-				trigger({
-					event: "source.ping",
-					replyTo: { kind: "channel", provider: "chat", channelId: "lazy" },
-				}),
-			],
-			run: async (_i, ctx) => {
-				const first = await ctx.thread!.post("first", "first");
-				expect(ctx.thread!.ref.threadId).toBe(first.threadId);
-				await ctx.sleep("sleep", 10);
-				await ctx.thread!.update("update", first, "updated");
-				await ctx.thread!.post("second", "second");
-				return ctx.invoke("child", child, {});
-			},
-		});
-		const test = setup([owner, child]);
-		await test.app.start();
-		await test.app.emit("source.ping", {});
-		await test.runtime.flush();
-		expect(test.chat.threads.size).toBe(1);
-		const thread = [...test.chat.threads.values()][0]!;
-		await test.runtime.advanceBy(10);
-		expect(test.chat.threads.size).toBe(1);
-		expect(thread.posts.map((p) => p.content)).toEqual(["updated", "second", "child"]);
-		expect(test.runtime.executions("child")[0]!.metadata.replyTo).toEqual(thread.ref);
-		expect(await thread.getState()).toBeNull();
-	});
-	it("does not create a channel thread without a post", async () => {
-		const test = setup([
-			defineWorkflow({
-				name: "owner",
-				triggers: [
-					trigger({ event, replyTo: { kind: "channel", provider: "chat", channelId: "lazy" } }),
-				],
-				run: async (_i, ctx) => {
-					await ctx.sleep("sleep", 10);
-				},
-			}),
-		]);
-		await test.app.start();
-		await test.app.emit(event, {});
-		await test.runtime.flush();
-		expect(test.chat.threads.size).toBe(0);
-		await test.runtime.advanceBy(10);
-		expect(test.chat.threads.size).toBe(0);
-	});
-});
-
-describe("approval edge cases", () => {
-	it("accepts a click emitted during card delivery, before the wait registers", async () => {
-		const test = setup([approvalWorkflow()]);
-		const dm = await test.chat.openDM(alice.identities[0]!);
-		const post = dm.post.bind(dm);
-		dm.post = async (content) => {
-			const ref = await post(content);
-			if (typeof content === "object" && "card" in content)
-				await test.chat.click(ref, content.card.actions![0]!.id, alice.identities[0]!);
-			return ref;
-		};
-		await enter(test);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "approved" });
-	});
-	it("keeps assigned approvers fixed through replay and excludes newly rotated-in members", async () => {
-		let members = [alice];
-		const group = defineGroup({ id: "rotation", resolve: () => members });
-		const test = setup([
-			workflow(
-				async (_i, ctx) =>
-					(
-						await ctx.waitForApproval("approval", {
-							title: "Proposal",
-							details: {},
-							approvers: group,
-							timeout: 100,
-						})
-					).status,
-			),
-		]);
-		await enter(test);
-		const c = await card(test);
-		members = [alice, bob];
-		await test.chat.click(c.post.ref, c.approve, bob.identities[0]!);
-		await test.runtime.flush();
-		expect(test.chat.ephemeral).toHaveLength(1);
-		expect((await test.chat.openDM(bob.identities[0]!)).posts).toHaveLength(0);
-		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "approved" });
-	});
-	it("does not extend expiry after invalid decisions and ignores late clicks", async () => {
-		const test = setup([approvalWorkflow(100)]);
-		await enter(test);
-		const c = await card(test);
-		await test.runtime.advanceBy(90);
-		await test.chat.click(c.post.ref, c.approve, outsider.identities[0]!);
-		await test.runtime.flush();
-		await test.runtime.advanceBy(10);
-		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "expired" });
-		expect(c.post.updates).toHaveLength(1);
-	});
-	it("returns the same decision on repeated handle waits and does not cancel it afterwards", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				const handle = await ctx.requestApproval("approval", {
-					title: "Proposal",
-					details: {},
-					approvers: team,
-				});
-				const first = await handle.wait("first");
-				const second = await handle.wait("second");
-				await handle.cancel("cancel", "superseded");
-				await ctx.sleep("after", 10);
-				return [first.status, second.status];
-			}),
-		]);
-		await enter(test);
-		const c = await card(test);
-		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
-		await test.runtime.flush();
-		await test.runtime.advanceBy(10);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-			output: ["approved", "approved"],
-		});
-		expect(c.post.updates).toHaveLength(1);
-	});
-	it("updates every approver card and originating status exactly once across later replay", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx.waitForApproval("approval", { title: "Proposal", details: {}, approvers: team });
-				await ctx.sleep("after", 10);
-			}),
-		]);
-		await enter(test);
-		const c = await card(test);
-		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!, { dedupeId: "one" });
-		await test.runtime.flush();
-		await test.chat.click(c.post.ref, c.reject, bob.identities[0]!, { dedupeId: "different" });
-		await test.runtime.advanceBy(10);
-		for (const thread of test.chat.threads.values())
-			for (const post of thread.posts) {
-				expect(post.updates).toHaveLength(1);
-				expect(post.content).toMatchObject({ card: { text: "Approved by Alice", actions: [] } });
-			}
-	});
-	it("records a decision whose approver card was deleted and relabels the remaining cards", async () => {
-		const warnings: string[] = [];
-		const logger = { debug() {}, info() {}, error() {}, warn: (m: string) => warnings.push(m) };
-		const test = setup([approvalWorkflow()], { logger });
-		await enter(test);
-		const aliceDM = await test.chat.openDM(alice.identities[0]!);
-		aliceDM.posts.splice(0);
-		const bobDM = await test.chat.openDM(bob.identities[0]!);
-		const approve = (bobDM.posts[0]!.content as { card: { actions: { id: string }[] } }).card
-			.actions[0]!.id;
-		await test.chat.click(bobDM.posts[0]!.ref, approve, bob.identities[0]!);
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "approved" });
-		expect(bobDM.posts[0]!.content).toMatchObject({ card: { text: "Approved by Bob" } });
-		expect((await test.chat.thread(surface)).posts[0]!.content).toMatchObject({
-			card: { text: "Approved by Bob", actions: [] },
-		});
-		expect(warnings).toContain("Approval card update failed");
-	});
-	it("resumes card updates after an interruption without repeating or cancelling them", async () => {
-		const test = setup([approvalWorkflow()]);
-		await enter(test);
-		const c = await card(test);
-		const bobDM = await test.chat.openDM(bob.identities[0]!);
-		const update = bobDM.update.bind(bobDM);
-		let interrupted = false;
-		bobDM.update = async (...args) => {
-			if (!interrupted) {
-				interrupted = true;
-				throw new Error("interrupted");
-			}
-			return update(...args);
-		};
-		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
-		await test.runtime.flush();
-		expect(interrupted).toBe(true);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "approved" });
-		for (const thread of test.chat.threads.values())
-			for (const post of thread.posts) {
-				expect(post.updates).toHaveLength(1);
-				expect(post.content).toMatchObject({ card: { text: "Approved by Alice", actions: [] } });
-			}
-	});
-	it("updates cards when a workflow fails or abandons an unawaited approval", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx.requestApproval("approval", { title: "Proposal", details: {}, approvers: team });
-				throw new Error("failed");
-			}),
-		]);
-		await enter(test);
-		const c = await test.chat.openDM(alice.identities[0]!);
-		expect(c.posts[0]!.content).toMatchObject({ card: { text: "Cancelled", actions: [] } });
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ status: "failed" });
-	});
-});
-
-describe("runtime fidelity", () => {
-	it("records successful steps across retry after a later failure", async () => {
-		let attempts = 0;
-		let effects = 0;
-		const owner = defineWorkflow({
-			name: "owner",
-			triggers: [trigger({ event })],
-			retries: { maxAttempts: 2 },
-			run: async (_i, ctx) => {
-				await ctx.step("effect", () => ++effects);
-				if (++attempts === 1) throw new Error("retry");
-				return effects;
-			},
-		});
-		const test = setup([owner]);
-		await enter(test);
-		expect(effects).toBe(1);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-			status: "completed",
-			output: 1,
-		});
-	});
-	it("redelivers failed settlement hooks without replaying terminal handlers", async () => {
-		const runtime = new MemoryRuntime();
-		let handlers = 0;
-		let deliveries = 0;
-		runtime.register({
-			events: [],
-			workflows: [
-				{
-					name: "owner",
-					triggers: [],
-					handler: async () => {
-						handlers++;
-					},
-					onSettled: async () => {
-						if (++deliveries === 1) throw new Error("network");
-					},
-				},
-			],
-		});
-		await runtime.start();
-		await runtime.invoke("owner", {}, { metadata });
-		await expect(runtime.flush()).rejects.toThrow("network");
-		await runtime.flush();
-		expect(handlers).toBe(1);
-		expect(deliveries).toBe(2);
-	});
-	it("start survives parent cancellation, while recursive invokes do not", async () => {
-		const grandchild = defineWorkflow({
-			name: "grandchild",
-			input: z.object({}),
-			run: async (_i, ctx) => {
-				await ctx.sleep("sleep", 100);
-			},
-		});
-		const child = defineWorkflow({
-			name: "child",
-			input: z.object({}),
-			run: async (_i, ctx) => ctx.invoke("grandchild", grandchild, {}),
-		});
-		const background = defineWorkflow({
-			name: "background",
-			input: z.object({}),
-			run: async (_i, ctx) => {
-				await ctx.sleep("sleep", 100);
-			},
-		});
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx.start("background", background, {});
-				return ctx.invoke("child", child, {});
-			}),
-			child,
-			grandchild,
-			background,
-		]);
-		await enter(test);
-		await test.runtime.cancel(test.runtime.executions("owner")[0]!.executionId);
-		await test.runtime.flush();
-		expect(test.runtime.executions("child")[0]!.result?.status).toBe("cancelled");
-		expect(test.runtime.executions("grandchild")[0]!.result?.status).toBe("cancelled");
-		expect(test.runtime.executions("background")[0]!.result).toBeUndefined();
-		await test.runtime.advanceBy(100);
-		expect(test.runtime.executions("background")[0]!.result?.status).toBe("completed");
-	});
-	it("initializes state once and validates initial values", async () => {
-		let initializations = 0;
-		const state = defineState({
-			name: "state",
-			scope: "thread",
-			schema: z.object({ count: z.number() }),
-			initial: () => ({ count: ++initializations }),
-		});
-		const test = setup(
-			[
-				workflow(async (_i, ctx) => [
-					(await ctx.state(state).get("one")).count,
-					(await ctx.state(state).get("two")).count,
-				]),
-			],
-			{ agents: fakeAgents() },
-		);
-		await enter(test);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: [1, 1] });
-	});
-});
-
-describe("additional port and correlation guarantees", () => {
-	it("finishes an in-flight card step then cancels and cleans up its receipt", async () => {
-		const test = setup([approvalWorkflow()]);
-		const dm = await test.chat.openDM(alice.identities[0]!);
-		const post = dm.post.bind(dm);
-		dm.post = async (content) => {
-			const receipt = await post(content);
-			await test.runtime.cancel(test.runtime.executions("owner")[0]!.executionId);
-			return receipt;
-		};
-		await enter(test);
-		expect(test.runtime.executions("owner")[0]!.result?.status).toBe("cancelled");
-		expect(dm.posts[0]!.content).toMatchObject({ card: { text: "Cancelled", actions: [] } });
-	});
-	it("honors scalar filter operators with AND fields and OR alternatives", async () => {
-		const owner = defineWorkflow({
-			name: "owner",
-			triggers: [
-				trigger({
-					event: "source.item",
-					filter: {
-						level: ["error", "fatal"],
-						path: [{ prefix: "api/" }],
-						size: [{ numeric: [">=", 5, "<", 10] }],
-						optional: [{ exists: false }],
-						enabled: [{ "anything-but": false }],
-					},
-				}),
-			],
-			run: async () => "matched",
-		});
-		const test = setup([owner]);
-		await test.app.start();
-		await test.app.emit("source.item", { level: "error", path: "api/x", size: 6, enabled: true });
-		await test.app.emit("source.item", { level: "warning", path: "api/x", size: 6, enabled: true });
-		await test.app.emit("source.item", { level: "error", path: "api/x", size: 6, enabled: {} });
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")).toHaveLength(1);
-	});
-	it("enforces workflow concurrency without a mutex", async () => {
-		const runtime = new MemoryRuntime();
-		let active = 0;
-		let maximum = 0;
-		runtime.register({
-			events: [],
-			workflows: [
-				{
-					name: "limited",
-					triggers: [],
-					concurrency: 1,
-					handler: async (_i, execution) => {
-						await execution.step("work", async () => {
-							active++;
-							maximum = Math.max(maximum, active);
-							await Promise.resolve();
-							active--;
-						});
-					},
-				},
-			],
-		});
-		await runtime.start();
-		for (let i = 0; i < 3; i++) await runtime.invoke("limited", {}, { metadata });
-		await runtime.flush();
-		expect(maximum).toBe(1);
-	});
-	it("rejects unknown child waits and invalid timers", async () => {
-		const runtime = new MemoryRuntime();
-		runtime.register({
-			events: [],
-			workflows: [
-				{
-					name: "owner",
-					triggers: [],
-					handler: async (_i, execution) => {
-						await execution.waitForAny("wait", {
-							child: { kind: "execution", executionId: "missing" },
-						});
-					},
-				},
-			],
-		});
-		await runtime.start();
-		const id = await runtime.invoke("owner", {}, { metadata });
-		await runtime.flush();
-		expect(runtime.result(id)).toMatchObject({
-			status: "failed",
-			error: "Unknown execution: missing",
-		});
-	});
-	it("registers agent port workflows once and wraps their middleware and terminal settlement", async () => {
-		const seen: string[] = [];
-		const agents = fakeAgents({
-			workflows: [{ name: "agent-run", triggers: [], handler: async () => "agent-result" }],
-		});
-		const test = setup([], {
-			agents,
-			plugins: [
-				definePlugin({
-					id: "hook",
-					hooks: {
-						workflow: [
-							async (execution, ctx, next) => {
-								seen.push(execution.workflow);
-								return next(ctx);
-							},
-						],
-					},
-				}),
-			],
-		});
-		await test.app.start();
-		const id = await test.runtime.invoke("agent-run", {}, { metadata });
-		await test.runtime.flush();
-		expect(test.runtime.result(id)).toMatchObject({ output: "agent-result" });
-		expect(seen).toEqual(["agent-run"]);
-		expect(
-			test.runtime.emitted.filter((event) => event.name === "fabrial.execution.settled"),
-		).toHaveLength(1);
 	});
 	it("recognizes users discovered through dynamic groups and provider-scoped membership", async () => {
 		const user = defineUser({ id: "dynamic", identities: [identity("D")] });
@@ -1130,234 +207,30 @@ describe("additional port and correlation guarantees", () => {
 		});
 		expect(await test.app.host.directory.identitiesFor("dynamic")).toEqual(user.identities);
 	});
-	it("handles generated-id collisions deterministically without repeating effects", async () => {
-		let effects = 0;
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx.step("x", () => ++effects);
-				await ctx.step("x:1", () => ++effects);
-				await ctx.step("x", () => ++effects);
-				await ctx.sleep("sleep", 1);
-				return effects;
-			}),
-		]);
-		await enter(test);
-		await test.runtime.advanceBy(1);
-		expect(effects).toBe(3);
-		expect(test.runtime.stepIds(test.runtime.executions("owner")[0]!.executionId)).toEqual(
-			expect.arrayContaining(["x", "x:1", "x#1"]),
+});
+
+describe("fake ports", () => {
+	it("fake ChatPort atomically updates state without exposing mutable stored objects", async () => {
+		const chat = new FakeChat();
+		const thread = await chat.thread(surface);
+		await thread.updateState(() => ({ count: 0 }));
+		await Promise.all(
+			Array.from({ length: 100 }, () =>
+				thread.updateState((state) => state && { ...state, count: Number(state.count) + 1 }),
+			),
 		);
-	});
-	it("does not permit an alternate workflow object to bypass registered input validation", async () => {
-		const registered = defineWorkflow({
-			name: "registered",
-			input: z.object({ count: z.number() }),
-			run: async () => "secret",
-		});
-		const impostor = defineWorkflow({
-			name: "registered",
-			input: z.object({}),
-			run: async () => "fake",
-		});
-		const test = setup([workflow(async (_i, ctx) => ctx.invoke("call", impostor, {})), registered]);
-		await enter(test);
-		expect(test.runtime.executions("registered")).toHaveLength(0);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-			status: "failed",
-			error: expect.stringContaining("Invalid registered input"),
-		});
-	});
-});
-
-describe("ingress tombstones and reservation recovery", () => {
-	it("keeps the last 100 receipts across settlements; actions dedupe in the runtime", async () => {
-		const test = setup([workflow(async () => {})]);
-		await test.app.start();
-		for (let i = 0; i < 101; i++) {
-			await test.chat.receive(message(`inbound-${i}`));
-			await test.runtime.flush();
-		}
-		const thread = await test.chat.thread(surface);
-		expect((await thread.getState())?.ingestedDedupeIds).toHaveLength(100);
-		expect((await thread.getState())?.ingestedDedupeIds?.[0]?.id).toBe("inbound-1");
-		expect(await test.chat.receive(message("inbound-100"))).toBe("ignored");
-		// Beyond the bounded window the runtime still dedupes; the orphaned slot must expire.
-		expect(await test.chat.receive(message("inbound-0"))).toBe("new");
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")).toHaveLength(101);
-		await test.runtime.advanceBy(10 * 60 * 1000);
-		const ref = { ...surface, messageId: "card" };
-		const decided = () =>
-			test.runtime.emitted.filter((e) => e.name === "fabrial.approval.decided").length;
-		for (let i = 0; i < 2; i++)
-			await test.chat.click(ref, "fabrial.approval.approve:a", alice.identities[0]!, {
-				dedupeId: "inbound-100",
-			});
-		expect(decided()).toBe(1);
-		await test.chat.receive(message("next"));
-		await test.runtime.flush();
-		await test.chat.click(ref, "fabrial.approval.approve:a", alice.identities[0]!, {
-			dedupeId: "inbound-100",
-		});
-		expect(decided()).toBe(1);
 		const state = await thread.getState();
-		expect(state?.ingestedDedupeIds).toHaveLength(100);
-		expect(state?.ingestedDedupeIds?.every((receipt) => receipt.kind === "message")).toBe(true);
-		state!.ingestedDedupeIds![0]!.id = "mutated snapshot";
-		expect((await thread.getState())?.ingestedDedupeIds?.[0]?.id).not.toBe("mutated snapshot");
-		await test.runtime.advanceBy(30 * 24 * 60 * 60 * 1000);
-		expect(await thread.getState()).toBeNull();
-	});
-
-	it("uses the final updater decision when a lock retry sees an ingress tombstone", async () => {
-		const test = setup([workflow(async () => {})]);
-		await test.app.start();
-		const thread = await test.chat.thread(surface);
-		const update = thread.updateState.bind(thread);
-		let retried = false;
-		thread.updateState = async (fn) => {
-			if (retried) return update(fn);
-			retried = true;
-			const speculative = fn(null);
-			await update(() => speculative);
-			return update(fn);
-		};
-		// The retry sees the pending receipt of its own attempt and dispatches its route once.
-		expect(await test.chat.receive(message("retry"))).toBe("new");
-		expect(test.runtime.emitted).toHaveLength(1);
-		expect((await thread.getState())?.ingestedDedupeIds).toEqual([
-			{ kind: "message", id: "retry", at: expect.any(Number) },
-		]);
+		expect(state?.count).toBe(100);
+		state!.count = 0;
+		expect((await thread.getState())?.count).toBe(100);
 	});
 });
 
-describe("provider route response context", () => {
-	it("passes replyTo and authenticated requestedBy from typed route emits through ingest", async () => {
-		const provider = definePlugin({
-			id: "provider",
-			events: { opened: defineEvent({ payload: z.object({ id: z.string() }) }) },
-			routes: {
-				"POST /opened": async (_request, ctx) => {
-					await ctx.emit(
-						"opened",
-						{ id: "pr-1" },
-						{ id: "delivery", replyTo: surface, requestedBy: alice.identities[0]! },
-					);
-					return new Response("ok");
-				},
-			},
-		});
-		const owner = defineWorkflow({
-			name: "owner",
-			triggers: [trigger({ event: "provider.opened" })],
-			run: async (_i, ctx) => {
-				expect(ctx.actor?.id).toBe("alice");
-				expect(ctx.thread!.ref).toEqual(surface);
-			},
-		});
-		const test = setup([owner], { plugins: [provider] });
-		await test.app.start();
-		await test.app.fetch(new Request("https://test/opened", { method: "POST" }));
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.metadata.requestedBy?.id).toBe("alice");
-	});
-	it("uses receipt-derived metadata for state and agents after lazy channel posts", async () => {
-		const counter = defineState({
-			name: "counter",
-			scope: "thread",
-			schema: z.object({ count: z.number() }),
-			initial: () => ({ count: 0 }),
-		});
-		const child = defineWorkflow({
-			name: "child",
-			input: z.object({}),
-			run: async (_i, ctx) => (await ctx.state(counter).get("get")).count,
-		});
-		const owner = defineWorkflow({
-			name: "owner",
-			triggers: [
-				trigger({ event, replyTo: { kind: "channel", provider: "chat", channelId: "lazy" } }),
-			],
-			run: async (_i, ctx) => {
-				const ref = await ctx.thread!.post("first", "first");
-				expect(ctx.metadata.replyTo?.threadId).toBe(ref.threadId);
-				await ctx.state(counter).update("update", (draft) => {
-					draft.count++;
-				});
-				return ctx.invoke("child", child, {});
-			},
-		});
-		const test = setup([owner, child], { agents: fakeAgents() });
-		await test.app.start();
-		await test.app.emit(event, {});
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: 1 });
-	});
-});
-
-describe("thread ownership during parent cancellation", () => {
-	it("treats missing prototype-named filter fields as absent", async () => {
-		const owner = defineWorkflow({
-			name: "owner",
-			triggers: [trigger({ event, filter: { toString: [{ exists: false }] } })],
-			run: async () => {},
-		});
-		const test = setup([owner]);
-		await test.app.start();
-		await test.app.emit(event, {});
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")).toHaveLength(1);
-	});
-});
-
-describe("review regressions", () => {
-	it.each(["fabrial:receipt", "x#1"])("rejects reserved operation id %s", async (id) => {
-		const test = setup([workflow(async (_i, ctx) => ctx.step(id, () => 1))]);
-		await enter(test);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-			status: "failed",
-			error: expect.stringContaining("reserved"),
-		});
-	});
-
-	it("delivers approval cards concurrently, durably per card", async () => {
-		const test = setup([approvalWorkflow()]);
-		const first = await test.chat.openDM(alice.identities[0]!);
-		const second = await test.chat.openDM(bob.identities[0]!);
-		let secondStarted = false;
-		const secondPost = second.post.bind(second);
-		second.post = async (content) => {
-			secondStarted = true;
-			return secondPost(content);
-		};
-		const firstPost = first.post.bind(first);
-		first.post = async (content) => {
-			await new Promise((resolve) => setTimeout(resolve, 0));
-			expect(secondStarted).toBe(true);
-			return firstPost(content);
-		};
-		await enter(test);
-		expect(test.runtime.executions("owner")[0]!.status).toBe("suspended");
-		expect(first.posts).toHaveLength(1);
-		expect(second.posts).toHaveLength(1);
-	});
-
-	it("catches a valid decision emitted while rejecting an invalid click", async () => {
-		const test = setup([approvalWorkflow()]);
-		await enter(test);
-		const c = await card(test);
-		const notice = test.chat.postEphemeral.bind(test.chat);
-		test.chat.postEphemeral = async (...args) => {
-			await notice(...args);
-			await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
-		};
-		await test.chat.click(c.post.ref, c.approve, outsider.identities[0]!);
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "approved" });
-	});
-
+describe("cleanup workflow", () => {
+	// PHASE2: task 5. These drive the internal cleanup workflow through MemoryRuntime internals (a
+	// handler swapped in its registry, stepIds, cursor "0"); task 9 replaces that workflow and its tests.
 	it("cleanup catches presentations and settlement emitted between successive waits", async () => {
-		const test = setup([approvalWorkflow()]);
+		const test = memory([approvalWorkflow()]);
 		const cleanup = test.runtime.workflows.get("fabrial.cleanup")!;
 		const handler = cleanup.handler;
 		let extra: Awaited<ReturnType<typeof test.chat.openDM>> | undefined;
@@ -1389,308 +262,8 @@ describe("review regressions", () => {
 		).toBe(true);
 	});
 
-	it("does not restart a race timer after an invalid approval at 90ms", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				const approval = await ctx.requestApproval("a", {
-					title: "Proposal",
-					details: {},
-					approvers: team,
-					timeout: 1000,
-				});
-				return (await ctx.race("r", { approval: approval.decision(), timer: ctx.timer(100) })).key;
-			}),
-		]);
-		await enter(test);
-		const c = await card(test);
-		await test.runtime.advanceBy(90);
-		await test.chat.click(c.post.ref, c.approve, outsider.identities[0]!);
-		await test.runtime.flush();
-		await test.runtime.advanceBy(10);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "timer" });
-	});
-
-	it("preserves cron replyTo in the registered runtime contract", () => {
-		const cron = defineWorkflow({
-			name: "cron",
-			cron: [{ schedule: "0 * * * *", replyTo: surface }],
-			run: async () => {},
-		});
-		const test = setup([cron]);
-		expect(test.runtime.workflows.get("cron")!.cron).toEqual([
-			{ schedule: "0 * * * *", name: "cron", replyTo: surface },
-		]);
-	});
-
-	it.each(["title", "details"] as const)("rejects changed approval %s on replay", async (field) => {
-		let changed = false;
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				return (
-					await ctx.waitForApproval("a", {
-						title: changed && field === "title" ? "Changed" : "Proposal",
-						details: changed && field === "details" ? { sql: "delete" } : { sql: "select" },
-						approvers: team,
-					})
-				).status;
-			}),
-		]);
-		await enter(test);
-		const c = await card(test);
-		changed = true;
-		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-			status: "failed",
-			error: expect.stringContaining("proposal changed"),
-		});
-	});
-
-	it("treats reordered proposal detail keys as the same proposal", async () => {
-		let changed = false;
-		const test = setup([
-			workflow(
-				async (_i, ctx) =>
-					(
-						await ctx.waitForApproval("a", {
-							title: "Proposal",
-							details: changed ? { b: 2, a: 1 } : { a: 1, b: 2 },
-							approvers: team,
-						})
-					).status,
-			),
-		]);
-		await enter(test);
-		const c = await card(test);
-		changed = true;
-		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
-		await test.runtime.flush();
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "approved" });
-	});
-
-	it.each([false, true])(
-		"tries DM identities preferring the origin, with fallback (all unsupported=%s)",
-		async (unsupported) => {
-			const user = defineUser({
-				id: "multi",
-				identities: [
-					{ ...identity("S"), provider: "slack" },
-					{ ...identity("G"), provider: "github" },
-				],
-			});
-			const test = setup(
-				[
-					workflow(async (_i, ctx) =>
-						ctx
-							.requestApproval("a", { title: "Proposal", details: {}, approvers: user })
-							.then(() => "requested"),
-					),
-				],
-				{ identity: [alice, user] },
-			);
-			const attempts: string[] = [];
-			const open = test.chat.openDM.bind(test.chat);
-			test.chat.openDM = async (identity) => {
-				attempts.push(identity.provider);
-				if (identity.provider === "github" || unsupported) throw new Error("No DM support");
-				return open(identity);
-			};
-			await test.app.start();
-			await test.app.emit(event, message("initial"), {
-				origin: { provider: "github" },
-				replyTo: { ...surface, provider: "slack" },
-			});
-			await test.runtime.flush();
-			expect(attempts).toEqual(["github", "slack"]);
-			expect(test.runtime.executions("owner")[0]!.result).toMatchObject(
-				unsupported
-					? {
-							status: "failed",
-							error: expect.stringContaining("no identity whose provider can open DMs"),
-						}
-					: { output: "requested" },
-			);
-		},
-	);
-});
-
-describe("updated in-memory port fidelity", () => {
-	it.each([false, true])(
-		"only explicit after sees events emitted before registration (after=%s)",
-		async (explicit) => {
-			const runtime = new MemoryRuntime();
-			runtime.register({
-				events: [],
-				workflows: [
-					{
-						name: "waiter",
-						triggers: [],
-						handler: async (_i, execution) => {
-							const after = await execution.cursor("fabrial:cursor");
-							await execution.step("fabrial:emit", () =>
-								execution.emit("ping", { value: "early" }),
-							);
-							const value = await execution.waitForEvent("wait", {
-								event: "ping",
-								...(explicit ? { after } : {}),
-								deadline: runtime.now() + 100,
-							});
-							return value as unknown as Json;
-						},
-					},
-				],
-			});
-			await runtime.start();
-			const id = await runtime.invoke("waiter", {}, { metadata });
-			await runtime.flush();
-			if (explicit)
-				expect(runtime.result(id)).toMatchObject({
-					output: { payload: { value: "early" }, cursor: "1" },
-				});
-			else {
-				expect(runtime.result(id)).toBeUndefined();
-				await runtime.emit("ping", { value: "late" }, { metadata });
-				await runtime.flush();
-				expect(runtime.result(id)).toMatchObject({
-					output: { payload: { value: "late" }, cursor: "2" },
-				});
-			}
-		},
-	);
-
-	it("memoizes a cursor across replay and continues after the consumed event cursor", async () => {
-		const runtime = new MemoryRuntime();
-		runtime.register({
-			events: [],
-			workflows: [
-				{
-					name: "waiter",
-					triggers: [],
-					handler: async (_i, execution) => {
-						const cursor = await execution.cursor("fabrial:cursor");
-						await execution.sleep("delay", 10);
-						const first = await execution.waitForEvent("first", { event: "ping", after: cursor });
-						await execution.step("fabrial:between", () =>
-							execution.emit("ping", { value: "second" }),
-						);
-						const second = await execution.waitForEvent("second", {
-							event: "ping",
-							after: first!.cursor,
-						});
-						return [cursor, first!.payload.value!, second!.payload.value!];
-					},
-				},
-			],
-		});
-		await runtime.start();
-		const id = await runtime.invoke("waiter", {}, { metadata });
-		await runtime.flush();
-		await runtime.emit("ping", { value: "first" }, { metadata });
-		await runtime.advanceBy(10);
-		expect(runtime.result(id)).toMatchObject({ output: ["0", "first", "second"] });
-	});
-
-	it("fires timers at absolute at even when registration is delayed", async () => {
-		const runtime = new MemoryRuntime();
-		const at = runtime.now() + 100;
-		runtime.register({
-			events: [],
-			workflows: [
-				{
-					name: "waiter",
-					triggers: [],
-					handler: async (_i, execution) => {
-						await execution.sleep("delay", 90);
-						return (await execution.waitForAny("timer", { timer: { kind: "timer", at } })).kind;
-					},
-				},
-			],
-		});
-		await runtime.start();
-		const id = await runtime.invoke("waiter", {}, { metadata });
-		await runtime.flush();
-		await runtime.advanceBy(90);
-		expect(runtime.result(id)).toBeUndefined();
-		await runtime.advanceBy(10);
-		expect(runtime.result(id)).toMatchObject({ output: "timer" });
-	});
-
-	it("does not let a late event beat an absolute expired deadline", async () => {
-		const runtime = new MemoryRuntime();
-		const deadline = runtime.now() + 100;
-		runtime.register({
-			events: [],
-			workflows: [
-				{
-					name: "waiter",
-					triggers: [],
-					handler: async (_i, execution) => {
-						const after = await execution.cursor("cursor");
-						await execution.sleep("delay", 200);
-						return (await execution.waitForEvent("wait", {
-							event: "ping",
-							after,
-							deadline,
-						})) as unknown as Json;
-					},
-				},
-			],
-		});
-		await runtime.start();
-		const id = await runtime.invoke("waiter", {}, { metadata });
-		await runtime.flush();
-		await runtime.advanceBy(150);
-		await runtime.emit("ping", {}, { metadata });
-		await runtime.advanceBy(50);
-		expect(runtime.result(id)).toMatchObject({ output: null });
-	});
-
-	it("suppresses a canonical owner's competing observer emission, even when it arrives first", async () => {
-		const runtime = new MemoryRuntime();
-		runtime.register({
-			events: [],
-			workflows: [
-				{
-					name: "owner",
-					triggers: [
-						{ event: "observer", role: "observer" },
-						{ event: "owned", role: "owner" },
-					],
-					handler: async () => "ok",
-				},
-			],
-		});
-		await runtime.start();
-		const options = {
-			metadata: { ...metadata, replyTo: surface as InvocationMetadata["replyTo"] },
-			dispatchId: "dispatch",
-			dispatchOwner: { workflow: "owner", event: "owned" },
-		};
-		await runtime.emit("observer", {}, options);
-		expect(runtime.executions()).toHaveLength(0);
-		await runtime.emit("owned", {}, { ...options, owner: "owner" });
-		await runtime.flush();
-		expect(runtime.executions()).toHaveLength(1);
-		expect(runtime.executions()[0]!.metadata.replyTo).toEqual(surface);
-	});
-
-	it("fake ChatPort atomically updates state without exposing mutable stored objects", async () => {
-		const chat = new FakeChat();
-		const thread = await chat.thread(surface);
-		await thread.updateState(() => ({ count: 0 }));
-		await Promise.all(
-			Array.from({ length: 100 }, () =>
-				thread.updateState((state) => state && { ...state, count: Number(state.count) + 1 }),
-			),
-		);
-		const state = await thread.getState();
-		expect(state?.count).toBe(100);
-		state!.count = 0;
-		expect((await thread.getState())?.count).toBe(100);
-	});
-
 	it.each(["first", "second"])("cleanup leaves the thread's routing state alone (%s)", async () => {
-		const test = setup([]);
+		const test = memory([]);
 		const thread = await test.chat.thread(surface);
 		const ref = await thread.post("hello");
 		await thread.updateState(() => ({
@@ -1716,7 +289,119 @@ describe("updated in-memory port fidelity", () => {
 	});
 });
 
-describe("registration interleavings", () => {
+// Executions that stay on the in-memory runtime for now; the rest run on real Conductor in
+// tests/integration/core.
+describe("in-memory executions", () => {
+	// PHASE2: move to real Conductor once conductor fixes the frozen test clock (event created_at == subscription created_at)
+	it("expires and renders cards without actions", async () => {
+		const test = memory([approvalWorkflow(100)]);
+		await enter(test);
+		const c = await card(test);
+		await test.runtime.advanceBy(100);
+		expect(test.runtime.executions()[0]!.result).toMatchObject({ output: "expired" });
+		expect(c.post.content).toMatchObject({ card: { text: "Expired", actions: [] } });
+	});
+	// PHASE2: move to real Conductor once conductor fixes the frozen test clock (event created_at == subscription created_at)
+	it("does not extend expiry after invalid decisions and ignores late clicks", async () => {
+		const test = memory([approvalWorkflow(100)]);
+		await enter(test);
+		const c = await card(test);
+		await test.runtime.advanceBy(90);
+		await test.chat.click(c.post.ref, c.approve, outsider.identities[0]!);
+		await test.runtime.flush();
+		await test.runtime.advanceBy(10);
+		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
+		await test.runtime.flush();
+		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "expired" });
+		expect(c.post.updates).toHaveLength(1);
+	});
+	// PHASE2: move to real Conductor once conductor fixes the frozen test clock (event created_at == subscription created_at)
+	it("does not restart a race timer after an invalid approval at 90ms", async () => {
+		const test = memory([
+			workflow(async (_i, ctx) => {
+				const approval = await ctx.requestApproval("a", {
+					title: "Proposal",
+					details: {},
+					approvers: team,
+					timeout: 1000,
+				});
+				return (await ctx.race("r", { approval: approval.decision(), timer: ctx.timer(100) })).key;
+			}),
+		]);
+		await enter(test);
+		const c = await card(test);
+		await test.runtime.advanceBy(90);
+		await test.chat.click(c.post.ref, c.approve, outsider.identities[0]!);
+		await test.runtime.flush();
+		await test.runtime.advanceBy(10);
+		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "timer" });
+	});
+	// PHASE2: move to real Conductor once conductor fixes the frozen test clock (event created_at == subscription created_at)
+	it("fires timers at absolute at even when registration is delayed", async () => {
+		const runtime = new MemoryRuntime();
+		const at = runtime.now() + 100;
+		runtime.register({
+			events: [],
+			workflows: [
+				{
+					name: "waiter",
+					triggers: [],
+					handler: async (_i, execution) => {
+						await execution.sleep("delay", 90);
+						return (await execution.waitForAny("timer", { timer: { kind: "timer", at } })).kind;
+					},
+				},
+			],
+		});
+		await runtime.start();
+		const id = await runtime.invoke("waiter", {}, { metadata });
+		await runtime.flush();
+		await runtime.advanceBy(90);
+		expect(runtime.result(id)).toBeUndefined();
+		await runtime.advanceBy(10);
+		expect(runtime.result(id)).toMatchObject({ output: "timer" });
+	});
+	// PHASE2: move to real Conductor once conductor fixes the frozen test clock (event created_at == subscription created_at)
+	it("rebinds first-post receipts on replay, transfers real refs to children, and clears state", async () => {
+		const child = defineWorkflow({
+			name: "child",
+			input: z.object({}),
+			run: async (_i, ctx) => {
+				await ctx.thread!.post("child", "child");
+				return ctx.thread!.ref.threadId;
+			},
+		});
+		const owner = defineWorkflow({
+			name: "owner",
+			triggers: [
+				trigger({
+					event: "source.ping",
+					replyTo: { kind: "channel", provider: "chat", channelId: "lazy" },
+				}),
+			],
+			run: async (_i, ctx) => {
+				const first = await ctx.thread!.post("first", "first");
+				expect(ctx.thread!.ref.threadId).toBe(first.threadId);
+				await ctx.sleep("sleep", 10);
+				await ctx.thread!.update("update", first, "updated");
+				await ctx.thread!.post("second", "second");
+				return ctx.invoke("child", child, {});
+			},
+		});
+		const test = memory([owner, child]);
+		await test.app.start();
+		await test.app.emit("source.ping", {});
+		await test.runtime.flush();
+		expect(test.chat.threads.size).toBe(1);
+		const thread = [...test.chat.threads.values()][0]!;
+		await test.runtime.advanceBy(10);
+		expect(test.chat.threads.size).toBe(1);
+		expect(thread.posts.map((p) => p.content)).toEqual(["updated", "second", "child"]);
+		expect(test.runtime.executions("child")[0]!.metadata.replyTo).toEqual(thread.ref);
+		expect(await thread.getState()).toBeNull();
+	});
+	// PHASE2: move to real Conductor with the native race (task 9): Conductor suspends the attempt at the
+	// first wait, so the emit in the same attempt never runs while the custom race's wait is pending.
 	it("does not lose an event emitted after registration while the attempt is still running", async () => {
 		const runtime = new MemoryRuntime();
 		runtime.register({
@@ -1739,32 +424,5 @@ describe("registration interleavings", () => {
 		const id = await runtime.invoke("waiter", {}, { metadata });
 		await runtime.flush();
 		expect(runtime.result(id)).toMatchObject({ output: { payload: { value: "registered" } } });
-	});
-
-	it("waitForApproval accepts framework-generated repetition suffixes without relaxing user id validation", async () => {
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				const decisions = [];
-				for (let i = 0; i < 2; i++)
-					decisions.push(
-						(await ctx.waitForApproval("a", { title: "Proposal", details: {}, approvers: alice }))
-							.status,
-					);
-				return decisions;
-			}),
-		]);
-		const dm = await test.chat.openDM(alice.identities[0]!);
-		const post = dm.post.bind(dm);
-		dm.post = async (content) => {
-			const ref = await post(content);
-			if (typeof content === "object" && "card" in content)
-				await test.chat.click(ref, content.card.actions![0]!.id, alice.identities[0]!);
-			return ref;
-		};
-		await enter(test);
-		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({
-			output: ["approved", "approved"],
-		});
-		expect(dm.posts).toHaveLength(2);
 	});
 });
