@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { createModels } from "@earendil-works/pi-ai/models";
 import type { Message } from "@earendil-works/pi-ai";
 import {
@@ -7,8 +6,7 @@ import {
 	fauxProvider,
 	fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
-import postgres, { type Sql } from "postgres";
-import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import { z } from "zod";
 import {
 	chatEvents,
@@ -23,20 +21,11 @@ import {
 	type ExternalIdentity,
 	type JsonObject,
 } from "../../../src/index.ts";
-import { pi, PostgresStorage } from "../../../src/agents/index.ts";
-import { FakeChat, MemoryRuntime, testApp } from "../../../src/testing.ts";
+import { pi } from "../../../src/agents/index.ts";
+import { FakeChat } from "../../../src/testing.ts";
+import { useAgents } from "./setup.ts";
 
-let sql: Sql;
-let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
-beforeAll(async () => {
-	container = await new PostgreSqlContainer("postgres:17-alpine").start();
-	sql = postgres(container.getConnectionUri(), { onnotice: () => {} });
-	await PostgresStorage.migrate(sql);
-});
-afterAll(async () => {
-	await sql?.end();
-	await container?.stop();
-});
+const { sql, launch, idle } = useAgents();
 
 const chat = definePlugin({ id: "chat", events: chatEvents() });
 const gh = definePlugin({ id: "gh", events: chatEvents() });
@@ -50,10 +39,6 @@ const sentry = definePlugin({
 	},
 });
 const f = createFabrial({ plugins: [chat, gh, sentry] });
-const stops: (() => Promise<void>)[] = [];
-afterEach(async () => {
-	for (const stop of stops.splice(0)) await stop();
-});
 
 const text = (messages: readonly Message[]) => JSON.stringify(messages);
 type Response = Parameters<ReturnType<typeof fauxProvider>["setResponses"]>[0][number];
@@ -71,28 +56,16 @@ async function setup(
 	models.setProvider(faux.provider);
 	const model = `${faux.provider.id}/${faux.getModel().id}`;
 	const { agents, workflows = [] } = build({ channel, model });
-	const runtime = new MemoryRuntime({ idPrefix: randomUUID() });
-	const fake = new FakeChat(() => runtime.now());
-	const app = testApp(f, {
-		workflows,
-		routedAgents: agents,
+	const {
 		runtime,
 		chat: fake,
-		agents: pi({ models, sql, settings: { retry: { enabled: false } } }),
+		app,
+	} = await launch(f, {
+		workflows,
+		routedAgents: agents,
+		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
 	});
-	await app.start();
-	stops.push(() => app.stop());
-	const settle = async () => {
-		await expect
-			.poll(
-				async () => {
-					await runtime.flush();
-					return runtime.executions().every((e) => e.status === "settled");
-				},
-				{ timeout: 10_000 },
-			)
-			.toBe(true);
-	};
+	const settle = () => idle(runtime.queue);
 	const threadId = (thread: string, provider = "chat") =>
 		provider === "chat" ? `chat:${channel}:${thread}` : `${provider}:${thread}`;
 	const message = (
@@ -366,7 +339,7 @@ it("a ctx.agent call runs in its own Session and never follows the thread: later
 	expect(t.faux.state.callCount).toBe(1);
 	expect(await t.posts("b1")).toEqual(["Answer 1"]);
 	const [thread] =
-		await sql`SELECT 1 FROM fabrial_pi.sessions WHERE key = ${`chat:chat:${t.channel}:b1`}`;
+		await sql()`SELECT 1 FROM fabrial_pi.sessions WHERE key = ${`chat:chat:${t.channel}:b1`}`;
 	expect(thread).toBeUndefined();
 });
 
@@ -483,15 +456,14 @@ it("equal specificity between an agent's and a workflow's trigger fails at start
 		triggers: [chatTrigger("chat", "mentioned", { channel })],
 		async run() {},
 	});
-	const runtime = new MemoryRuntime();
-	const app = testApp(f, {
-		workflows: [workflow],
-		routedAgents: [agent],
-		runtime,
-		chat: new FakeChat(),
-		agents: pi({ models: createModels(), sql }),
-	});
-	await expect(app.start()).rejects.toThrow(
+	await expect(
+		launch(f, {
+			workflows: [workflow],
+			routedAgents: [agent],
+			chat: new FakeChat(),
+			agents: pi({ models: createModels(), sql: sql() }),
+		}),
+	).rejects.toThrow(
 		`Ambiguous trigger owners: tie-${channel}, agent tie-${channel} on chat.mentioned`,
 	);
 });
