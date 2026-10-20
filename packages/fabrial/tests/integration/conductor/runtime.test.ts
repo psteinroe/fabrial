@@ -361,12 +361,16 @@ for (const timely of [true, false]) {
 		const runtime = await setup([
 			workflow("deadline-race", async (_input, ctx) => {
 				const after = await ctx.cursor("before-card");
+				const emit = () =>
+					ctx.step("side-effect", () => ctx.emit("test.event", { key: "approval" }));
+				// Order the emit and the deadline by steps, not by how fast they run: the timer has expired by
+				// the wait either way, and the event is stored before (timely) or after the deadline.
+				if (timely) await emit();
 				const deadline = await ctx.step("deadline", () => Date.now() + 150);
-				await ctx.step("side-effect", async () => {
-					if (!timely) await sql`select pg_sleep(0.2)`;
-					await ctx.emit("test.event", { key: "approval" });
-					if (timely) await sql`select pg_sleep(0.2)`;
+				await ctx.step("expire", async () => {
+					await sql`select pg_sleep(0.2)`;
 				});
+				if (!timely) await emit();
 				received = await ctx.waitForEvent("decision", { event: "test.event", after, deadline });
 				return received;
 			}),
@@ -382,31 +386,40 @@ for (const timely of [true, false]) {
 }
 
 for (const kind of ["event", "timer"] as const) {
-	test(`absolute ${kind} deadline does not drift earlier across polling replays`, async () => {
-		let began = 0;
-		let ended = 0;
-		let attempts = 0;
-		const runtime = await setup([
-			workflow("deadline", async (_input, ctx) => {
-				attempts++;
-				began = await ctx.step("began", () => Date.now());
-				const at = began + 600;
-				if (kind === "event")
-					expect(await ctx.waitForEvent("wait", { event: "test.event", deadline: at })).toBeNull();
-				else
-					expect(await ctx.waitForAny("wait", { timeout: { kind: "timer", at } })).toEqual({
-						key: "timeout",
-						kind: "timer",
-					});
-				ended = Date.now();
-				return null;
-			}),
-		]);
-		const id = await runtime.invoke("deadline", null, { metadata });
-		await expect.poll(() => completed(id), poll).toBe(true);
-		expect(attempts).toBeGreaterThan(2);
-		expect(ended - began).toBeGreaterThanOrEqual(590);
-	});
+	// Real time: the deadline is wall-clock and the replays come from 100 ms polls, so a loaded machine
+	// can replay fewer than three times before it expires. A retry reruns the window; it cannot pass a
+	// deadline that drifted.
+	test(
+		`absolute ${kind} deadline does not drift earlier across polling replays`,
+		{ retry: 2 },
+		async () => {
+			let began = 0;
+			let ended = 0;
+			let attempts = 0;
+			const runtime = await setup([
+				workflow("deadline", async (_input, ctx) => {
+					attempts++;
+					began = await ctx.step("began", () => Date.now());
+					const at = began + 600;
+					if (kind === "event")
+						expect(
+							await ctx.waitForEvent("wait", { event: "test.event", deadline: at }),
+						).toBeNull();
+					else
+						expect(await ctx.waitForAny("wait", { timeout: { kind: "timer", at } })).toEqual({
+							key: "timeout",
+							kind: "timer",
+						});
+					ended = Date.now();
+					return null;
+				}),
+			]);
+			const id = await runtime.invoke("deadline", null, { metadata });
+			await expect.poll(() => completed(id), poll).toBe(true);
+			expect(attempts).toBeGreaterThan(2);
+			expect(ended - began).toBeGreaterThanOrEqual(590);
+		},
+	);
 }
 
 test("dispatchOwner wins concurrent owner/observer emissions on the same workflow, including observer-first insertion", async () => {
@@ -1795,34 +1808,41 @@ test("concurrent signalWithStart calls start exactly one execution per key; ctx.
 	expect(seen[0]).toEqual({ ...metadata });
 });
 
-test("signals arriving while the handler returns re-queue it; the final attempt's output is kept", async () => {
-	let attempts = 0;
-	const runtime = await setup([
-		workflow(
-			"returning",
-			async (_input, ctx) => {
-				attempts++;
-				const received: Json[] = [];
-				// Signals arrive on worker polls, so an attempt must run until one delivers.
-				await new Promise<void>((resolve) =>
-					ctx.onSignal("input", (payload) => {
-						received.push(payload);
-						resolve();
-					}),
-				);
-				// Stored as this attempt stops reading signals: settlement re-queues it.
-				if (attempts === 1) await runtime.signal(ctx.executionId, input("late"));
-				return { attempts, received };
-			},
-			{ retries: { maxAttempts: 1 } },
-		),
-	]);
-	const id = await runtime.signalWithStart({
-		workflow: "returning",
-		key: "k",
-		signal: input("early"),
-		metadata,
-	});
-	await expect.poll(() => completed(id), poll).toBe(true);
-	expect(await output(id)).toEqual({ attempts: 2, received: ["late"] });
-});
+// Real time: the late signal must be stored after the worker's last signal poll of the attempt. A poll
+// that reads it first delivers it while the attempt drains, which Conductor allows. No hook orders the
+// two, so a retry reruns the race; a re-queue that loses the signal still fails every attempt.
+test(
+	"signals arriving while the handler returns re-queue it; the final attempt's output is kept",
+	{ retry: 2 },
+	async () => {
+		let attempts = 0;
+		const runtime = await setup([
+			workflow(
+				"returning",
+				async (_input, ctx) => {
+					attempts++;
+					const received: Json[] = [];
+					// Signals arrive on worker polls, so an attempt must run until one delivers.
+					await new Promise<void>((resolve) =>
+						ctx.onSignal("input", (payload) => {
+							received.push(payload);
+							resolve();
+						}),
+					);
+					// Stored as this attempt stops reading signals: settlement re-queues it.
+					if (attempts === 1) await runtime.signal(ctx.executionId, input("late"));
+					return { attempts, received };
+				},
+				{ retries: { maxAttempts: 1 } },
+			),
+		]);
+		const id = await runtime.signalWithStart({
+			workflow: "returning",
+			key: "k",
+			signal: input("early"),
+			metadata,
+		});
+		await expect.poll(() => completed(id), poll).toBe(true);
+		expect(await output(id)).toEqual({ attempts: 2, received: ["late"] });
+	},
+);

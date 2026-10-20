@@ -2,6 +2,9 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
 	test: {
+		// Every integration file runs Postgres-polling workers; more files at once on a loaded machine only
+		// slow each other past their timeouts.
+		maxWorkers: 4,
 		projects: [
 			{
 				extends: true,

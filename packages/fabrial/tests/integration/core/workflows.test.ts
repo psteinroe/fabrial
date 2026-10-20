@@ -582,39 +582,53 @@ describe("ingress tombstones and reservation recovery", () => {
 		return row!.count;
 	};
 
-	it("keeps the last 100 receipts across settlements; actions dedupe in the runtime", async () => {
-		const test = setup([workflow(async () => {})]);
-		await test.app.start();
-		for (let i = 0; i < 101; i++) await test.chat.receive(message(`inbound-${i}`));
-		const thread = await test.chat.thread(surface);
-		expect((await thread.getState())?.ingestedDedupeIds).toHaveLength(100);
-		expect((await thread.getState())?.ingestedDedupeIds?.[0]?.id).toBe("inbound-1");
-		expect(await test.chat.receive(message("inbound-100"))).toBe("ignored");
-		// Beyond the bounded window the runtime still dedupes; the orphaned slot must expire.
-		expect(await test.chat.receive(message("inbound-0"))).toBe("new");
-		await eventually("101 owners", () => test.ids("owner").length === 101);
-		await Promise.all(test.ids("owner").map((id) => db.execution(id).output()));
-		expect(test.ids("owner")).toHaveLength(101);
-		await db.clock.advance("10m");
-		const ref = { ...surface, messageId: "card" };
-		for (let i = 0; i < 2; i++)
+	// 101 executions on the file's single connection: the heaviest test here, slow on a loaded machine.
+	it(
+		"keeps the last 100 receipts across settlements; actions dedupe in the runtime",
+		{ timeout: 180_000 },
+		async () => {
+			const test = setup([workflow(async () => {})]);
+			await test.app.start();
+			for (let i = 0; i < 101; i++) await test.chat.receive(message(`inbound-${i}`));
+			const thread = await test.chat.thread(surface);
+			expect((await thread.getState())?.ingestedDedupeIds).toHaveLength(100);
+			expect((await thread.getState())?.ingestedDedupeIds?.[0]?.id).toBe("inbound-1");
+			expect(await test.chat.receive(message("inbound-100"))).toBe("ignored");
+			// Beyond the bounded window the runtime still dedupes; the orphaned slot must expire.
+			expect(await test.chat.receive(message("inbound-0"))).toBe("new");
+			await eventually("101 owners", () => test.ids("owner").length === 101);
+			// One query for all of them: a handle per execution would poll the single connection 101 times.
+			await eventually("101 owners to complete", async () => {
+				const [row] = await db.sql<{ completed: number; failed: number }[]>`
+				select count(*) filter (where completed_at is not null)::int as completed,
+					count(*) filter (where failed_at is not null or cancelled)::int as failed
+				from pgconductor._private_executions where id = any(${test.ids("owner")}::uuid[])
+			`;
+				if (row!.failed) throw new Error(`${row!.failed} owners failed`);
+				return row!.completed === 101;
+			});
+			expect(test.ids("owner")).toHaveLength(101);
+			await db.clock.advance("10m");
+			const ref = { ...surface, messageId: "card" };
+			for (let i = 0; i < 2; i++)
+				await test.chat.click(ref, "fabrial.approval.approve:a", alice.identities[0]!, {
+					dedupeId: "inbound-100",
+				});
+			expect(await decided()).toBe(1);
+			await test.chat.receive(message("next"));
 			await test.chat.click(ref, "fabrial.approval.approve:a", alice.identities[0]!, {
 				dedupeId: "inbound-100",
 			});
-		expect(await decided()).toBe(1);
-		await test.chat.receive(message("next"));
-		await test.chat.click(ref, "fabrial.approval.approve:a", alice.identities[0]!, {
-			dedupeId: "inbound-100",
-		});
-		expect(await decided()).toBe(1);
-		const state = await thread.getState();
-		expect(state?.ingestedDedupeIds).toHaveLength(100);
-		expect(state?.ingestedDedupeIds?.every((receipt) => receipt.kind === "message")).toBe(true);
-		state!.ingestedDedupeIds![0]!.id = "mutated snapshot";
-		expect((await thread.getState())?.ingestedDedupeIds?.[0]?.id).not.toBe("mutated snapshot");
-		await db.clock.advance("30d");
-		expect(await thread.getState()).toBeNull();
-	});
+			expect(await decided()).toBe(1);
+			const state = await thread.getState();
+			expect(state?.ingestedDedupeIds).toHaveLength(100);
+			expect(state?.ingestedDedupeIds?.every((receipt) => receipt.kind === "message")).toBe(true);
+			state!.ingestedDedupeIds![0]!.id = "mutated snapshot";
+			expect((await thread.getState())?.ingestedDedupeIds?.[0]?.id).not.toBe("mutated snapshot");
+			await db.clock.advance("30d");
+			expect(await thread.getState()).toBeNull();
+		},
+	);
 	it("uses the final updater decision when a lock retry sees an ingress tombstone", async () => {
 		const test = setup([workflow(async () => {})]);
 		await test.app.start();

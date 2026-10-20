@@ -331,13 +331,16 @@ it("requester Cancel request updates the card to Cancelled without writing SQL",
 	scriptRepair();
 	await mention();
 	await approval();
-	const status = calls.find(
-		(c) =>
-			c.method === "chat.postMessage" &&
-			c.args.channel === "C_SUPPORT" &&
-			button(c, "Cancel request"),
-	)!;
-	expect(status).toBeDefined();
+	// The requester's status card and the approver's card are separate posts, in no fixed order.
+	const statusCard = () =>
+		calls.find(
+			(c) =>
+				c.method === "chat.postMessage" &&
+				c.args.channel === "C_SUPPORT" &&
+				button(c, "Cancel request"),
+		);
+	await expect.poll(statusCard, poll).toBeDefined();
+	const status = statusCard()!;
 	expect(status.args.thread_ts).toBe("1700000000.000001");
 	const [child] = await sql`SELECT payload -> '__fabrial' -> 'metadata' AS metadata
 		FROM pgconductor._private_executions WHERE task_key = 'run-sql'`;

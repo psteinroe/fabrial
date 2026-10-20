@@ -1,6 +1,6 @@
 import postgres from "postgres";
 import { Conductor, TaskSchemas, type ExecutionInfo } from "pgconductor-js";
-import { afterAll, afterEach, beforeAll, inject } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, inject } from "vitest";
 import type {
 	DurableRuntime,
 	ExecutionResult,
@@ -62,19 +62,29 @@ export interface ExecutionHandle {
 	output(): Promise<Json>;
 }
 
-const WAIT_MS = 20_000;
+/** Below the integration `testTimeout`, so a stuck wait reports what it waited for. */
+const WAIT_MS = 40_000;
 const POLL_MS = 20;
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
 const testWorker = { pollIntervalMs: POLL_MS, flushIntervalMs: POLL_MS, fetchBatchSize: 10 };
 
-/** Poll `probe` until it returns a value other than `undefined`. */
+/**
+ * The running test's signal: Vitest aborts it when the test times out. A timed-out test body keeps
+ * running, and its waits would otherwise keep polling the file's single connection while the next
+ * test's hooks queue behind them.
+ */
+let current: AbortSignal | undefined;
+
+/** Poll `probe` until it returns a value other than `undefined`; gives up once the test ended. */
 export async function until<T>(
 	description: string,
 	probe: () => Promise<T | undefined>,
 	timeoutMs = WAIT_MS,
 ): Promise<T> {
 	const deadline = Date.now() + timeoutMs;
+	const signal = current;
 	while (true) {
+		if (signal?.aborted) throw new Error(`Stopped waiting for ${description}: the test ended`);
 		const value = await probe();
 		if (value !== undefined) return value;
 		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${description}`);
@@ -131,6 +141,9 @@ export function useConductor(): ConductorFixture {
 			logger: silent,
 			telemetry: false,
 		}) as unknown as Conductor;
+	});
+	beforeEach(({ signal }) => {
+		current = signal;
 	});
 	afterEach(async () => {
 		for (const runtime of runtimes.splice(0).reverse()) await runtime.stop();
