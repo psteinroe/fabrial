@@ -466,6 +466,14 @@ describe("native approval waits", () => {
 		expect(cardOf(bobDM.posts[0]!.content).actions).toEqual([]);
 	});
 
+	// Cleanup retries back off on the test clock: advance it until every unreachable card gives up.
+	const givenUp = (queue: string, count: number) =>
+		until("the unreachable cards to be given up", async () => {
+			if ((await cleanups(queue)).filter((row) => row.failed).length >= count) return true;
+			await db.clock.advance("1m");
+			return undefined;
+		});
+
 	it("decides with the cards that were delivered when one approver cannot be reached", async () => {
 		const warnings: string[] = [];
 		const logger = { debug() {}, info() {}, error() {}, warn: (m: string) => warnings.push(m) };
@@ -480,14 +488,40 @@ describe("native approval waits", () => {
 		await eventually("the delivery warning", () =>
 			warnings.includes("Approval card delivery failed"),
 		);
+		// Bob's cleanup is retried, then gives up; the approval keeps waiting on Alice's card.
+		await givenUp(test.runtime.queue, 1);
+		await owner.suspended();
 		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
 		expect(await owner.output()).toBe("approved");
 		await eventually(
 			"alice's relabelled card",
 			() => cardOf(c.post.content).text === "Approved by Alice",
 		);
-		// Bob's cleanup is retried, then gives up; it never blocks the others.
 		expect(await cleanups(test.runtime.queue)).toHaveLength(3);
+	});
+
+	it("fails at once when no approver can be reached", async () => {
+		const test = setup([approvalWorkflow()]);
+		test.chat.openDM = async () => {
+			throw new Error("No DM support");
+		};
+		const started = db.clock.now().getTime();
+		const owner = await enter(test);
+		const thread = await test.chat.thread(surface);
+		await until("the status card", async () => thread.posts[0]);
+		// The requester's status card was delivered, but it is not an approver card.
+		await givenUp(test.runtime.queue, 2);
+		expect(await owner.settled()).toMatchObject({
+			status: "failed",
+			error: expect.stringContaining("Approval failed: No approver could be reached"),
+		});
+		// Long before the 24h deadline.
+		expect(db.clock.now().getTime() - started).toBeLessThan(60 * 60_000);
+		await eventually(
+			"the relabelled status card",
+			() => cardOf(thread.posts[0]!.content).text === "No approver could be reached",
+		);
+		expect(cardOf(thread.posts[0]!.content).actions).toEqual([]);
 	});
 
 	it("races an approval without closing it and never extends its deadline across resumes", async () => {

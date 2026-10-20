@@ -38,8 +38,10 @@ import { notifyFollowers } from "./follows.ts";
 import {
 	APPROVAL_DECIDED_EVENT,
 	APPROVAL_DECISION_WORKFLOW,
+	APPROVAL_DELIVERY_WORKFLOW,
 	APPROVAL_REQUEST_WORKFLOW,
 	approvalDecisionWorkflow,
+	approvalDeliveryWorkflow,
 	approvalRequestWorkflow,
 	authorized,
 	loadRequest,
@@ -473,6 +475,7 @@ export function buildApp(config: CoreConfig): App {
 	for (const workflow of agents?.workflows ?? []) extraWorkflows.set(workflow.name, workflow);
 	extraWorkflows.set(APPROVAL_REQUEST_WORKFLOW, approvalRequestWorkflow());
 	extraWorkflows.set(APPROVAL_DECISION_WORKFLOW, approvalDecisionWorkflow(now));
+	extraWorkflows.set(APPROVAL_DELIVERY_WORKFLOW, approvalDeliveryWorkflow());
 	extraWorkflows.set(CLEANUP_WORKFLOW, {
 		name: CLEANUP_WORKFLOW,
 		triggers: [],

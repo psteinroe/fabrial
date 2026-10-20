@@ -10,6 +10,8 @@ import type { DurableExecution, RuntimeWorkflow } from "./runtime.ts";
 export const APPROVAL_REQUEST_WORKFLOW = "fabrial.approval.request";
 /** One execution per approval request that waits for its decision; its result is the final decision. */
 export const APPROVAL_DECISION_WORKFLOW = "fabrial.approval.decision";
+/** One execution per approval that settles early only when no approver card could be delivered. */
+export const APPROVAL_DELIVERY_WORKFLOW = "fabrial.approval.delivery";
 /** Authorized decisions only: the routing workflow emits a click after checking it. */
 export const APPROVAL_DECIDED_EVENT = "fabrial.approval.decided";
 
@@ -61,15 +63,41 @@ export interface DecisionInput {
 	cards: { destination: CardDestination; card: Json }[];
 }
 
-/** The decision execution's result: the decision and the label every card shows. */
-export interface DecisionResult {
-	decision: ApprovalDecision;
-	label: string;
+/**
+ * The decision execution's result: the decision, or why the approval failed, and the label every card
+ * shows.
+ */
+export type DecisionResult =
+	| { decision: ApprovalDecision; label: string }
+	| { error: string; label: string };
+
+/** Why an approval fails when every approver card failed permanently. */
+export const UNREACHABLE = "No approver could be reached";
+
+/**
+ * Waits on the approver cards' cleanups in turn and returns once one completes, which it does only after
+ * its card was posted and the approval decided. It settles before the decision only when every approver
+ * card failed for good.
+ */
+export function approvalDeliveryWorkflow(): RuntimeWorkflow {
+	return {
+		name: APPROVAL_DELIVERY_WORKFLOW,
+		triggers: [],
+		retentionDays: REQUEST_RETENTION_DAYS,
+		handler: async (input, execution) => {
+			const { cleanups } = input as { cleanups: string[] };
+			for (const [index, id] of cleanups.entries())
+				if ((await execution.waitForResult(`card:${index}`, id)).status === "completed")
+					return { reached: true };
+			return { reached: false };
+		},
+	};
 }
 
 /**
  * Subscribes once to the authorized decisions, then starts one cleanup per card, so a click on a card
- * just posted is never missed. The first decision wins; the caller settling first cancels the approval.
+ * just posted is never missed. The first decision wins; the caller settling first cancels the approval,
+ * and every approver card failing for good fails it.
  */
 export function approvalDecisionWorkflow(now: () => number): RuntimeWorkflow {
 	return {
@@ -82,7 +110,7 @@ export function approvalDecisionWorkflow(now: () => number): RuntimeWorkflow {
 				event: APPROVAL_DECIDED_EVENT,
 				filter: { approvalId: [data.approvalId] },
 			});
-			await Promise.all(
+			const cleanups = await Promise.all(
 				data.cards.map((card, index) =>
 					execution.start(
 						`card:${index}`,
@@ -97,11 +125,25 @@ export function approvalDecisionWorkflow(now: () => number): RuntimeWorkflow {
 					),
 				),
 			);
+			// The requester's status card is not an approver card.
+			const delivery = await execution.start(
+				"delivery",
+				APPROVAL_DELIVERY_WORKFLOW,
+				{ cleanups: cleanups.filter((_id, index) => data.cards[index]!.destination.kind === "dm") },
+				{ metadata: { replyTo: null, ownerWorkflow: null, triggerEvent: null } },
+			);
 			const winner = await execution.waitForAny(
 				"decision",
-				{ decided, caller: { execution: data.callerId } },
+				{ decided, caller: { execution: data.callerId }, delivery: { execution: delivery } },
 				{ timeoutMs: Math.max(0, data.deadline - now()) },
 			);
+			if (winner.kind === "execution" && winner.key === "delivery") {
+				const error =
+					winner.result.status === "completed"
+						? UNREACHABLE
+						: `Approval delivery ${winner.result.status}`;
+				return { error, label: error } satisfies DecisionResult;
+			}
 			const decidedAt = new Date(now()).toISOString();
 			let result: DecisionResult;
 			if (winner.kind === "event") {

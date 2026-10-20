@@ -141,8 +141,11 @@ export async function createApproval(
 		accept: (winner) => {
 			if (winner.kind !== "execution") throw new Error("Invalid approval decision");
 			const result = winner.result;
-			if (result.status === "completed")
-				return (result.output as unknown as DecisionResult).decision as unknown as Json;
+			if (result.status === "completed") {
+				const output = result.output as unknown as DecisionResult;
+				if ("error" in output) throw new Error(`Approval failed: ${output.error}`);
+				return output.decision as unknown as Json;
+			}
 			if (result.status === "failed") throw new Error(`Approval failed: ${result.error}`);
 			return {
 				status: "cancelled",
