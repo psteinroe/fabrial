@@ -48,7 +48,7 @@ Load `schema.sql` in `APP_DATABASE_URL`. Replace the sample external user IDs,
 channel IDs, team keys, and model references in source with your own.
 `supportAgent` uses `"anthropic/claude-sonnet-4-5"`; routing calls
 `ctx.evaluate` with the classifier `"typesafe/jev-latest"`. A missing or erroring
-classifier explicitly falls back to support; `#bugs` always hands off. Define
+classifier explicitly falls back to support; `#bugs` is always investigated inline. Define
 agents before `app.start()`.
 
 Endpoints:
@@ -95,7 +95,7 @@ restart test stops the app and starts a new one on the same database.
 
 Coverage: approval + duplicate click, rejection, requester cancellation,
 non-approver notice then approval, restart during approval, PR owner + observer,
-bug handoff, Linear triage, and database-enforced read-only/multiple-statement
+inline bug investigation, independent per-thread support conversations, Linear triage, and database-enforced read-only/multiple-statement
 rejection. Assertions poll durable state, never sleep arbitrary durations. Tests
 pin the on-call week so Bob is the approver regardless of the calendar.
 
@@ -105,9 +105,7 @@ Workflow-tool children retain the originating thread without inheriting
 trigger ownership; no example-local runtime workaround is needed. The passing
 unit regression checks the child metadata contract, and the real cancellation
 scenario checks the emitted child metadata and requester card in the origin thread.
-Settled chat-message routing state retains ingress tombstones with
-`interactionId: null`, rather than disappearing. Direct lifecycle ingress creates
-no routing tombstone. Approval tests click on card delivery without waiting for a
+Approval tests click on card delivery without waiting for a
 native subscription: durable event cursors retain pre-registration decisions.
 
 - **Conductor boundaries still apply:** strict mutexes are soft across
@@ -121,7 +119,7 @@ native subscription: durable event cursors retain pre-registration decisions.
 
 `acme-support` has a trigger on every message in `#help` (`C_HELP`) with `session: "channel"`: one conversation for the whole channel, listed in `f.app({ workflows, agents })`. Each asker's final reply posts automatically in the asker's thread, and the conversation follows each thread. The integration test covers two threads sharing that conversation, each answer going to its asker's thread, and a restart after ingress.
 
-`general-assistant` is the router for mentions elsewhere: bug reports are handed to `bugIntake`; everything else goes to `acme-support` with `ctx.send` (one conversation per thread), whose final reply posts in the thread. Later replies there go straight to the agent.
+`general-assistant` is the router for mentions elsewhere: the router investigates bug reports inline with `ctx.agent` and posts the analysis; everything else goes to `acme-support` with `ctx.send` and `session: "thread"`, overriding the agent's `"channel"`, so each thread outside `#help` is a conversation of its own. Its final reply posts in the thread, and later replies there go straight to the agent. The integration test covers two such threads getting independent conversations.
 
 ## Developer agent
 

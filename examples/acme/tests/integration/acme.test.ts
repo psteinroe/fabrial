@@ -194,18 +194,18 @@ async function slackRequest(payload: unknown, action = false) {
 		}),
 	);
 }
-async function mention(channel = "C_SUPPORT") {
+async function mention(channel = "C_SUPPORT", ts = "1700000000.000001", user = "U_ALICE") {
 	const response = await slackRequest({
 		type: "event_callback",
 		team_id: process.env.SLACK_TEAM_ID,
 		event_id: randomUUID(),
 		event: {
 			type: "app_mention",
-			user: "U_ALICE",
+			user,
 			channel,
 			text: "<@U_BOT> Please repair organisation org-acme's missing credit",
-			ts: "1700000000.000001",
-			event_ts: "1700000000.000001",
+			ts,
+			event_ts: ts,
 		},
 	});
 	expect(response.status).toBe(200);
@@ -544,6 +544,35 @@ it("#bugs: the router investigates inline with ctx.agent and posts the analysis;
 	expect(calls.some((c) => String(c.args.text).includes("I'll investigate this bug report"))).toBe(
 		true,
 	);
+});
+it("mentions outside #help: two threads get independent support conversations", async () => {
+	const step = (context: { messages: readonly { role: string; content: unknown }[] }) => {
+		const asks = (JSON.stringify(context.messages).match(/<message /g) ?? []).length;
+		return reply.text(`Answer ${asks}`);
+	};
+	faux.respond([step, step]);
+	await mention("C_SUPPORT", "1700000300.000001");
+	const replies = () =>
+		calls.filter(
+			(c) =>
+				c.method === "chat.postMessage" &&
+				c.args.channel === "C_SUPPORT" &&
+				String(c.args.text).includes("Answer"),
+		);
+	await expect.poll(() => replies().length, poll).toBe(1);
+	await mention("C_SUPPORT", "1700000400.000001", "U_BOB");
+	await expect.poll(() => replies().length, poll).toBe(2);
+	// Each thread's conversation saw only its own message.
+	expect(replies().map((c) => [c.args.thread_ts, c.args.text])).toEqual([
+		["1700000300.000001", "Answer 1"],
+		["1700000400.000001", "Answer 1"],
+	]);
+	const sessions =
+		await sql`SELECT key FROM fabrial_pi.sessions WHERE key LIKE '%C_SUPPORT%' ORDER BY key`;
+	expect(sessions.map((row) => row.key)).toEqual([
+		"slack:slack:C_SUPPORT:1700000300.000001",
+		"slack:slack:C_SUPPORT:1700000400.000001",
+	]);
 });
 it("signed Linear issue created webhook posts a triage comment", async () => {
 	const client = app.host.clients().linear;
