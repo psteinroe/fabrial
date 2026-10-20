@@ -553,15 +553,17 @@ class ConductorRuntime implements DurableRuntime {
 			},
 			onSignal: (name, handler) =>
 				raw.onSignal(name, (payload, info) => handler(payload as Json, { id: info.id })),
-			// PHASE2: ctx.signalWithStart only inherits this execution's metadata, so the client call
-			// runs in a step instead (at-least-once: a lost receipt can signal again).
-			signalWithStart: (id, options) =>
-				raw.step(operationId(id), () =>
-					this.signalWithStart({
-						...options,
-						metadata: mergeMetadata(metadata, options.metadata),
-					}),
-				),
+			signalWithStart: (id, options) => {
+				this.definition(options.workflow);
+				return raw.signalWithStart(operationId(id), {
+					task: options.workflow,
+					queue: this.queue,
+					key: options.key,
+					signal: options.signal,
+					input: { input: options.input ?? null },
+					metadata: mergeMetadata(metadata, options.metadata),
+				} as unknown as Parameters<TaskContext["signalWithStart"]>[1]);
+			},
 			emit: (event, payload, options) =>
 				this.emit(event, payload, {
 					id: options?.id,
