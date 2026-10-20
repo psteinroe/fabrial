@@ -2,15 +2,10 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import postgres from "postgres";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { z } from "zod";
-import {
-	Conductor,
-	Orchestrator,
-	TaskSchemas,
-	defineTask,
-} from "../../../src/runtime/conductor/index.ts";
+import { Conductor, Orchestrator, TaskSchemas, defineTask } from "pgconductor-js";
 
-// Fabrial runs on Node while Conductor is developed and tested on Bun. This guards the assumption
-// that its source runs unchanged on Node against a real Postgres.
+// Fabrial consumes Conductor's built Node package. This guards that its public exports resolve to
+// the built dist and run against a real Postgres.
 
 let container: StartedPostgreSqlContainer;
 let sql: postgres.Sql;

@@ -1,12 +1,6 @@
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
-	server: {
-		deps: {
-			// SHIM(conductor#9): pgconductor-js is TypeScript source, so Vite must transform it.
-			inline: [/pgconductor-js/],
-		},
-	},
 	test: {
 		projects: [
 			{

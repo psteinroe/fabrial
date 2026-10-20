@@ -18,12 +18,11 @@ import {
 } from "../../../src/index.ts";
 import { FakeChat, testApp } from "../../../src/testing.ts";
 import { z } from "zod";
+import type { AnyTask, Conductor } from "pgconductor-js";
 import {
 	conductor,
 	ExecutionError,
 	type ConductorExecution,
-	type Conductor,
-	type AnyTask,
 } from "../../../src/runtime/conductor/index.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
@@ -1662,7 +1661,7 @@ test("stop drains a fetch that delivers queued executions after worker abort", a
 	const original = native.client.db.getExecutions.bind(native.client.db);
 	const fetch = vi.spyOn(native.client.db, "getExecutions").mockImplementation(async (...args) => {
 		const rows = await original(...args);
-		if (rows.some((row) => row.task_key === "queued")) {
+		if (rows.executions.some((row) => row.task_key === "queued")) {
 			fetched();
 			await delivery;
 		}

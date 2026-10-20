@@ -1,5 +1,4 @@
 import postgres from "postgres";
-import { releaseQueuedExecutionsOnStop } from "./shutdown.ts";
 import {
 	EXECUTION_SETTLED_EVENT,
 	type DurableExecution,
@@ -16,6 +15,7 @@ import {
 	type ExecutionResult,
 	type EventCursor,
 } from "../../index.ts";
+import { matchesFilter } from "../../internal.ts";
 import {
 	Conductor,
 	Orchestrator,
@@ -24,11 +24,9 @@ import {
 	type TaskContext,
 	type AnyTask,
 	type Logger,
-	compileEventFilter,
 	type EventDefinition,
 	type WorkerConfig,
-	type EventFilterTerm,
-} from "./pgconductor.ts";
+} from "pgconductor-js";
 
 const RESERVED = "__fabrial";
 const DISPATCH_QUEUE = "pgconductor.internal";
@@ -48,9 +46,17 @@ type Carrier = {
 	dispatchOwner?: { workflow: string; event: string };
 	parent?: string;
 };
-type NativeExecution = { id: string; locked_by: string; task_key: string; queue: string };
-// SHIM(conductor#3): today's context hides execution identity. Keep the private access in one place;
-// core's per-attempt wrapper still runs on every replay. Never catch Conductor's hang-up control flow.
+type NativeExecution = {
+	id: string;
+	locked_by: string;
+	claim_token: string;
+	task_key: string;
+	queue: string;
+};
+// SHIM(conductor#3): ctx.executionId is public, but the claim (locked_by, claim_token) that fences
+// the custom race SQL is not. Keep the private access in one place; core's per-attempt wrapper still
+// runs on every replay. Never catch Conductor's hang-up control flow.
+// PHASE2: removed in task 12
 function nativeExecution(ctx: TaskContext): NativeExecution {
 	return (ctx as unknown as { opts: { execution: NativeExecution } }).opts.execution;
 }
@@ -69,9 +75,8 @@ function release(ctx: TaskContext, ms: number): Promise<never> {
 async function rawOutput(sql: postgres.Sql, ctx: TaskContext, output: Json): Promise<void> {
 	// SHIM(conductor#7): independent native executions don't retain their output. Overwrite, not
 	// memoize: an attempt re-queued for undelivered signals discards its result and returns again.
-	const { id, queue } = nativeExecution(ctx);
 	await sql`insert into pgconductor._private_steps (execution_id, queue, key, result)
-		values (${id}::uuid, ${queue}, '__fabrial:output', ${sql.json({ result: output })})
+		values (${ctx.executionId}::uuid, ${ctx.queue}, '__fabrial:output', ${sql.json({ result: output })})
 		on conflict (execution_id, key) do update set result = excluded.result`;
 }
 function carrier(payload: JsonObject): Carrier {
@@ -115,54 +120,6 @@ type TerminalRow = {
 	completed_at: Date | null;
 	result: { result: Json } | null;
 };
-
-// SHIM(conductor#6): buffered fallback for events dispatched during a polling replay's claim.
-// Terms are compiled/validated by Conductor; fields are ANDed and alternatives are ORed.
-function matchesTerms(payload: JsonObject, terms: EventFilterTerm[]): boolean {
-	const fields = new Map<string, boolean>();
-	for (const term of terms) {
-		const value = payload[term.field_name];
-		const scalar = value === null ? "null" : typeof value;
-		let matches = false;
-		switch (term.operator) {
-			case "exists":
-				matches = (value !== undefined) === term.boolean_value;
-				break;
-			case "prefix":
-				matches = typeof value === "string" && value.startsWith(term.text_value!);
-				break;
-			case "numeric_range":
-				matches =
-					typeof value === "number" &&
-					(term.lower_value == null ||
-						(term.lower_inclusive ? value >= term.lower_value : value > term.lower_value)) &&
-					(term.upper_value == null ||
-						(term.upper_inclusive ? value <= term.upper_value : value < term.upper_value));
-				break;
-			case "exact":
-			case "anything_but": {
-				const expected =
-					term.scalar_type === "null"
-						? null
-						: term.scalar_type === "string"
-							? term.text_value
-							: term.scalar_type === "number"
-								? term.number_value
-								: term.boolean_value;
-				const equal = scalar === term.scalar_type && value === expected;
-				matches =
-					term.operator === "exact"
-						? equal
-						: value !== undefined &&
-							["string", "number", "boolean", "null"].includes(scalar) &&
-							!equal;
-				break;
-			}
-		}
-		fields.set(term.field_name, (fields.get(term.field_name) ?? false) || matches);
-	}
-	return [...fields.values()].every(Boolean);
-}
 
 // SHIM(conductor#8): the internal dispatcher defaults to immediate deletion. Override its native
 // retention config before worker registration, so even events queued before restart keep receipts.
@@ -337,9 +294,10 @@ class ConductorRuntime implements DurableRuntime {
 						},
 						triggers,
 						async (event, ctx) => {
-							const raw = nativeExecution(ctx);
 							const payload = event.payload;
-							const inherited = payload ? carrier(payload).metadata : emptyMetadata(raw.id);
+							const inherited = payload
+								? carrier(payload).metadata
+								: emptyMetadata(ctx.executionId);
 							const isOwner =
 								payload &&
 								carrier(payload).owner === definition.name &&
@@ -347,11 +305,7 @@ class ConductorRuntime implements DurableRuntime {
 									(trigger) =>
 										trigger.role === "owner" &&
 										trigger.event === event.name &&
-										matchesTerms(
-											payload,
-											compileEventFilter(trigger.event, trigger.filter, this.eventDefinitions)
-												.terms,
-										),
+										matchesFilter(payload, trigger.filter),
 								);
 							// Canonical ownership is carried on every category of the ingress. Suppress
 							// this workflow's competing observer submissions BEFORE insert-on-conflict.
@@ -369,7 +323,7 @@ class ConductorRuntime implements DurableRuntime {
 							const input: Json = payload ? clean(payload) : { name: event.name };
 							// Multiple matching subscriptions of one workflow collapse to one actual invocation.
 							const [source] = await this.sql<{ parent_execution_id: string | null }[]>`
-					select parent_execution_id from pgconductor._private_executions where id = ${raw.id}::uuid
+					select parent_execution_id from pgconductor._private_executions where id = ${ctx.executionId}::uuid
 				`;
 							await this.launch(
 								definition.name,
@@ -379,7 +333,7 @@ class ConductorRuntime implements DurableRuntime {
 								// shared dispatch ID dedupes the actual workflow, not the event receipt.
 								payload && carrier(payload).dispatchId !== undefined
 									? `__fabrial:dispatch:${JSON.stringify([carrier(payload).dispatchId, definition.name])}`
-									: `event:${source?.parent_execution_id ?? raw.id}:${definition.name}`,
+									: `event:${source?.parent_execution_id ?? ctx.executionId}:${definition.name}`,
 							);
 							return {};
 						},
@@ -393,7 +347,6 @@ class ConductorRuntime implements DurableRuntime {
 			defaultWorker: this.config.worker,
 		});
 		retainDispatchReceipts(this.orchestrator);
-		releaseQueuedExecutionsOnStop(this.orchestrator);
 		this.registered = true;
 	}
 
@@ -648,7 +601,7 @@ class ConductorRuntime implements DurableRuntime {
 		raw: TaskContext,
 		metadata: InvocationMetadata,
 	): ConductorExecution {
-		const executionId = nativeExecution(raw).id;
+		const executionId = raw.executionId;
 		const start: DurableExecution["start"] = (id, name, input, options) =>
 			raw.step(operationId(id), () =>
 				this.launch(
@@ -826,7 +779,6 @@ class ConductorRuntime implements DurableRuntime {
 					});
 			} else {
 				const branchKey = `${key}:event:${name}`;
-				const compiled = compileEventFilter(branch.event, branch.filter, this.eventDefinitions);
 				const event = observed.find(
 					(row) =>
 						row.id !== null &&
@@ -834,7 +786,7 @@ class ConductorRuntime implements DurableRuntime {
 						row.payload.eventKey === branch.event &&
 						BigInt(cursorPosition(row.payload.__fabrialCursor as string)) >
 							BigInt(cursorPosition(branch.after ?? boundary)) &&
-						matchesTerms(row.payload.payload as JsonObject, compiled.terms),
+						matchesFilter(row.payload.payload as JsonObject, branch.filter),
 				);
 				if (event) {
 					candidates.push({
@@ -849,28 +801,13 @@ class ConductorRuntime implements DurableRuntime {
 					});
 					continue;
 				}
-				const registered = await this.sql.begin(async (sql) => {
-					const [claim] = await sql<{ id: string }[]>`
-						select id from pgconductor._private_executions where id = ${execution.id}::uuid
-						and locked_by = ${execution.locked_by}::uuid and not cancelled
-						and failed_at is null and completed_at is null for update
-					`;
-					if (!claim) return false;
-					const [subscription] = await sql<{ id: string }[]>`
-						insert into pgconductor._private_custom_event_subscriptions
-						(event_key, task_key, queue, required_field_count, kind, execution_id, step_key)
-						values (${branch.event}, ${execution.task_key}, ${this.queue}, ${compiled.required_field_count}, 'execution_wait', ${execution.id}::uuid, ${branchKey})
-						on conflict (execution_id, step_key) do nothing returning id
-					`;
-					if (subscription)
-						await sql`
-						insert into pgconductor._private_event_filter_terms
-						(subscription_id, term_number, event_key, field_name, operator, scalar_type, text_value, number_value, boolean_value, number_range)
-						select * from pgconductor._private_expand_event_filter_terms(${subscription.id}::uuid, ${branch.event}, ${sql.json(compiled.terms)})
-					`;
-					return true;
-				});
-				if (!registered) return release(raw, 0);
+				// Public, claim-fenced registration; only the buffered receipt polling above stays private.
+				await (
+					raw.subscribe as (
+						key: string,
+						options: { event: EventDefinition<string, JsonObject, string>; filter?: object },
+					) => Promise<unknown>
+				)(branchKey, { event: this.event(branch.event), filter: branch.filter });
 			}
 		}
 		const winner = candidates.sort(
@@ -882,7 +819,8 @@ class ConductorRuntime implements DurableRuntime {
 		const saved = await this.sql.begin(async (sql) => {
 			const [claim] = await sql<{ id: string }[]>`
 				select id from pgconductor._private_executions where id = ${execution.id}::uuid
-				and locked_by = ${execution.locked_by}::uuid and not cancelled
+				and locked_by = ${execution.locked_by}::uuid and claim_token = ${execution.claim_token}::uuid
+				and not cancelled
 				and failed_at is null and completed_at is null for update
 			`;
 			if (!claim) return false;

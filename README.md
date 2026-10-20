@@ -17,8 +17,8 @@ See the [fabrial package](./packages/fabrial/README.md) and the [Acme example](.
 Requires Node ≥ 22.19, pnpm, [just](https://github.com/casey/just), and Docker (integration tests start Postgres with testcontainers).
 
 ```sh
-git submodule update --init   # vendored pgconductor-js, until it ships a Node build
+git submodule update --init   # pgconductor-js, pinned until a version is published
 pnpm install
-just test
+just test                     # builds pgconductor-js first (pnpm build:conductor)
 just ready                    # lint, typecheck, format
 ```

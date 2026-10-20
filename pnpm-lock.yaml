@@ -48,18 +48,12 @@ catalogs:
     '@testcontainers/postgresql':
       specifier: 12.2.0
       version: 12.2.0
-    '@types/bun':
-      specifier: 1.4.2
-      version: 1.4.2
     '@types/node':
       specifier: 26.6.4
       version: 26.6.4
     chat:
       specifier: 4.41.1
       version: 4.41.1
-    cron-parser:
-      specifier: 5.4.0
-      version: 5.4.0
     expect-type:
       specifier: 1.2.2
       version: 1.2.2
@@ -75,15 +69,18 @@ catalogs:
     postgres:
       specifier: 3.4.7
       version: 3.4.7
-    prettier:
-      specifier: 3.4.2
-      version: 3.4.2
+    tsx:
+      specifier: 4.23.15
+      version: 4.23.15
     typebox:
       specifier: 1.3.27
       version: 1.3.27
     typescript:
       specifier: 7.0.2
       version: 7.0.2
+    vite:
+      specifier: 8.3.4
+      version: 8.3.4
     vitest:
       specifier: 4.1.11
       version: 4.1.11
@@ -118,7 +115,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1))
+        version: 4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
 
   examples/acme:
     dependencies:
@@ -143,7 +140,7 @@ importers:
     devDependencies:
       '@chat-adapter/tests':
         specifier: 'catalog:'
-        version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1)))
+        version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)))
       '@slack/web-api':
         specifier: 'catalog:'
         version: 8.2.0
@@ -161,7 +158,7 @@ importers:
         version: 7.0.2
       vitest:
         specifier: 'catalog:'
-        version: 4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1))
+        version: 4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
 
   packages/fabrial:
     dependencies:
@@ -201,7 +198,7 @@ importers:
         version: 4.41.1(zod@4.6.5)
       '@chat-adapter/tests':
         specifier: 'catalog:'
-        version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1)))
+        version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)))
       '@testcontainers/postgresql':
         specifier: 'catalog:'
         version: 12.2.0
@@ -226,7 +223,7 @@ importers:
         version: 4.41.1(zod@4.6.5)
       '@chat-adapter/tests':
         specifier: 'catalog:'
-        version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1)))
+        version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)))
 
   packages/linear:
     dependencies:
@@ -245,7 +242,7 @@ importers:
         version: 4.41.1(zod@4.6.5)
       '@chat-adapter/tests':
         specifier: 'catalog:'
-        version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1)))
+        version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)))
 
   packages/slack:
     dependencies:
@@ -264,7 +261,7 @@ importers:
         version: 4.41.1(zod@4.6.5)
       '@chat-adapter/tests':
         specifier: 'catalog:'
-        version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1)))
+        version: 4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)))
       zod:
         specifier: 'catalog:'
         version: 4.6.5
@@ -272,17 +269,14 @@ importers:
   vendor/postgres-conductor/packages/pgconductor-js:
     dependencies:
       '@standard-schema/spec':
-        specifier: 'catalog:'
-        version: 1.0.0
+        specifier: ^1.0.0
+        version: 1.1.0
       cron-parser:
-        specifier: 'catalog:'
+        specifier: ^5.4.0
         version: 5.4.0
       postgres:
-        specifier: 'catalog:'
+        specifier: ^3.4.7
         version: 3.4.7
-      typescript:
-        specifier: 'catalog:'
-        version: 7.0.2
     devDependencies:
       '@opentelemetry/api':
         specifier: 'catalog:'
@@ -293,15 +287,24 @@ importers:
       '@testcontainers/postgresql':
         specifier: 'catalog:'
         version: 12.2.0
-      '@types/bun':
+      '@types/node':
         specifier: 'catalog:'
-        version: 1.4.2
+        version: 26.6.4
       expect-type:
         specifier: 'catalog:'
         version: 1.2.2
-      prettier:
+      tsx:
         specifier: 'catalog:'
-        version: 3.4.2
+        version: 4.23.15
+      typescript:
+        specifier: 'catalog:'
+        version: 7.0.2
+      vite:
+        specifier: 'catalog:'
+        version: 8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)
+      vitest:
+        specifier: 'catalog:'
+        version: 4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
       zod:
         specifier: 'catalog:'
         version: 4.6.5
@@ -1231,9 +1234,6 @@ packages:
   '@testcontainers/postgresql@12.2.0':
     resolution: {integrity: sha512-14oNBbKdqIkWTiw8XwP6YqWnuBebiij8m4fF03WTSHvNt5FfvQpGTLwIV3p07UpDnqWRFvY50YFzbiYdB+SWuA==}
 
-  '@types/bun@1.4.2':
-    resolution: {integrity: sha512-GimotNn7+ZV0uVArItBbriZsR1oNf0+WTzPkdcFrzShI7k2norL0uzEaJT8T33dWr7O/c9ZDuAFQrctKCi72oQ==}
-
   '@types/chai@5.2.3':
     resolution: {integrity: sha512-Mw558oeA9fFbv65/y4mHtXDs9bPnFMZAL/jxdPFUpOHHIXX91mcgEHbS5Lahr+pwZFR8A7GQleRWeI6cGFC2UA==}
 
@@ -1584,9 +1584,6 @@ packages:
   buildcheck@0.0.7:
     resolution: {integrity: sha512-lHblz4ahamxpTmnsk+MNTRWsjYKv965MwOrSJyeD588rR3Jcu7swE+0wN5F+PbL5cjgu/9ObkhfzEPuofEMwLA==}
     engines: {node: '>=10.0.0'}
-
-  bun-types@1.4.2:
-    resolution: {integrity: sha512-bxV1FgK7yBIzjRe5zBozIM4Bem11ZJcCXSrjWRG3YWLt8yFDePu4cLjpebO8OvPeIE9trbyPF4fuj3Cia4Fj3w==}
 
   byline@5.0.0:
     resolution: {integrity: sha512-s6webAy+R4SR8XVuJWt2V2rGvhnrhxN+9S15GNuTK3wKPOXFF6RNc+8ug2XhH+2s4f+uudG4kUVYmYOQWL2g0Q==}
@@ -2237,8 +2234,8 @@ packages:
   nan@2.29.0:
     resolution: {integrity: sha512-GlGk3HIvitbvs+LT3g6XUP1kpirKNvmDFwF/bmo6XNWSb/eYEs/O4bfgIEIXCZ+lIOTS5xNwDvSGMw6FJdAhtA==}
 
-  nanoid@3.3.19:
-    resolution: {integrity: sha512-Y2tUNy4ouw6tq5oDSKeQYGOyhkUBhNOcGV/02KC+6kd9eDGqdZd++mjMiIDilrBYvjEnCYvVtsuHCuP+okSfug==}
+  nanoid@3.3.20:
+    resolution: {integrity: sha512-uKdg2G3GNCKQn9byYOpxbGqrT2fGO5KRt5J/8b3pok8rT6qxGWF6hxMyJiEYtAf+FVyYuD9hRaDqX5uPFYJ4ZQ==}
     engines: {node: ^10 || ^12 || ^13.7 || ^14 || >=15.0.1}
     hasBin: true
 
@@ -2390,8 +2387,8 @@ packages:
     resolution: {integrity: sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA==}
     engines: {node: '>=12'}
 
-  postcss@8.5.28:
-    resolution: {integrity: sha512-RRuzqDtt5Y9h3quz5hWhK+TPnsmVs6WwSU6LkJMeY4HstUEDuYTG8UJSdawMRzmzAtV+KEoG8N3Qg2qLy5vM/A==}
+  postcss@8.5.31:
+    resolution: {integrity: sha512-YUbWYCgErwnMAVkjUnYa+KlMBzGpHwiIt/DE7f0G33AuX2LH9UcTk6KgWxd3zRU+pN3u/C+Xl3EnMLM4Hea7Sg==}
     engines: {node: ^10 || ^12 || >=14}
 
   postgres-array@2.0.0:
@@ -2413,11 +2410,6 @@ packages:
   postgres@3.4.7:
     resolution: {integrity: sha512-Jtc2612XINuBjIl/QTWsV5UvE8UHuNblcO3vVADSrKsrc6RqGX6lOW1cEo3CM2v0XG4Nat8nI+YM7/f26VxXLw==}
     engines: {node: '>=12'}
-
-  prettier@3.4.2:
-    resolution: {integrity: sha512-e9MewbtFo+Fevyuxn/4rrcDAaq0IYxPGLvObpQjiZBMAzB9IGmzlnG9RZy3FFas+eBMu2vA0CszMeduow5dIuQ==}
-    engines: {node: '>=14'}
-    hasBin: true
 
   process-nextick-args@2.0.1:
     resolution: {integrity: sha512-3ouUOpQhtgrbOa17J7+uxOTpITYWaGP7/AhoR3+A+/1e9skrzelGi/dXzEYyvbxubEF6Wn2ypscTKiKJFFn1ag==}
@@ -2634,6 +2626,11 @@ packages:
   tslib@2.8.1:
     resolution: {integrity: sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==}
 
+  tsx@4.23.15:
+    resolution: {integrity: sha512-Yiex1Ovn8z2xPpOWckIiysV1SSyRMY9BkLF++q0yKiDxCqRhosKfMg3janKkiLBwZ5c/YryloKwGZcrEmtwxKw==}
+    engines: {node: '>=18.0.0'}
+    hasBin: true
+
   tweetnacl@0.14.5:
     resolution: {integrity: sha512-KXXFFdAbFXY4geFIwoyNK+f5Z1b7swfXABfL7HXCmoIWMKU3dmS26672A4EeQtDzLKy7SXmfBu51JolvEKwtGA==}
 
@@ -2685,8 +2682,8 @@ packages:
   vfile@6.0.3:
     resolution: {integrity: sha512-KzIbH/9tXat2u30jf+smMwFCsno4wHVdNmzFyL+T/L3UGqqk6JKfVqOFOZEpZSHADH1k40ab6NUIXZq422ov3Q==}
 
-  vite@8.3.2:
-    resolution: {integrity: sha512-SQr1x6W5vVSbROg7vsyXIaxK9b0G7zsT68acdWWRmnBUsgDieLCRG+Rep9WdZgcposvv/GSnr4GUUBqB3vXq6w==}
+  vite@8.3.4:
+    resolution: {integrity: sha512-IftLE8phJhdNRIGNEV4JCCvfNScoZQVfcXaN8TQropWGJtOHcu+iAB9pHcuGvmEb/kddw0LBe/jS8ztdC6xdiQ==}
     engines: {node: ^20.19.0 || >=22.12.0}
     hasBin: true
     peerDependencies:
@@ -3100,10 +3097,10 @@ snapshots:
       - workflow
       - zod
 
-  '@chat-adapter/tests@4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1)))':
+  '@chat-adapter/tests@4.41.1(chat@4.41.1(zod@4.6.5))(vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)))':
     dependencies:
       chat: 4.41.1(zod@4.6.5)
-      vitest: 4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1))
+      vitest: 4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
 
   '@earendil-works/chord@1.0.0':
     dependencies:
@@ -3733,10 +3730,6 @@ snapshots:
       - react-native-b4a
       - supports-color
 
-  '@types/bun@1.4.2':
-    dependencies:
-      bun-types: 1.4.2
-
   '@types/chai@5.2.3':
     dependencies:
       '@types/deep-eql': 4.0.2
@@ -3867,13 +3860,13 @@ snapshots:
       chai: 6.3.0
       tinyrainbow: 3.2.0
 
-  '@vitest/mocker@4.1.11(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1))':
+  '@vitest/mocker@4.1.11(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))':
     dependencies:
       '@vitest/spy': 4.1.11
       estree-walker: 3.0.3
       magic-string: 0.30.21
     optionalDependencies:
-      vite: 8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1)
+      vite: 8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)
 
   '@vitest/pretty-format@4.1.11':
     dependencies:
@@ -4044,10 +4037,6 @@ snapshots:
 
   buildcheck@0.0.7:
     optional: true
-
-  bun-types@1.4.2:
-    dependencies:
-      '@types/node': 26.6.4
 
   byline@5.0.0: {}
 
@@ -4863,7 +4852,7 @@ snapshots:
   nan@2.29.0:
     optional: true
 
-  nanoid@3.3.19: {}
+  nanoid@3.3.20: {}
 
   node-domexception@1.0.0: {}
 
@@ -5013,9 +5002,9 @@ snapshots:
 
   picomatch@4.0.7: {}
 
-  postcss@8.5.28:
+  postcss@8.5.31:
     dependencies:
-      nanoid: 3.3.19
+      nanoid: 3.3.20
       picocolors: 1.1.1
       source-map-js: 1.2.2
 
@@ -5030,8 +5019,6 @@ snapshots:
       xtend: 4.0.2
 
   postgres@3.4.7: {}
-
-  prettier@3.4.2: {}
 
   process-nextick-args@2.0.1: {}
 
@@ -5336,6 +5323,12 @@ snapshots:
 
   tslib@2.8.1: {}
 
+  tsx@4.23.15:
+    dependencies:
+      esbuild: 0.28.2
+    optionalDependencies:
+      fsevents: 2.3.3
+
   tweetnacl@0.14.5: {}
 
   typebox@1.3.27: {}
@@ -5414,23 +5407,24 @@ snapshots:
       '@types/unist': 3.0.3
       vfile-message: 4.0.3
 
-  vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1):
+  vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1):
     dependencies:
       lightningcss: 1.33.0
       picomatch: 4.0.7
-      postcss: 8.5.28
+      postcss: 8.5.31
       rolldown: 1.2.12
       tinyglobby: 0.2.17
     optionalDependencies:
       '@types/node': 26.6.4
       esbuild: 0.28.2
       fsevents: 2.3.3
+      tsx: 4.23.15
       yaml: 2.9.1
 
-  vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1)):
+  vitest@4.1.11(@opentelemetry/api@1.9.0)(@types/node@26.6.4)(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)):
     dependencies:
       '@vitest/expect': 4.1.11
-      '@vitest/mocker': 4.1.11(vite@8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1))
+      '@vitest/mocker': 4.1.11(vite@8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
       '@vitest/pretty-format': 4.1.11
       '@vitest/runner': 4.1.11
       '@vitest/snapshot': 4.1.11
@@ -5447,7 +5441,7 @@ snapshots:
       tinyexec: 1.3.1
       tinyglobby: 0.2.17
       tinyrainbow: 3.2.0
-      vite: 8.3.2(@types/node@26.6.4)(esbuild@0.28.2)(yaml@2.9.1)
+      vite: 8.3.4(@types/node@26.6.4)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1)
       why-is-node-running: 2.3.0
     optionalDependencies:
       '@opentelemetry/api': 1.9.0

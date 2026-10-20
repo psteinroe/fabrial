@@ -84,7 +84,7 @@ Not needed: `ctx.waitForResult` works for any execution id and wakes on every te
 - The reconcile loop that cancels children of ended parents (item 2) and the settled-execution monitor (item 3).
 - Private access to the task context (item 4) and the abort-controller calls used to reschedule (item 1).
 - The metadata envelope in payloads and the event-position sequence (native metadata, middleware, subscriptions).
-- The vendored submodule and the Bun type shim, once #75 publishes a Node build.
+- The vendored submodule, once a version is published.
 - The extra `UPDATE` after cancelling (item 5).
 
 ## Not needed from Conductor
