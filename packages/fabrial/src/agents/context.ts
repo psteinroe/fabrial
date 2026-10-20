@@ -94,7 +94,8 @@ export async function fields(
 	const requestId = await currentRequest(bridge, conversationId, context);
 	const invocation = (await bridge.harness.snapshot(Invocation, requestId, context))!;
 	const run = await bridge.runOf(conversationId, context);
-	// Tools, and the workflows they start, follow in this conversation by default.
+	// Tools, and the workflows they start, follow in this conversation by default. A subagent's tools follow in the
+	// root conversation: the Session is the lead's, the run is the lead request's, and replyTo is that request's thread.
 	const metadata: InvocationMetadata = {
 		...(invocation as InvocationMetadata),
 		conversation: { session: bridge.session, agent: run.agent } satisfies ConversationRef,

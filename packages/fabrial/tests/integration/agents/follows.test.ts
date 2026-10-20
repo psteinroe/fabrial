@@ -75,15 +75,31 @@ const developer = f.defineAgent({
 	triggers: [trigger({ event: "chat.message", filter: { channelId: [channel] } })],
 });
 
+const orchestrated = `o${randomUUID().slice(0, 8)}`;
+const worker = f.defineAgent({
+	name: "worker",
+	description: "Handles one request.",
+	model: `${faux.provider.id}/${faux.getModel().id}`,
+	toolkits: ["github"],
+});
+const lead = f.defineAgent({
+	name: "lead",
+	description: "Starts a worker per message.",
+	model: `${faux.provider.id}/${faux.getModel().id}`,
+	session: "channel",
+	subagents: [worker],
+	triggers: [trigger({ event: "chat.message", filter: { channelId: [orchestrated] } })],
+});
+
 /** Chat SDK state outlives app restarts (Postgres in production); one fake chat stands in for it. */
 let runtime: MemoryRuntime;
 const chat = new FakeChat(() => runtime.now());
 
-async function launch() {
+async function launch(routedAgents = [developer]) {
 	runtime = new MemoryRuntime({ idPrefix: randomUUID() });
 	const app = testApp(f, {
 		workflows: [],
-		routedAgents: [developer],
+		routedAgents,
 		runtime,
 		chat,
 		agents: pi({ models, sql, settings: { retry: { enabled: false } } }),
@@ -220,5 +236,71 @@ it("a chat conversation follows its PR: tool follow, restart, review wakes the a
 	await t.webhook(webhooks.reopened(), "reopen-1");
 	expect(faux.state.callCount).toBe(7);
 	expect((await posts()).at(-1)).toBe("Merged; done.");
+	await t.app.stop();
+});
+
+it("orchestrator: a channel lead starts a background worker per message; reports and a worker's follow answer in that message's thread", async () => {
+	const textOf = (message: { content: unknown } | undefined) =>
+		typeof message?.content === "string"
+			? message.content
+			: JSON.stringify((message?.content as { text?: string }[] | undefined)?.map((c) => c.text));
+	const which = (text: string) => (text.includes("second") ? "second" : "first");
+	const step = (context: { messages: { role: string; content: unknown }[] }) => {
+		const messages = context.messages.filter((each) => each.role !== "system");
+		const text = textOf(messages.at(-1));
+		const workerTask = messages.length === 1;
+		if (text.includes("requested changes")) return fauxAssistantMessage("Lead handles the review.");
+		if (text.includes("<subagent")) return fauxAssistantMessage(`Reported ${which(text)}.`);
+		if (text.includes("<message"))
+			return fauxAssistantMessage(
+				fauxToolCall("worker", { task: `Handle the ${which(text)} request`, background: true }),
+				{ stopReason: "toolUse" },
+			);
+		if (text.includes("Started")) return fauxAssistantMessage("On it.");
+		if (workerTask && text.includes("second"))
+			return fauxAssistantMessage(
+				fauxToolCall("github_follow_pull_request", { pr: "acme/app#5" }),
+				{
+					stopReason: "toolUse",
+				},
+			);
+		if (workerTask) return fauxAssistantMessage("Worker done with first.");
+		return fauxAssistantMessage("Worker done with second.");
+	};
+	faux.setResponses(Array.from({ length: 12 }, () => step));
+	const ask = (thread: string, id: string, text: string) =>
+		chat.receive({
+			...message(`chat:${orchestrated}:${thread}`, id, text),
+			channelId: orchestrated,
+		});
+	const posts = async (thread: string) =>
+		(
+			await chat.thread({
+				kind: "thread",
+				provider: "chat",
+				threadId: `chat:${orchestrated}:${thread}`,
+			})
+		).posts.map((post) => post.content);
+	const t = await launch([lead]);
+	await ask("t1", "m1", "The first request");
+	await t.settle();
+	await ask("t2", "m2", "The second request");
+	await t.settle();
+	// Each worker's report is answered in the thread of the message that started it.
+	expect(await posts("t1")).toContain("Reported first.");
+	expect(await posts("t2")).toContain("Reported second.");
+	expect(await posts("t1")).not.toContain("Reported second.");
+	// The worker's follow belongs to the lead's conversation, replying in the second message's thread.
+	expect(await records()).toEqual([
+		{
+			session: `chat:channel:${orchestrated}`,
+			agent: "lead",
+			resource: "github:acme/app#5",
+			replyTo: { kind: "thread", provider: "chat", threadId: `chat:${orchestrated}:t2` },
+		},
+	]);
+	await t.webhook(webhooks.review("changes_requested"), "orchestrated-review");
+	expect((await posts("t2")).at(-1)).toBe("Lead handles the review.");
+	expect(await posts("t1")).not.toContain("Lead handles the review.");
 	await t.app.stop();
 });
