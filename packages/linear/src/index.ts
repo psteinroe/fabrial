@@ -57,12 +57,19 @@ const webhookSchema = z.object({
 	updatedFrom: z.record(z.string(), z.json()).optional(),
 });
 
-/** Verify and preserve custom-verifier body rewrites, then enforce installation before any dispatch. */
-async function scopedWebhook(request: Request, body: string, options: LinearOptions) {
+/**
+ * Verify a webhook (preserving custom-verifier body rewrites), its freshness, and its organization: one
+ * check for both ingress paths, so the SDK's comments, reactions, sessions and revocations are scoped too.
+ */
+async function verifyWebhook(
+	request: Request,
+	body: string,
+	options: LinearOptions,
+): Promise<{ body: string; payload: unknown } | { status: number; error: string }> {
 	try {
 		if (options.webhookVerifier) {
 			const result = await options.webhookVerifier(request, body);
-			if (!result) return false;
+			if (!result) return { status: 401, error: "Invalid signature" };
 			if (typeof result === "string") body = result;
 		} else {
 			const signature = request.headers.get("linear-signature") ?? "";
@@ -71,54 +78,43 @@ async function scopedWebhook(request: Request, body: string, options: LinearOpti
 				signature.length !== expected.length ||
 				!timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
 			)
-				return false;
+				return { status: 401, error: "Invalid signature" };
 		}
-		const parsed = z
-			.object({
-				organizationId: z.string(),
-				webhookTimestamp: z.number().optional(),
-			})
-			.safeParse(JSON.parse(body) as unknown);
-		if (!parsed.success || parsed.data.organizationId !== options.organizationId) return false;
-		if (
-			!options.webhookVerifier &&
-			(parsed.data.webhookTimestamp === undefined ||
-				Math.abs(Date.now() - parsed.data.webhookTimestamp) > 60_000)
-		)
-			return false;
-		return body;
 	} catch {
-		return false;
+		return { status: 401, error: "Invalid signature" };
 	}
+	let payload: unknown;
+	try {
+		payload = JSON.parse(body);
+	} catch {
+		return { status: 400, error: "Invalid JSON" };
+	}
+	const envelope = z
+		.object({ organizationId: z.string(), webhookTimestamp: z.number().optional() })
+		.safeParse(payload);
+	if (!envelope.success) return { status: 400, error: "Invalid payload" };
+	const { organizationId, webhookTimestamp } = envelope.data;
+	if (
+		!options.webhookVerifier &&
+		(webhookTimestamp === undefined || Math.abs(Date.now() - webhookTimestamp) > 60_000)
+	)
+		return { status: 401, error: "Expired webhook" };
+	if (organizationId !== options.organizationId)
+		return { status: 403, error: "Wrong organization" };
+	return { body, payload };
 }
 
-/** Linear SDK channels are issue UUIDs. Enrich inbound comment channels to team keys for routing. */
-class TeamLinearAdapter extends LinearAdapter {
-	private readonly teams = new Map<string, string>();
-	constructor(private readonly options: LinearOptions) {
+/** The SDK adapter in comment mode, scoped to the configured organization. Channels are the SDK's: issues. */
+class ScopedLinearAdapter extends LinearAdapter {
+	constructor(options: LinearOptions) {
 		super({
 			...options,
 			mode: "comments",
-			// Scope ALL webhook types, not just comments (OAuth revocations, reactions, sessions).
-			webhookVerifier: (request, body) => scopedWebhook(request, body, options),
+			webhookVerifier: async (request, body) => {
+				const verified = await verifyWebhook(request, body, options);
+				return "body" in verified ? verified.body : false;
+			},
 		});
-	}
-	protected override async onCommentEvent(...args: Parameters<LinearAdapter["onCommentEvent"]>) {
-		const [payload] = args;
-		if (payload.organizationId !== this.options.organizationId)
-			throw new Error("Wrong Linear organization");
-		if (payload.action === "create" && payload.data.issueId) {
-			const issue = await this.linearClient.issue(payload.data.issueId);
-			const team = await issue.team;
-			if (!team) throw new Error(`Linear issue ${issue.id} has no team`);
-			if (this.teams.size >= 1000) this.teams.delete(this.teams.keys().next().value!);
-			this.teams.set(payload.data.issueId, team.key);
-		}
-		return super.onCommentEvent(...args);
-	}
-	override channelIdFromThreadId(threadId: string) {
-		const { issueId } = this.decodeThreadId(threadId);
-		return `linear:${this.teams.get(issueId) ?? issueId}`;
 	}
 }
 const organizations = new WeakMap<LinearClient, string>();
@@ -128,8 +124,8 @@ const createPlugin = definePlugin<
 	typeof events,
 	{ linear: LinearClient }
 >((options) => {
-	let instance: TeamLinearAdapter | undefined;
-	const adapter = () => (instance ??= new TeamLinearAdapter(options));
+	let instance: ScopedLinearAdapter | undefined;
+	const adapter = () => (instance ??= new ScopedLinearAdapter(options));
 	return {
 		id: "linear",
 		init() {
@@ -163,49 +159,11 @@ const createPlugin = definePlugin<
 		routes: {
 			"POST /linear/webhook": async (request, ctx) => {
 				const { clients } = ctx;
-				let body = await request.text();
-				let verified = false;
-				try {
-					if (options.webhookVerifier) {
-						const result = await options.webhookVerifier(request, body);
-						verified = Boolean(result);
-						if (typeof result === "string") body = result;
-					} else {
-						const signature = request.headers.get("linear-signature") ?? "";
-						const expected = createHmac("sha256", options.webhookSecret!)
-							.update(body)
-							.digest("hex");
-						verified =
-							signature.length === expected.length &&
-							timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-					}
-				} catch {
-					/* Verification fails closed. */
-				}
-				if (!verified) return new Response("Invalid signature", { status: 401 });
-				let raw: unknown;
-				try {
-					raw = JSON.parse(body);
-				} catch {
-					return new Response("Invalid JSON", { status: 400 });
-				}
-				const envelope = z
-					.object({
-						type: z.string(),
-						action: z.string(),
-						organizationId: z.string(),
-						webhookTimestamp: z.number().optional(),
-					})
-					.safeParse(raw);
+				const verified = await verifyWebhook(request, await request.text(), options);
+				if (!("body" in verified)) return new Response(verified.error, { status: verified.status });
+				const raw = verified.payload;
+				const envelope = z.object({ type: z.string(), action: z.string() }).safeParse(raw);
 				if (!envelope.success) return new Response("Invalid payload", { status: 400 });
-				if (
-					!options.webhookVerifier &&
-					(envelope.data.webhookTimestamp === undefined ||
-						Math.abs(Date.now() - envelope.data.webhookTimestamp) > 60_000)
-				)
-					return new Response("Expired webhook", { status: 401 });
-				if (envelope.data.organizationId !== options.organizationId)
-					return new Response("Wrong organization", { status: 403 });
 				if (envelope.data.type !== "Issue" || !["create", "update"].includes(envelope.data.action))
 					return new Response(null, { status: 200 });
 				const parsed = webhookSchema.safeParse(raw);
@@ -269,11 +227,10 @@ export interface LinearFilter {
 	stateType?: string;
 	observe?: boolean;
 }
-export function mentioned(
-	filter: Pick<LinearFilter, "team" | "observe"> & { thread?: string } = {},
-) {
+/** `issue`: the issue's UUID, the SDK's channel. Comment payloads carry no team: see the README. */
+export function mentioned(filter: { issue?: string; thread?: string; observe?: boolean } = {}) {
 	return chatTrigger("linear", "mentioned", {
-		channel: filter.team,
+		channel: filter.issue,
 		thread: filter.thread,
 		observe: filter.observe,
 	});

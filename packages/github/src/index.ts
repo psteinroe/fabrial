@@ -292,6 +292,19 @@ export function parsePullRequest(pr: string): PullRequestRef {
 }
 
 const TRUSTED = ["OWNER", "MEMBER", "COLLABORATOR"];
+/**
+ * The author policy for every comment and review that can reach an agent: chat messages, thread history,
+ * and the comment/review lifecycle events follows are notified of. People with write access count, and this
+ * app's own bot; other bots and outsiders don't.
+ */
+function trusted(
+	user: { id: number; type?: string },
+	association: string | undefined,
+	botUserId: string | undefined,
+): boolean {
+	if (botUserId !== undefined && String(user.id) === botUserId) return true;
+	return user.type !== "Bot" && TRUSTED.includes(association ?? "");
+}
 const PULL_REQUEST_EVENTS: readonly EventKey[] = [
 	"pullRequestClosed",
 	"pullRequestReopened",
@@ -317,8 +330,8 @@ type PullRequestFields = GitHubPullRequestEvent &
 	>;
 
 /**
- * Render a pull request event. Comments and reviews count only from people with write access or from this
- * app's own bot (whose own comments are `low`: seen on the next run, they don't wake the agent).
+ * Render a pull request event. Untrusted comments and reviews are never emitted (see `trusted`); this
+ * app's own are `low`: seen on the next run, they don't wake the agent.
  */
 function notifyPullRequest(
 	{ name, payload }: PluginEvent,
@@ -327,8 +340,7 @@ function notifyPullRequest(
 	const p = payload as unknown as PullRequestFields;
 	const pr = `${p.repo}#${p.number}`;
 	const by = { pr, actor: p.actorLogin, actorType: p.actorType };
-	const own = p.actorType === "Bot" && botUserId !== undefined && p.actorId === botUserId;
-	const trusted = p.actorType === "Bot" ? own : TRUSTED.includes(String(p.association));
+	const own = botUserId !== undefined && p.actorId === botUserId;
 	switch (name as EventKey) {
 		case "pullRequestClosed":
 			return p.merged
@@ -350,7 +362,6 @@ function notifyPullRequest(
 				attributes: { ...by, sha: p.headSha ?? null },
 			};
 		case "pullRequestReviewed": {
-			if (!trusted) return undefined;
 			const verb =
 				p.state === "approved"
 					? "approved"
@@ -365,7 +376,6 @@ function notifyPullRequest(
 			};
 		}
 		case "pullRequestCommented":
-			if (!trusted) return undefined;
 			return {
 				kind: "comment",
 				summary: `${by.actor} commented on ${pr}${p.path ? ` (${p.path})` : ""}:\n\n${p.body}`,
@@ -388,7 +398,7 @@ function notifyPullRequest(
 }
 
 function pullRequestKind(
-	botUserId: string | undefined,
+	botUserId: () => string | undefined,
 	threadOf: (repo: string, number: number) => ThreadRef,
 ): ResourceKind<PullRequestRef> {
 	return {
@@ -399,7 +409,7 @@ function pullRequestKind(
 			const p = payload as unknown as PullRequestFields;
 			return (p.pullRequests ?? [p.number]).map((number) => threadOf(p.repo, number));
 		},
-		notify: (event) => notifyPullRequest(event, botUserId),
+		notify: (event) => notifyPullRequest(event, botUserId()),
 		defaults: DEFAULT_KINDS,
 	};
 }
@@ -511,8 +521,10 @@ function isPAT(options: GitHubOptions): options is Extract<GitHubOptions, { toke
 	return typeof options.token === "string";
 }
 
+/** The SDK adapter, scoped to the configured installation/owner and to trusted comment authors. */
 class ScopedGitHubAdapter extends GitHubAdapter {
 	private owner: Promise<string> | undefined;
+	private detecting: Promise<void> | undefined;
 	constructor(private readonly options: GitHubOptions) {
 		let accepts: (payload: unknown) => Promise<boolean>;
 		super({
@@ -527,6 +539,35 @@ class ScopedGitHubAdapter extends GitHubAdapter {
 			},
 		});
 		accepts = (payload) => this.acceptPayload(payload);
+	}
+
+	/** This app's bot account: the configured `botUserId`, else the one the SDK detects from its credentials. */
+	async ownBotId(): Promise<string | undefined> {
+		if (this.botUserId === undefined && this.defaultOctokit)
+			await (this.detecting ??= this.detectBotUserId(this.defaultOctokit).finally(() => {
+				this.detecting = undefined;
+			}));
+		return this.botUserId;
+	}
+
+	private trusts(comment: { user: { id: number; type?: string } }): boolean {
+		const association = (comment as { author_association?: string }).author_association;
+		return trusted(comment.user, association, this.botUserId);
+	}
+
+	// The SDK has no author filter: drop untrusted comments before they reach Chat, and from history.
+	protected override handleIssueComment(...args: Parameters<GitHubAdapter["handleIssueComment"]>) {
+		if (this.trusts(args[0].comment)) super.handleIssueComment(...args);
+	}
+	protected override handleReviewComment(
+		...args: Parameters<GitHubAdapter["handleReviewComment"]>
+	) {
+		if (this.trusts(args[0].comment)) super.handleReviewComment(...args);
+	}
+	override async fetchMessages(...args: Parameters<GitHubAdapter["fetchMessages"]>) {
+		await this.ownBotId();
+		const fetched = await super.fetchMessages(...args);
+		return { ...fetched, messages: fetched.messages.filter((m) => this.trusts(m.raw.comment)) };
 	}
 
 	async acceptPayload(raw: unknown): Promise<boolean> {
@@ -603,7 +644,7 @@ const createPlugin = definePlugin<
 		clients: () => ({ github: adapter().octokit }),
 		resources: {
 			pullRequest: pullRequestKind(
-				options.botUserId === undefined ? undefined : String(options.botUserId),
+				() => adapter().botUserId,
 				(repo, number) => {
 					const [owner, name] = repo.split("/") as [string, string];
 					return {
@@ -617,14 +658,16 @@ const createPlugin = definePlugin<
 		toolkit: () => ({ tools: [followTool, unfollowTool, commentTool, replyToReviewTool] }),
 		identity: {
 			async lookup(subject, clients) {
-				if (subject.provider !== "github" || subject.installationId !== installationId)
+				if (
+					subject.provider !== "github" ||
+					subject.installationId !== installationId ||
+					!/^\d+$/.test(subject.subjectId)
+				)
 					return undefined;
 				try {
-					const { data } = /^\d+$/.test(subject.subjectId)
-						? await clients.github.request("GET /user/{account_id}", {
-								account_id: Number(subject.subjectId),
-							})
-						: await clients.github.rest.users.getByUsername({ username: subject.subjectId });
+					const { data } = await clients.github.request("GET /user/{account_id}", {
+						account_id: Number(subject.subjectId),
+					});
 					return { name: data.name || data.login };
 				} catch (error) {
 					if (error instanceof Error && "status" in error && error.status === 404) return undefined;
@@ -656,6 +699,18 @@ const createPlugin = definePlugin<
 						adapter().encodeThreadId({ owner, repo, prNumber, type: "pr" }),
 					);
 					if (!found) return new Response(null, { status: 200 });
+					// Comments and reviews carry an author's words: only trusted ones are emitted. The other
+					// lifecycle events, and `opened` below, are public facts with the actor in the payload.
+					const association = found.payload.association as string | undefined;
+					if (
+						association !== undefined &&
+						!trusted(
+							{ id: found.actor, type: found.payload.actorType as string },
+							association,
+							await adapter().ownBotId(),
+						)
+					)
+						return new Response(null, { status: 200 });
 					const delivery = request.headers.get("x-github-delivery");
 					if (!delivery) return new Response("Missing delivery id", { status: 400 });
 					const threadId = found.payload.threadId as string | undefined;
@@ -745,22 +800,13 @@ export function mentioned(filter: GitHubFilter = {}) {
 		observe: filter.observe,
 	});
 }
-function openedTrigger(
-	event: "pullRequestOpened" | "issueOpened",
-	filter: Pick<GitHubFilter, "repo" | "observe">,
-) {
-	return trigger<GitHubConversation>({
-		event: `github.${event}`,
-		filter: filter.repo ? { repo: [filter.repo] } : {},
-		observe: filter.observe,
-		specificity: filter.repo ? 1 : 0,
-	});
-}
+/** Opened by anyone who can open one, outsiders included: check `authorId` before acting for them. */
 export function pullRequestOpened(filter: Pick<GitHubFilter, "repo" | "observe"> = {}) {
-	return openedTrigger("pullRequestOpened", filter);
+	return eventTrigger<GitHubConversation>("pullRequestOpened", { ...filter });
 }
+/** Opened by anyone who can open one, outsiders included: check `authorId` before acting for them. */
 export function issueOpened(filter: Pick<GitHubFilter, "repo" | "observe"> = {}) {
-	return openedTrigger("issueOpened", filter);
+	return eventTrigger<GitHubConversation>("issueOpened", { ...filter });
 }
 type Many<T> = T | readonly T[];
 interface PullRequestFilter {
@@ -814,17 +860,18 @@ export const checkSuiteCompleted = (filter: CheckFilter = {}) =>
 	eventTrigger<GitHubCheckCompleted>("checkSuiteCompleted", { ...filter });
 export const checkRunCompleted = (filter: CheckFilter = {}) =>
 	eventTrigger<GitHubCheckCompleted>("checkRunCompleted", { ...filter });
-export function identity(
-	options: { installationId?: string | number } & (
-		| { login: string; userId?: never }
-		| { userId: string | number; login?: never }
-	),
-): ExternalIdentity {
-	return chatIdentity(
-		"github",
-		String(options.installationId ?? "default"),
-		String(options.userId ?? options.login),
-	);
+/**
+ * A GitHub account by its numeric id, as webhooks and comments identify it (logins can be renamed).
+ * Find it with `gh api users/<login> --jq .id`.
+ */
+export function identity(options: {
+	installationId?: string | number;
+	userId: string | number;
+}): ExternalIdentity {
+	const userId = String(options.userId);
+	if (!/^\d+$/.test(userId))
+		throw new Error(`GitHub identities use numeric account ids, got "${userId}"`);
+	return chatIdentity("github", String(options.installationId ?? "default"), userId);
 }
 export const github = Object.assign(createPlugin, {
 	mentioned,

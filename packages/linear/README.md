@@ -25,15 +25,15 @@ Use with `chat({ state })`. `ctx.clients.linear` is the adapter's authenticated 
 
 Helpers are named exports and properties on `linear`:
 
-- `mentioned({ team?, thread?, observe? })`: global < team < thread specificity.
+- `mentioned({ issue?, thread?, observe? })`: global < issue < thread specificity; `issue` is the issue's UUID, Chat SDK's channel.
 - `issueCreated({ team?, stateType?, observe? })`, `issueUpdated(...)`: specificity counts team/state constraints.
 - `identity({ organizationId, userId })`.
 - `triageResponsibility({ id, team })`: team key lookup, then the API's live `triageResponsibility.currentUser`; fails closed if absent. No cached authorization or local rotation policy.
 
 ## Contract workarounds
 
-Chat SDK channels are normally issue UUIDs, while Fabrial's standard chat payload cannot carry `teamKey`. This adapter fetches the issue's team for each verified inbound comment and temporarily maps its channel to the team key so `mentioned({ team })` works. The mapping is bounded and process-local; reconstructed threads without cached ingress retain the issue UUID as channel. Team renames/moves can change a retried comment's channel-based dedupe key. Prefer a future `ChatCapability` message-enrichment/filterable-fields hook plus a stable message-dedupe hook, preserving SDK channel IDs instead of this mapping.
+Comment channels are Chat SDK's: the issue UUID (`linear:issueId`), stable across restarts and replicas, and one per issue, so `session: "channel"` never merges issues. Fabrial's chat payload has no field for the issue's team, so comment triggers can't filter by team; lifecycle triggers can (`teamKey`). Team-scoped comment routing needs a core `ChatCapability` hook that adds provider attributes to message payloads, rather than rewriting the SDK's channel.
 
 Lifecycle routes use core's `EmitOptions.replyTo` for the issue thread and `requestedBy` for the creator (`creator.id`/`creatorId`, falling back to the creation actor); updates retain the update actor. A lifecycle issue-level thread and later comment-root threads are distinct SDK conversations; replying beneath a posted top-level comment does not automatically bind it back to the original issue-level interaction. A future issue-to-comment response rebind contract can support that continuation. Multiple plugin aliases/request-scoped multi-tenant clients are not supported.
 
-Organization isolation applies before dispatch on both ingress paths, including comments, reactions, agent sessions and OAuth revocations. Custom webhook-verifier body rewrites are scoped using the verified replacement body, not the original request.
+One verification (signature or custom verifier, freshness, organization) runs on both ingress paths, before dispatch, including comments, reactions, agent sessions and OAuth revocations. Custom webhook-verifier body rewrites are scoped using the verified replacement body, not the original request.

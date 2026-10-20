@@ -81,38 +81,35 @@ describe("GitHub provider", () => {
 		});
 		expect(Object.keys(built.filter ?? {})).toEqual(Object.keys(filter));
 	});
-	it("creates installation-scoped numeric and login identities", () => {
+	it("creates installation-scoped identities from numeric account ids only", () => {
 		expect(identity({ userId: 1 })).toEqual({
 			provider: "github",
 			installationId: "default",
 			subjectId: "1",
 		});
-		expect(identity({ installationId: 42, login: "alice" })).toEqual({
+		expect(identity({ installationId: 42, userId: "7" })).toEqual({
 			provider: "github",
 			installationId: "42",
-			subjectId: "alice",
+			subjectId: "7",
 		});
+		expect(() => identity({ userId: "alice" })).toThrow("numeric account ids");
 	});
-	it("looks up numeric IDs and logins using the exposed client", async () => {
+	it("looks up numeric IDs using the exposed client and ignores logins", async () => {
 		const plugin = github(options);
 		const clients = plugin.clients!({});
 		const numeric = vi
 			.spyOn(clients.github, "request")
 			.mockResolvedValue({ data: { name: "Alice", login: "alice" } } as never);
-		const login = vi
-			.spyOn(clients.github.rest.users, "getByUsername")
-			.mockResolvedValue({ data: { name: null, login: "alice" } } as never);
 		expect(await plugin.identity!.lookup!(identity({ userId: 1 }), clients)).toEqual({
 			name: "Alice",
 		});
-		expect(numeric).toHaveBeenCalledWith("GET /user/{account_id}", { account_id: 1 });
-		expect(await plugin.identity!.lookup!(identity({ login: "alice" }), clients)).toEqual({
-			name: "alice",
-		});
-		expect(login).toHaveBeenCalledWith({ username: "alice" });
+		expect(numeric).toHaveBeenCalledExactlyOnceWith("GET /user/{account_id}", { account_id: 1 });
+		const login = { provider: "github", installationId: "default", subjectId: "alice" };
+		expect(await plugin.identity!.lookup!(login, clients)).toBeUndefined();
 		expect(
 			await plugin.identity!.lookup!(identity({ installationId: "other", userId: 1 }), clients),
 		).toBeUndefined();
+		expect(numeric).toHaveBeenCalledOnce();
 	});
 	it("returns undefined for missing users, but propagates outages", async () => {
 		const plugin = github(options);
@@ -152,6 +149,7 @@ describe("GitHub comment ingress", () => {
 					id: 10,
 					body: "@bot hello",
 					user: alice,
+					author_association: "MEMBER",
 					created_at: "2026-01-01T00:00:00Z",
 					updated_at: "2026-01-01T00:00:00Z",
 					html_url: "https://github.com/acme/app/issues/5#issuecomment-10",
@@ -197,6 +195,7 @@ describe("GitHub comment ingress", () => {
 					in_reply_to_id: parent,
 					body: "hello",
 					user: alice,
+					author_association: "MEMBER",
 					created_at: "2026-01-01T00:00:00Z",
 					updated_at: "2026-01-01T00:00:00Z",
 				},

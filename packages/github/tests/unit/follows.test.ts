@@ -79,12 +79,13 @@ describe("pull request resources", () => {
 	it("drops comments and reviews from outside collaborators and other bots", async () => {
 		for (const association of ["OWNER", "MEMBER", "COLLABORATOR"])
 			expect(await notified(webhooks.comment(association))).toBeDefined();
+		// Untrusted comments and reviews are never emitted, so neither workflows nor follows see them.
 		for (const association of ["CONTRIBUTOR", "NONE", "FIRST_TIME_CONTRIBUTOR"]) {
-			expect(await notified(webhooks.comment(association, outsider))).toBeUndefined();
-			expect(await notified(webhooks.review("approved", association, outsider))).toBeUndefined();
+			expect(await emitted(webhooks.comment(association, outsider))).toBeUndefined();
+			expect(await emitted(webhooks.review("approved", association, outsider))).toBeUndefined();
 		}
 		expect(await notified(webhooks.comment("NONE", bot))).toMatchObject({ priority: "low" });
-		expect(await notified(webhooks.comment("NONE", { ...bot, id: 100 }))).toBeUndefined();
+		expect(await emitted(webhooks.comment("NONE", { ...bot, id: 100 }))).toBeUndefined();
 		// Lifecycle events are not filtered by author.
 		const merged = webhooks.closed(true);
 		expect(

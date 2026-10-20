@@ -16,7 +16,7 @@ const f = createFabrial({ plugins: [plugin] });
 // Define workflows with f.defineWorkflow; wire runtime/chat with f.app({ runtime, chat, workflows }).
 ```
 
-Supports PAT credentials or a single GitHub App installation (`appId`, `privateKey`, numeric `installationId`). Credentials and adapter options are passed through to Chat SDK. Set `botUserId` to prevent self-reply loops. Verification requires an explicit `webhookSecret` or `webhookVerifier`; it does not silently use environment credentials.
+Supports PAT credentials or a single GitHub App installation (`appId`, `privateKey`, numeric `installationId`). Credentials and adapter options are passed through to Chat SDK. The app's own bot is `botUserId` when set, else the account Chat SDK detects from the credentials; set it explicitly where detection can't run (e.g. installation-token providers). Verification requires an explicit `webhookSecret` or `webhookVerifier`; it does not silently use environment credentials.
 
 Configure two GitHub webhook subscriptions:
 
@@ -31,13 +31,25 @@ Helpers are named exports and properties on `github`:
 - `pullRequestOpened({ repo?, observe? })`, `issueOpened({ repo?, observe? })`: global < repository specificity.
 - `pullRequestClosed({ repo?, number?, merged? })`, `pullRequestReopened({ repo?, number? })`, `pullRequestLabeled({ repo?, number?, label? })`, `pullRequestSynchronized({ repo?, number? })`, `pullRequestReviewed({ repo?, number?, state? })`, `pullRequestCommented({ repo?, number? })`: pull request lifecycle triggers; each set filter field narrows the trigger and adds specificity. All take `observe?`.
 - `checkSuiteCompleted({ repo?, conclusion? })`, `checkRunCompleted({ repo?, conclusion? })`: check lifecycle triggers, with the same specificity rules and `observe?`.
-- `identity({ userId, installationId? })` or `identity({ login, installationId? })`.
+- `identity({ userId, installationId? })`: `userId` is the numeric account id (`gh api users/<login> --jq .id`); anything else throws.
 
-Inbound identities use stable numeric GitHub user IDs, including lifecycle authors. Login identities support profile lookup, but **are not automatically equated to numeric identities by core**. Use `userId` in `defineUser` for inbound principal/approval matching. Login alias canonicalization needs an identity-directory contract extension.
+Identities are numeric GitHub account ids, the same ids webhooks and comments carry, so a `defineUser` identity matches inbound principals and approvals. Logins are not identities: they can be renamed and never match an inbound id.
 
 Lifecycle routes use core's `EmitOptions.replyTo` for the PR/issue thread and `requestedBy` for its author (not the webhook sender). Multiple plugin aliases and request-scoped multi-tenant clients are not supported by the current Chat provider-id contract.
 
 Both ingress paths reject payloads outside the configured App installation. PATs restrict repository owners to `owner`, or default to the token's authenticated user (resolved via GitHub API and cached; failures remain retryable). An explicit `owner` additionally restricts App repositories. The owner in `repository.full_name` and, when present, `repository.owner.login` must agree with that scope. A numeric PAT `installationId` also rejects conflicting payload installation IDs when present; string installation IDs remain identity namespaces.
+
+## Author trust
+
+Comments and reviews reach agents only from `OWNER`, `MEMBER`, or `COLLABORATOR` author associations, or from this app's own bot; other bots and outsiders are dropped. The one policy applies on every path:
+
+- `/github/events`: the adapter drops untrusted comments and review comments before Chat SDK dispatches them, so they never become `mentioned`/`message` events;
+- thread history: untrusted comments are left out of fetched history (so a history window may hold fewer than 50 messages);
+- `/github/webhook`: untrusted `pullRequestCommented` and `pullRequestReviewed` are not emitted, so neither workflows nor follows see them.
+
+The other lifecycle events (opened, closed, reopened, labeled, synchronize, checks) are deliberately public facts: anyone who can open an issue or pull request triggers `issueOpened`/`pullRequestOpened`, with their title and body. Their payloads carry the author or actor (`authorId`, `actorId`, `actorType`) and `requestedBy` the author's identity; a workflow that acts on an outsider's request should check them.
+
+Chat SDK's GitHub adapter has no author filter, so the policy lives here; an upstream `shouldProcessMessage`/author-filter hook on the adapter would let it shrink to configuration.
 
 ## Following pull requests
 
@@ -56,7 +68,7 @@ Both ingress paths reject payloads outside the configured App installation. PATs
 
 - **Defaults.** A follow receives commits, reviews, comments, merge, close, and reopen. `events: "all"` adds labels and checks. `priority: { review: "low" }` overrides the defaults per kind.
 - **Lifetime.** A follow lasts until `ctx.unfollow`; merge and close are delivered, and the agent decides.
-- **Filter.** Comments and reviews count only from `OWNER`, `MEMBER`, or `COLLABORATOR` author associations. Bot accounts count only when they are this app's own bot (`botUserId`); its own comments and reviews are `low`, so they don't wake the agent.
+- **Filter.** Comments and reviews follow the [author trust](#author-trust) policy. This app's own comments and reviews are `low`, so they don't wake the agent.
 - **Toolkit.** Agents that list `"github"` in `toolkits` get, all acting for the agent's own conversation or with the app's client:
   - `github_follow_pull_request({ pr, events? })` and `github_unfollow_pull_request({ pr })`;
   - `github_comment({ pr, body })`: a comment on the PR's conversation;

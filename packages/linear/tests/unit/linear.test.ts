@@ -27,11 +27,11 @@ describe("Linear provider", () => {
 	});
 	it("builds team/state filters with increasing specificity and observer support", () => {
 		expect(mentioned()).toMatchObject({ event: "linear.mentioned", specificity: 0 });
-		expect(mentioned({ team: "ENG" })).toMatchObject({
-			filter: { channelId: ["ENG"] },
+		expect(mentioned({ issue: "issue" })).toMatchObject({
+			filter: { channelId: ["issue"] },
 			specificity: 1,
 		});
-		expect(mentioned({ team: "ENG", thread: "linear:issue:c:root" })).toMatchObject({
+		expect(mentioned({ issue: "issue", thread: "linear:issue:c:root" })).toMatchObject({
 			specificity: 2,
 		});
 		expect(issueCreated({ team: "ENG", observe: true })).toMatchObject({
@@ -124,52 +124,54 @@ describe("Linear triage responsibility", () => {
 });
 
 describe("Linear comment ingress", () => {
-	it.each([undefined, "root"])(
-		"normalizes nested comments (parent=%s), team routing and retry dedupe",
-		async (parentId) => {
-			const plugin = linear(options);
-			const adapter = plugin.chat!.adapter() as LinearAdapter;
-			vi.spyOn(adapter, "initialize").mockImplementation(async (sdk) => {
-				Object.assign(adapter, {
-					chat: sdk,
-					defaultBotUserId: "bot-id",
-					defaultOrganizationId: "org",
-				});
+	function setup() {
+		const plugin = linear(options);
+		const adapter = plugin.chat!.adapter() as LinearAdapter;
+		vi.spyOn(adapter, "initialize").mockImplementation(async (sdk) => {
+			Object.assign(adapter, {
+				chat: sdk,
+				defaultBotUserId: "bot-id",
+				defaultOrganizationId: "org",
 			});
-			vi.spyOn(adapter.linearClient, "issue").mockResolvedValue({
-				id: "issue",
-				team: Promise.resolve({ key: "ENG" }),
-			} as never);
-			const env = connect(plugin);
-			const payload = {
-				type: "Comment",
-				action: "create",
-				organizationId: "org",
-				webhookTimestamp: Date.now(),
-				url: "https://linear.app/acme/issue/ENG-1",
-				data: {
-					id: "comment",
-					issueId: "issue",
-					parentId,
-					body: "@bot hello",
-					createdAt: "2026-01-01T00:00:00Z",
-					updatedAt: "2026-01-01T00:00:00Z",
-					user: {
-						id: "alice",
-						name: "Alice",
-						email: "alice@example.com",
-						url: "https://linear.app/acme/profiles/alice",
-					},
-				},
-			};
-			const route = env.connection.routes["POST /linear/events"]!;
+		});
+		const issue = vi.spyOn(adapter.linearClient, "issue");
+		const env = connect(plugin);
+		const route = env.connection.routes["POST /linear/events"]!;
+		return { adapter, issue, env, route };
+	}
+	const comment = (issueId: string, id: string, parentId?: string) => ({
+		type: "Comment",
+		action: "create",
+		organizationId: "org",
+		webhookTimestamp: Date.now(),
+		url: "https://linear.app/acme/issue/ENG-1",
+		data: {
+			id,
+			issueId,
+			parentId,
+			body: "@bot hello",
+			createdAt: "2026-01-01T00:00:00Z",
+			updatedAt: "2026-01-01T00:00:00Z",
+			user: {
+				id: "alice",
+				name: "Alice",
+				email: "alice@example.com",
+				url: "https://linear.app/acme/profiles/alice",
+			},
+		},
+	});
+	it.each([undefined, "root"])(
+		"normalizes nested comments (parent=%s), issue channels and retry dedupe",
+		async (parentId) => {
+			const { issue, env, route } = setup();
+			const payload = comment("issue", "comment", parentId);
 			expect((await route(request(payload))).status).toBe(200);
 			expect((await route(request(payload))).status).toBe(200);
 			const calls = vi.mocked(env.host.receiveMessage).mock.calls;
 			expect(calls).toHaveLength(2);
 			expect(calls[0]![0]).toMatchObject({
 				provider: "linear",
-				channelId: "ENG",
+				channelId: "issue",
 				threadId: `linear:issue:c:${parentId ?? "comment"}`,
 				messageId: "comment",
 				isMention: true,
@@ -178,11 +180,22 @@ describe("Linear comment ingress", () => {
 			});
 			expect(calls[0]![1]).toMatchObject({
 				events: ["linear.message", "linear.mentioned"],
-				dedupeId: JSON.stringify(["linear", "ENG", "comment"]),
+				dedupeId: JSON.stringify(["linear", "issue", "comment"]),
 			});
 			expect(calls[1]![1].dedupeId).toBe(calls[0]![1].dedupeId);
+			expect(issue).not.toHaveBeenCalled();
 		},
 	);
+	it("keeps two issues of one team apart, with channels a fresh adapter reconstructs", async () => {
+		const { env, route } = setup();
+		expect((await route(request(comment("issue-a", "a")))).status).toBe(200);
+		expect((await route(request(comment("issue-b", "b")))).status).toBe(200);
+		const received = vi.mocked(env.host.receiveMessage).mock.calls.map(([message]) => message);
+		expect(received.map((m) => m.channelId)).toEqual(["issue-a", "issue-b"]);
+		const fresh = linear(options).chat!.adapter() as LinearAdapter;
+		for (const message of received)
+			expect(fresh.channelIdFromThreadId(message.threadId)).toBe(`linear:${message.channelId}`);
+	});
 	it("rejects bad signatures without looking up issues or receiving messages", async () => {
 		const plugin = linear(options);
 		const adapter = plugin.chat!.adapter() as LinearAdapter;
