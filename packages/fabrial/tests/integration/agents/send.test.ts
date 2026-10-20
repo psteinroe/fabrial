@@ -748,6 +748,7 @@ it(
 it("a sent run's background child reports as a follow-up; the lead's answer posts to the starting input's thread", async () => {
 	const t = await setup(undefined, { researcher: true });
 	const tool = `researcher_${t.channel}`;
+	const seen: string[] = [];
 	const last = (messages: readonly Message[]) => {
 		const message = messages.findLast((each) => (each.role as string) !== "system")!;
 		return typeof message.content === "string" ? message.content : text([message]);
@@ -755,6 +756,7 @@ it("a sent run's background child reports as a follow-up; the lead's answer post
 	t.respond(
 		Array.from({ length: 12 }, () => (context: { messages: Message[] }) => {
 			const latest = last(context.messages);
+			seen.push(latest);
 			if (latest === "Find the cause") return fauxAssistantMessage("It is DNS");
 			if (latest.includes("subagent name=") && latest.includes("It is DNS"))
 				return fauxAssistantMessage("Found: DNS");
@@ -769,7 +771,12 @@ it("a sent run's background child reports as a follow-up; the lead's answer post
 	// The child reports after the lead's run returned: wait for the answer to its report.
 	await until("the report's answer", async () =>
 		(await t.posts("t1")).some((post) => post.content === "Found: DNS") ? true : undefined,
-	);
+	).catch(async (error: Error) => {
+		const posts = (await t.posts("t1")).map((post) => post.content);
+		throw new Error(
+			`${error.message}; model saw ${JSON.stringify(seen)}; posts ${JSON.stringify(posts)}; sessions ${JSON.stringify(await sessions(t.runtime.queue))}`,
+		);
+	});
 	await t.settle();
 	expect((await t.posts("t1")).map((post) => post.content)).toEqual([
 		"Looking into it",
