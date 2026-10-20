@@ -105,5 +105,15 @@ export function useAgents() {
 		return rows.map((row) => row.id);
 	}
 
-	return { db, sql, launch, idle, open };
+	/** Executions of `workflow` on the app on `queue`, settled or not, oldest first. */
+	async function all(queue: string, workflow: string) {
+		const rows = await sql()<{ id: string }[]>`
+			select id from pgconductor._private_executions
+			where queue = ${queue} and task_key = ${workflow}
+			order by created_at
+		`;
+		return rows.map((row) => row.id);
+	}
+
+	return { db, sql, launch, idle, open, all };
 }

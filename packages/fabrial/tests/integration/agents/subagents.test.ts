@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Context as TranscriptContext } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
@@ -10,8 +9,7 @@ import {
 } from "@earendil-works/pi-ai/providers/faux";
 import { createSession, type StorageWrite } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import postgres, { type Sql } from "postgres";
-import { afterAll, beforeAll, expect, it, vi } from "vitest";
+import { expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
 	createFabrial,
@@ -19,31 +17,31 @@ import {
 	type Agent,
 	type FabrialHost,
 	type InvocationMetadata,
+	type RuntimeEvent,
 	type RuntimeWorkflow,
 } from "../../../src/index.ts";
 import { toolName } from "../../../src/agent.ts";
 import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { SubagentWork } from "../../../src/agents/documents.ts";
-import { FakeChat, MemoryRuntime, testApp } from "../../../src/testing.ts";
+import { FakeChat } from "../../../src/testing.ts";
+import { until } from "../../conductor/helper.ts";
+import { useAgents } from "./setup.ts";
+import { AGENT_SETTLED_EVENT } from "../../../src/runtime.ts";
+
+/** Events core registers for its own waits; these fixtures register with the runtime directly. */
+const internalEvents: RuntimeEvent[] = [{ name: AGENT_SETTLED_EVENT, filterable: ["requestId"] }];
 
 const definitions = createFabrial({ plugins: [] });
 const { defineAgent, defineTool, defineWorkflow } = definitions;
 
-let sql: Sql;
-let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
-beforeAll(async () => {
-	container = await new PostgreSqlContainer("postgres:17-alpine").start();
-	sql = postgres(container.getConnectionUri(), { onnotice: () => {} });
-	await PostgresStorage.migrate(sql);
-});
-afterAll(async () => {
-	await sql?.end();
-	await container?.stop();
-});
+/**
+ * The Pi integration connected to a bare host on real Conductor, in real time; apps built with `launch`
+ * for the tests that route through core.
+ */
+const { db, sql, launch, idle, open } = useAgents();
 
 function fixture() {
-	// Calls key their Session by execution id: unique ids keep tests apart in the shared database.
-	const runtime = new MemoryRuntime({ idPrefix: randomUUID() });
+	const runtime = db.runtime();
 	const chat = new FakeChat();
 	const faux = fauxProvider();
 	const models = createModels();
@@ -68,7 +66,9 @@ function fixture() {
 		directory: { isMember: async () => true },
 		resolvePrincipal: async () => null,
 	} as unknown as FabrialHost;
-	const integration = pi({ models, sql, settings: { retry: { enabled: false } } }).connect(host);
+	const integration = pi({ models, sql: sql(), settings: { retry: { enabled: false } } }).connect(
+		host,
+	);
 	const model = `${faux.provider.id}/${faux.getModel().id}`;
 	/** Scripted responses that record the context each request saw. */
 	const contexts: TranscriptContext[] = [];
@@ -82,8 +82,16 @@ function fixture() {
 	/** The Session of the latest call: a `ctx.agent` call runs in its own. */
 	let calling = "";
 	const key = () => callSession(calling, "agent");
-	/** Runs `agent` from a workflow call with `input`; the runtime settles everything it started. */
-	const call = async (agent: Agent, input: string, others: RuntimeWorkflow[] = []) => {
+	/**
+	 * Runs `agent` from a workflow call with `input`. `settled()` resolves with the call's result once
+	 * everything it started settled.
+	 */
+	const call = async (
+		agent: Agent,
+		input: string,
+		others: RuntimeWorkflow[] = [],
+		events: RuntimeEvent[] = [],
+	) => {
 		const workflow: RuntimeWorkflow = {
 			name: randomUUID(),
 			triggers: [],
@@ -91,17 +99,22 @@ function fixture() {
 		};
 		runtime.register({
 			workflows: hooked(integration, [workflow, ...integration.workflows, ...others]),
-			events: [],
+			events: [...events, ...internalEvents],
 		});
 		await integration.start();
 		await runtime.start();
 		const id = await runtime.invoke(workflow.name, null, { metadata });
 		calling = id;
-		return { id, settled: runtime.flush().then(() => runtime.result(id)) };
+		const settled = async () => {
+			const result = await db.execution(id).settled();
+			await idle(runtime.queue);
+			return result;
+		};
+		return { id, settled };
 	};
 	const writes = async () =>
 		(
-			await sql`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${key()} ORDER BY seq`
+			await sql()`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${key()} ORDER BY seq`
 		).flatMap((row) => JSON.parse(String(row.writes)) as StorageWrite[]);
 	return {
 		runtime,
@@ -184,7 +197,10 @@ it("a fresh foreground child answers its task and the lead uses the escaped resu
 		fauxAssistantMessage("The researcher says it is DNS."),
 	]);
 	const { settled } = await f.call(lead, "Why is the site down?");
-	expect(await settled).toEqual({ status: "completed", output: "The researcher says it is DNS." });
+	expect(await settled()).toEqual({
+		status: "completed",
+		output: "The researcher says it is DNS.",
+	});
 	const [first, child, last] = f.contexts;
 	const offered = toolsOf(first!).find((each) => each.name === tool)!;
 	expect(offered.description).toBe(researcher.definition.description);
@@ -225,7 +241,7 @@ it("a forked self copy sees the lead's transcript and gets no subagent tools at 
 		fauxAssistantMessage("done"),
 	]);
 	const { settled } = await f.call(lead, "The code word is pineapple.");
-	expect(await settled).toMatchObject({ status: "completed", output: "done" });
+	expect(await settled()).toMatchObject({ status: "completed", output: "done" });
 	const [first, child, last] = f.contexts;
 	expect(
 		Object.keys(toolsOf(first!).find((each) => each.name === tool)!.parameters.properties),
@@ -259,7 +275,7 @@ it("depth 2 passes one level down: a self copy gets the subagent tool, its child
 		fauxAssistantMessage("top"),
 	]);
 	const { settled } = await f.call(lead, "Go deep");
-	expect(await settled).toMatchObject({ status: "completed", output: "top" });
+	expect(await settled()).toMatchObject({ status: "completed", output: "top" });
 	const offered = [tool, "subagent_stop"];
 	expect(f.contexts.map(toolNames)).toEqual([offered, offered, [], offered, offered]);
 	expect(toolResults(f.contexts[3]!)).toEqual([
@@ -292,8 +308,8 @@ it("continuing a named child keeps its history; unknown names are tool errors", 
 		fauxAssistantMessage("done"),
 	]);
 	const { settled } = await f.call(lead, "Go");
-	await settled;
-	expect(await settled).toMatchObject({ status: "completed", output: "done" });
+	await settled();
+	expect(await settled()).toMatchObject({ status: "completed", output: "done" });
 	const continued = f.contexts[3]!;
 	expect(userTexts(continued)).toEqual(["Remember 7", "What number?"]);
 	expect(toolResults(f.contexts[4]!)).toEqual([
@@ -324,7 +340,7 @@ it("limits.concurrent turns away calls beyond the limit with an error the model 
 		fauxAssistantMessage("done"),
 	]);
 	const { settled } = await f.call(lead, "Go");
-	expect(await settled).toMatchObject({ status: "completed", output: "done" });
+	expect(await settled()).toMatchObject({ status: "completed", output: "done" });
 	const results = toolResults(f.contexts[2]!);
 	expect(results).toHaveLength(2);
 	expect(results.filter((text) => text.includes('status="done">answer'))).toHaveLength(1);
@@ -373,7 +389,7 @@ it("aborting the lead aborts the child through Pi ownership", async () => {
 	const { id, settled } = await f.call(lead, "Go");
 	await blocking;
 	await f.runtime.cancel(id, "Stopped");
-	expect(await settled).toMatchObject({ status: "cancelled" });
+	expect(await settled()).toMatchObject({ status: "cancelled" });
 	expect(aborted).toBe(true);
 	// The `cancel` signal aborts the lead's run in its Session; Pi's cascade aborts the child's tasks through ownership.
 	const tasks = [
@@ -430,7 +446,7 @@ it("a child's workflow tool acts for the lead's request; the Session is released
 			},
 		},
 	]);
-	expect(await settled).toEqual({ status: "completed", output: "all done" });
+	expect(await settled()).toEqual({ status: "completed", output: "all done" });
 	expect(seen).toHaveLength(1);
 	expect(seen[0]).toMatchObject({
 		interactionId: f.metadata.interactionId,
@@ -468,7 +484,7 @@ it("a child that fails returns a generic failed result and logs the provider err
 		fauxAssistantMessage("I'll answer myself."),
 	]);
 	const { settled } = await f.call(lead, "Go");
-	expect(await settled).toMatchObject({ status: "completed", output: "I'll answer myself." });
+	expect(await settled()).toMatchObject({ status: "completed", output: "I'll answer myself." });
 	const [result] = toolResults(f.contexts[2]!);
 	expect(result).toMatch(
 		new RegExp(
@@ -546,7 +562,7 @@ it("a background child returns its name at once; a call settles after the lead a
 		return say(`unexpected: ${text}`);
 	});
 	const { settled } = await f.call(lead, "Why is the site down?");
-	expect(await settled).toEqual({ status: "completed", output: "Final: DNS" });
+	expect(await settled()).toEqual({ status: "completed", output: "Final: DNS" });
 	const started = f.contexts.find((context) => lastText(context).startsWith("Started"))!;
 	expect(lastText(started)).toBe(
 		`Started ${tool}-1 in the background. Its answer arrives later as input <subagent name="${tool}-1">; continue meanwhile.`,
@@ -609,7 +625,7 @@ it("continuing a busy background child steers it; an idle one gets new input; ea
 		}),
 	);
 	const { settled } = await f.call(lead, "Go");
-	expect(await settled).toEqual({ status: "completed", output: "Final" });
+	expect(await settled()).toEqual({ status: "completed", output: "Final" });
 	const reports = f.contexts.map(lastText).filter((text) => text.startsWith("<subagent"));
 	expect(reports).toEqual([
 		`<subagent name="${name}" status="done">1 2 3 4</subagent>`,
@@ -658,7 +674,7 @@ it("subagent_stop aborts a background child's work; it reports nothing and the c
 		return say(`unexpected: ${text}`);
 	});
 	const { settled } = await f.call(lead, "Go");
-	expect(await settled).toEqual({ status: "completed", output: "Stopped it." });
+	expect(await settled()).toEqual({ status: "completed", output: "Stopped it." });
 	expect(aborted).toBe(true);
 	expect(f.contexts.map(lastText)).toContain(`Stopped ${tool}-1. It can be continued by name.`);
 	expect(await requests(f, "fabrial.subagent-report:")).toEqual([]);
@@ -681,7 +697,7 @@ it("a background child's report survives the Session being released and the driv
 		run: async () => {
 			// The first run replaces the Session owner, so the driver loses its lease and is redelivered.
 			if (!crashes++)
-				await sql`UPDATE fabrial_pi.sessions SET epoch = epoch + 1, owner = NULL, lease_until = NULL
+				await sql()`UPDATE fabrial_pi.sessions SET epoch = epoch + 1, owner = NULL, lease_until = NULL
 					WHERE key = ${f.key()}`;
 			return "flaked";
 		},
@@ -716,7 +732,7 @@ it("a background child's report survives the Session being released and the driv
 			},
 		},
 	]);
-	expect(await settled).toEqual({ status: "completed", output: "Final" });
+	expect(await settled()).toEqual({ status: "completed", output: "Final" });
 	expect(released).toBe(true);
 	expect(crashes).toBeGreaterThanOrEqual(1);
 	expect(await requests(f, "fabrial.subagent-report:")).toHaveLength(1);
@@ -738,7 +754,7 @@ it("limits.concurrent counts a running background child durably across driver at
 		run: async (_input, ctx) => {
 			// The first run replaces the Session owner: the driver loses its lease and is redelivered.
 			if (!runs++) {
-				await sql`UPDATE fabrial_pi.sessions SET epoch = epoch + 1, owner = NULL, lease_until = NULL
+				await sql()`UPDATE fabrial_pi.sessions SET epoch = epoch + 1, owner = NULL, lease_until = NULL
 					WHERE key = ${f.key()}`;
 				crashed.open();
 			}
@@ -774,7 +790,7 @@ it("limits.concurrent counts a running background child durably across driver at
 		maxAttempts: 3,
 	};
 	const { settled } = await f.call(lead, "Go");
-	expect(await settled).toEqual({ status: "completed", output: "Final" });
+	expect(await settled()).toEqual({ status: "completed", output: "Final" });
 	expect(f.contexts.map(lastText)).toContain(
 		`1 subagents are already running, the limit for this conversation. Wait for one of them to answer, then call ${tool} again.`,
 	);
@@ -808,7 +824,7 @@ it("cancelling the interaction aborts its background children", async () => {
 	const { id, settled } = await f.call(lead, "Go");
 	await started.opened;
 	await f.runtime.cancel(id, "Stopped");
-	expect(await settled).toMatchObject({ status: "cancelled" });
+	expect(await settled()).toMatchObject({ status: "cancelled" });
 	const tasks = await latestTasks(f);
 	const reporter = tasks.find((task) => task.kind === "fabrial.subagent-reporter")!;
 	expect(reporter.abortRequested || reporter.state.status === "terminal").toBe(true);
@@ -869,7 +885,6 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 			return say(`unexpected: ${text}`);
 		}),
 	);
-	const runtime = new MemoryRuntime();
 	const chat = new FakeChat();
 	const dm = await chat.openDM(alice.identities[0]!);
 	const post = dm.post.bind(dm);
@@ -886,14 +901,12 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 		}
 		return ref;
 	};
-	const app = testApp(g, {
+	const { runtime } = await launch(g, {
 		workflows: [runSql, entry],
-		runtime,
 		chat,
-		agents: pi({ models, sql, settings: { retry: { enabled: false } } }),
+		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
 	});
-	await app.start();
-	try {
+	{
 		const id = await runtime.invoke(entry.name, null, {
 			metadata: {
 				interactionId: randomUUID(),
@@ -904,21 +917,11 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 				triggerEvent: null,
 			},
 		});
-		await expect
-			.poll(
-				async () => {
-					await runtime.flush();
-					return runtime.result(id);
-				},
-				{ timeout: 10_000 },
-			)
-			.toMatchObject({
-				status: "completed",
-				output: `Lead: <subagent name="${toolName(researcher.name)}-1" status="done">Fixed after approval.</subagent>`,
-			});
+		expect(await db.execution(id).settled()).toMatchObject({
+			status: "completed",
+			output: `Lead: <subagent name="${toolName(researcher.name)}-1" status="done">Fixed after approval.</subagent>`,
+		});
 		expect(cards).toBe(1);
-	} finally {
-		await app.stop();
 	}
 });
 
@@ -948,10 +951,8 @@ it.each([
 			return {
 				workflow,
 				runtime,
-				go: async () => {
-					await f.runtime.emit(`go-${workflow.name}`, {}, { metadata: f.metadata });
-					void f.runtime.flush();
-				},
+				event: { name: `go-${workflow.name}`, filterable: [] },
+				go: () => f.runtime.emit(`go-${workflow.name}`, {}, { metadata: f.metadata }),
 			};
 		};
 		const lead = waiter("lead");
@@ -981,20 +982,30 @@ it.each([
 			if (text.startsWith("<subagent")) return say(`Final: ${text}`);
 			return say(`unexpected: ${text}`);
 		});
-		const { id } = await f.call(agent, "Go", [lead.runtime, child.runtime]);
+		const { id, settled } = await f.call(
+			agent,
+			"Go",
+			[lead.runtime, child.runtime],
+			[lead.event, child.event],
+		);
 		await Promise.all([parked.lead.opened, parked.child.opened]);
-		const settle = async () => {
-			await f.runtime.flush();
-			return f.runtime.result(id);
-		};
-		await expect.poll(settle).toBeUndefined();
+		for (const waiter of [lead, child])
+			await db
+				.execution(
+					await until(
+						`${waiter.workflow.name} to start`,
+						async () => (await open(f.runtime.queue, waiter.workflow.name))[0],
+					),
+				)
+				.suspended("wait");
+		expect((await db.execution(id).info())?.status).not.toMatch(/completed|failed|cancelled/);
 		const waiters = { lead, child };
 		await waiters[order[0]].go();
 		await expect
 			.poll(() => f.contexts.map(lastText), { timeout: 10_000 })
 			.toContain(order[0] === "lead" ? '"lead went"' : '"child went"');
 		await waiters[order[1]].go();
-		await expect.poll(settle, { timeout: 10_000 }).toEqual({
+		expect(await settled()).toEqual({
 			status: "completed",
 			output: `Final: <subagent name="${tool}-1" status="done">child done</subagent>`,
 		});
@@ -1060,7 +1071,6 @@ it("a background child waiting for approval releases the Session: a new message 
 			return say(`unexpected: ${text}`);
 		}),
 	);
-	const runtime = new MemoryRuntime();
 	const chat = new FakeChat();
 	const dm = await chat.openDM(alice.identities[0]!);
 	const post = dm.post.bind(dm);
@@ -1074,13 +1084,11 @@ it("a background child waiting for approval releases the Session: a new message 
 		if (action) approve = () => chat.click(ref, action.id, alice.identities[0]!);
 		return ref;
 	};
-	const app = testApp(g, {
+	const { runtime } = await launch(g, {
 		workflows: [runSql, ask],
-		runtime,
 		chat,
-		agents: pi({ models, sql, settings: { retry: { enabled: false } } }),
+		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
 	});
-	await app.start();
 	const send = (text: string) =>
 		runtime.invoke(
 			ask.name,
@@ -1097,52 +1105,36 @@ it("a background child waiting for approval releases the Session: a new message 
 			},
 		);
 	const posts = async () => {
-		await runtime.flush();
 		// Replies only; the approval status card is posted here too.
 		return (await chat.thread(thread)).posts.flatMap((each) =>
 			typeof each.content === "string" ? [each.content] : [],
 		);
 	};
-	try {
+	{
 		await send("Fix the row");
-		await expect.poll(posts, { timeout: 10_000 }).toEqual(["On it."]);
-		await expect
-			.poll(async () => (await runtime.flush(), !!approve), { timeout: 10_000 })
-			.toBe(true);
+		await expect.poll(posts, { timeout: 30_000 }).toEqual(["On it."]);
+		await until("the approval card", async () => (approve ? true : undefined));
 		// Every live task waits on the approval: the Session's execution returned and its lease is free.
 		await expect
-			.poll(async () => {
-				await runtime.flush();
-				return runtime
-					.executions()
-					.filter((each) => each.workflow === "fabrial.session" && each.status !== "settled")
-					.map((each) => each.status);
-			})
+			.poll(() => open(runtime.queue, "fabrial.session"), { timeout: 30_000 })
 			.toEqual([]);
-		const storage = await PostgresStorage.open(sql, session);
+		const storage = await PostgresStorage.open(sql(), session);
 		await storage.close(BACKGROUND_CONTEXT);
 		await send("Status?");
 		await expect
-			.poll(posts, { timeout: 10_000 })
+			.poll(posts, { timeout: 30_000 })
 			.toEqual(["On it.", "Still waiting for approval."]);
 		await approve!();
 		// The report reaches the lead after its Session reopened; the run stays hosted until it is answered, so the
 		// answer posts.
 		await expect
-			.poll(posts, { timeout: 10_000 })
+			.poll(posts, { timeout: 30_000 })
 			.toEqual([
 				"On it.",
 				"Still waiting for approval.",
 				`Done: <subagent name="${tool}-1" status="done">Fixed after approval.</subagent>`,
 			]);
-		await expect
-			.poll(async () => {
-				await runtime.flush();
-				return runtime.executions().every((each) => each.status === "settled");
-			})
-			.toBe(true);
-	} finally {
-		await app.stop();
+		await idle(runtime.queue);
 	}
 });
 
@@ -1162,8 +1154,8 @@ it("a child's answer frees its concurrency slot as it settles, and its status li
 		return say(`unexpected: ${text}`);
 	});
 	const { settled } = await f.call(lead, "Go");
-	expect(await settled).toEqual({ status: "completed", output: "Final" });
-	const storage = await PostgresStorage.open(sql, f.key());
+	expect(await settled()).toEqual({ status: "completed", output: "Final" });
+	const storage = await PostgresStorage.open(sql(), f.key());
 	const session = createSession(storage);
 	try {
 		// Holders stay recorded, so a rerun is admitted, but none counts against the limit.
@@ -1193,7 +1185,7 @@ it("a child's answer frees its concurrency slot as it settles, and its status li
 async function leaseFreed(key: string) {
 	await expect
 		.poll(
-			async () => (await sql`SELECT owner FROM fabrial_pi.sessions WHERE key = ${key}`)[0]?.owner,
+			async () => (await sql()`SELECT owner FROM fabrial_pi.sessions WHERE key = ${key}`)[0]?.owner,
 			{ timeout: 10_000, interval: 20 },
 		)
 		.toBeNull();
@@ -1266,14 +1258,10 @@ it("continuing a background child from another actor and thread runs its tools f
 			return say("ok");
 		}),
 	);
-	const runtime = new MemoryRuntime();
-	const app = testApp(g, {
+	const { runtime } = await launch(g, {
 		workflows: [ask],
-		runtime,
-		chat: new FakeChat(),
-		agents: pi({ models, sql, settings: { retry: { enabled: false } } }),
+		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
 	});
-	await app.start();
 	const threads = [randomUUID(), randomUUID()];
 	const send = (text: string, index: number) =>
 		runtime.invoke(
@@ -1290,17 +1278,10 @@ it("continuing a background child from another actor and thread runs its tools f
 				},
 			},
 		);
-	try {
-		await send("Go", 0);
-		await expect
-			.poll(async () => (await runtime.flush(), seen.length), { timeout: 10_000 })
-			.toBe(1);
-		await send("Again", 1);
-		await expect
-			.poll(async () => (await runtime.flush(), seen.length), { timeout: 10_000 })
-			.toBe(2);
-		expect(seen).toEqual([`${users[0]!.id}@${threads[0]}`, `${users[1]!.id}@${threads[1]}`]);
-	} finally {
-		await app.stop();
-	}
+	await send("Go", 0);
+	await expect.poll(() => seen.length, { timeout: 30_000 }).toBe(1);
+	await send("Again", 1);
+	await expect.poll(() => seen.length, { timeout: 30_000 }).toBe(2);
+	expect(seen).toEqual([`${users[0]!.id}@${threads[0]}`, `${users[1]!.id}@${threads[1]}`]);
+	await idle(runtime.queue);
 });

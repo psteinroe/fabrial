@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import type { Message, ToolResultMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
@@ -19,35 +18,34 @@ import {
 	type DurableExecution,
 	type FabrialHost,
 	type InvocationMetadata,
+	type RuntimeEvent,
 	type RuntimeWorkflow,
 	type ToolCall,
 } from "../../../src/index.ts";
-import { FakeChat, MemoryRuntime } from "../../../src/testing.ts";
-import postgres, { type Sql } from "postgres";
-import { afterAll, beforeAll, expect, it, vi } from "vitest";
+import { FakeChat } from "../../../src/testing.ts";
+import { expect, it, vi } from "vitest";
 import { ChildIntents, Runs } from "../../../src/agents/documents.ts";
 import { z } from "zod";
 import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { until } from "../../conductor/helper.ts";
+import { useAgents } from "./setup.ts";
+import { AGENT_SETTLED_EVENT } from "../../../src/runtime.ts";
+
+/** Events core registers for its own waits; these fixtures register with the runtime directly. */
+const internalEvents: RuntimeEvent[] = [{ name: AGENT_SETTLED_EVENT, filterable: ["requestId"] }];
 const definitions = createFabrial({ plugins: [] });
 const { defineWorkflow } = definitions;
 const { defineAgent, defineTool, defineToolkit, defineState } = definitions;
 
-let sql: Sql;
-let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
-beforeAll(async () => {
-	container = await new PostgreSqlContainer("postgres:17-alpine").start();
-	sql = postgres(container.getConnectionUri());
-	await PostgresStorage.migrate(sql);
-});
-afterAll(async () => {
-	await sql?.end();
-	await container?.stop();
-});
+/**
+ * The Pi integration connected to a bare host on real Conductor, in real time: tests register workflows
+ * with the runtime directly and wait for executions through `db.execution`.
+ */
+const { db, sql, idle, open, all } = useAgents();
 
 function fixture(plugins: FabrialHost["plugins"] = [], definitionScope: object = definitions) {
-	// Calls key their Session by execution id: unique ids keep tests apart in the shared database.
-	const runtime = new MemoryRuntime({ idPrefix: randomUUID() });
+	const runtime = db.runtime();
 	const chat = new FakeChat();
 	const faux = fauxProvider();
 	const models = createModels();
@@ -76,7 +74,9 @@ function fixture(plugins: FabrialHost["plugins"] = [], definitionScope: object =
 			name: identity.subjectId,
 		}),
 	} as unknown as FabrialHost;
-	const integration = pi({ models, sql, settings: { retry: { enabled: false } } }).connect(host);
+	const integration = pi({ models, sql: sql(), settings: { retry: { enabled: false } } }).connect(
+		host,
+	);
 	return { runtime, chat, faux, integration, metadata, host };
 }
 async function execute(f: ReturnType<typeof fixture>, workflow: RuntimeWorkflow) {
@@ -84,17 +84,17 @@ async function execute(f: ReturnType<typeof fixture>, workflow: RuntimeWorkflow)
 	await f.integration.start();
 	await f.runtime.start();
 	const id = await f.runtime.invoke(workflow.name, null, { metadata: f.metadata });
-	await f.runtime.flush();
-	return { id, result: f.runtime.result(id) };
+	return { id, result: await db.execution(id).settled() };
 }
 function runtimeRegister(
 	f: ReturnType<typeof fixture>,
 	workflow: RuntimeWorkflow,
 	others: RuntimeWorkflow[] = [],
+	events: RuntimeEvent[] = [],
 ) {
 	f.runtime.register({
 		workflows: hooked(f.integration, [workflow, ...f.integration.workflows, ...others]),
-		events: [],
+		events: [...events, ...internalEvents],
 	});
 }
 
@@ -129,7 +129,7 @@ it("runs durable structured answers and memoizes submissions; each call has a Se
 	expect(f.faux.state.callCount).toBe(2);
 	for (const call of ["answer", "again"]) {
 		const commits =
-			await sql`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${callSession(id, call)} ORDER BY seq`;
+			await sql()`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${callSession(id, call)} ORDER BY seq`;
 		const conversations = commits
 			.flatMap((row) => JSON.parse(String(row.writes)) as { type: string }[])
 			.filter((write) => write.type === "conversation");
@@ -137,7 +137,7 @@ it("runs durable structured answers and memoizes submissions; each call has a Se
 	}
 	// Neither call wrote to the thread's Session.
 	const [thread] =
-		await sql`SELECT 1 FROM fabrial_pi.sessions WHERE key = ${`slack-test:${(f.metadata.replyTo as { threadId: string }).threadId}`}`;
+		await sql()`SELECT 1 FROM fabrial_pi.sessions WHERE key = ${`slack-test:${(f.metadata.replyTo as { threadId: string }).threadId}`}`;
 	expect(thread).toBeUndefined();
 	await f.integration.stop();
 });
@@ -206,7 +206,7 @@ it("binds adapter identity, clients, sections and durable posts; commits tool st
 	expect(recorded.posts).toHaveLength(1);
 	expect(recorded.statuses).toContain("Thinking…");
 	expect(recorded.statuses.at(-1)).toBeNull();
-	const rows = await sql`SELECT writes FROM fabrial_pi.commits`;
+	const rows = await sql()`SELECT writes FROM fabrial_pi.commits`;
 	expect(
 		rows.some((row) => {
 			const writes = JSON.parse(String(row.writes)) as {
@@ -263,7 +263,7 @@ it("releases the Session while a workflow tool waits and reconnects with a stabl
 					triggerEvent: null,
 					ownerWorkflow: null,
 				});
-				const storage = await PostgresStorage.open(sql, execution.metadata.piChild as string);
+				const storage = await PostgresStorage.open(sql(), execution.metadata.piChild as string);
 				await storage.close(BACKGROUND_CONTEXT);
 				return "ok";
 			},
@@ -272,9 +272,11 @@ it("releases the Session while a workflow tool waits and reconnects with a stabl
 	await f.integration.start();
 	await f.runtime.start();
 	const id = await f.runtime.invoke(workflow.name, null, { metadata: f.metadata });
-	await f.runtime.flush();
-	expect(f.runtime.result(id)).toEqual({ status: "completed", output: "child finished" });
-	expect(f.runtime.executions(child.name)).toHaveLength(1);
+	expect(await db.execution(id).settled()).toEqual({
+		status: "completed",
+		output: "child finished",
+	});
+	expect(await all(f.runtime.queue, child.name)).toHaveLength(1);
 	await f.integration.stop();
 });
 
@@ -289,6 +291,7 @@ it("rejects invalid structured answers", async () => {
 	const workflow: RuntimeWorkflow = {
 		name: randomUUID(),
 		triggers: [],
+		retries: { maxAttempts: 1 },
 		handler: (_input, execution) =>
 			f.integration.agents.run(execution, "agent", agent, {
 				input: "Answer",
@@ -305,7 +308,7 @@ it("rejects invalid structured answers", async () => {
 
 it("aborts live task kinds that are no longer installed at start and logs them", async () => {
 	const session = randomUUID();
-	const storage = await PostgresStorage.open(sql, session);
+	const storage = await PostgresStorage.open(sql(), session);
 	const id = await storage.mintId();
 	await storage.commit(
 		[
@@ -351,6 +354,8 @@ it.each([[false], [true]])(
 	async (detached) => {
 		const f = fixture();
 		const child = defineWorkflow({ name: randomUUID(), run: async () => null });
+		// The approval the workflow tool waits for; the test sends it.
+		const approved = { name: `approved-${randomUUID()}`, filterable: [] };
 		(f.host.workflows as unknown as (typeof child)[]).push(child);
 		const agent = defineAgent({
 			name: randomUUID(),
@@ -370,41 +375,51 @@ it.each([[false], [true]])(
 			handler: (_input, execution) =>
 				f.integration.agents.run(execution, "agent", agent, { input: "Wait", detached }),
 		};
-		runtimeRegister(f, workflow, [
-			{
-				name: child.name,
-				triggers: [],
-				handler: async (_input, execution) => {
-					await execution.sleep("approval", 86_400_000);
-					return "approved";
+		runtimeRegister(
+			f,
+			workflow,
+			[
+				{
+					name: child.name,
+					triggers: [],
+					handler: async (_input, execution) => {
+						await execution.waitForEvent("approval", { event: approved.name });
+						return "approved";
+					},
 				},
-			},
-		]);
+			],
+			[approved],
+		);
 		await f.integration.start();
 		await f.runtime.start();
 		const id = await f.runtime.invoke(workflow.name, null, { metadata: f.metadata });
-		await f.runtime.flush();
-		expect(f.runtime.executions(child.name)[0]?.status).toBe("suspended");
+		const tool = db.execution(
+			await until(
+				"the workflow tool to start",
+				async () => (await all(f.runtime.queue, child.name))[0],
+			),
+		);
+		await tool.suspended("approval");
 		await f.runtime.cancel(id, "User stopped");
 		// The cancelled caller signals `cancel` to the Session its call reached.
-		await f.runtime.flush();
-		expect(f.runtime.result(id)?.status).toBe("cancelled");
+		expect((await db.execution(id).settled()).status).toBe("cancelled");
 		if (detached) {
 			// The run outlives its caller: the workflow tool finishes and the agent answers.
-			expect(f.runtime.executions(child.name)[0]?.status).toBe("suspended");
-			await f.runtime.advanceBy(86_400_000);
-			await expect
-				.poll(async () => (await f.runtime.flush(), f.faux.state.callCount), { timeout: 10_000 })
-				.toBe(2);
+			await until("the Session to release while its tool waits", async () =>
+				(await open(f.runtime.queue, "fabrial.session")).length ? undefined : true,
+			);
+			expect(["pending", "running"]).toContain((await tool.info())?.status);
+			await f.runtime.emit(approved.name, {}, { metadata: f.metadata });
+			await until("the agent to answer", async () =>
+				f.faux.state.callCount === 2 ? true : undefined,
+			);
 		} else {
-			expect(f.runtime.executions(child.name)[0]?.result?.status).toBe("cancelled");
-			expect(f.faux.state.callCount).toBe(1);
+			expect((await tool.settled()).status).toBe("cancelled");
 		}
-		expect(f.runtime.executions("fabrial.session").every((each) => each.status === "settled")).toBe(
-			true,
-		);
+		await idle(f.runtime.queue);
+		if (!detached) expect(f.faux.state.callCount).toBe(1);
 		const [lease] =
-			await sql`SELECT owner FROM fabrial_pi.sessions WHERE key = ${callSession(id, "agent")}`;
+			await sql()`SELECT owner FROM fabrial_pi.sessions WHERE key = ${callSession(id, "agent")}`;
 		expect(lease?.owner).toBeNull();
 		await f.integration.stop();
 	},
@@ -553,17 +568,12 @@ it("attributes observer calls to each Session's own agent while two Sessions int
 	await f.integration.start();
 	await f.runtime.start();
 	const first = await f.runtime.invoke(a.name, null, { metadata: f.metadata });
-	const flushed = f.runtime.flush();
 	await inside;
 	// Each Session numbers its conversations from the start, so both leads share a conversation id.
 	const second = await f.runtime.invoke(b.name, null, { metadata: f.metadata });
-	await expect
-		.poll(() => f.runtime.result(second), { timeout: 30_000 })
-		.toEqual({ status: "completed", output: "b done" });
+	expect(await db.execution(second).settled()).toEqual({ status: "completed", output: "b done" });
 	release();
-	await flushed;
-	await f.runtime.flush();
-	expect(f.runtime.result(first)).toEqual({ status: "completed", output: "a done" });
+	expect(await db.execution(first).settled()).toEqual({ status: "completed", output: "a done" });
 	expect(calls.map((call) => [call.name, call.agent])).toEqual([
 		["lookup", other.name],
 		["wait", waiting.name],
@@ -679,7 +689,7 @@ it("workflow state needs a posted thread; an unposted channel locator is not a S
 		},
 	});
 	expect(result).toEqual({ status: "completed", output: "ok" });
-	expect(f.runtime.executions("fabrial.session")).toHaveLength(0);
+	expect(await all(f.runtime.queue, "fabrial.session")).toHaveLength(0);
 	expect(f.chat.threads.size).toBe(0);
 	await f.integration.stop();
 });
@@ -734,7 +744,7 @@ it("delayed cancellation reconciles lost start receipts and leaves a newer conve
 	};
 	f.runtime.register({
 		workflows: hooked(f.integration, [childWorkflow, ...f.integration.workflows]),
-		events: [],
+		events: internalEvents,
 	});
 	await f.integration.start();
 	await f.runtime.start();
@@ -744,7 +754,7 @@ it("delayed cancellation reconciles lost start receipts and leaves a newer conve
 		metadata: f.metadata,
 		dedupeKey,
 	});
-	const storage = await PostgresStorage.open(sql, callSession("old", "agent"));
+	const storage = await PostgresStorage.open(sql(), callSession("old", "agent"));
 	const harness = await Harness.open(
 		storage,
 		{ models: createModels(), registry: createRegistry() },
@@ -804,10 +814,10 @@ it("delayed cancellation reconciles lost start receipts and leaves a newer conve
 		status: "cancelled",
 		reason: "late cancellation",
 	});
-	await f.runtime.flush();
-	expect(f.runtime.executions(childWorkflow.name)).toHaveLength(1);
-	expect(f.runtime.result(child)).toMatchObject({ status: "cancelled" });
-	const reopened = await PostgresStorage.open(sql, callSession("old", "agent"));
+	expect(await db.execution(child).settled()).toMatchObject({ status: "cancelled" });
+	await idle(f.runtime.queue);
+	expect(await all(f.runtime.queue, childWorkflow.name)).toHaveLength(1);
+	const reopened = await PostgresStorage.open(sql(), callSession("old", "agent"));
 	const session = createSession(reopened);
 	try {
 		// The Session went on to run the newer request (it has no model here), but never aborted it.
@@ -859,7 +869,6 @@ it("stop joins driver routing cleanup after the harness has closed", async () =>
 	await f.integration.start();
 	await f.runtime.start();
 	await f.runtime.invoke(workflow.name, null, { metadata: f.metadata });
-	const driving = f.runtime.flush();
 	let stopped = false;
 	try {
 		await cleaning;
@@ -873,7 +882,6 @@ it("stop joins driver routing cleanup after the harness has closed", async () =>
 		expect(stopped).toBe(true);
 	} finally {
 		release();
-		await driving;
 		await f.integration.stop();
 	}
 });
