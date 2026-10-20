@@ -16,7 +16,7 @@ import {
 	workflow,
 } from "./setup.ts";
 
-const { db, setup, enter, eventually, realTime } = useCoreApp();
+const { db, setup, enter, eventually } = useCoreApp();
 
 describe("routing and lifecycle", () => {
 	it("selects specificity, merges triggers, runs observers without a thread and dedupes ingress", async () => {
@@ -137,13 +137,13 @@ describe("durability and context", () => {
 				await ctx.step("x", () => ++effects);
 				await ctx.step("x:1", () => ++effects);
 				await ctx.step("x", () => ++effects);
-				await ctx.sleep("sleep", 1);
+				await ctx.sleep("sleep", "1h");
 				return effects;
 			}),
 		]);
 		const owner = await enter(test);
 		await owner.suspended("sleep");
-		await db.clock.advance(1);
+		await db.clock.advance("1h");
 		expect(await owner.output()).toBe(3);
 		expect(effects).toBe(3);
 	});
@@ -182,14 +182,14 @@ describe("durability and context", () => {
 		const test = setup(
 			[
 				workflow(async (_i, ctx) => {
-					await ctx.sleep("pause", 1);
+					await ctx.sleep("pause", "1h");
 				}),
 			],
 			{ plugins: [plugin, p("a"), p("b")] },
 		);
 		const owner = await enter(test);
 		await owner.suspended("pause");
-		await db.clock.advance(1);
+		await db.clock.advance("1h");
 		await owner.output();
 		// Conductor middleware: `next` settles when the attempt suspends, so every attempt is a full round.
 		const round = ["a:before", "b:before", "b:after", "a:after"];
@@ -225,7 +225,7 @@ describe("durability and context", () => {
 						{ kind: "fabrial.agent", name: "echo" },
 						{ input: "echo" },
 					);
-					await ctx.sleep("sleep", 10);
+					await ctx.sleep("sleep", "1h");
 					return { answer, count: (await ctx.state(counter).get("read")).count };
 				}),
 			],
@@ -233,7 +233,7 @@ describe("durability and context", () => {
 		);
 		const owner = await enter(test);
 		await owner.suspended("sleep");
-		await db.clock.advance(10);
+		await db.clock.advance("1h");
 		expect(await owner.output()).toEqual({ answer: "echo", count: 1 });
 		expect(evaluations).toBe(1);
 	});
@@ -293,7 +293,6 @@ describe("durability and context", () => {
 
 describe("children", () => {
 	it("invokes children with metadata, validates schemas, and starts independently", async () => {
-		await realTime();
 		const child = defineWorkflow({
 			name: "child",
 			input: z.object({ value: z.number() }),
@@ -352,7 +351,6 @@ describe("children", () => {
 		expect(test.ids("registered")).toHaveLength(0);
 	});
 	it("invokes another workflow without a permission check", async () => {
-		await realTime();
 		const other = defineWorkflow({
 			name: "other",
 			input: z.object({}),
@@ -367,7 +365,7 @@ describe("children", () => {
 			name: "child",
 			input: z.object({}),
 			run: async (_i, ctx) => {
-				await ctx.sleep("sleep", 100);
+				await ctx.sleep("sleep", "1h");
 				return "done";
 			},
 		});
@@ -382,7 +380,7 @@ describe("children", () => {
 		expect(await owner.settled()).toMatchObject({ status: "cancelled" });
 		if (detached) {
 			expect(await execution.info()).toMatchObject({ status: "pending" });
-			await db.clock.advance(100);
+			await db.clock.advance("1h");
 			expect(await execution.settled()).toMatchObject({ status: "completed" });
 		} else expect(await execution.settled()).toMatchObject({ status: "cancelled" });
 	});
@@ -391,7 +389,7 @@ describe("children", () => {
 			name: "grandchild",
 			input: z.object({}),
 			run: async (_i, ctx) => {
-				await ctx.sleep("sleep", 100);
+				await ctx.sleep("sleep", "1h");
 			},
 		});
 		const child = defineWorkflow({
@@ -403,7 +401,7 @@ describe("children", () => {
 			name: "background",
 			input: z.object({}),
 			run: async (_i, ctx) => {
-				await ctx.sleep("sleep", 100);
+				await ctx.sleep("sleep", "1h");
 			},
 		});
 		const test = setup([
@@ -424,7 +422,7 @@ describe("children", () => {
 		expect(await (await test.execution("child")).settled()).toMatchObject({ status: "cancelled" });
 		expect(await leaf.settled()).toMatchObject({ status: "cancelled" });
 		expect(await detached.info()).toMatchObject({ status: "pending" });
-		await db.clock.advance(100);
+		await db.clock.advance("1h");
 		expect(await detached.settled()).toMatchObject({ status: "completed" });
 	});
 });
@@ -443,7 +441,7 @@ describe("multi-category chat ingress", () => {
 			],
 			run: async (_i, ctx) => {
 				seen.push({ workflow: "specific", thread: !!ctx.thread });
-				await ctx.sleep("pause", 10);
+				await ctx.sleep("pause", "1h");
 			},
 		});
 		const observer = defineWorkflow({
@@ -557,7 +555,7 @@ describe("lazy channel threads", () => {
 					trigger({ event, replyTo: { kind: "channel", provider: "chat", channelId: "lazy" } }),
 				],
 				run: async (_i, ctx) => {
-					await ctx.sleep("sleep", 10);
+					await ctx.sleep("sleep", "1h");
 				},
 			}),
 		]);
@@ -565,7 +563,7 @@ describe("lazy channel threads", () => {
 		await test.app.emit(event, {});
 		const execution = await (await test.execution()).suspended("sleep");
 		expect(test.chat.threads.size).toBe(0);
-		await db.clock.advance(10);
+		await db.clock.advance("1h");
 		await execution.output();
 		expect(test.chat.threads.size).toBe(0);
 	});
@@ -703,7 +701,6 @@ describe("provider route response context", () => {
 		expect(await db.execution(id).output()).toEqual({ thread: surface.threadId, owner: null });
 	});
 	it("uses receipt-derived metadata for state and agents after lazy channel posts", async () => {
-		await realTime();
 		const counter = defineState({
 			name: "counter",
 			scope: "thread",

@@ -14,7 +14,7 @@ import {
 	workflow,
 } from "./setup.ts";
 
-const { db, setup, enter, card, eventually, realTime } = useCoreApp();
+const { db, setup, enter, card, eventually } = useCoreApp();
 
 /** Executions of `workflow` on `queue`, oldest first: internal workflows are not recorded. */
 async function executions(queue: string, workflow: string) {
@@ -39,7 +39,6 @@ describe("cleanup workflow", () => {
 	// PHASE2(task 9): wraps the cleanup handler's waits, which replay on Conductor where the in-memory
 	// engine resumed them in place; task 9 replaces the cleanup workflow and this test.
 	it.skip("cleanup catches presentations and settlement emitted between successive waits", async () => {
-		realTime();
 		const test = setup([approvalWorkflow()]);
 		let extra: Awaited<ReturnType<typeof test.chat.openDM>> | undefined;
 		// Wrap the cleanup handler as it is registered, before the runtime starts.
@@ -86,7 +85,6 @@ describe("cleanup workflow", () => {
 	});
 
 	it.each(["first", "second"])("cleanup leaves the thread's routing state alone (%s)", async () => {
-		realTime();
 		const test = setup([]);
 		const thread = await test.chat.thread(surface);
 		const ref = await thread.post("hello");
@@ -114,28 +112,34 @@ describe("cleanup workflow", () => {
 	});
 });
 
-// Approvals wait on events and a timer at once. PHASE2: these run on real time, with timeouts long enough
-// to deliver the card first, until conductor #98 fixes event waits under a set test clock; then move
-// the clock instead and assert the exact deadlines again.
+// Approvals wait on events and a timer at once. The test clock keeps running from where it was set, so
+// the timeouts leave room to deliver the card before the clock moves them to the exact deadline.
 describe("expiry and timers", () => {
-	const timeout = 3_000;
+	const timeout = 60_000;
+	const early = 54_000;
 
 	it("expires and renders cards without actions", async () => {
-		realTime();
 		const test = setup([approvalWorkflow(timeout)]);
 		const execution = await enter(test);
 		const c = await card(test);
+		await execution.suspended();
+		await db.clock.advance(timeout);
 		expect(await execution.output()).toBe("expired");
 		await eventually("the card to expire", () => c.post.updates.length > 0);
 		expect(c.post.content).toMatchObject({ card: { text: "Expired", actions: [] } });
 	});
 
 	it("does not extend expiry after invalid decisions and ignores late clicks", async () => {
-		realTime();
 		const test = setup([approvalWorkflow(timeout)]);
 		const execution = await enter(test);
 		const c = await card(test);
+		await execution.suspended();
+		await db.clock.advance(early);
 		await test.chat.click(c.post.ref, c.approve, outsider.identities[0]!);
+		await eventually("the ephemeral rejection", () => test.chat.ephemeral.length === 1);
+		await execution.suspended();
+		expect((await execution.info())?.status).toBe("pending");
+		await db.clock.advance(timeout - early);
 		expect(await execution.output()).toBe("expired");
 		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
 		await dispatched();
@@ -145,14 +149,13 @@ describe("expiry and timers", () => {
 	});
 
 	it("does not restart a race timer after an invalid approval", async () => {
-		realTime();
 		const test = setup([
 			workflow(async (_i, ctx) => {
 				const approval = await ctx.requestApproval("a", {
 					title: "Proposal",
 					details: {},
 					approvers: team,
-					timeout: 60_000,
+					timeout: "1h",
 				});
 				return (await ctx.race("r", { approval: approval.decision(), timer: ctx.timer(timeout) }))
 					.key;
@@ -160,33 +163,38 @@ describe("expiry and timers", () => {
 		]);
 		const execution = await enter(test);
 		const c = await card(test);
+		await execution.suspended();
+		await db.clock.advance(early);
 		await test.chat.click(c.post.ref, c.approve, outsider.identities[0]!);
+		await eventually("the ephemeral rejection", () => test.chat.ephemeral.length === 1);
+		await execution.suspended();
+		expect((await execution.info())?.status).toBe("pending");
+		await db.clock.advance(timeout - early);
 		expect(await execution.output()).toBe("timer");
 	});
 
 	it("fires timers at absolute at even when registration is delayed", async () => {
-		const at = db.clock.now().getTime() + 100;
+		const at = db.clock.now().getTime() + timeout;
 		const runtime = await db.start([
 			{
 				name: "waiter",
 				triggers: [],
 				handler: async (_i, execution) => {
-					await execution.sleep("delay", 90);
+					await execution.sleep("delay", early);
 					return (await execution.waitForAny("timer", { timer: { kind: "timer", at } })).kind;
 				},
 			},
 		]);
 		const execution = db.execution(await runtime.invoke("waiter", {}, { metadata }));
 		await execution.suspended("delay");
-		await db.clock.advance(90);
+		await db.clock.advance(early);
 		await execution.suspended();
 		expect((await execution.info())?.status).toBe("pending");
-		await db.clock.advance(10);
+		await db.clock.advance(timeout - early);
 		expect(await execution.output()).toBe("timer");
 	});
 
 	it("rebinds first-post receipts on replay, transfers real refs to children, and clears state", async () => {
-		realTime();
 		const child = defineWorkflow({
 			name: "child",
 			input: z.object({}),

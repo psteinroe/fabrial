@@ -5,8 +5,6 @@ import { until, useConductor } from "../../conductor/helper.ts";
 // Runtime-port contracts the core relies on, on real Conductor.
 const db = useConductor();
 beforeEach(() => db.clock.set(new Date()));
-// PHASE2: drop once conductor fixes the frozen test clock (event created_at == subscription created_at).
-const realTime = () => db.clock.reset();
 const metadata: InvocationMetadata = {
 	interactionId: "test",
 	origin: null,
@@ -18,7 +16,7 @@ const events = ["ping", "observer", "owned"].map((name) => ({ name, filterable: 
 const waiter = (handler: RuntimeWorkflow["handler"]): RuntimeWorkflow => ({
 	name: "waiter",
 	triggers: [],
-	// One attempt: the frozen test clock never reaches Conductor's retry backoff.
+	// One attempt: the test clock reaches Conductor's retry backoff only when a test moves it.
 	retries: { maxAttempts: 1 },
 	handler,
 });
@@ -86,7 +84,6 @@ it("rejects unknown child waits", async () => {
 it.each([false, true])(
 	"only explicit after sees events emitted before registration (after=%s)",
 	async (explicit) => {
-		await realTime();
 		const runtime = await db.start(
 			[
 				waiter(async (_i, execution) => {
@@ -118,7 +115,7 @@ it("memoizes a cursor across replay and continues after the consumed event curso
 		[
 			waiter(async (_i, execution) => {
 				const cursor = await execution.cursor("fabrial:cursor");
-				await execution.sleep("delay", 10);
+				await execution.sleep("delay", 3_600_000);
 				const first = await execution.waitForEvent("first", { event: "ping", after: cursor });
 				await execution.step("fabrial:between", () => execution.emit("ping", { value: "second" }));
 				const second = await execution.waitForEvent("second", {
@@ -133,7 +130,7 @@ it("memoizes a cursor across replay and continues after the consumed event curso
 	const execution = db.execution(await runtime.invoke("waiter", {}, { metadata }));
 	await execution.suspended("delay");
 	await runtime.emit("ping", { value: "first" }, { metadata });
-	await db.clock.advance(10);
+	await db.clock.advance("1h");
 	expect(await execution.output()).toEqual(["first", "second"]);
 });
 
@@ -141,9 +138,9 @@ it("does not let a late event beat an absolute expired deadline", async () => {
 	const runtime = await db.start(
 		[
 			waiter(async (_i, execution) => {
-				const deadline = await execution.step("deadline", () => runtime.now!() + 100);
+				const deadline = await execution.step("deadline", () => runtime.now!() + 30_000);
 				const after = await execution.cursor("cursor");
-				await execution.sleep("delay", 200);
+				await execution.sleep("delay", 60_000);
 				return (await execution.waitForEvent("wait", {
 					event: "ping",
 					after,
@@ -155,9 +152,9 @@ it("does not let a late event beat an absolute expired deadline", async () => {
 	);
 	const execution = db.execution(await runtime.invoke("waiter", {}, { metadata }));
 	await execution.suspended("delay");
-	await db.clock.advance(150);
+	await db.clock.advance(54_000);
 	await runtime.emit("ping", {}, { metadata });
-	await db.clock.advance(50);
+	await db.clock.advance(6_000);
 	expect(await execution.output()).toBeNull();
 });
 

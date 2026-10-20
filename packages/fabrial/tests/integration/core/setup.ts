@@ -80,7 +80,7 @@ export const source = definePlugin({
 });
 /**
  * One attempt, as on the in-memory runtime: Conductor retries failed attempts after a backoff (three
- * attempts by default), which a frozen test clock never reaches.
+ * attempts by default), which the test clock reaches only when a test moves it.
  */
 export const once = { maxAttempts: 1 };
 export const workflow = (
@@ -100,8 +100,8 @@ export const approvalWorkflow = (timeout: string | number = "24h", requesterCont
 	});
 
 /**
- * Core apps on real Conductor with FakeChat. Database time is frozen at the start of each test and moves
- * only by `db.clock.advance`, after the wait it should end is registered. Every attempt of an app
+ * Core apps on real Conductor with FakeChat. Database time is set at the start of each test, keeps
+ * running from there, and jumps by `db.clock.advance` after the wait it should end is registered. Every attempt of an app
  * workflow is recorded by a middleware, which is how tests find their executions.
  */
 export function useCoreApp() {
@@ -175,13 +175,5 @@ export function useCoreApp() {
 	const eventually = (description: string, probe: () => boolean | Promise<boolean>) =>
 		until(description, async () => ((await probe()) ? true : undefined));
 
-	/**
-	 * Run this test on real time, for tests that wait for events and never move the clock.
-	 *
-	 * PHASE2: drop once conductor fixes the frozen test clock (event created_at == subscription
-	 * created_at): under a frozen clock an event wait never matches an event emitted after it.
-	 */
-	const realTime = () => db.clock.reset();
-
-	return { db, setup, enter, card, eventually, realTime };
+	return { db, setup, enter, card, eventually };
 }

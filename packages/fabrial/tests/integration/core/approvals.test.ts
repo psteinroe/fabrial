@@ -15,7 +15,7 @@ import {
 	workflow,
 } from "./setup.ts";
 
-const { db, setup, enter, card, eventually, realTime } = useCoreApp();
+const { db, setup, enter, card, eventually } = useCoreApp();
 const cardOf = (content: unknown) =>
 	(content as { card: { text?: string; actions: { id: string }[] } }).card;
 
@@ -32,7 +32,6 @@ describe("approvals", () => {
 		expect(c.post.updates).toHaveLength(1);
 	});
 	it("delivers a click exactly once when its first emit fails and the provider retries", async () => {
-		await realTime();
 		const test = setup([approvalWorkflow()]);
 		const owner = await enter(test);
 		const c = await card(test);
@@ -53,7 +52,6 @@ describe("approvals", () => {
 		expect(c.post.updates).toHaveLength(1);
 	});
 	it("rejects non-approvers ephemerally and continues waiting", async () => {
-		await realTime();
 		const test = setup([approvalWorkflow()]);
 		const owner = await enter(test);
 		const c = await card(test);
@@ -74,7 +72,7 @@ describe("approvals", () => {
 							title: "Approval",
 							details: "x",
 							approvers: rotation,
-							timeout: 100,
+							timeout: "1h",
 						})
 					).status,
 			),
@@ -85,11 +83,10 @@ describe("approvals", () => {
 		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
 		await eventually("the ephemeral rejection", () => test.chat.ephemeral.length === 1);
 		await owner.suspended();
-		await db.clock.advance(100);
+		await db.clock.advance("1h");
 		expect(await owner.output()).toBe("expired");
 	});
 	it("allows only the requester to cancel using the status control", async () => {
-		await realTime();
 		const test = setup([approvalWorkflow()]);
 		const owner = await enter(test);
 		const thread = await test.chat.thread(surface);
@@ -108,7 +105,6 @@ describe("approvals", () => {
 		expect(post.content).toMatchObject({ card: { actions: [] } });
 	});
 	it("cancellation of a suspended workflow updates pending cards", async () => {
-		await realTime();
 		const test = setup([approvalWorkflow()]);
 		const owner = await enter(test);
 		const c = await card(test);
@@ -153,7 +149,7 @@ describe("approval edge cases", () => {
 							title: "Proposal",
 							details: {},
 							approvers: group,
-							timeout: 100,
+							timeout: "1h",
 						})
 					).status,
 			),
@@ -178,7 +174,7 @@ describe("approval edge cases", () => {
 				const first = await handle.wait("first");
 				const second = await handle.wait("second");
 				await handle.cancel("cancel", "superseded");
-				await ctx.sleep("after", 10);
+				await ctx.sleep("after", "1h");
 				return [first.status, second.status];
 			}),
 		]);
@@ -186,7 +182,7 @@ describe("approval edge cases", () => {
 		const c = await card(test);
 		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
 		await owner.suspended("after");
-		await db.clock.advance(10);
+		await db.clock.advance("1h");
 		expect(await owner.output()).toEqual(["approved", "approved"]);
 		await eventually("the card update", () => c.post.updates.length > 0);
 		expect(c.post.updates).toHaveLength(1);
@@ -195,7 +191,7 @@ describe("approval edge cases", () => {
 		const test = setup([
 			workflow(async (_i, ctx) => {
 				await ctx.waitForApproval("approval", { title: "Proposal", details: {}, approvers: team });
-				await ctx.sleep("after", 10);
+				await ctx.sleep("after", "1h");
 			}),
 		]);
 		const owner = await enter(test);
@@ -203,7 +199,7 @@ describe("approval edge cases", () => {
 		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!, { dedupeId: "one" });
 		await owner.suspended("after");
 		await test.chat.click(c.post.ref, c.reject, bob.identities[0]!, { dedupeId: "different" });
-		await db.clock.advance(10);
+		await db.clock.advance("1h");
 		await owner.output();
 		const posts = () => [...test.chat.threads.values()].flatMap((thread) => thread.posts);
 		await eventually("every card update", () => posts().every((post) => post.updates.length > 0));
@@ -235,7 +231,6 @@ describe("approval edge cases", () => {
 		);
 	});
 	it("resumes card updates after an interruption without repeating or cancelling them", async () => {
-		await realTime();
 		const test = setup([approvalWorkflow()]);
 		const owner = await enter(test);
 		const c = await card(test);
@@ -321,7 +316,6 @@ describe("approval edge cases", () => {
 		expect(await owner.output()).toBe("approved");
 	});
 	it.each(["title", "details"] as const)("rejects changed approval %s on replay", async (field) => {
-		await realTime();
 		let changed = false;
 		const test = setup([
 			workflow(
@@ -346,7 +340,6 @@ describe("approval edge cases", () => {
 		});
 	});
 	it("treats reordered proposal detail keys as the same proposal", async () => {
-		await realTime();
 		let changed = false;
 		const test = setup([
 			workflow(
