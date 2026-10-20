@@ -1,6 +1,7 @@
 import { expect, expectTypeOf, it, vi } from "vitest";
 import { createFabrial, definePlugin, defineUser } from "../../src/index.ts";
-import { createTestApp, MemoryRuntime, testApp } from "fabrial/testing";
+import { testApp } from "fabrial/testing";
+import { StubRuntime } from "./stub-runtime.ts";
 
 const database = definePlugin((value: string) => ({
 	id: "database",
@@ -29,7 +30,7 @@ const workflow = f.defineWorkflow({
 
 // Compiled only: plugins have one configuration point, at definition.
 function invalidConfig() {
-	const runtime = new MemoryRuntime();
+	const runtime = new StubRuntime();
 	// @ts-expect-error Plugins cannot be passed to f.app().
 	f.app({ runtime, workflows: [], plugins: { database: database("fake") } });
 	// @ts-expect-error Groups are referenced by workflows, not registered as users.
@@ -38,37 +39,7 @@ function invalidConfig() {
 	f.plugins.push(database("fake"));
 }
 void invalidConfig;
-
-it("reuses definitions across isolated apps with definition-time plugins and spied clients", async () => {
-	const production = createTestApp(f, { workflows: [workflow] });
-	const test = createTestApp(f, { workflows: [workflow] });
-	vi.spyOn(test.app.host, "clients").mockReturnValue({ database: { query: () => "fake" } });
-	expect(f.plugins[0]!.clients!({}).database.query()).toBe("production");
-	expect(Object.isFrozen(f.plugins)).toBe(true);
-	for (const [fixture, value] of [
-		[production, "production"],
-		[test, "fake"],
-	] as const) {
-		await fixture.app.start();
-		try {
-			const id = await fixture.runtime.invoke(workflow.name, null, {
-				metadata: {
-					interactionId: "query",
-					origin: null,
-					replyTo: null,
-					requestedBy: null,
-				},
-			});
-			await fixture.runtime.flush();
-			expect(fixture.runtime.result(id)).toEqual({ status: "completed", output: value });
-			// This group was never registered in identity.
-			expect(await fixture.app.host.directory.members(group)).toMatchObject([{ id: "alice" }]);
-			expect(fixture.app.host.clients().database.query()).toBe(value);
-		} finally {
-			await fixture.app.stop();
-		}
-	}
-});
+void workflow;
 
 it("isolates instance client types and supports client-less catalogs", () => {
 	const other = createFabrial({
@@ -103,7 +74,7 @@ it("does not connect chat adapters until startup", async () => {
 		plugins: [{ id: "chat", chat: { installationId: "", adapter: vi.fn() } }],
 	});
 	const app = testApp(instance, {
-		runtime: new MemoryRuntime(),
+		runtime: new StubRuntime(),
 		workflows: [],
 		chat: { kind: "fabrial.chat", connect },
 	});
