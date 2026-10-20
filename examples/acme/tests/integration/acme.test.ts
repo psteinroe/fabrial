@@ -412,8 +412,7 @@ it("restarts Conductor, Pi and Chat during approval and completes exactly once",
 		await sql`SELECT id FROM pgconductor._private_executions WHERE task_key = 'run-sql'`;
 	expect(children).toHaveLength(1);
 });
-// PHASE2: still fails with conductor #101 merged (stop() resolves before the delivery is released); re-enable after a follow-up conductor fix
-it.skip("stops promptly once an in-flight approval-card delivery finishes", async () => {
+it("stops promptly once an in-flight approval-card delivery finishes", async () => {
 	let reached!: () => void;
 	const delivering = new Promise<void>((resolve) => {
 		reached = resolve;
