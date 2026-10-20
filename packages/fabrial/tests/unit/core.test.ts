@@ -9,13 +9,7 @@ import {
 	trigger,
 	weeklyRotation,
 } from "../../src/index.ts";
-import type {
-	AnyWorkflow,
-	EventFilter,
-	ExternalIdentity,
-	Json,
-	WorkflowContext,
-} from "../../src/index.ts";
+import type { AnyWorkflow, EventFilter, ExternalIdentity } from "../../src/index.ts";
 import { FakeChat, StubRuntime, testApp } from "fabrial/testing";
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
