@@ -2,17 +2,19 @@ import type { ApprovalDecision, ApprovalHandle, ApprovalOptions } from "./approv
 import type { ContextOptions, InternalAwaitable } from "./context.ts";
 import {
 	APPROVAL_DECIDED_EVENT,
+	APPROVAL_DECISION_WORKFLOW,
 	APPROVAL_REQUEST_WORKFLOW,
 	type ApprovalRequest,
+	type DecisionInput,
+	type DecisionResult,
 } from "./approval-workflows.ts";
 import { definedGroup, type Principal } from "./identity.ts";
-import { APPROVAL_CLOSED_EVENT, CLEANUP_WORKFLOW, PRESENTATION_EVENT } from "./cleanup.ts";
+import type { CardDestination } from "./cleanup.ts";
 import { boundedTimeout } from "./internal.ts";
-import type { Json, JsonObject } from "./json.ts";
-import type { Awaitable, MessageRef, OutboundMessage } from "./thread.ts";
+import type { Json } from "./json.ts";
+import type { Awaitable, Surface } from "./thread.ts";
 
 interface ApprovalContext extends ContextOptions {
-	post(id: string, message: OutboundMessage, presentationId?: string): Promise<MessageRef>;
 	op(id: string): string;
 	race(id: string, awaitables: Record<string, Awaitable>): Promise<{ key: string; value: Json }>;
 }
@@ -33,8 +35,7 @@ export async function createApproval(
 	ctx: ApprovalContext,
 ): Promise<ApprovalHandle> {
 	const { host, execution, metadata, now } = ctx;
-	const chat = host.chat();
-	if (!chat) throw new Error("Approvals require a chat integration");
+	if (!host.chat()) throw new Error("Approvals require a chat integration");
 	const originatingProvider = metadata.origin?.provider ?? metadata.replyTo?.provider;
 	const targets = Array.isArray(options.approvers) ? options.approvers : [options.approvers];
 	const request = (await execution.step(`fabrial:${id}:request`, async () => {
@@ -81,151 +82,74 @@ export async function createApproval(
 			`Approval ${id} proposal changed: title/details must match the persisted request`,
 		);
 	// The request's own execution: its result is what the routing workflow authorizes clicks against.
+	const internal = { replyTo: null, ownerWorkflow: null, triggerEvent: null };
 	const approvalId = await execution.start(
 		`fabrial:${id}:record`,
 		APPROVAL_REQUEST_WORKFLOW,
 		request as unknown as Json,
-		{ metadata: { ...metadata, replyTo: null, ownerWorkflow: null, triggerEvent: null } },
+		{ metadata: { ...metadata, ...internal } },
 	);
-	const after = await execution.cursor(`fabrial:${id}:cursor`);
 	const approvers = request.approvers;
-	await execution.start(
-		`fabrial:${id}:cleanup`,
-		CLEANUP_WORKFLOW,
-		{
-			executionId: execution.executionId,
-			approvalId,
-			presentationId: approvalId,
-			after,
-			title: request.title,
-		},
-		{
-			metadata: {
-				...metadata,
-				replyTo: null,
-				ownerWorkflow: null,
-				triggerEvent: null,
+	const cards: DecisionInput["cards"] = approvers.map((approver) => ({
+		destination: {
+			kind: "dm",
+			approver,
+			provider: originatingProvider ?? null,
+		} satisfies CardDestination,
+		card: {
+			...((request.card as unknown as ApprovalOptions["card"]) ?? {
+				title: request.title,
+				text:
+					typeof request.details === "string" ? request.details : JSON.stringify(request.details),
+			}),
+			actions: [
+				{ id: `fabrial.approval.approve:${approvalId}`, label: "Approve", style: "primary" },
+				{ id: `fabrial.approval.reject:${approvalId}`, label: "Reject", style: "danger" },
+			],
+		} as unknown as Json,
+	}));
+	if (metadata.replyTo)
+		cards.push({
+			destination: { kind: "surface", surface: metadata.replyTo as Surface },
+			card: {
+				title: request.title,
+				text: "Waiting for approval",
+				actions:
+					request.requesterControls === false
+						? []
+						: [{ id: `fabrial.approval.cancel:${approvalId}`, label: "Cancel request" }],
 			},
-		},
-	);
-	const status = metadata.replyTo
-		? ctx.post(
-				`fabrial:${id}:status`,
-				{
-					card: {
-						title: request.title,
-						text: "Waiting for approval",
-						actions:
-							request.requesterControls === false
-								? []
-								: [{ id: `fabrial.approval.cancel:${approvalId}`, label: "Cancel request" }],
-					},
-				},
-				approvalId,
-			)
-		: undefined;
-	const deliveries = await Promise.allSettled([
-		...approvers.map(async (approver, index) => {
-			return (await execution.step(`fabrial:${id}:card:${index}`, async () => {
-				const identities = approver.identities
-					.map((identity, index) => ({ identity, index }))
-					.sort(
-						(a, b) =>
-							Number(b.identity.provider === originatingProvider) -
-								Number(a.identity.provider === originatingProvider) || a.index - b.index,
-					);
-				let dm: Awaited<ReturnType<typeof chat.openDM>> | undefined;
-				for (const { identity } of identities) {
-					try {
-						dm = await chat.openDM(identity);
-						break;
-					} catch {
-						/* Try the next provider identity. */
-					}
-				}
-				if (!dm)
-					throw new Error(`Approver ${approver.id} has no identity whose provider can open DMs`);
-				const receipt = await dm.post({
-					card: {
-						...((request.card as unknown as ApprovalOptions["card"]) ?? {
-							title: request.title,
-							text:
-								typeof request.details === "string"
-									? request.details
-									: JSON.stringify(request.details),
-						}),
-						actions: [
-							{ id: `fabrial.approval.approve:${approvalId}`, label: "Approve", style: "primary" },
-							{ id: `fabrial.approval.reject:${approvalId}`, label: "Reject", style: "danger" },
-						],
-					},
-				});
-				await execution.emit(
-					PRESENTATION_EVENT,
-					{ presentationId: approvalId, ref: receipt as unknown as JsonObject },
-					{ id: `${approvalId}:card:${index}` },
-				);
-				return receipt as unknown as JsonObject;
-			})) as unknown as MessageRef;
-		}),
-		...(status ? [status] : []),
-	]);
-	const failed = deliveries.find((delivery) => delivery.status === "rejected");
-	if (failed?.status === "rejected") throw failed.reason;
-
-	const label = (decision: ApprovalDecision, reason?: string) =>
-		decision.status === "approved"
-			? `Approved by ${decision.decidedBy?.name ?? decision.decidedBy?.id}`
-			: decision.status === "rejected"
-				? `Rejected by ${decision.decidedBy?.name ?? decision.decidedBy?.id}`
-				: decision.status === "expired"
-					? "Expired"
-					: reason === "superseded"
-						? "Superseded"
-						: "Cancelled";
-	let resolution: ApprovalDecision | undefined;
-	/** Record the decision first; the cleanup watcher then relabels each card on its own. */
-	const finish = async (decision: ApprovalDecision, reason?: string): Promise<ApprovalDecision> => {
-		const result = await execution.step(`fabrial:${id}:resolved`, async () => {
-			await execution.emit(
-				APPROVAL_CLOSED_EVENT,
-				{ approvalId, label: label(decision, reason) },
-				{ id: approvalId },
-			);
-			return decision as unknown as JsonObject;
 		});
-		resolution = result as unknown as ApprovalDecision;
-		return resolution;
-	};
+	// Subscribes to decisions before its cleanups post the cards; independent of this execution.
+	const decisionId = await execution.start(
+		`fabrial:${id}:decision`,
+		APPROVAL_DECISION_WORKFLOW,
+		{
+			approvalId,
+			callerId: execution.executionId,
+			deadline: request.deadline,
+			title: request.title,
+			cards,
+		} satisfies DecisionInput as unknown as Json,
+		{ metadata: { ...metadata, ...internal } },
+	);
 
 	const awaitable: InternalAwaitable = {
 		kind: "fabrial.awaitable",
-		branch: {
-			kind: "event",
-			event: APPROVAL_DECIDED_EVENT,
-			filter: { approvalId: [approvalId] },
-			after,
-		},
-		deadline: request.deadline,
-		prepare: async () => ({ ready: !!resolution, value: (resolution as unknown as Json) ?? null }),
-		// Only authorized decisions reach the approval: the routing workflow checks every click.
-		accept: async (_waitId, value) => {
-			if (value === null)
-				return (await finish({
-					status: "expired",
-					approved: false,
-					decidedBy: null,
-					decidedAt: new Date(now()).toISOString(),
-				})) as unknown as Json;
-			const event = value as JsonObject;
-			const decision: ApprovalDecision = {
-				status: event.status as ApprovalDecision["status"],
-				approved: event.status === "approved",
-				decidedBy: event.actor as unknown as Principal | null,
+		// Losing a race leaves the decision running: the approval can be awaited again.
+		branch: { execution: decisionId },
+		accept: (winner) => {
+			if (winner.kind !== "execution") throw new Error("Invalid approval decision");
+			const result = winner.result;
+			if (result.status === "completed")
+				return (result.output as unknown as DecisionResult).decision as unknown as Json;
+			if (result.status === "failed") throw new Error(`Approval failed: ${result.error}`);
+			return {
+				status: "cancelled",
+				approved: false,
+				decidedBy: null,
 				decidedAt: new Date(now()).toISOString(),
-				...(typeof event.comment === "string" ? { comment: event.comment } : {}),
-			};
-			return (await finish(decision, event.reason as string | undefined)) as unknown as Json;
+			} satisfies ApprovalDecision as unknown as Json;
 		},
 	};
 	return {
@@ -235,26 +159,15 @@ export async function createApproval(
 		wait: async (waitId) =>
 			(await ctx.race(ctx.op(waitId), { decision: awaitable }))
 				.value as unknown as ApprovalDecision,
+		// Decides the approval unless a decision came first; the decision execution ignores later ones.
 		cancel: async (cancelId, reason) => {
-			const key = ctx.op(cancelId);
-			if (resolution) return;
-			await execution.step(key, async () => {
+			await execution.step(ctx.op(cancelId), async () => {
 				await execution.emit(
 					APPROVAL_DECIDED_EVENT,
-					{ approvalId, status: "cancelled", actor: null, internal: execution.executionId, reason },
+					{ approvalId, status: "cancelled", actor: null, comment: reason, reason },
 					{ id: `${approvalId}:cancel` },
 				);
 			});
-			await finish(
-				{
-					status: "cancelled",
-					approved: false,
-					decidedBy: null,
-					decidedAt: new Date(now()).toISOString(),
-					comment: reason,
-				},
-				reason,
-			);
 		},
 	};
 }

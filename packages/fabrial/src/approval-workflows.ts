@@ -1,11 +1,16 @@
 import type { FabrialHost } from "./app.ts";
+import type { ApprovalDecision } from "./approval.ts";
+import { CLEANUP_WORKFLOW, type CardDestination, type CleanupInput } from "./cleanup.ts";
 import { samePrincipal } from "./directory.ts";
 import { definedGroup, type Principal } from "./identity.ts";
-import type { Json } from "./json.ts";
+import type { Json, JsonObject } from "./json.ts";
 import type { DurableExecution, RuntimeWorkflow } from "./runtime.ts";
 
 /** One execution per approval request; its result is the request the routing workflow authorizes clicks against. */
 export const APPROVAL_REQUEST_WORKFLOW = "fabrial.approval.request";
+/** One execution per approval request that waits for its decision; its result is the final decision. */
+export const APPROVAL_DECISION_WORKFLOW = "fabrial.approval.decision";
+/** Authorized decisions only: the routing workflow emits a click after checking it. */
 export const APPROVAL_DECIDED_EVENT = "fabrial.approval.decided";
 
 /**
@@ -43,6 +48,97 @@ export function approvalRequestWorkflow(): RuntimeWorkflow {
 		triggers: [],
 		retentionDays: REQUEST_RETENTION_DAYS,
 		handler: async (input) => input,
+	};
+}
+
+export interface DecisionInput {
+	/** The request execution. */
+	approvalId: string;
+	callerId: string;
+	/** Epoch ms, persisted with the request: resumes never extend it. */
+	deadline: number;
+	title: string;
+	cards: { destination: CardDestination; card: Json }[];
+}
+
+/** The decision execution's result: the decision and the label every card shows. */
+export interface DecisionResult {
+	decision: ApprovalDecision;
+	label: string;
+}
+
+/**
+ * Subscribes once to the authorized decisions, then starts one cleanup per card, so a click on a card
+ * just posted is never missed. The first decision wins; the caller settling first cancels the approval.
+ */
+export function approvalDecisionWorkflow(now: () => number): RuntimeWorkflow {
+	return {
+		name: APPROVAL_DECISION_WORKFLOW,
+		triggers: [],
+		retentionDays: REQUEST_RETENTION_DAYS,
+		handler: async (input, execution) => {
+			const data = input as unknown as DecisionInput;
+			const decided = await execution.subscribe("decided", {
+				event: APPROVAL_DECIDED_EVENT,
+				filter: { approvalId: [data.approvalId] },
+			});
+			await Promise.all(
+				data.cards.map((card, index) =>
+					execution.start(
+						`card:${index}`,
+						CLEANUP_WORKFLOW,
+						{
+							requestExecutionId: data.approvalId,
+							decisionId: execution.executionId,
+							callerId: data.callerId,
+							title: data.title,
+							...card,
+						} satisfies CleanupInput as unknown as Json,
+						{ metadata: { replyTo: null, ownerWorkflow: null, triggerEvent: null } },
+					),
+				),
+			);
+			const winner = await execution.waitForAny(
+				"decision",
+				{ decided, caller: { execution: data.callerId } },
+				{ timeoutMs: Math.max(0, data.deadline - now()) },
+			);
+			const decidedAt = new Date(now()).toISOString();
+			let result: DecisionResult;
+			if (winner.kind === "event") {
+				const event = winner.event.payload;
+				const status = event.status as ApprovalDecision["status"];
+				const actor = event.actor as unknown as Principal | null;
+				const name = actor?.name ?? actor?.id;
+				result = {
+					decision: {
+						status,
+						approved: status === "approved",
+						decidedBy: actor,
+						decidedAt,
+						...(typeof event.comment === "string" ? { comment: event.comment } : {}),
+					},
+					label:
+						status === "approved"
+							? `Approved by ${name}`
+							: status === "rejected"
+								? `Rejected by ${name}`
+								: event.reason === "superseded"
+									? "Superseded"
+									: "Cancelled",
+				};
+			} else
+				result = {
+					decision: {
+						status: winner.kind === "timeout" ? "expired" : "cancelled",
+						approved: false,
+						decidedBy: null,
+						decidedAt,
+					},
+					label: winner.kind === "timeout" ? "Expired" : "Cancelled",
+				};
+			return result as unknown as JsonObject;
+		},
 	};
 }
 

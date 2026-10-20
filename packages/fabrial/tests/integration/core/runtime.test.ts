@@ -69,14 +69,14 @@ it("rejects unknown child waits", async () => {
 	const runtime = await db.start([
 		waiter(async (_i, execution) => {
 			await execution.waitForAny("wait", {
-				child: { kind: "execution", executionId: crypto.randomUUID() },
+				child: { execution: crypto.randomUUID() },
 			});
 		}),
 	]);
 	const id = await runtime.invoke("waiter", {}, { metadata });
 	expect(await db.execution(id).settled()).toMatchObject({
 		status: "failed",
-		error: expect.stringContaining("Unknown execution"),
+		error: expect.stringContaining("not found"),
 	});
 });
 

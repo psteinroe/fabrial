@@ -406,17 +406,21 @@ for (const kind of ["event", "timer"] as const) {
 							await ctx.waitForEvent("wait", { event: "test.event", deadline: at }),
 						).toBeNull();
 					else
-						expect(await ctx.waitForAny("wait", { timeout: { kind: "timer", at } })).toEqual({
-							key: "timeout",
-							kind: "timer",
-						});
+						expect(
+							await ctx.waitForAny(
+								"wait",
+								{ event: await ctx.subscribe("event", { event: "test.event" }) },
+								{ timeoutMs: Math.max(0, at - Date.now()) },
+							),
+						).toEqual({ key: "timeout", kind: "timeout" });
 					ended = Date.now();
 					return null;
 				}),
 			]);
 			const id = await runtime.invoke("deadline", null, { metadata });
 			await expect.poll(() => completed(id), poll).toBe(true);
-			expect(attempts).toBeGreaterThan(2);
+			// The cursor wait replays on every poll; the native race resumes once.
+			expect(attempts).toBeGreaterThan(kind === "event" ? 2 : 1);
 			expect(ended - began).toBeGreaterThanOrEqual(590);
 		},
 	);
@@ -556,24 +560,30 @@ for (const winner of ["first", "second", "child", "timer"] as const) {
 			workflow("race", async (_input, ctx) => {
 				childId = await ctx.start("child", "child", {});
 				const branches: Record<string, WaitBranch> = {
-					first: { kind: "event", event: "test.event", filter: { key: ["first"] } },
-					second: { kind: "event", event: "test.event", filter: { key: ["second"] } },
-					child: { kind: "execution", executionId: childId },
-					timer: {
-						kind: "timer",
-						at: await ctx.step(
-							"deadline",
-							() => Date.now() + (winner === "timer" ? 1_000 : 10_000),
-						),
-					},
+					first: await ctx.subscribe("first", { event: "test.event", filter: { key: ["first"] } }),
+					second: await ctx.subscribe("second", {
+						event: "test.event",
+						filter: { key: ["second"] },
+					}),
+					child: { execution: childId },
 				};
-				result = await ctx.waitForAny("race", branches);
+				result = await ctx.waitForAny("race", branches, {
+					timeoutMs: winner === "timer" ? 1_000 : 10_000,
+				});
 				await ctx.sleep("replay-winner", 30);
 				return result;
 			}),
 		]);
 		const id = await runtime.invoke("race", {}, { metadata });
-		await waiting(id, 2);
+		// The native race holds its branches itself while it waits.
+		await expect
+			.poll(async () => {
+				const [row] = await sql<{ waiting: boolean }[]>`
+					select locked_by is null and waiting_step_key = 'race' as waiting
+					from pgconductor._private_executions where id = ${id}::uuid`;
+				return row?.waiting;
+			}, poll)
+			.toBe(true);
 		if (winner === "child") {
 			await waiting(childId!);
 			await runtime.emit("test.other", { key: "child" }, { metadata });
@@ -583,12 +593,11 @@ for (const winner of ["first", "second", "child", "timer"] as const) {
 			winner === "child"
 				? { key: "child", kind: "execution", result: { status: "completed", output: 42 } }
 				: winner === "timer"
-					? { key: "timer", kind: "timer" }
+					? { key: "timeout", kind: "timeout" }
 					: {
 							key: winner,
 							kind: "event",
 							event: { name: "test.event", payload: { key: winner } },
-							cursor: expect.any(String),
 						},
 		);
 		const [row] = await sql<
@@ -643,7 +652,7 @@ test("cancel via execution, distinguish failed/cancelled child results, timeout,
 		workflow("cancel-call", async (_input, ctx) => {
 			const child = await ctx.start("independent", "suspended", {});
 			await ctx.cancel(child, "deliberate");
-			return ctx.waitForAny("result", { child: { kind: "execution", executionId: child } });
+			return ctx.waitForAny("result", { child: { execution: child } });
 		}),
 		workflow("failure-call", async (_input, ctx) => {
 			try {
@@ -822,16 +831,14 @@ test("waitForAny races concurrent events, replays a single winner, and excludes 
 			releaseId = ctx.executionId;
 			await ctx.waitForEvent("gate", { event: "test.other" });
 			const result = await ctx.waitForAny("race", {
-				first: {
-					kind: "event",
+				first: await ctx.subscribe("first", {
 					event: "test.event",
 					filter: { key: [{ prefix: "first" }], amount: [{ numeric: [">=", 2, "<", 5] }] },
-				},
-				second: {
-					kind: "event",
+				}),
+				second: await ctx.subscribe("second", {
 					event: "test.event",
 					filter: { key: [{ "anything-but": "first" }], amount: [{ exists: false }] },
-				},
+				}),
 			});
 			results.push(result);
 			await ctx.sleep("replay", 20);
@@ -859,14 +866,11 @@ test("waitForAny races concurrent events, replays a single winner, and excludes 
 test("waitForAny resumes across restart and can wait on the execution-settled event", async () => {
 	let result: Json | undefined;
 	const definition = workflow("restart-race", async (input, ctx) => {
-		result = await ctx.waitForAny("race", {
-			settled: {
-				kind: "event",
-				event: EXECUTION_SETTLED_EVENT,
-				filter: { executionId: [input as string] },
-			},
-			timeout: { kind: "timer", at: await ctx.step("deadline", () => Date.now() + 10_000) },
+		const settled = await ctx.subscribe("settled", {
+			event: EXECUTION_SETTLED_EVENT,
+			filter: { executionId: [input as string] },
 		});
+		result = await ctx.waitForAny("race", { settled }, { timeoutMs: 10_000 });
 		return result;
 	});
 	const first = await setup([definition]);
@@ -887,7 +891,6 @@ test("waitForAny resumes across restart and can wait on the execution-settled ev
 	expect(result).toEqual({
 		key: "settled",
 		kind: "event",
-		cursor: expect.any(String),
 		event: {
 			name: EXECUTION_SETTLED_EVENT,
 			payload: { executionId: row!.payload.input, result: { status: "completed", output: "done" } },
@@ -912,7 +915,7 @@ test("structured cancellation is recursive, removes waits, and reports cancelled
 		workflow("parent", async (_input, ctx) => ctx.invoke("child", "child", {})),
 		workflow("watch", async (input, ctx) => {
 			result = await ctx.waitForAny("child", {
-				child: { kind: "execution", executionId: input as string },
+				child: { execution: input as string },
 			});
 			return result;
 		}),
@@ -967,19 +970,21 @@ test("a permanently failed parent cancels its attached child, not its detached o
 			"parent",
 			async (_input, ctx) => {
 				await ctx.start("detached", "child", "detached");
-				await ctx.waitForAny("attached", {
-					timer: { kind: "timer", at: await ctx.step("deadline", () => Date.now() + 200) },
-					child: {
-						kind: "execution",
-						// The attached call's child, started without waiting through the raw context.
-						executionId: await (ctx as ConductorExecution).raw.invoke(
-							"attached",
-							{ name: "child" } as never,
-							{ input: "attached" } as never,
-							{ cancelWithParent: true },
-						),
+				await ctx.waitForAny(
+					"attached",
+					{
+						child: {
+							// The attached call's child, started without waiting through the raw context.
+							execution: await (ctx as ConductorExecution).raw.invoke(
+								"attached",
+								{ name: "child" } as never,
+								{ input: "attached" } as never,
+								{ cancelWithParent: true },
+							),
+						},
 					},
-				});
+					{ timeoutMs: 200 },
+				);
 				throw new Error("parent broke");
 			},
 			{ retries: { maxAttempts: 1 } },
@@ -1177,7 +1182,7 @@ test("running cancellation aborts the native signal and preserves the caller's r
 		}),
 		workflow("watch", async (input, ctx) => {
 			result = await ctx.waitForAny("result", {
-				child: { kind: "execution", executionId: input as string },
+				child: { execution: input as string },
 			});
 			return result;
 		}),

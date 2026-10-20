@@ -31,24 +31,30 @@ export type DurationInput = string | number;
  * Opaque, durable position in the event stream (Conductor item 1). Events emitted after a cursor satisfy
  * waits that pass it as `after`, even if they were emitted before the wait registered. Every consumed
  * event returns its own cursor, so successive waits can continue exactly after the last consumed event.
+ * PHASE2(task 11): only the `ctx.agent` settlement wait still uses cursors.
  */
 export type EventCursor = string;
 
-/** Branch of `waitForAny`. Timers use an absolute deadline (epoch ms), fixed once by the caller. */
-export type WaitBranch =
-	| { kind: "event"; event: string; filter?: EventFilter; after?: EventCursor }
-	| { kind: "execution"; executionId: string }
-	| { kind: "timer"; at: number };
+/**
+ * A one-shot event subscription (Conductor `ctx.subscribe`): it holds the first matching event emitted
+ * after it became active, even while the execution is still running. Memoized by its id.
+ */
+export interface Subscription {
+	readonly kind: "fabrial.subscription";
+	readonly id: string;
+}
+
+/**
+ * Branch of `waitForAny`: a subscription receives its event, an execution settles, or this execution
+ * receives a signal with that name (Conductor `ctx.waitForAny`).
+ */
+export type WaitBranch = Subscription | { execution: string } | { signal: string };
 
 export type WaitForAnyResult =
-	| {
-			key: string;
-			kind: "event";
-			event: { name: string; payload: JsonObject };
-			cursor: EventCursor;
-	  }
+	| { key: string; kind: "event"; event: { name: string; payload: JsonObject } }
 	| { key: string; kind: "execution"; result: ExecutionResult }
-	| { key: string; kind: "timer" };
+	| { key: string; kind: "signal"; signal: { id: string; name: string } }
+	| { key: "timeout"; kind: "timeout" };
 
 export type ExecutionResult =
 	| { status: "completed"; output: Json }
@@ -97,13 +103,24 @@ export interface DurableExecution {
 	/**
 	 * Wait for one matching event emitted after `after` (or after registration when omitted), until the
 	 * absolute `deadline` (epoch ms). Returns null on timeout (Conductor item 1).
+	 * PHASE2(task 11): only the `ctx.agent` settlement wait uses it; everything else subscribes.
 	 */
 	waitForEvent(
 		id: string,
 		options: { event: string; filter?: EventFilter; after?: EventCursor; deadline?: number },
 	): Promise<{ name: string; payload: JsonObject; cursor: EventCursor } | null>;
-	/** First of several branches wins (Conductor item 6). */
-	waitForAny(id: string, branches: Record<string, WaitBranch>): Promise<WaitForAnyResult>;
+	/** Subscribe to one matching event without suspending; wait on it with `waitForAny`. */
+	subscribe(id: string, options: { event: string; filter?: EventFilter }): Promise<Subscription>;
+	/**
+	 * First of several branches wins, memoized by `id`. The timeout starts at the first call, so a
+	 * resume never extends it; `key: "timeout"` is reserved. Losing subscriptions close; losing
+	 * executions keep running and can be waited on again.
+	 */
+	waitForAny(
+		id: string,
+		branches: Record<string, WaitBranch>,
+		options?: { timeoutMs?: number },
+	): Promise<WaitForAnyResult>;
 	/** Memoized: wait until an execution settles. Throws if it is unknown or removed by retention. */
 	waitForResult(id: string, executionId: string): Promise<ExecutionResult>;
 	/** Start a child and wait for its result. Cancelled with the parent unless `detached` (Conductor item 5). */

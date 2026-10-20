@@ -32,12 +32,14 @@ import type {
 } from "./runtime.ts";
 import type { ChatMessage, ThreadRef } from "./thread.ts";
 import { createContext } from "./context.ts";
-import { APPROVAL_CLOSED_EVENT, CLEANUP_WORKFLOW, PRESENTATION_EVENT, cleanup } from "./cleanup.ts";
+import { CLEANUP_ATTEMPTS, CLEANUP_WORKFLOW, cleanup } from "./cleanup.ts";
 import type { TriggerSpec } from "./trigger.ts";
 import { notifyFollowers } from "./follows.ts";
 import {
 	APPROVAL_DECIDED_EVENT,
+	APPROVAL_DECISION_WORKFLOW,
 	APPROVAL_REQUEST_WORKFLOW,
+	approvalDecisionWorkflow,
 	approvalRequestWorkflow,
 	authorized,
 	loadRequest,
@@ -470,10 +472,11 @@ export function buildApp(config: CoreConfig): App {
 	const extraWorkflows = new Map((agents?.agents.workflows() ?? []).map((w) => [w.name, w]));
 	for (const workflow of agents?.workflows ?? []) extraWorkflows.set(workflow.name, workflow);
 	extraWorkflows.set(APPROVAL_REQUEST_WORKFLOW, approvalRequestWorkflow());
+	extraWorkflows.set(APPROVAL_DECISION_WORKFLOW, approvalDecisionWorkflow(now));
 	extraWorkflows.set(CLEANUP_WORKFLOW, {
 		name: CLEANUP_WORKFLOW,
 		triggers: [],
-		retries: { maxAttempts: 3 },
+		retries: { maxAttempts: CLEANUP_ATTEMPTS },
 		handler: (input, execution) => cleanup(input, execution, host),
 	});
 	for (const workflow of extraWorkflows.values())
@@ -521,8 +524,6 @@ export function buildApp(config: CoreConfig): App {
 			),
 			{ name: INGRESS_EVENT, filterable: [] },
 			{ name: APPROVAL_DECIDED_EVENT, filterable: ["approvalId"] },
-			{ name: APPROVAL_CLOSED_EVENT, filterable: ["approvalId"] },
-			{ name: PRESENTATION_EVENT, filterable: ["presentationId"] },
 			{ name: EXECUTION_SETTLED_EVENT, filterable: ["executionId"] },
 			{ name: AGENT_SETTLED_EVENT, filterable: ["requestId"] },
 		],

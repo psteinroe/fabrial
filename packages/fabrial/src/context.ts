@@ -1,22 +1,26 @@
 import type { AgentIntegration, FabrialHost } from "./app.ts";
-import { PRESENTATION_EVENT } from "./cleanup.ts";
 import { createApproval } from "./protocol.ts";
 import { duration } from "./internal.ts";
 import type { Json, JsonObject } from "./json.ts";
-import type { DurableExecution, InvocationMetadata, ThreadIO, WaitBranch } from "./runtime.ts";
+import type {
+	DurableExecution,
+	InvocationMetadata,
+	ThreadIO,
+	WaitBranch,
+	WaitForAnyResult,
+} from "./runtime.ts";
 import { parseSchema } from "./schema.ts";
 import { follow, prepareSend } from "./send.ts";
 import { followResource, storedFollowOptions, unfollowResource } from "./follows.ts";
 import type { Awaitable, MessageRef, OutboundMessage, Thread, Surface } from "./thread.ts";
 import type { AnyWorkflow, WorkflowContext } from "./workflow.ts";
 
+/** An awaitable is a native wait branch, or a timer that starts when its race first runs. */
 export interface InternalAwaitable extends Awaitable {
-	branch: WaitBranch;
-	deadline?: number;
+	branch?: WaitBranch;
 	timerMs?: number;
-	prepare?: (id: string) => Promise<{ ready: boolean; value: Json }>;
-	/** Turn the winning branch's value (null for a timeout) into the awaitable's value. */
-	accept?: (id: string, value: Json) => Promise<Json>;
+	/** Turn the winning branch into the awaitable's value. */
+	accept?: (winner: WaitForAnyResult) => Json;
 }
 
 export interface ContextOptions {
@@ -56,21 +60,11 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 	};
 	if (metadata.replyTo?.kind === "thread" && host.chat()) await getIO();
 
-	const post = async (
-		id: string,
-		message: OutboundMessage,
-		presentationId?: string,
-	): Promise<MessageRef> => {
-		const ref = (await execution.step(id, async () => {
-			const receipt = await (await getIO()).post(message);
-			if (presentationId)
-				await execution.emit(
-					PRESENTATION_EVENT,
-					{ presentationId, ref: receipt as unknown as JsonObject },
-					{ id: `${presentationId}:${id}` },
-				);
-			return receipt as unknown as JsonObject;
-		})) as unknown as MessageRef;
+	const post = async (id: string, message: OutboundMessage): Promise<MessageRef> => {
+		const ref = (await execution.step(
+			id,
+			async () => (await (await getIO()).post(message)) as unknown as JsonObject,
+		)) as unknown as MessageRef;
 		io = await host
 			.chat()!
 			.thread({ kind: "thread", provider: ref.provider, threadId: ref.threadId });
@@ -80,48 +74,57 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 		return ref;
 	};
 
+	/**
+	 * One native wait: branches race, and the earliest timer is its timeout. Timers are fixed when the
+	 * race first runs; losing subscriptions close, losing executions keep running.
+	 */
 	const race = async (
 		id: string,
 		awaitables: Record<string, Awaitable>,
 	): Promise<{ key: string; value: Json }> => {
 		const entries = Object.entries(awaitables) as [string, InternalAwaitable][];
 		if (!entries.length) throw new Error("race needs at least one awaitable");
-		const cursor = await execution.cursor(`fabrial:${id}:cursor`);
-		const eventBranches: Record<string, WaitBranch> = {};
-		for (const [key, awaitable] of entries) {
-			if (!awaitable.branch) throw new Error("Invalid Fabrial awaitable");
-			eventBranches[key] =
-				awaitable.branch.kind === "event"
-					? { ...awaitable.branch, after: awaitable.branch.after ?? cursor }
-					: awaitable.branch;
-			if (awaitable.timerMs !== undefined)
-				eventBranches[key] = {
-					kind: "timer",
-					at: await execution.step(`fabrial:${id}:timer:${key}`, () => now() + awaitable.timerMs!),
-				};
-			const prepared = await awaitable.prepare?.(`fabrial:${id}:prepare:${key}`);
-			if (prepared?.ready) return { key, value: prepared.value };
+		for (const [, awaitable] of entries)
+			if (!awaitable.branch && awaitable.timerMs === undefined)
+				throw new Error("Invalid Fabrial awaitable");
+		const deadlines = (await execution.step(`fabrial:${id}:timers`, () =>
+			Object.fromEntries(
+				entries.flatMap(([key, awaitable]) =>
+					awaitable.timerMs === undefined ? [] : [[key, now() + awaitable.timerMs]],
+				),
+			),
+		)) as Record<string, number>;
+		// Ties go to the timer listed first.
+		const timer = Object.entries(deadlines).reduce<[string, number] | undefined>(
+			(earliest, entry) => (!earliest || entry[1] < earliest[1] ? entry : earliest),
+			undefined,
+		);
+		const branches = Object.fromEntries(
+			entries.flatMap(([key, awaitable]) =>
+				awaitable.branch ? [[`branch:${key}`, awaitable.branch]] : [],
+			),
+		);
+		const remaining = timer && Math.max(0, timer[1] - now());
+		if (!Object.keys(branches).length) {
+			await execution.sleep(`fabrial:${id}:wait`, remaining!);
+			return { key: timer![0], value: null };
 		}
-		const branches: Record<string, WaitBranch> = {};
-		for (const [key, awaitable] of entries) {
-			branches[key] = eventBranches[key]!;
-			if (awaitable.deadline !== undefined)
-				branches[`fabrial:timeout:${key}`] = { kind: "timer", at: awaitable.deadline };
-		}
-		const winner = await execution.waitForAny(`fabrial:${id}:wait`, branches);
-		const timeout = winner.key.startsWith("fabrial:timeout:");
-		const key = timeout ? winner.key.slice("fabrial:timeout:".length) : winner.key;
-		const awaitable = entries.find(([k]) => k === key)![1];
-		const value =
-			winner.kind === "event"
+		const winner = await execution.waitForAny(
+			`fabrial:${id}:wait`,
+			branches,
+			remaining === undefined ? undefined : { timeoutMs: remaining },
+		);
+		if (winner.kind === "timeout") return { key: timer![0], value: null };
+		const key = winner.key.slice("branch:".length);
+		const awaitable = awaitables[key] as InternalAwaitable;
+		const value = awaitable.accept
+			? awaitable.accept(winner)
+			: winner.kind === "event"
 				? winner.event.payload
 				: winner.kind === "execution"
 					? (winner.result as unknown as Json)
-					: null;
-		return {
-			key,
-			value: awaitable.accept ? await awaitable.accept(`fabrial:${id}:accept`, value) : value,
-		};
+					: (winner.signal as unknown as Json);
+		return { key, value };
 	};
 	const surface = metadata.replyTo as Surface | null;
 	const thread: Thread | undefined =
@@ -236,18 +239,16 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 				return agents.state.update(execution, op(id), state, fn);
 			},
 		}),
-		requestApproval: async (id, opts) =>
-			createApproval(op(id), opts, { ...options, post, race, op }),
+		requestApproval: async (id, opts) => createApproval(op(id), opts, { ...options, race, op }),
 		waitForApproval: async (id, opts) => {
 			const key = op(id);
-			const approval = await createApproval(key, opts, { ...options, post, race, op });
+			const approval = await createApproval(key, opts, { ...options, race, op });
 			return (await race(`${key}:decision`, { decision: approval.decision() })).value as never;
 		},
 		race: async (id, awaitables) => (await race(op(id), awaitables)) as never,
 		timer: (value) =>
 			({
 				kind: "fabrial.awaitable",
-				branch: { kind: "timer", at: 0 },
 				timerMs: duration(value),
 			}) as InternalAwaitable as Awaitable<null>,
 		invoke: async (id, workflow, input, opts) => {

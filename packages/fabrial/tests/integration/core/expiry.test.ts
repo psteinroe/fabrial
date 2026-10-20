@@ -1,20 +1,20 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { trigger } from "../../../src/index.ts";
-import type { Json, JsonObject, RuntimeWorkflow } from "../../../src/index.ts";
 import {
 	alice,
 	approvalWorkflow,
+	bob,
 	defineWorkflow,
 	metadata,
 	outsider,
-	surface,
 	team,
 	useCoreApp,
 	workflow,
 } from "./setup.ts";
 
 const { db, setup, enter, card, eventually } = useCoreApp();
+const cardOf = (content: unknown) => (content as { card: { text?: string } }).card;
 
 /** Executions of `workflow` on `queue`, oldest first: internal workflows are not recorded. */
 async function executions(queue: string, workflow: string) {
@@ -36,79 +36,31 @@ const dispatched = () =>
 	});
 
 describe("cleanup workflow", () => {
-	// PHASE2(task 9): wraps the cleanup handler's waits, which replay on Conductor where the in-memory
-	// engine resumed them in place; task 9 replaces the cleanup workflow and this test.
-	it.skip("cleanup catches presentations and settlement emitted between successive waits", async () => {
+	// Replaces "cleanup catches presentations and settlement emitted between successive waits": each
+	// card has its own cleanup, which posts the card itself, so there is no presentation stream to miss.
+	it("cleans up each posted card when the caller is cancelled before every card is posted", async () => {
 		const test = setup([approvalWorkflow()]);
-		let extra: Awaited<ReturnType<typeof test.chat.openDM>> | undefined;
-		// Wrap the cleanup handler as it is registered, before the runtime starts.
-		const register = test.runtime.register.bind(test.runtime);
-		test.runtime.register = (definitions) =>
-			register({
-				...definitions,
-				workflows: definitions.workflows.map((each): RuntimeWorkflow =>
-					each.name !== "fabrial.cleanup"
-						? each
-						: {
-								...each,
-								handler: (input, execution) =>
-									each.handler(input, {
-										...execution,
-										waitForAny: async (id, branches) => {
-											const result = await execution.waitForAny(id, branches);
-											if (!extra && result.kind === "event" && result.key === "presented") {
-												extra = await test.chat.openDM(outsider.identities[0]!);
-												const ref = await extra.post({ card: { title: "extra", actions: [] } });
-												const data = input as JsonObject;
-												await execution.emit("fabrial.presentation", {
-													presentationId: data.presentationId!,
-													ref: ref as unknown as Json,
-												});
-												await execution.emit("fabrial.execution.settled", {
-													executionId: data.executionId!,
-												});
-											}
-											return result;
-										},
-									}),
-							},
-				),
-			});
-		await enter(test);
-		await eventually("the extra card to be cancelled", () => {
-			const content = extra?.posts[0]?.content;
-			return typeof content === "object" && "card" in content && content.card.text === "Cancelled";
-		});
-		expect(extra!.posts[0]!.content).toMatchObject({ card: { text: "Cancelled", actions: [] } });
-		const [cleanup] = await executions(test.runtime.queue, "fabrial.cleanup");
-		expect((await db.execution(cleanup!).settled()).status).toBe("completed");
-	});
-
-	it.each(["first", "second"])("cleanup leaves the thread's routing state alone (%s)", async () => {
-		const test = setup([]);
-		const thread = await test.chat.thread(surface);
-		const ref = await thread.post("hello");
-		await thread.updateState(() => ({
-			statusMessageId: null,
-			follows: [{ session: "chat:thread", agent: "support" }],
-		}));
-		const state = await thread.getState();
-		await test.app.start();
-		// Without `after`, cleanup starts from the current cursor: emit once it waits.
-		const id = await test.runtime.invoke(
-			"fabrial.cleanup",
-			{ executionId: "old", presentationId: "p" },
-			{ metadata: { ...metadata, interactionId: "old" } },
+		const bobDM = await test.chat.openDM(bob.identities[0]!);
+		const post = bobDM.post.bind(bobDM);
+		let release!: () => void;
+		const released = new Promise<void>((resolve) => (release = resolve));
+		bobDM.post = async (content) => {
+			await released;
+			return post(content);
+		};
+		const owner = await enter(test);
+		const c = await card(test);
+		await test.runtime.cancel(owner.id);
+		expect(await owner.settled()).toMatchObject({ status: "cancelled" });
+		await eventually("alice's cancelled card", () => cardOf(c.post.content).text === "Cancelled");
+		release();
+		await eventually(
+			"bob's cancelled card",
+			() => !!bobDM.posts[0] && cardOf(bobDM.posts[0].content).text === "Cancelled",
 		);
-		await db.execution(id).suspended();
-		await test.runtime.emit(
-			"fabrial.presentation",
-			{ presentationId: "p", ref: ref as unknown as Json },
-			{ metadata },
-		);
-		await test.runtime.emit("fabrial.execution.settled", { executionId: "old" }, { metadata });
-		expect((await db.execution(id).settled()).status).toBe("completed");
-		expect(await thread.getState()).toEqual(state);
+		const cleanups = await executions(test.runtime.queue, "fabrial.cleanup");
+		expect(cleanups).toHaveLength(3);
+		for (const id of cleanups) expect((await db.execution(id).settled()).status).toBe("completed");
 	});
 });
 
@@ -176,23 +128,34 @@ describe("expiry and timers", () => {
 
 	it("fires timers at absolute at even when registration is delayed", async () => {
 		const at = db.clock.now().getTime() + timeout;
-		const runtime = await db.start([
-			{
-				name: "waiter",
-				triggers: [],
-				handler: async (_i, execution) => {
-					await execution.sleep("delay", early);
-					return (await execution.waitForAny("timer", { timer: { kind: "timer", at } })).kind;
+		const runtime = await db.start(
+			[
+				{
+					name: "waiter",
+					triggers: [],
+					handler: async (_i, execution) => {
+						await execution.sleep("delay", early);
+						// The timeout starts at the first wait: computed from the absolute deadline.
+						const never = await execution.subscribe("never", { event: "test.never" });
+						return (
+							await execution.waitForAny(
+								"timer",
+								{ never },
+								{ timeoutMs: Math.max(0, at - db.clock.now().getTime()) },
+							)
+						).kind;
+					},
 				},
-			},
-		]);
+			],
+			{ events: [{ name: "test.never", filterable: [] }] },
+		);
 		const execution = db.execution(await runtime.invoke("waiter", {}, { metadata }));
 		await execution.suspended("delay");
 		await db.clock.advance(early);
 		await execution.suspended();
 		expect((await execution.info())?.status).toBe("pending");
 		await db.clock.advance(timeout - early);
-		expect(await execution.output()).toBe("timer");
+		expect(await execution.output()).toBe("timeout");
 	});
 
 	it("rebinds first-post receipts on replay, transfers real refs to children, and clears state", async () => {
@@ -233,7 +196,23 @@ describe("expiry and timers", () => {
 		expect(await thread.getState()).toBeNull();
 	});
 
-	// PHASE2(task 9): Conductor suspends the attempt at its first wait, so an emit later in the same
-	// attempt never runs while Fabrial's custom race waits. Re-enable with the native race.
-	it.todo("does not lose an event emitted after registration while the attempt is still running");
+	it("does not lose an event emitted after registration while the attempt is still running", async () => {
+		const runtime = await db.start(
+			[
+				{
+					name: "waiter",
+					triggers: [],
+					handler: async (_i, execution) => {
+						const ping = await execution.subscribe("ping", { event: "test.ping" });
+						await execution.step("emit", () => execution.emit("test.ping", { n: 1 }));
+						const winner = await execution.waitForAny("wait", { ping }, { timeoutMs: 60_000 });
+						return winner.kind === "event" ? winner.event.payload : null;
+					},
+				},
+			],
+			{ events: [{ name: "test.ping", filterable: [] }] },
+		);
+		const execution = db.execution(await runtime.invoke("waiter", {}, { metadata }));
+		expect(await execution.output()).toEqual({ n: 1 });
+	});
 });

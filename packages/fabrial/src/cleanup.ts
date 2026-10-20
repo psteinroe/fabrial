@@ -1,82 +1,104 @@
-import type { Json, JsonObject } from "./json.ts";
 import type { FabrialHost } from "./app.ts";
-import type { DurableExecution, WaitBranch } from "./runtime.ts";
-import { EXECUTION_SETTLED_EVENT } from "./runtime.ts";
-import type { MessageRef } from "./thread.ts";
+import type { DecisionResult } from "./approval-workflows.ts";
+import type { Principal } from "./identity.ts";
+import type { Json, JsonObject } from "./json.ts";
+import type { DurableExecution, ThreadIO } from "./runtime.ts";
+import type { MessageRef, OutboundMessage, Surface } from "./thread.ts";
 
 export const CLEANUP_WORKFLOW = "fabrial.cleanup";
-export const APPROVAL_CLOSED_EVENT = "fabrial.approval.closed";
-export const PRESENTATION_EVENT = "fabrial.presentation";
 
-/** Independent durable watcher: presentation cleanup must survive cancellation and process restarts. */
+/** Where an approval card goes: an approver's DM (origin provider first) or the requester's surface. */
+export type CardDestination =
+	| { kind: "dm"; approver: Principal; provider: string | null }
+	| { kind: "surface"; surface: Surface };
+
+export interface CleanupInput {
+	requestExecutionId: string;
+	/** The decision execution: its result labels the card. */
+	decisionId: string;
+	/** The execution that requested the approval: settling first cancels the card. */
+	callerId: string;
+	destination: CardDestination;
+	/** Card content, with its actions. */
+	card: Json;
+	title: string;
+}
+
+/** Retried attempts repeat only the card's failed post or update; a card still failing is given up. */
+export const CLEANUP_ATTEMPTS = 3;
+
+/**
+ * One independent execution per approval card: posts it, waits for the decision or the caller to
+ * settle, and relabels it without actions. It survives cancellation of the caller and restarts.
+ */
 export async function cleanup(
 	input: Json,
 	execution: DurableExecution,
 	host: FabrialHost,
 ): Promise<void> {
-	const data = input as JsonObject;
-	const after =
-		typeof data.after === "string" ? data.after : await execution.cursor("fabrial:cursor");
-	const branches: Record<string, WaitBranch> = {
-		settled: {
-			kind: "event",
-			after,
-			event: EXECUTION_SETTLED_EVENT,
-			filter: { executionId: [data.executionId as string] },
-		},
-		presented: {
-			kind: "event",
-			after,
-			event: PRESENTATION_EVENT,
-			filter: { presentationId: [data.presentationId as string] },
-		},
-	};
-	if (typeof data.approvalId === "string")
-		branches.closed = {
-			kind: "event",
-			after,
-			event: APPROVAL_CLOSED_EVENT,
-			filter: { approvalId: [data.approvalId] },
-		};
-	const refs: MessageRef[] = [];
-	// A decided approval names its label; anything else settling first cancels the cards.
-	let label = "Cancelled";
-	for (let attempt = 0; ; attempt++) {
-		const winner = await execution.waitForAny(`fabrial:wait:${attempt}`, branches);
-		if (winner.kind === "event")
-			for (const branch of Object.values(branches))
-				if (branch.kind === "event") branch.after = winner.cursor;
-		if (winner.key === "presented" && winner.kind === "event") {
-			refs.push(winner.event.payload.ref as unknown as MessageRef);
-			continue;
-		}
-		if (winner.key === "closed" && winner.kind === "event")
-			label = winner.event.payload.label as string;
-		break;
-	}
-	// Only approval cards register a presentation with this watcher.
+	const data = input as unknown as CleanupInput;
 	const chat = host.chat();
-	if (!data.approvalId || !chat) return;
-	// Each card updates on its own: a deleted card or provider error doesn't block the others, and a
-	// retry of this workflow repeats only the cards that failed.
-	let failures = 0;
-	for (const [index, ref] of refs.entries())
+	if (!chat) throw new Error("Approvals require a chat integration");
+	const warn = (message: string, error: unknown) =>
+		host.logger.warn(message, {
+			approvalId: data.requestExecutionId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	const ref = (await execution
+		.step("post", async () => {
+			const io = await open(host, data.destination);
+			return (await io.post({
+				card: data.card,
+			} as unknown as OutboundMessage)) as unknown as JsonObject;
+		})
+		.catch((error: unknown) => {
+			warn("Approval card delivery failed", error);
+			throw error;
+		})) as unknown as MessageRef;
+	// The decision settles before a caller waiting on it can, so a valid decision is never "Cancelled".
+	const winner = await execution.waitForAny("closed", {
+		decision: { execution: data.decisionId },
+		caller: { execution: data.callerId },
+	});
+	const label =
+		winner.key === "decision" && winner.kind === "execution" && winner.result.status === "completed"
+			? (winner.result.output as unknown as DecisionResult).label
+			: "Cancelled";
+	await execution
+		.step("update", async () => {
+			const io = await chat.thread({
+				kind: "thread",
+				provider: ref.provider,
+				threadId: ref.threadId,
+			});
+			await io.update(ref, { card: { title: data.title, text: label, actions: [] } });
+		})
+		.catch((error: unknown) => {
+			warn("Approval card update failed", error);
+			throw error;
+		});
+}
+
+async function open(host: FabrialHost, destination: CardDestination): Promise<ThreadIO> {
+	const chat = host.chat()!;
+	if (destination.kind === "surface")
+		return destination.surface.kind === "thread"
+			? chat.thread(destination.surface)
+			: chat.resolve(destination.surface);
+	const { approver, provider } = destination;
+	const identities = approver.identities
+		.map((identity, index) => ({ identity, index }))
+		.sort(
+			(a, b) =>
+				Number(b.identity.provider === provider) - Number(a.identity.provider === provider) ||
+				a.index - b.index,
+		);
+	for (const { identity } of identities) {
 		try {
-			await execution.step(`fabrial:cleanup:${index}`, async () => {
-				const io = await chat.thread({
-					kind: "thread",
-					provider: ref.provider,
-					threadId: ref.threadId,
-				});
-				await io.update(ref, { card: { title: data.title as string, text: label, actions: [] } });
-			});
-		} catch (error) {
-			failures++;
-			host.logger.warn("Approval card update failed", {
-				approvalId: data.approvalId,
-				messageId: ref.messageId,
-				error: error instanceof Error ? error.message : String(error),
-			});
+			return await chat.openDM(identity);
+		} catch {
+			/* Try the next provider identity. */
 		}
-	if (failures) throw new Error(`${failures} approval card update(s) failed`);
+	}
+	throw new Error(`Approver ${approver.id} has no identity whose provider can open DMs`);
 }
