@@ -864,15 +864,7 @@ A full review against the goal (Fabrial is glue over Chat SDK, Pi Durable, and C
 
 ## Conductor issues
 
-Most of what Fabrial needed from Conductor has landed (race-safe subscriptions, metadata, middleware, start without waiting, idempotent emit, signals and keyed executions); a Node build is in progress. Still needed, so the adapter uses public APIs only, with no polling or private access ([PGCONDUCTOR.md](./PGCONDUCTOR.md) has the full spec and acceptance criteria):
-
-1. **Wait for a started execution** with its outcome as a value (`ctx.waitForResult`, an `{ execution }` branch for `ctx.waitForAny`).
-2. **Children linked without being awaited** (`ctx.invoke(…, { cancelWithParent: true })`).
-3. **Notify on settlement** (`onSettled: { task, key, signal }`): a signal to a keyed execution in the settling transaction, for every terminal state.
-4. **Public `ctx.executionId`.**
-5. **Pending cancels set `cancelled = true`** (in progress).
-
-These live in Conductor rather than in Fabrial because only the engine sees every terminal state (crashes, retries exhausted, cancels while pending) in the transaction that settles it; Eve, on Vercel Workflow, builds the same reporting and cascading in its own session program.
+None outstanding. Everything Fabrial needed from Conductor has landed, and the adapter uses public APIs only, with no polling, private access, or Fabrial-owned engine state ([PGCONDUCTOR.md](./PGCONDUCTOR.md) lists the PRs). Execution outcomes are reported with small executions that `ctx.waitForResult` and signal, so Conductor needs no settlement hook.
 
 ## Open questions
 
