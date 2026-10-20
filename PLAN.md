@@ -858,6 +858,7 @@ A full review against the goal (Fabrial is glue over Chat SDK, Pi Durable, and C
 - **Approval cards show what is authorized.** Every card shows the exact proposal and the verified requester and source thread; custom content adds to it and never replaces it. An optional rejection reason (modal) and an optional destination (default: approvers' DMs; a destination never grants authority). First eligible decision wins; no quorum, no editing a proposal (cancel and request again).
 - **Final replies are at-least-once.** Chat SDK posts have no idempotency key; a crash after a post and before its receipt can repeat it. Runs wait for their final post and surface failures.
 - **Ingress verifies and emits; one workflow routes.** Webhooks verify, normalize, and emit one event with a dedupe key (retained about one to two days). An internal routing workflow resolves followers, triggers, and approval clicks and signals Sessions; Conductor retries it. No pending receipts in thread state.
+- **Conductor runs everything internally.** Fabrial's durable behavior is Conductor tasks and workflows: ingress emits, internal workflows route, authorize approval clicks, clean up cards, supervise workflow tools, and watch `ctx.agent` callers. Fabrial keeps no custom receipts, monitors, cursors, or polling loops.
 - **Tests run on real Conductor** with its test clock; the in-memory runtime engine is removed. Fake chat, scripted models, and pure unit tests stay.
 - **Conductor stays a submodule** pinned to `main` until a version is published.
 
