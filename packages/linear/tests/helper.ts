@@ -17,6 +17,7 @@ export function connect(plugin: AnyPlugin) {
 			cancel: vi.fn(),
 			signalWithStart: vi.fn(),
 			signal: vi.fn(),
+			getExecution: vi.fn(async () => null),
 			start: vi.fn(),
 			stop: vi.fn(),
 		},

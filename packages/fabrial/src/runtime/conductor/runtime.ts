@@ -239,6 +239,8 @@ class ConductorRuntime implements DurableRuntime {
 				maxAttempts?: number;
 				concurrency?: number;
 				groupConcurrency?: number;
+				removeOnComplete?: { days: number };
+				removeOnFail?: { days: number };
 			},
 			triggers: object[],
 			handler: (
@@ -261,6 +263,12 @@ class ConductorRuntime implements DurableRuntime {
 						queue: this.queue,
 						maxAttempts: definition.retries?.maxAttempts,
 						concurrency: definition.concurrency,
+						...(definition.retentionDays !== undefined
+							? {
+									removeOnComplete: { days: definition.retentionDays },
+									removeOnFail: { days: definition.retentionDays },
+								}
+							: {}),
 					},
 					triggers,
 					async (event, ctx) => {
@@ -377,6 +385,26 @@ class ConductorRuntime implements DurableRuntime {
 		this.assertReady();
 		// Attached children (`cancelWithParent`) are cancelled with it, transitively.
 		return this.client!.cancel(executionId, { reason });
+	}
+
+	async getExecution(
+		executionId: string,
+	): Promise<{ workflow: string; result: ExecutionResult | null } | null> {
+		this.assertReady();
+		// Ids come from clicks and other untrusted input: anything but a UUID is unknown.
+		if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(executionId))
+			return null;
+		const info = await this.client!.getExecution(executionId);
+		if (!info || info.queue !== this.queue) return null;
+		const result: ExecutionResult | null =
+			info.status === "completed"
+				? { status: "completed", output: (info.result as { output: Json } | null)?.output ?? null }
+				: info.status === "failed"
+					? { status: "failed", error: info.error ?? "Execution failed" }
+					: info.status === "cancelled"
+						? { status: "cancelled", reason: info.error ?? "Cancelled by user" }
+						: null;
+		return { workflow: info.taskKey, result };
 	}
 
 	async signal(executionId: string, signal: RuntimeSignal): Promise<boolean> {
@@ -523,6 +551,13 @@ class ConductorRuntime implements DurableRuntime {
 				return { ...winner.event, cursor: winner.cursor };
 			},
 			waitForAny: (id, branches) => this.waitForAny(raw, operationId(id), branches),
+			waitForResult: async (id, executionId) => {
+				const outcome = await raw.waitForResult<{ output: Json }>(operationId(id), executionId);
+				if (outcome.status === "timeout") throw new Error("Unexpected result wait timeout");
+				return outcome.status === "completed"
+					? { status: "completed", output: outcome.result.output }
+					: outcome;
+			},
 			start,
 			invoke: async (id, name, input, options) => {
 				operationId(id);

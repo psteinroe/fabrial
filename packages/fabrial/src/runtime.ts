@@ -104,6 +104,8 @@ export interface DurableExecution {
 	): Promise<{ name: string; payload: JsonObject; cursor: EventCursor } | null>;
 	/** First of several branches wins (Conductor item 6). */
 	waitForAny(id: string, branches: Record<string, WaitBranch>): Promise<WaitForAnyResult>;
+	/** Memoized: wait until an execution settles. Throws if it is unknown or removed by retention. */
+	waitForResult(id: string, executionId: string): Promise<ExecutionResult>;
 	/** Start a child and wait for its result. Cancelled with the parent unless `detached` (Conductor item 5). */
 	invoke(
 		id: string,
@@ -162,6 +164,11 @@ export interface RuntimeWorkflow {
 	concurrency?: number;
 	retries?: { maxAttempts?: number };
 	/**
+	 * Days a settled execution stays readable (`getExecution`, result waits); kept forever by default.
+	 * Never 0 for executions others wait on: a wait registered after removal fails.
+	 */
+	retentionDays?: number;
+	/**
 	 * Wraps every attempt, including each resume (Conductor middleware). `next` settles when the attempt
 	 * ends: it resolves when the handler returns, suspends or is cancelled, and rejects when it throws.
 	 * The value passed to `next` reaches `handler` as `attempt`.
@@ -210,6 +217,10 @@ export interface DurableRuntime {
 		options: { metadata: InvocationMetadata; dedupeKey?: string },
 	): Promise<string>;
 	cancel(executionId: string, reason?: string): Promise<boolean>;
+	/** An execution of this runtime: its workflow and, once settled, its result. Null if unknown or removed. */
+	getExecution(
+		executionId: string,
+	): Promise<{ workflow: string; result: ExecutionResult | null } | null>;
 	/** See `SignalWithStartOptions`. Returns the id of the execution that received the signal. */
 	signalWithStart(
 		options: SignalWithStartOptions & { metadata: InvocationMetadata },

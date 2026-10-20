@@ -76,6 +76,9 @@ export class StubRuntime implements DurableRuntime {
 	signal(): never {
 		throw new Error("StubRuntime runs no workflows");
 	}
+	async getExecution(): Promise<null> {
+		return null;
+	}
 }
 
 function messageText(content: OutboundMessage): string {

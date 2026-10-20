@@ -40,6 +40,7 @@ export function setup(state: StateAdapter = createMemoryState()) {
 			cancel: vi.fn(async () => true),
 			signalWithStart: vi.fn(),
 			signal: vi.fn(),
+			getExecution: vi.fn(async () => null),
 			start: vi.fn(),
 			stop: vi.fn(),
 		},
