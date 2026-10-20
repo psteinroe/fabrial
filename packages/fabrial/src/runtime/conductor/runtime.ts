@@ -29,7 +29,6 @@ import {
 	type WorkerConfig,
 } from "pgconductor-js";
 
-const RESERVED = "__fabrial";
 const DISPATCH_QUEUE = "pgconductor.internal";
 const DISPATCH_TASK = "pgconductor.event-dispatch";
 const EVENT_STREAM_LOCK = [724831, 1] as const;
@@ -40,12 +39,6 @@ const emptyMetadata = (interactionId: string): InvocationMetadata => ({
 	requestedBy: null,
 });
 
-// PHASE2: task 7 replaces the dispatch envelope with one routing workflow.
-type Carrier = {
-	owner?: string;
-	dispatchId?: string;
-	dispatchOwner?: { workflow: string; event: string };
-};
 /** Set by the attempt middleware on the native context; the handler reuses its execution. */
 const ATTEMPT = Symbol("fabrial.attempt");
 type Attempt = { execution: ConductorExecution; value: unknown };
@@ -82,17 +75,8 @@ async function rawOutput(sql: postgres.Sql, ctx: TaskContext, output: Json): Pro
 		values (${ctx.executionId}::uuid, ${ctx.queue}, '__fabrial:output', ${sql.json({ result: output })})
 		on conflict (execution_id, key) do update set result = excluded.result`;
 }
-function carrier(payload: JsonObject): Carrier {
-	return (payload[RESERVED] ?? {}) as unknown as Carrier;
-}
 function metadataOf(ctx: TaskContext): InvocationMetadata {
 	return (ctx.metadata as InvocationMetadata | undefined) ?? emptyMetadata(ctx.executionId);
-}
-function clean(payload: JsonObject): JsonObject {
-	const { [RESERVED]: ignored, __fabrialOwner: owner, ...result } = payload;
-	void ignored;
-	void owner;
-	return result;
 }
 function mergeMetadata(
 	metadata: InvocationMetadata,
@@ -208,20 +192,12 @@ class ConductorRuntime implements DurableRuntime {
 	register({ workflows, events }: { workflows: RuntimeWorkflow[]; events: RuntimeEvent[] }): void {
 		if (this.registered) throw new Error("Conductor runtime is already registered");
 		for (const workflow of workflows) {
-			if (
-				this.definitions.has(workflow.name) ||
-				workflow.name.startsWith("fabrial.route:") ||
-				workflow.name.startsWith("pgconductor.")
-			) {
+			if (this.definitions.has(workflow.name) || workflow.name.startsWith("pgconductor.")) {
 				throw new Error(`Duplicate or reserved workflow: ${workflow.name}`);
 			}
 			this.definitions.set(workflow.name, workflow);
 		}
 		const catalog = new Map(events.map((event) => [event.name, event]));
-		for (const event of events) {
-			if (event.filterable.includes(RESERVED) || event.filterable.includes("__fabrialOwner"))
-				throw new Error("Reserved Fabrial event field");
-		}
 		catalog.set(EXECUTION_SETTLED_EVENT, {
 			name: EXECUTION_SETTLED_EVENT,
 			filterable: ["executionId"],
@@ -229,8 +205,7 @@ class ConductorRuntime implements DurableRuntime {
 		this.eventDefinitions = [...catalog.values()].map((event) => ({
 			name: event.name,
 			payload: undefined as unknown as JsonObject,
-			// SHIM(conductor#2): metadata lives in a reserved field; payload filters remain top-level.
-			filterable: [...event.filterable, "__fabrialOwner"],
+			filterable: [...event.filterable],
 		}));
 		// Per-attempt hooks run as native middleware: its `next` settles when the attempt suspends.
 		const attempt: Middleware<TaskContext> = async ({ execution, ctx }, next) => {
@@ -273,6 +248,12 @@ class ConductorRuntime implements DurableRuntime {
 		) => AnyTask;
 		const tasks: AnyTask[] = [];
 		for (const definition of workflows) {
+			// Native triggers on the workflow's own task: events start it with their payload and metadata.
+			const triggers: object[] = [
+				{ invocable: true },
+				...definition.triggers.map((trigger) => ({ event: trigger.event, filter: trigger.filter })),
+				...(definition.cron ?? []).map((cron) => ({ cron: cron.schedule, name: cron.name })),
+			];
 			tasks.push(
 				createTask(
 					{
@@ -281,89 +262,21 @@ class ConductorRuntime implements DurableRuntime {
 						maxAttempts: definition.retries?.maxAttempts,
 						concurrency: definition.concurrency,
 					},
-					[{ invocable: true }],
+					triggers,
 					async (event, ctx) => {
 						const attempt = (ctx as unknown as { [ATTEMPT]?: Attempt })[ATTEMPT];
 						const execution =
 							attempt?.execution ?? this.execution(definition.name, ctx, metadataOf(ctx));
-						const output = await definition.handler(
-							event.payload!.input!,
-							execution,
-							attempt?.value,
-						);
+						const input: Json =
+							event.name === "pgconductor.invoke"
+								? event.payload!.input!
+								: (event.payload ?? { name: event.name });
+						const output = await definition.handler(input, execution, attempt?.value);
 						await rawOutput(this.sql, ctx, output ?? null);
 						return { output: output ?? null };
 					},
 				),
 			);
-			const triggers: object[] = definition.triggers.map((trigger) => ({
-				event: trigger.event,
-				filter: {
-					...trigger.filter,
-					...(trigger.role === "owner" ? { __fabrialOwner: [definition.name] } : {}),
-				},
-			}));
-			triggers.push(
-				...(definition.cron ?? []).map((cron) => ({ cron: cron.schedule, name: cron.name })),
-			);
-			if (triggers.length)
-				tasks.push(
-					createTask(
-						{
-							name: `fabrial.route:${definition.name}`,
-							queue: this.queue,
-						},
-						triggers,
-						async (event, ctx) => {
-							const payload = event.payload;
-							// Events carry native metadata, which the dispatcher passes to triggered executions.
-							const inherited = metadataOf(ctx);
-							const isOwner =
-								payload &&
-								carrier(payload).owner === definition.name &&
-								definition.triggers.some(
-									(trigger) =>
-										trigger.role === "owner" &&
-										trigger.event === event.name &&
-										matchesFilter(payload, trigger.filter),
-								);
-							// Canonical ownership is carried on every category of the ingress. Suppress
-							// this workflow's competing observer submissions BEFORE insert-on-conflict.
-							const dispatchOwner = payload && carrier(payload).dispatchOwner;
-							if (
-								dispatchOwner &&
-								dispatchOwner.workflow === definition.name &&
-								(event.name !== dispatchOwner.event || !isOwner)
-							)
-								return {};
-							const metadata = {
-								...inherited,
-								replyTo: isOwner ? inherited.replyTo : null,
-							};
-							const input: Json = payload ? clean(payload) : { name: event.name };
-							// Multiple matching subscriptions of one workflow collapse to one actual invocation.
-							// PHASE2: task 7 replaces per-workflow routing tasks and this private lookup.
-							const [source] = await this.sql<{ parent_execution_id: string | null }[]>`
-					select parent_execution_id from pgconductor._private_executions where id = ${ctx.executionId}::uuid
-				`;
-							await ctx.invoke(
-								"__fabrial:route",
-								{ name: definition.name, queue: this.queue },
-								{ input },
-								{
-									metadata,
-									// SHIM(conductor#8): one ingress can emit several event categories. The
-									// shared dispatch ID dedupes the actual workflow, not the event receipt.
-									dedupe_key:
-										payload && carrier(payload).dispatchId !== undefined
-											? `__fabrial:dispatch:${JSON.stringify([carrier(payload).dispatchId, definition.name])}`
-											: `event:${source?.parent_execution_id ?? ctx.executionId}:${definition.name}`,
-								},
-							);
-							return {};
-						},
-					),
-				);
 		}
 		this.client = client as unknown as Conductor;
 		this.orchestrator = Orchestrator.create({
@@ -446,33 +359,14 @@ class ConductorRuntime implements DurableRuntime {
 	async emit(
 		event: string,
 		payload: JsonObject,
-		options: {
-			id?: string;
-			metadata: InvocationMetadata;
-			owner?: string;
-			dispatchId?: string;
-			dispatchOwner?: { workflow: string; event: string };
-		},
+		options: { id?: string; metadata: InvocationMetadata },
 	): Promise<void> {
 		this.assertReady();
 		this.event(event);
-		if (RESERVED in payload || "__fabrialOwner" in payload)
-			throw new Error("Reserved Fabrial event field");
 		await this.insert(
 			DISPATCH_TASK,
 			DISPATCH_QUEUE,
-			{
-				eventKey: event,
-				payload: {
-					...payload,
-					[RESERVED]: {
-						...(options.owner ? { owner: options.owner } : {}),
-						...(options.dispatchId !== undefined ? { dispatchId: options.dispatchId } : {}),
-						...(options.dispatchOwner ? { dispatchOwner: options.dispatchOwner } : {}),
-					},
-					__fabrialOwner: options.owner ?? null,
-				},
-			},
+			{ eventKey: event, payload },
 			options.metadata,
 			options.id === undefined ? undefined : JSON.stringify([event, options.id]),
 			true,
@@ -772,7 +666,7 @@ class ConductorRuntime implements DurableRuntime {
 						result: {
 							key: name,
 							kind: "event",
-							event: { name: branch.event, payload: clean(event.payload.payload as JsonObject) },
+							event: { name: branch.event, payload: event.payload.payload as JsonObject },
 							cursor: event.payload.__fabrialCursor as string,
 						},
 						at: event.event_at,

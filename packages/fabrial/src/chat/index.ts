@@ -18,8 +18,6 @@ export { renderMessage } from "./port.ts";
 export interface ChatOptions {
 	state: StateAdapter;
 	userName?: string;
-	/** Supply the deployment's background-task hook. Without it routes await ingress tasks. */
-	waitUntil?: (task: Promise<unknown>) => void;
 }
 
 /** Platform action receipts are not exposed uniformly by Chat SDK; prefer native receipt ids. */
@@ -93,8 +91,8 @@ export function chat(options: ChatOptions): ChatIntegration {
 				const events = [`${provider}.${normalized.isDM ? "dm" : "message"}`];
 				if (normalized.isMention) events.push(`${provider}.mentioned`);
 				const dedupeId = JSON.stringify([provider, normalized.channelId, message.id]);
-				const routed = await host.receiveMessage(normalized, { events, dedupeId });
-				if (routed !== "ignored") await thread.subscribe();
+				// The routing workflow subscribes the thread when something handles the message.
+				await host.receiveMessage(normalized, { events, dedupeId });
 				if (thread.signal.aborted) {
 					// A bare SDK abort carries no stopper identity. Never attribute it to the message
 					// author: Slack aborts the turn BEFORE delivering its actor-bearing stop event.
@@ -154,18 +152,17 @@ export function chat(options: ChatOptions): ChatIntegration {
 			const routes: Record<string, (request: Request) => Promise<Response>> = {};
 			for (const provider of capabilities.keys()) {
 				routes[`POST /${provider}/events`] = async (request) => {
+					// Respond once ingress is stored: acknowledging earlier risks losing the delivery.
 					const tasks: Promise<unknown>[] = [];
 					const response = await bot.webhooks[provider]!(request, {
-						waitUntil:
-							options.waitUntil ??
-							((task) => {
-								tasks.push(task);
-							}),
-						// Core dedupes after durable ingress; SDK dedupes before dispatch and can lose retries.
+						waitUntil: (task) => {
+							tasks.push(task);
+						},
+						// Core dedupes by the ingress emit's key; SDK dedupes before dispatch and can lose retries.
 						deduplicate: false,
 						propagateHandlerErrors: true,
 					});
-					if (!options.waitUntil) await Promise.all(tasks);
+					await Promise.all(tasks);
 					return response;
 				};
 			}

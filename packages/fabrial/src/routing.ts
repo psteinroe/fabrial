@@ -1,23 +1,64 @@
+import type { Origin } from "./events.ts";
+import type { ExternalIdentity } from "./identity.ts";
+import type { JsonObject } from "./json.ts";
 import type { Follow, ThreadRoutingState } from "./runtime.ts";
+import type { Surface } from "./thread.ts";
 
-const TOMBSTONE_LIMIT = 100;
-type Receipt = NonNullable<ThreadRoutingState["ingestedDedupeIds"]>[number];
-type IngressKind = Receipt["kind"];
+/** The one event ingress emits; `fabrial.route` triggers on it. */
+export const INGRESS_EVENT = "fabrial.ingress";
+/** The internal workflow that routes every ingress event. */
+export const ROUTE_WORKFLOW = "fabrial.route";
 
-export function ingress(
-	state: ThreadRoutingState | null,
-	kind: IngressKind,
-	id: string,
-): Receipt | undefined {
-	return state?.ingestedDedupeIds?.find((entry) => entry.kind === kind && entry.id === id);
+/**
+ * Verified, normalized input from a webhook or chat, as `fabrial.ingress` carries it. Ingress emits it once
+ * per provider delivery: the emit dedupes by `kind` and `id` (and the event name of plugin events), for as
+ * long as Conductor retains the event's dispatch (about one to two days). A redelivery after that routes
+ * again.
+ */
+export interface IngressEvent extends JsonObject {
+	/** The provider's delivery or message id. */
+	id: string;
+	/** A plugin event, a chat message, a card action (approval click), or a stop in a thread. */
+	kind: "event" | "message" | "action" | "stop";
+	/** Event categories: the plugin event's name, or a message's (`slack.message`, `slack.mentioned`). */
+	events: string[];
+	/** The plugin event's payload, the `ChatMessage`, or the action (`actionId`, `value`, `messageId`). */
+	payload: JsonObject;
+	origin: (Origin & JsonObject) | null;
+	/** Where replies go: the event's surface, or the thread of a message, action or stop. */
+	replyTo: (Surface & JsonObject) | null;
+	/** The authenticated sender, resolved to a principal by the router. */
+	actor: (ExternalIdentity & JsonObject) | null;
 }
 
-export function hasIngress(
-	state: ThreadRoutingState | null,
-	kind: IngressKind,
-	id: string,
-): boolean {
-	return !!ingress(state, kind, id);
+/** The emit's dedupe key of an ingress event. */
+export const ingressKey = (ingress: IngressEvent): string =>
+	JSON.stringify(
+		ingress.kind === "event"
+			? [ingress.kind, ingress.events[0], ingress.id]
+			: [ingress.kind, ingress.id],
+	);
+
+/** A workflow the router starts, and the event category it starts on. */
+export interface RoutedWorkflow extends JsonObject {
+	workflow: string;
+	event: string;
+}
+
+/**
+ * How the router routed one ingress event, persisted in its `route` step: the conversations that receive it
+ * (followers, or the agent whose trigger won), the owner workflow, and the observers. `ignored` when nothing
+ * handles it: it leaves no follow record and no thread subscription.
+ */
+export interface RouteDecision extends JsonObject {
+	route: "follow" | "new" | "ignored";
+	conversations: Follow[];
+	owner: RoutedWorkflow | null;
+	observers: RoutedWorkflow[];
+	/** Where the owner's (or the agent's) replies go. */
+	replyTo: (Surface & JsonObject) | null;
+	/** The winning trigger's event category, else the input's first. */
+	event: string;
 }
 
 /** Add a follow record for a conversation (idempotent). */
@@ -28,37 +69,5 @@ export function addFollow(state: ThreadRoutingState | null, follow: Follow): Thr
 	return {
 		...base,
 		follows: [...(base.follows ?? []), { session: follow.session, agent: follow.agent }],
-	};
-}
-
-/** Record an ingress receipt; `pending` marks a routed delivery that isn't confirmed yet. */
-export function rememberIngress(
-	state: ThreadRoutingState | null,
-	kind: IngressKind,
-	id: string,
-	at: number,
-	pending?: Receipt["pending"],
-): ThreadRoutingState {
-	return {
-		...state,
-		ingestedDedupeIds: [
-			...(state?.ingestedDedupeIds ?? []),
-			{ kind, id, at, ...(pending ? { pending } : {}) },
-		].slice(-TOMBSTONE_LIMIT),
-	};
-}
-
-/** Confirm a pending receipt once its delivery succeeded. */
-export function confirmIngress(
-	state: ThreadRoutingState | null,
-	kind: IngressKind,
-	id: string,
-): ThreadRoutingState | null {
-	if (!ingress(state, kind, id)?.pending) return state;
-	return {
-		...state,
-		ingestedDedupeIds: state!.ingestedDedupeIds!.map((entry) =>
-			entry.kind === kind && entry.id === id ? { kind, id, at: entry.at } : entry,
-		),
 	};
 }

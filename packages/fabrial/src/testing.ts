@@ -95,6 +95,8 @@ class FakeThread implements ThreadIO {
 	readonly posts: FakePost[] = [];
 	readonly messages: ChatMessage[] = [];
 	readonly statuses: (string | null)[] = [];
+	/** Whether the thread is subscribed (Chat SDK delivers its messages as subscribed messages). */
+	subscribed = false;
 	private state: ThreadRoutingState | null = null;
 	private expires = 0;
 	constructor(
@@ -144,6 +146,9 @@ class FakeThread implements ThreadIO {
 			: -1;
 		return clone(this.messages.slice(lastBot + 1).slice(-(options.limit ?? 50)));
 	}
+	async subscribe(): Promise<void> {
+		this.subscribed = true;
+	}
 	async getState(): Promise<ThreadRoutingState | null> {
 		return this.owner.now() >= this.expires ? null : clone(this.state);
 	}
@@ -153,6 +158,8 @@ class FakeThread implements ThreadIO {
 		// No await between read and write: atomic within this in-memory process.
 		this.state = clone(fn(this.owner.now() >= this.expires ? null : clone(this.state)));
 		this.expires = this.owner.now() + THREAD_TTL;
+		// Like Chat SDK state writes, a stored state subscribes the thread.
+		if (this.state) this.subscribed = true;
 		return clone(this.state);
 	}
 }
@@ -196,6 +203,10 @@ class FakeChannelThread implements ThreadIO {
 	}
 	async history(options: { limit?: number; sinceLastBotReply?: boolean }): Promise<ChatMessage[]> {
 		return this.actual ? this.actual.history(options) : [];
+	}
+	async subscribe(): Promise<void> {
+		if (!this.actual) throw new Error("Cannot subscribe a provisional channel thread");
+		await this.actual.subscribe();
 	}
 	async getState(): Promise<ThreadRoutingState | null> {
 		return this.actual ? this.actual.getState() : null;
@@ -253,7 +264,7 @@ export class FakeChat implements ChatPort, ChatIntegration {
 	async receive(
 		message: ChatMessage,
 		options: { events?: readonly string[]; event?: string; dedupeId?: string } = {},
-	): Promise<"follow" | "new" | "ignored"> {
+	): Promise<"accepted" | "ignored"> {
 		if (!this.host) throw new Error("FakeChat must be connected to an app");
 		const thread = await this.thread({
 			kind: "thread",
@@ -348,7 +359,15 @@ export function fakeAgents(
 							};
 						})),
 				async deliver(agent, request) {
-					if (!sent.some((s) => s.requestId === request.requestId && s.agent === agent.name))
+					// Like a conversation, dedupe a redelivered request per session.
+					if (
+						!sent.some(
+							(s) =>
+								s.requestId === request.requestId &&
+								s.agent === agent.name &&
+								s.session === request.session,
+						)
+					)
 						sent.push(clone({ ...request, agent: agent.name }));
 					return {
 						requestId: request.requestId,

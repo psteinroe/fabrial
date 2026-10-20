@@ -149,11 +149,14 @@ export interface DurableExecution {
 	cancel(executionId: string, reason?: string): Promise<boolean>;
 }
 
-/** Registered with the runtime by core. Triggers are resolved by core (ownership); see `DurableRuntime.emit`. */
+/**
+ * Registered with the runtime by core. App workflows have no event triggers: the routing workflow starts
+ * them. Internal workflows (the router) trigger on events directly.
+ */
 export interface RuntimeWorkflow {
 	name: string;
-	/** Event triggers. Owner triggers only receive events whose `owner` matches this workflow. */
-	triggers: { event: string; filter?: EventFilter; role: "owner" | "observer" }[];
+	/** Event triggers: each matching event starts one execution, with the event's payload and metadata. */
+	triggers: { event: string; filter?: EventFilter }[];
 	/** Cron deliveries carry replyTo into invocation metadata and own the thread when a surface is supplied. */
 	cron?: { schedule: string; name: string; replyTo?: Surface }[];
 	concurrency?: number;
@@ -193,24 +196,13 @@ export interface DurableRuntime {
 	now?(): number;
 	register(definition: { workflows: RuntimeWorkflow[]; events: RuntimeEvent[] }): void;
 	/**
-	 * Emit an event. `owner` names the single workflow (if any) whose owner trigger receives it;
-	 * observer triggers always match. `id` dedupes redeliveries (Conductor item 8).
+	 * Emit an event. `id` dedupes redeliveries per event name, for as long as Conductor retains the
+	 * event's dispatch (about one to two days).
 	 */
 	emit(
 		event: string,
 		payload: JsonObject,
-		options: {
-			id?: string;
-			metadata: InvocationMetadata;
-			owner?: string;
-			/** One ingress spanning event categories: dedupe triggered runs by (dispatchId, workflow). */
-			dispatchId?: string;
-			/**
-			 * The ingress's canonical owner, passed on every emission of that ingress: the owner workflow only
-			 * runs from this event (as owner), never from a competing observer emission.
-			 */
-			dispatchOwner?: { workflow: string; event: string };
-		},
+		options: { id?: string; metadata: InvocationMetadata },
 	): Promise<void>;
 	invoke(
 		workflow: string,
@@ -238,6 +230,8 @@ export interface ThreadIO {
 	/** Replaceable progress status ("Thinking…"); `null` clears it. Best effort, never durable. */
 	setStatus(text: string | null): Promise<void>;
 	history(options: { limit?: number; sinceLastBotReply?: boolean }): Promise<ChatMessage[]>;
+	/** Subscribe the thread in Chat SDK, so its later messages arrive as subscribed messages. */
+	subscribe(): Promise<void>;
 	/** Fabrial's routing state in Chat SDK thread state (30-day TTL, refreshed on write). */
 	getState(): Promise<ThreadRoutingState | null>;
 	/**
@@ -269,18 +263,8 @@ export type ResourceFollow = Follow & {
 	events?: "all";
 };
 
-/** Fabrial's state of a thread: ingress receipts, follows, and the progress status message. */
+/** Fabrial's state of a thread: follows and the progress status message. */
 export type ThreadRoutingState = JsonObject & {
-	/**
-	 * Last 100 ingress receipts (subject to the thread TTL). A receipt with `pending` was routed, but its
-	 * delivery isn't confirmed yet: a redelivery replays that route instead of routing again.
-	 */
-	ingestedDedupeIds?: {
-		kind: "message" | "cancellation";
-		id: string;
-		at: number;
-		pending?: { route: "follow" | "new"; conversations: Follow[] };
-	}[];
 	statusMessageId?: string | null;
 	/** Conversations following this thread, whatever their session kind: its messages reach them. */
 	follows?: Follow[];

@@ -143,6 +143,10 @@ class LiveThread implements ThreadIO {
 			.map((m) => normalizeMessage(this.provider, this.capability, this.sdk, m));
 	}
 
+	async subscribe() {
+		await this.sdk.subscribe();
+	}
+
 	async getState(): Promise<ThreadRoutingState | null> {
 		return structuredClone((await this.sdk.state)?.fabrial ?? null);
 	}
@@ -243,6 +247,10 @@ class LazyThread implements ThreadIO {
 	}
 	async history(options: { limit?: number; sinceLastBotReply?: boolean }) {
 		return this.live ? this.live.history(options) : [];
+	}
+	async subscribe() {
+		if (!this.live) throw new Error("Cannot subscribe a provisional channel thread");
+		await this.live.subscribe();
 	}
 	async getState() {
 		return this.live ? this.live.getState() : null;

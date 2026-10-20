@@ -29,8 +29,9 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 	chat(): ChatPort | undefined;
 
 	/**
-	 * New work from a plugin: resolves trigger ownership (most specific owner + all observers) and
-	 * emits through the runtime, or delivers to an agent's conversation. Returns the owning workflow name, if any.
+	 * New work from a plugin: emits one `fabrial.ingress` event (deduped by `id`). The routing workflow
+	 * starts the most specific owner (a workflow, or an agent's conversation) and all observers, and
+	 * notifies conversations following the event's resources.
 	 */
 	ingest(
 		event: string,
@@ -41,11 +42,12 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 			requestedBy?: ExternalIdentity;
 			interactionId?: string;
 		},
-	): Promise<{ owner: string | undefined; observers: string[] }>;
+	): Promise<"accepted">;
 
 	/**
-	 * Inbound chat message. Goes to the conversations following its thread, else to the most specific
-	 * matching trigger. Returns how it was routed.
+	 * Inbound chat message: emits one `fabrial.ingress` event (deduped by `dedupeId`) unless a bot sent it.
+	 * The routing workflow delivers it to the conversations following its thread, else to the most specific
+	 * matching trigger, and to observers.
 	 */
 	receiveMessage(
 		message: ChatMessage,
@@ -54,7 +56,7 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 			/** @deprecated Use events. */ event?: string;
 			dedupeId: string;
 		},
-	): Promise<"follow" | "new" | "ignored">;
+	): Promise<"accepted" | "ignored">;
 
 	/** Inbound card action (approval buttons, [Cancel request]). */
 	receiveAction(action: {

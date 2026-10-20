@@ -2,19 +2,35 @@ import type { App, CoreConfig, FabrialHost, Logger } from "./app.ts";
 import { createDirectory } from "./directory.ts";
 import { filtersOverlap, matchesFilter } from "./internal.ts";
 import { definedAgents, type Agent } from "./agent.ts";
-import { addFollow, confirmIngress, hasIngress, ingress, rememberIngress } from "./routing.ts";
-import { conversationSession, follow, isChatMessage, prepareInput, threadSession } from "./send.ts";
+import {
+	addFollow,
+	INGRESS_EVENT,
+	ingressKey,
+	ROUTE_WORKFLOW,
+	type IngressEvent,
+	type RouteDecision,
+	type RoutedWorkflow,
+} from "./routing.ts";
+import {
+	conversationSession,
+	follow,
+	isChatMessage,
+	prepareInput,
+	threadOf,
+	threadSession,
+} from "./send.ts";
 import type { AnyWorkflow, ExecutionInfo, WorkflowContext } from "./workflow.ts";
-import type { Json } from "./json.ts";
+import type { Json, JsonObject } from "./json.ts";
 import { AGENT_SETTLED_EVENT, EXECUTION_SETTLED_EVENT } from "./runtime.ts";
 import type {
 	AgentRef,
+	DurableExecution,
 	ExecutionResult,
 	Follow,
 	InvocationMetadata,
 	RuntimeWorkflow,
-	ThreadRoutingState,
 } from "./runtime.ts";
+import type { ChatMessage, ThreadRef } from "./thread.ts";
 import { createContext } from "./context.ts";
 import { APPROVAL_CLOSED_EVENT, CLEANUP_WORKFLOW, PRESENTATION_EVENT, cleanup } from "./cleanup.ts";
 import type { TriggerSpec } from "./trigger.ts";
@@ -67,7 +83,8 @@ export function buildApp(config: CoreConfig): App {
 	];
 	const specificity = (spec: TriggerSpec) =>
 		spec.specificity ?? Object.keys(spec.filter ?? {}).length;
-	const select = (events: readonly string[], payload: import("./json.ts").JsonObject) => {
+	/** The most specific owner trigger of an input's categories (`tied` when two owners compete), and its observers. */
+	const select = (events: readonly string[], payload: JsonObject) => {
 		const matching = triggers.filter(
 			(t) => events.includes(t.spec.event) && matchesFilter(payload, t.spec.filter),
 		);
@@ -75,16 +92,20 @@ export function buildApp(config: CoreConfig): App {
 			.filter((t) => !t.spec.observe)
 			.sort((a, b) => specificity(b.spec) - specificity(a.spec));
 		const selected = owners[0];
-		if (
-			selected &&
+		const tied =
+			!!selected &&
 			owners.some(
 				(t) => t.owner !== selected.owner && specificity(t.spec) === specificity(selected.spec),
-			)
-		)
-			throw new Error(`Ambiguous owner for ${events.join(", ")}`);
+			);
+		// One start per observing workflow, on the first category it observes.
+		const observers = new Map<string, string>();
+		for (const t of matching)
+			if (t.spec.observe && !observers.has(t.workflow!.name))
+				observers.set(t.workflow!.name, t.spec.event);
 		return {
 			selected,
-			observers: [...new Set(matching.filter((t) => t.spec.observe).map((t) => t.workflow!.name))],
+			tied,
+			observers: [...observers].map(([workflow, event]): RoutedWorkflow => ({ workflow, event })),
 		};
 	};
 	/** Agents a message can name (`@agent-name`): those with triggers and every agent of the instance. */
@@ -123,69 +144,178 @@ export function buildApp(config: CoreConfig): App {
 		await port.deliver(agent, request);
 		return request;
 	};
-	const routeEvent: FabrialHost["ingest"] = async (event, payload, options) => {
-		const { selected, observers } = select([event], payload);
-		if (selected?.agent) {
-			// An agent's trigger: the event goes to a conversation; observers still run.
-			const metadata: InvocationMetadata = {
-				interactionId:
-					options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID()),
-				origin: (options.origin ?? {
-					provider: event.split(".")[0]!,
-				}) as InvocationMetadata["origin"],
-				replyTo: (options.replyTo ??
-					selected.agent.definition.home ??
-					selected.spec.replyTo ??
-					null) as InvocationMetadata["replyTo"],
-				requestedBy: options.requestedBy
-					? ((await directory.resolveIdentity(
-							options.requestedBy,
-						)) as InvocationMetadata["requestedBy"])
-					: null,
-				ownerWorkflow: null,
-				triggerEvent: event,
-			};
-			if (observers.length)
-				await runtime.emit(event, payload, { id: options.id, metadata, owner: undefined });
-			const session = conversationSession(
-				selected.agent.definition.session,
-				payload,
-				metadata.replyTo,
-				metadata.interactionId,
-			);
-			const request = await deliver(
-				selected.agent,
-				{ session, agent: selected.agent.name },
-				payload,
-				metadata,
-			);
-			await follow(host, request.follow, { session, agent: selected.agent.name });
-			return { owner: `agent:${selected.agent.name}`, observers };
-		}
-		const metadata: InvocationMetadata = {
-			interactionId:
-				options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID()),
-			origin: (options.origin ?? {
-				provider: event.split(".")[0]!,
-			}) as InvocationMetadata["origin"],
-			replyTo: (options.replyTo ?? selected?.spec.replyTo ?? null) as InvocationMetadata["replyTo"],
-			requestedBy: options.requestedBy
-				? ((await directory.resolveIdentity(
-						options.requestedBy,
-					)) as InvocationMetadata["requestedBy"])
-				: null,
-			ownerWorkflow: selected?.workflow!.name ?? null,
-			triggerEvent: event,
-		};
-		await runtime.emit(event, payload, {
-			id: options.id,
-			metadata,
-			owner: selected?.workflow!.name,
-			dispatchOwner: selected
-				? { workflow: selected.workflow!.name, event: selected.spec.event }
-				: undefined,
+	/** Store the request: one `fabrial.ingress` event, deduped by its provider id. `fabrial.route` routes it. */
+	const accept = async (ingress: IngressEvent, interactionId: string) => {
+		await runtime.emit(INGRESS_EVENT, ingress, {
+			id: ingressKey(ingress),
+			metadata: { interactionId, origin: ingress.origin, replyTo: null, requestedBy: null },
 		});
-		return { owner: selected?.workflow!.name, observers };
+		return "accepted" as const;
+	};
+	/**
+	 * The routing workflow, run once per ingress event and retried by Conductor. Each effect is a durable
+	 * operation: a retry after a partial delivery resumes after the deliveries that completed, and a
+	 * delivery that completed without its receipt is deduped by its request id.
+	 */
+	const route = async (ingress: IngressEvent, execution: DurableExecution): Promise<Json> => {
+		const { interactionId } = execution.metadata;
+		const actor = (
+			ingress.actor
+				? await execution.step(
+						"actor",
+						async () => (await directory.resolveIdentity(ingress.actor!)) as unknown as Json,
+					)
+				: null
+		) as InvocationMetadata["requestedBy"];
+		if (ingress.kind === "action") {
+			// PHASE2: task 8 authorizes the click here; until then the waiting approval checks it.
+			const action = ingress.payload as {
+				actionId: string;
+				value: string | null;
+				messageId: string;
+			};
+			const match = /^fabrial\.approval\.(approve|reject|cancel):(.+)$/.exec(action.actionId)!;
+			await execution.emit(
+				"fabrial.approval.decided",
+				{
+					approvalId: match[2]!,
+					status:
+						match[1] === "approve" ? "approved" : match[1] === "reject" ? "rejected" : "cancelled",
+					actor: actor as unknown as Json,
+					identity: ingress.actor,
+					thread: ingress.replyTo,
+					messageId: action.messageId,
+					comment: action.value,
+					dedupeId: ingress.id,
+				},
+				{
+					id: ingress.id,
+					metadata: {
+						interactionId: match[2]!,
+						origin: { provider: ingress.actor!.provider },
+						replyTo: null,
+						requestedBy: actor,
+					},
+				},
+			);
+			return null;
+		}
+		if (ingress.kind === "stop") {
+			const io = await chat?.port.thread(ingress.replyTo as ThreadRef);
+			const follows = (await execution.step(
+				"follows",
+				async () => ((await io?.getState())?.follows ?? []) as Json,
+			)) as Follow[];
+			// A stop cancels the current run of each conversation following the thread; anyone there may stop.
+			for (const [index, conversation] of follows.entries())
+				await execution.step(`stop:${index}`, async () => {
+					await agents?.agents.stop?.(conversation, ingress.id, `Stopped by ${actor!.id}`);
+				});
+			return null;
+		}
+		const message =
+			ingress.kind === "message" ? (ingress.payload as unknown as ChatMessage) : undefined;
+		const thread = message && threadOf(message);
+		const io = thread && (await chat?.port.thread(thread));
+		const decision = await execution.step("route", async (): Promise<RouteDecision> => {
+			const { selected, tied, observers } = select(ingress.events, ingress.payload);
+			const conversation = (agent: Agent, replyTo: InvocationMetadata["replyTo"]): Follow => ({
+				session: conversationSession(
+					agent.definition.session,
+					ingress.payload,
+					replyTo,
+					message ? threadSession(message.provider, message.threadId) : interactionId,
+				),
+				agent: agent.name,
+			});
+			// 1. Followers: everyone in a followed thread steers. Naming one agent addresses only that agent.
+			// Observers still run.
+			const followers = (await io?.getState())?.follows ?? [];
+			if (message && followers.length) {
+				const mentioned = mentionedAgent(message.text);
+				const own = mentioned ? followers.filter((f) => f.agent === mentioned.name) : followers;
+				return {
+					route: "follow",
+					conversations: own.length || !mentioned ? own : [conversation(mentioned, thread!)],
+					owner: null,
+					observers,
+					replyTo: thread!,
+					event: ingress.events[0]!,
+				};
+			}
+			// 2. Triggers: the most specific one wins, an agent's or a workflow's.
+			if (tied) throw new Error(`Ambiguous owner for ${ingress.events.join(", ")}`);
+			const replyTo = (thread ??
+				ingress.replyTo ??
+				selected?.agent?.definition.home ??
+				selected?.spec.replyTo ??
+				null) as InvocationMetadata["replyTo"];
+			const owner = selected?.workflow
+				? { workflow: selected.workflow.name, event: selected.spec.event }
+				: null;
+			const conversations = selected?.agent ? [conversation(selected.agent, replyTo)] : [];
+			// The owner runs once, as owner, even when it also observes another category.
+			const others = observers.filter((o) => o.workflow !== owner?.workflow);
+			return {
+				route: owner || conversations.length || others.length ? "new" : "ignored",
+				conversations,
+				owner,
+				observers: others,
+				replyTo,
+				event: selected?.spec.event ?? ingress.events[0]!,
+			};
+		});
+		// A handled thread stays subscribed; every conversation receiving its messages follows it.
+		if (io && decision.route !== "ignored")
+			await execution.step("follow", async () => {
+				if (decision.conversations.length)
+					await io.updateState((state) => decision.conversations.reduce(addFollow, state));
+				await io.subscribe();
+			});
+		const metadata: InvocationMetadata = {
+			interactionId,
+			origin: (message
+				? { provider: message.provider, messageId: message.messageId }
+				: (ingress.origin ?? {
+						provider: ingress.events[0]!.split(".")[0]!,
+					})) as InvocationMetadata["origin"],
+			replyTo: decision.replyTo,
+			requestedBy: actor,
+			ownerWorkflow: decision.owner?.workflow ?? null,
+			triggerEvent: decision.event,
+		};
+		const named = knownAgents();
+		for (const [index, conversation] of decision.conversations.entries())
+			await execution.step(`deliver:${index}`, async () => {
+				const request = await deliver(
+					named.get(conversation.agent) ?? { kind: "fabrial.agent", name: conversation.agent },
+					conversation,
+					ingress.payload,
+					{ ...metadata, ownerWorkflow: null },
+				);
+				// An event's conversation follows the thread its replies go to.
+				if (!message) await follow(host, request.follow, conversation);
+			});
+		if (decision.owner)
+			await execution.start("owner", decision.owner.workflow, ingress.payload, { metadata });
+		// Observers run without the thread.
+		for (const observer of decision.observers)
+			await execution.start(`observer:${observer.workflow}`, observer.workflow, ingress.payload, {
+				metadata: { ...metadata, replyTo: null, triggerEvent: observer.event },
+			});
+		// Each category is also emitted once for `ctx.waitForEvent`; no workflow triggers on it.
+		if (ingress.kind === "event" || decision.route === "new")
+			for (const event of ingress.events)
+				await execution.emit(event, ingress.payload, { id: ingress.id, metadata });
+		// Conversations following the event's resource threads get a notification; triggers still run.
+		if (ingress.kind === "event")
+			await execution.step("notify", async () => {
+				await notifyFollowers(host, agents?.agents, ingress.events[0]!, ingress.payload, {
+					...metadata,
+					replyTo: null,
+				});
+			});
+		return decision;
 	};
 	const host: FabrialHost = {
 		definitionScope: config.definitionScope,
@@ -197,156 +327,68 @@ export function buildApp(config: CoreConfig): App {
 		clients,
 		chat: () => chat?.port,
 		resolvePrincipal: (identity) => directory.resolveIdentity(identity),
-		async ingest(event, payload, options) {
-			const interactionId =
-				options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID());
-			const routed = await routeEvent(event, payload, { ...options, interactionId });
-			// Conversations following the event's resource threads get a notification; triggers still run.
-			await notifyFollowers(host, agents?.agents, event, payload, {
-				interactionId,
-				origin: (options.origin ?? {
-					provider: event.split(".")[0]!,
-				}) as InvocationMetadata["origin"],
-				replyTo: null,
-				requestedBy: options.requestedBy
-					? ((await directory.resolveIdentity(
-							options.requestedBy,
-						)) as InvocationMetadata["requestedBy"])
-					: null,
-			});
-			return routed;
-		},
+		ingest: (event, payload, options) =>
+			accept(
+				{
+					id: options.id ?? crypto.randomUUID(),
+					kind: "event",
+					events: [event],
+					payload,
+					origin: (options.origin ?? null) as IngressEvent["origin"],
+					replyTo: (options.replyTo ?? null) as IngressEvent["replyTo"],
+					actor: (options.requestedBy ?? null) as IngressEvent["actor"],
+				},
+				options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID()),
+			),
 		async receiveMessage(message, options) {
 			if (message.author.isBot) return "ignored";
-			const ref = {
-				kind: "thread" as const,
-				provider: message.provider,
-				threadId: message.threadId,
-			};
-			const io = await chat?.port.thread(ref);
-			const actor = await directory.resolveIdentity(message.author.identity);
 			const events = [...new Set(options.events ?? (options.event ? [options.event] : []))];
 			if (!events.length) throw new Error("Inbound messages need at least one event category");
-			const interactionId = `${message.provider}:${options.dedupeId}`;
-			const receivedAt = now();
-			const threadKey = threadSession(message.provider, message.threadId);
-			const mentioned = mentionedAgent(message.text);
-			const decision: { route: "new" | "follow" | "ignored"; conversations: Follow[] } = {
-				route: "new",
-				conversations: [],
-			};
-			// Recompute the decision on every lock retry; no dispatch/I/O occurs in the updater. The route is
-			// recorded as pending before it's dispatched, so a redelivery after a failed dispatch replays it.
-			const decide = (state: ThreadRoutingState | null): ThreadRoutingState | null => {
-				const receipt = ingress(state, "message", options.dedupeId);
-				if (receipt) {
-					decision.route = receipt.pending?.route ?? "ignored";
-					decision.conversations = receipt.pending?.conversations ?? [];
-					return state;
-				}
-				// 1. Followers: everyone in a followed thread steers. Naming one agent addresses only that agent.
-				const followers = state?.follows ?? [];
-				const conversation = (agent: Agent): Follow => ({
-					session: conversationSession(agent.definition.session, message, ref, threadKey),
-					agent: agent.name,
-				});
-				if (followers.length) {
-					decision.route = "follow";
-					const own = mentioned ? followers.filter((f) => f.agent === mentioned.name) : followers;
-					decision.conversations = own.length || !mentioned ? own : [conversation(mentioned)];
-				} else {
-					// 2. Triggers: the most specific one wins, an agent's or a workflow's.
-					decision.route = "new";
-					const agent = select(events, message).selected?.agent;
-					decision.conversations = agent ? [conversation(agent)] : [];
-				}
-				// Every conversation that receives a message from this thread follows it.
-				return rememberIngress(
-					decision.conversations.reduce(addFollow, state),
-					"message",
-					options.dedupeId,
-					receivedAt,
-					{ route: decision.route, conversations: decision.conversations },
-				);
-			};
-			if (io) await io.updateState(decide);
-			else decide(null);
-			if (decision.route === "ignored") return "ignored";
-			const { selected } =
-				decision.route === "new" ? select(events, message) : { selected: undefined };
-			const owner = selected?.workflow?.name;
-			const metadata: InvocationMetadata = {
-				interactionId,
-				origin: { provider: message.provider, messageId: message.messageId },
-				replyTo: ref as InvocationMetadata["replyTo"],
-				requestedBy: actor as InvocationMetadata["requestedBy"],
-				ownerWorkflow: owner ?? null,
-				triggerEvent: selected?.spec.event ?? events[0]!,
-			};
-			const named = knownAgents();
-			for (const conversation of decision.conversations)
-				await deliver(
-					named.get(conversation.agent) ?? { kind: "fabrial.agent", name: conversation.agent },
-					conversation,
-					message,
-					{ ...metadata, ownerWorkflow: null },
-				);
-			// Only the winning event dispatches an owner; the shared key merges overlapping observers, which
-			// run without the thread.
-			if (decision.route === "new")
-				for (const event of new Set([...(selected ? [selected.spec.event] : []), ...events]))
-					await runtime.emit(event, message, {
-						id: options.dedupeId,
-						metadata,
-						owner: event === selected?.spec.event ? owner : undefined,
-						dispatchId: interactionId,
-						dispatchOwner: owner ? { workflow: owner, event: selected!.spec.event } : undefined,
-					});
-			await io?.updateState((state) => confirmIngress(state, "message", options.dedupeId));
-			return decision.route;
+			return accept(
+				{
+					id: options.dedupeId,
+					kind: "message",
+					events,
+					payload: message,
+					origin: { provider: message.provider, messageId: message.messageId },
+					replyTo: threadOf(message),
+					actor: message.author.identity as IngressEvent["actor"],
+				},
+				`${message.provider}:${options.dedupeId}`,
+			);
 		},
 		async receiveCancellation(action) {
-			const io = await chat?.port.thread(action.thread);
-			const state = await io?.getState();
-			if (!state?.follows?.length || hasIngress(state, "cancellation", action.dedupeId)) return;
-			// A stop cancels the current run of each conversation following the thread; anyone there may stop.
-			const actor = await directory.resolveIdentity(action.actor);
-			for (const conversation of state.follows)
-				await agents?.agents.stop?.(conversation, action.dedupeId, `Stopped by ${actor.id}`);
-			const receivedAt = now();
-			await io!.updateState((latest) =>
-				hasIngress(latest, "cancellation", action.dedupeId)
-					? latest
-					: rememberIngress(latest, "cancellation", action.dedupeId, receivedAt),
+			await accept(
+				{
+					id: action.dedupeId,
+					kind: "stop",
+					events: [],
+					payload: {},
+					origin: { provider: action.thread.provider },
+					replyTo: action.thread as IngressEvent["replyTo"],
+					actor: action.actor as IngressEvent["actor"],
+				},
+				action.dedupeId,
 			);
 		},
 		async receiveAction(action) {
 			const match = /^fabrial\.approval\.(approve|reject|cancel):(.+)$/.exec(action.actionId);
 			if (!match) return;
-			const actor = await directory.resolveIdentity(action.actor);
-			// No receipt in thread state: the emit's dedupe id makes a provider retry deliver it once.
-			await runtime.emit(
-				"fabrial.approval.decided",
-				{
-					approvalId: match[2]!,
-					status:
-						match[1] === "approve" ? "approved" : match[1] === "reject" ? "rejected" : "cancelled",
-					actor: actor as unknown as Json,
-					identity: action.actor as unknown as Json,
-					thread: action.thread as unknown as Json,
-					messageId: action.messageId,
-					comment: action.value ?? null,
-					dedupeId: action.dedupeId,
-				},
+			await accept(
 				{
 					id: action.dedupeId,
-					metadata: {
-						interactionId: match[2]!,
-						origin: { provider: action.actor.provider },
-						replyTo: null,
-						requestedBy: actor as InvocationMetadata["requestedBy"],
+					kind: "action",
+					events: [],
+					payload: {
+						actionId: action.actionId,
+						value: action.value ?? null,
+						messageId: action.messageId,
 					},
+					origin: { provider: action.actor.provider },
+					replyTo: action.thread as IngressEvent["replyTo"],
+					actor: action.actor as IngressEvent["actor"],
 				},
+				match[2]!,
 			);
 		},
 	};
@@ -360,7 +402,7 @@ export function buildApp(config: CoreConfig): App {
 		await runtime.emit(
 			EXECUTION_SETTLED_EVENT,
 			{ executionId, result: result as unknown as Json },
-			{ id: executionId, metadata, owner: undefined },
+			{ id: executionId, metadata },
 		);
 	}
 	const middleware = config.plugins.flatMap((p) => p.hooks?.workflow ?? []);
@@ -378,11 +420,8 @@ export function buildApp(config: CoreConfig): App {
 	};
 	const workflows: RuntimeWorkflow[] = config.workflows.map((workflow) => ({
 		name: workflow.name,
-		triggers: (workflow.definition.triggers ?? []).map((t: TriggerSpec) => ({
-			event: t.event,
-			filter: t.filter,
-			role: t.observe ? "observer" : "owner",
-		})),
+		// The routing workflow starts app workflows; they have no runtime triggers.
+		triggers: [],
 		cron: workflow.definition.cron?.map((c) => ({
 			schedule: c.schedule,
 			name: c.name ?? workflow.name,
@@ -392,9 +431,7 @@ export function buildApp(config: CoreConfig): App {
 		retries: workflow.definition.retries,
 		onSettled: settled,
 		async attempt(execution, next) {
-			const observer =
-				!!execution.metadata.triggerEvent && execution.metadata.ownerWorkflow !== workflow.name;
-			const metadata = observer ? { ...execution.metadata, replyTo: null } : execution.metadata;
+			const metadata = execution.metadata;
 			const context = await createContext({ host, execution, metadata, agents, now });
 			await wrap(
 				{ executionId: execution.executionId, workflow: workflow.name, metadata },
@@ -440,6 +477,13 @@ export function buildApp(config: CoreConfig): App {
 			},
 			handler: (input, execution) => workflow.handler(input, execution),
 		});
+	// Routing is plumbing: no workflow context, plugin middleware or settlement event.
+	workflows.push({
+		name: ROUTE_WORKFLOW,
+		triggers: [{ event: INGRESS_EVENT }],
+		retries: { maxAttempts: 5 },
+		handler: (input, execution) => route(input as IngressEvent, execution),
+	});
 	runtime.register({
 		workflows,
 		events: [
@@ -449,6 +493,7 @@ export function buildApp(config: CoreConfig): App {
 					filterable: (event as { filterable: string[] }).filterable,
 				})),
 			),
+			{ name: INGRESS_EVENT, filterable: [] },
 			{ name: "fabrial.approval.decided", filterable: ["approvalId"] },
 			{ name: APPROVAL_CLOSED_EVENT, filterable: ["approvalId"] },
 			{ name: PRESENTATION_EVENT, filterable: ["presentationId"] },
