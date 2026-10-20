@@ -134,6 +134,10 @@ export function useConductor(): ConductorFixture {
 	});
 	afterEach(async () => {
 		for (const runtime of runtimes.splice(0).reverse()) await runtime.stop();
+		// Emits share Conductor's internal dispatch queue, which keeps receipts to dedupe ingress: forget
+		// this test's events, or the next test's `message("initial")` is a duplicate.
+		if (sql)
+			await sql`delete from pgconductor._private_executions where queue = 'pgconductor.internal'`;
 		await clock?.reset();
 	});
 	afterAll(async () => {
@@ -224,12 +228,23 @@ export function useConductor(): ConductorFixture {
 				);
 				return handle;
 			},
-			settled: () =>
-				until(`${id} to settle`, async () => {
-					const current = await info();
-					if (!current) throw new Error(`Unknown execution: ${id}`);
-					return settlement(current);
-				}),
+			settled: async () => {
+				let last: ExecutionInfo | undefined;
+				try {
+					return await until(`${id} to settle`, async () => {
+						last = (await info()) ?? undefined;
+						if (!last) throw new Error(`Unknown execution: ${id}`);
+						return settlement(last);
+					});
+				} catch (error) {
+					// Say where it is stuck: a pending retry, a wait nobody ends, or a worker that never ran it.
+					if (!last) throw error;
+					const { status, attempts, error: lastError } = last;
+					throw new Error(
+						`${(error as Error).message}; last seen ${JSON.stringify({ status, attempts, error: lastError, waiting: await waitsAt(id, undefined) })}`,
+					);
+				}
+			},
 			output: async () => {
 				const result = await handle.settled();
 				if (result.status === "completed") return result.output;
