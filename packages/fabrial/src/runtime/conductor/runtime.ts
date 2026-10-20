@@ -532,6 +532,7 @@ class ConductorRuntime implements DurableRuntime {
 				{
 					metadata: mergeMetadata(metadata, options?.metadata),
 					...(options?.dedupeKey !== undefined ? { dedupe_key: options.dedupeKey } : {}),
+					...(options?.cancelWithParent ? { cancelWithParent: true } : {}),
 				},
 			);
 		};

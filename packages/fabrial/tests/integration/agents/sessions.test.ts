@@ -227,6 +227,16 @@ async function released(key: string) {
 	expect(await lease(key)).toBeNull();
 }
 
+/** The Session's execution suspended on its tools and inputs: it has not ended, and the lease is free. */
+async function suspended(key: string) {
+	await expect
+		.poll(async () => {
+			const open = (await sessionExecutions()).filter((row) => !row.done);
+			return open.length === 1 && !open[0]!.running && (await lease(key)) === null;
+		}, poll)
+		.toBe(true);
+}
+
 it("a message ingested on another instance steers the run its host is busy with; never two Session executions run at once", async () => {
 	const look = f.defineTool({
 		name: "look",
@@ -551,7 +561,7 @@ it("a host that loses its Session lease during a model call closes its harness a
 	expect(owner).not.toBe(thief.owner);
 });
 
-it("a workflow tool waiting on approval ends the Session execution; the click resumes the tool and the agent answers", async () => {
+const approvalTool = () => {
 	const runSql = f.defineWorkflow({
 		name: `run-sql-${short()}`,
 		description: "Runs SQL after approval",
@@ -582,28 +592,65 @@ it("a workflow tool waiting on approval ends the Session execution; the click re
 		if (text === '"ran"') return say("Ran it.");
 		return say(`unexpected: ${text}`);
 	};
-	const a = await launch("a", [runSql, ask]);
-	const dm = await a.chat.openDM(alice.identities[0]!);
+	return { runSql, ask };
+};
+/** Captures the approval card's approve button posted to Alice's DM. */
+async function approvals(app: Awaited<ReturnType<typeof launch>>) {
+	const dm = await app.chat.openDM(alice.identities[0]!);
 	const post = dm.post.bind(dm);
-	let approve: (() => Promise<void>) | undefined;
+	const found: { ref?: Awaited<ReturnType<typeof post>>; action?: string } = {};
 	dm.post = async (content) => {
 		const ref = await post(content);
 		const action =
 			typeof content === "object" && "card" in content
 				? content.card.actions?.find((each) => each.id.startsWith("fabrial.approval.approve:"))
 				: undefined;
-		if (action) approve = () => a.chat.click(ref, action.id, alice.identities[0]!);
+		if (action) Object.assign(found, { ref, action: action.id });
 		return ref;
 	};
+	return found;
+}
+
+it("a workflow tool waiting on approval suspends the Session execution; after a restart the click resumes the tool and the agent answers", async () => {
+	const { runSql, ask } = approvalTool();
+	const a = await launch("a", [runSql, ask]);
+	const card = await approvals(a);
 	const metadata = metadataOf();
 	const caller = await a.runtime.invoke(ask.name, "Fix the row", { metadata });
-	await expect.poll(() => !!approve, poll).toBe(true);
-	// Waiting on the approval, no Session execution runs and the lease is free.
-	await released(metadata.interactionId);
+	await expect.poll(() => !!card.action, poll).toBe(true);
+	// Waiting on the approval, the Session's execution is suspended (not ended) and the lease is free.
+	const key = await only();
+	await suspended(key);
 	expect(requests).toHaveLength(1);
-	await approve!();
+	// The executions a Session waits on outlive the wait: tool workflows and effects are never removed by default.
+	const kept = await sql<{ key: string; complete: number | null; fail: number | null }[]>`
+		select key, remove_on_complete_days as complete, remove_on_fail_days as fail
+		from pgconductor._private_tasks where key in (${runSql.name}, 'fabrial.pi.effect')`;
+	expect(new Set(kept.map((task) => task.key))).toEqual(
+		new Set([runSql.name, "fabrial.pi.effect"]),
+	);
+	for (const task of kept) expect(task).toMatchObject({ complete: null, fail: null });
+	await a.stop();
+	const b = await launch("b", [runSql, ask]);
+	await b.chat.click(card.ref!, card.action!, alice.identities[0]!);
 	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
 	expect(await output(caller)).toBe("Ran it.");
 	expect(requests.map((request) => lastText(request.context))).toEqual(["Fix the row", '"ran"']);
-	await released(metadata.interactionId);
+	await released(key);
+});
+
+it("cancelling a run suspended on a workflow tool cancels the tool's execution", async () => {
+	const { runSql, ask } = approvalTool();
+	const a = await launch("a", [runSql, ask]);
+	const card = await approvals(a);
+	const caller = await a.runtime.invoke(ask.name, "Fix the row", { metadata: metadataOf() });
+	await expect.poll(() => !!card.action, poll).toBe(true);
+	const key = await only();
+	await suspended(key);
+	const [tool] = await sql<{ id: string }[]>`
+		select id from pgconductor._private_executions where task_key = ${runSql.name}`;
+	await a.runtime.cancel(caller, "User stopped");
+	await expect.poll(() => execution(tool!.id), poll).toMatchObject({ cancelled: true });
+	await released(key);
+	expect(requests).toHaveLength(1);
 });

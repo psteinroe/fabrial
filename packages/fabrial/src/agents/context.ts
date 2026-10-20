@@ -52,15 +52,18 @@ export interface BridgeFrame {
 	/** The Pi Session key this execution hosts. */
 	session: string;
 	/**
-	 * Tasks waiting on a workflow, by task id; while every running task waits, the Session closes. A short managed
-	 * effect (`effect`, e.g. a thread post) keeps it open instead.
+	 * Tasks waiting on a workflow (or a managed effect, e.g. a thread post), by task id; while every running task
+	 * waits, the Session's execution closes Pi and suspends until one of them settles or input arrives.
 	 */
-	children: Map<number, { executionId: string; detached: boolean; effect?: boolean }>;
+	children: Map<number, { executionId: string; detached: boolean }>;
 	/** Subagent calls waiting for their child's answer; they do not keep the Session open. */
 	waiting: Set<number>;
 	/** The run a conversation's current request belongs to, and the agent whose conversation runs it. */
 	runOf(conversationId: ConversationId, context: Context): Promise<{ id: string; agent: string }>;
-	/** Resolves with a workflow's result once its completion signal arrives; frees the task's slot in `children`. */
+	/**
+	 * Resolves with a workflow's result if it settled, memoized per child; else waits until the Session closes, and the
+	 * tool runs again when the Session's execution resumes. Frees the task's slot in `children`.
+	 */
 	waitChild(taskId: number, executionId: string, context: Context): Promise<JsonObject>;
 	/** Shows a status on the lead's progress surface, if it has one. */
 	status?: (text: string) => Promise<void>;
@@ -109,7 +112,7 @@ export async function fields(
 		ids.set(id, count + 1);
 		return count ? `${id}#${count}` : id;
 	};
-	const childResult = async (child: string, effect = false): Promise<Json> => {
+	const childResult = async (child: string): Promise<Json> => {
 		let result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
 		if (!result) {
 			await registerChild(
@@ -118,7 +121,6 @@ export async function fields(
 				api!.taskId,
 				{ executionId: child, detached: false },
 				context,
-				effect,
 			);
 			result = await bridge.waitChild(api!.taskId, child, context);
 		}
@@ -139,7 +141,7 @@ export async function fields(
 			false,
 			context,
 		);
-		return childResult(child, true);
+		return childResult(child);
 	};
 	const start = async <W extends AnyWorkflow>(id: string, workflow: W, input: WorkflowInput<W>) => {
 		if (!api) throw new Error("Prompt sections cannot start workflows");
@@ -289,7 +291,10 @@ export async function currentRequest(
 	return binding.requestId;
 }
 
-/** Persist the cancellation relationship BEFORE starting. A lost start receipt reconciles by global key. */
+/**
+ * Persist the run's intent BEFORE starting, so a stopped run cancels the child. Attached children are cancelled with
+ * the Session's execution; a lost start receipt reconciles by global key.
+ */
 export async function startChild(
 	bridge: BridgeFrame,
 	run: string,
@@ -301,18 +306,11 @@ export async function startChild(
 	context: Context,
 ): Promise<string> {
 	const dedupeKey = JSON.stringify(["fabrial.pi.child", bridge.session, key]);
-	const { piChild: _piChild, ...inherited } = cloneJson(metadata);
 	const intent = await bridge.harness.commit(async (tx) => {
 		const saved = await tx.doc(ChildIntents, key, {
 			workflow,
 			input: cloneJson(input ?? null),
-			// `piChild` makes the settlement of a child the Session waits for a signal to it.
-			metadata: {
-				...inherited,
-				triggerEvent: null,
-				ownerWorkflow: null,
-				...(detached ? {} : { piChild: bridge.session }),
-			},
+			metadata: { ...cloneJson(metadata), triggerEvent: null, ownerWorkflow: null },
 			dedupeKey,
 			detached,
 			executionId: null,
@@ -327,6 +325,7 @@ export async function startChild(
 	const executionId = await bridge.execution.start(key, intent.workflow, intent.input, {
 		metadata: intent.metadata,
 		dedupeKey: intent.dedupeKey,
+		cancelWithParent: !intent.detached,
 	});
 	await bridge.harness.commit(async (tx) => {
 		(await tx.doc(ChildIntents, key, intent)).executionId = executionId;
@@ -340,9 +339,8 @@ export async function registerChild(
 	taskId: number,
 	child: { executionId: string; detached: boolean },
 	context: Context,
-	effect = false,
 ): Promise<void> {
-	bridge.children.set(taskId, effect ? { ...child, effect } : child);
+	bridge.children.set(taskId, child);
 	await bridge.harness.commit(async (tx) => {
 		const record = (await tx.doc(Runs)).runs[run];
 		if (!record) throw new Error("Missing Pi bridge run binding");

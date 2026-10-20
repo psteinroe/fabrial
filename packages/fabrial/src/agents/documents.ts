@@ -94,6 +94,13 @@ export const ChildResults = defineDoc({
 	version: 1,
 	initial: (): { results: Record<string, JsonObject> } => ({ results: {} }),
 });
+/** How often the Session's execution suspended on its tools and inputs: names each wait. */
+export const Suspensions = defineDoc({
+	kind: "fabrial.suspensions",
+	scope: "session",
+	version: 1,
+	initial: (): { count: number } => ({ count: 0 }),
+});
 export const WorkflowReceipts = defineDocFamily({
 	family: true,
 	kind: "fabrial.workflow-state-receipt",

@@ -222,7 +222,7 @@ it("binds adapter identity, clients, sections and durable posts; commits tool st
 	await f.integration.stop();
 });
 
-it("releases the Session while a workflow tool waits and reconnects with a stable child id", async () => {
+it("suspends the Session while a workflow tool waits and resumes it with a stable child id", async () => {
 	const f = fixture();
 	f.metadata.triggerEvent = "slack.mentioned";
 	f.metadata.ownerWorkflow = "router";
@@ -263,7 +263,7 @@ it("releases the Session while a workflow tool waits and reconnects with a stabl
 					triggerEvent: null,
 					ownerWorkflow: null,
 				});
-				const storage = await PostgresStorage.open(sql(), execution.metadata.piChild as string);
+				const storage = await PostgresStorage.open(sql(), execution.metadata.piSession as string);
 				await storage.close(BACKGROUND_CONTEXT);
 				return "ok";
 			},
@@ -405,9 +405,13 @@ it.each([[false], [true]])(
 		expect((await db.execution(id).settled()).status).toBe("cancelled");
 		if (detached) {
 			// The run outlives its caller: the workflow tool finishes and the agent answers.
-			await until("the Session to release while its tool waits", async () =>
-				(await open(f.runtime.queue, "fabrial.session")).length ? undefined : true,
-			);
+			// The Session's execution suspends on its tool with the lease free.
+			await until("the Session to suspend while its tool waits", async () => {
+				const [lease] =
+					await sql()`SELECT owner FROM fabrial_pi.sessions WHERE key = ${callSession(id, "agent")}`;
+				return lease && lease.owner === null ? true : undefined;
+			});
+			expect(await open(f.runtime.queue, "fabrial.session")).toHaveLength(1);
 			expect(["pending", "running"]).toContain((await tool.info())?.status);
 			await f.runtime.emit(approved.name, {}, { metadata: f.metadata });
 			await until("the agent to answer", async () =>
@@ -729,7 +733,7 @@ it("replays a workflow state update after a lost runtime receipt without applyin
 	expect(await f.integration.state.get(execution, "read", state)).toEqual({ count: 11 });
 });
 
-it("delayed cancellation reconciles lost start receipts and leaves a newer conversation run intact", async () => {
+it("delayed cancellation skips lost start receipts and leaves a newer conversation run intact", async () => {
 	const f = fixture();
 	// Runs until the Session's cancellation reaches it.
 	const childWorkflow: RuntimeWorkflow = {
@@ -750,10 +754,6 @@ it("delayed cancellation reconciles lost start receipts and leaves a newer conve
 	await f.runtime.start();
 	const key = "fabrial:pi:lost-start";
 	const dedupeKey = JSON.stringify([callSession("old", "agent"), key]);
-	const child = await f.runtime.invoke(childWorkflow.name, null, {
-		metadata: f.metadata,
-		dedupeKey,
-	});
 	const storage = await PostgresStorage.open(sql(), callSession("old", "agent"));
 	const harness = await Harness.open(
 		storage,
@@ -814,9 +814,9 @@ it("delayed cancellation reconciles lost start receipts and leaves a newer conve
 		status: "cancelled",
 		reason: "late cancellation",
 	});
-	expect(await db.execution(child).settled()).toMatchObject({ status: "cancelled" });
 	await idle(f.runtime.queue);
-	expect(await all(f.runtime.queue, childWorkflow.name)).toHaveLength(1);
+	// A start whose receipt was lost is cancelled with the Session's execution, not started to be cancelled.
+	expect(await all(f.runtime.queue, childWorkflow.name)).toHaveLength(0);
 	const reopened = await PostgresStorage.open(sql(), callSession("old", "agent"));
 	const session = createSession(reopened);
 	try {

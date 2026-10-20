@@ -135,12 +135,19 @@ export interface DurableExecution {
 			timeoutMs?: number;
 		},
 	): Promise<Json>;
-	/** Start an independent execution without waiting; idempotent per id (Conductor item 7). Returns its id. */
+	/**
+	 * Start an execution without waiting; idempotent per id (Conductor item 7). Returns its id. Independent
+	 * unless `cancelWithParent`: then cancelling this execution cancels it too.
+	 */
 	start(
 		id: string,
 		workflow: string,
 		input: Json,
-		options?: { metadata?: Partial<InvocationMetadata>; dedupeKey?: string },
+		options?: {
+			metadata?: Partial<InvocationMetadata>;
+			dedupeKey?: string;
+			cancelWithParent?: boolean;
+		},
 	): Promise<string>;
 	/**
 	 * Listen for signals by name, once per name and attempt; register again on every replay. Signals stored
@@ -335,7 +342,7 @@ export interface AgentPort {
 		agent: AgentRef,
 		request: import("./send.ts").SendRequest,
 	): Promise<import("./send.ts").SendReceipt>;
-	/** Called for every terminal settlement: completions resume tools, cancellations cancel calls. */
+	/** Called for every terminal settlement: a cancelled caller cancels its calls. */
 	settled?(
 		executionId: string,
 		metadata: InvocationMetadata,

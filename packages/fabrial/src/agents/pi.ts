@@ -35,7 +35,7 @@ import {
 	type AgentRef,
 	AGENT_SETTLED_EVENT,
 	type DurableExecution,
-	type ExecutionResult,
+	type WaitBranch,
 	type FabrialHost,
 	type InvocationMetadata,
 	type Json,
@@ -101,6 +101,7 @@ import {
 	Invocation,
 	Runs,
 	SubagentWork,
+	Suspensions,
 	WorkflowReceipts,
 	ChildIntents,
 	EFFECT_WORKFLOW,
@@ -132,7 +133,6 @@ type SessionInput =
 			detached: boolean;
 	  }
 	| { kind: "stop"; agent: string; reason: string }
-	| { kind: "child"; executionId: string; result: ExecutionResult }
 	| { kind: "cancel"; caller: string; reason: string };
 
 /** A run of one conversation in the hosted Session: the requests it answers, until Pi has finished them. */
@@ -180,7 +180,7 @@ export function sessionKey(metadata: InvocationMetadata): string {
  * Takes the Session lease, retrying while another owner holds it. Two uses remain, both unavoidable: the Session's
  * execution opening after a crashed owner (its lease lasts until it expires) or while `ctx.state` holds the lease
  * briefly; and `ctx.state` from a workflow, which waits until the hosting execution releases the Session (it does
- * once every live task waits on a workflow).
+ * once every live task waits on a workflow, while it suspends).
  */
 async function acquire(sql: Sql, key: string, signal: AbortSignal): Promise<PostgresStorage> {
 	for (;;) {
@@ -485,7 +485,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		ownerWorkflow: null,
 		triggerEvent: null,
 		piSession: key,
-		piChild: null,
 	});
 
 	/** Every input reaches the Session's execution as a signal, starting one when the Session is closed. */
@@ -504,8 +503,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		});
 
 	/**
-	 * The Session execution: hosts the Pi Session while it has work. Signals arriving while it opens or closes wait
-	 * for the next opening; a signal delivered after the handler returned is sent again, which re-queues the execution.
+	 * The Session execution: hosts the Pi Session while it has work. Once every live task waits on a workflow, it closes
+	 * Pi (freeing the lease) and suspends until input arrives or one of those workflows settles; the next attempt
+	 * reopens Pi, and the waiting tools run again with their workflows' outcomes. Signals arriving while it opens or
+	 * closes wait for the next opening (and win the wait); a signal delivered after the handler returned is sent again,
+	 * which re-queues the execution.
 	 */
 	async function hostSession(input: Json, execution: DurableExecution): Promise<Json> {
 		if (!started) throw new Error("Start the Pi integration before running agents");
@@ -513,6 +515,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		let phase: "opening" | "open" | "closing" | "returned" = "opening";
 		let hosted: SessionHost | undefined;
 		const late: { payload: SessionInput; id: string; done: (error?: unknown) => void }[] = [];
+		// Registered before any wait: a signal still being handled when the wait registers wins it.
 		execution.onSignal("input", async (payload, { id }) => {
 			const input = payload as unknown as SessionInput;
 			if (phase === "returned") {
@@ -532,12 +535,23 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				phase = "open";
 				for (const each of late.splice(0))
 					session.handle(each.payload).then(() => each.done(), each.done);
+				let idle: Idle;
+				let missed: boolean;
 				try {
-					await session.idle;
+					idle = await session.idle;
 				} finally {
 					phase = "closing";
 					hosted = undefined;
-					await session.close();
+					missed = await session.close();
+				}
+				// Input handled after Pi went idle has not run yet.
+				if (missed) continue;
+				if (idle.kind === "parked") {
+					const branches: Record<string, WaitBranch> = { input: { signal: "input" } };
+					for (const [taskId, executionId] of idle.children)
+						branches[`task:${taskId}`] = { execution: executionId };
+					await execution.waitForAny(`idle:${idle.n}`, branches);
+					continue;
 				}
 				if (!late.length) return null;
 			}
@@ -549,18 +563,21 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		}
 	}
 
+	/** Pi has no work left (`done`), or every live task waits on a workflow (`parked`, by task id). */
+	type Idle = { kind: "done" } | { kind: "parked"; n: number; children: Map<number, string> };
+
 	interface SessionHost {
 		handle(input: SessionInput): Promise<void>;
-		/** Resolves when Pi has no work left but waits on workflows; rejects when the lease is lost. */
-		idle: Promise<void>;
-		close(): Promise<void>;
+		/** Resolves when Pi is idle; rejects when the lease is lost. */
+		idle: Promise<Idle>;
+		/** Closes Pi; true when input was handled after `idle` resolved, so Pi has work again. */
+		close(): Promise<boolean>;
 	}
 
 	async function openSession(key: string, execution: DurableExecution): Promise<SessionHost> {
 		// A crashed owner's lease lasts until it expires, and `ctx.state` takes the lease briefly.
 		const storage = await acquire(options.sql, key, execution.signal);
 		const signal = AbortSignal.any([execution.signal, storage.lost.signal]);
-		const waiters = new Map<string, ((result: JsonObject) => void)[]>();
 		const runs = new Map<string, HostedRun>();
 		const conversations = new Map<
 			string,
@@ -578,17 +595,16 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			runOf: (conversationId, context) => runOf(frame, conversationId, context),
 			waitChild: (taskId, executionId, context) =>
 				awaitWithContext(
-					new Promise<JsonObject>((resolve) => {
-						waiters.set(executionId, [...(waiters.get(executionId) ?? []), resolve]);
-						// A result recorded before this waiter registered.
-						void frame.harness.snapshot(ChildResults, context).then(
-							(doc) => {
-								const result = doc?.results[executionId];
-								if (result) resolve(result);
-							},
-							() => {},
+					(async () => {
+						const settled = await host.runtime.getExecution(executionId);
+						if (!settled) throw new Error(`Execution ${executionId} not found`);
+						if (!settled.result) return new Promise<never>(() => {});
+						const result = cloneJson(settled.result) as unknown as JsonObject;
+						return harness.commit(
+							async (tx) => ((await tx.doc(ChildResults)).results[executionId] ??= result),
+							context,
 						);
-					}),
+					})(),
 					context,
 				).finally(() => frame.children.delete(taskId)),
 			status: async (text) => latest()?.ui?.status(text),
@@ -604,10 +620,15 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		let inflight = 0;
 		let scheduled = false;
 		let closed = false;
-		let resolveIdle!: () => void;
+		let settled = false;
+		let missed = false;
+		let resolveIdle!: (idle: Idle) => void;
 		let rejectIdle!: (error: unknown) => void;
-		const idle = new Promise<void>((resolve, reject) => {
-			resolveIdle = resolve;
+		const idle = new Promise<Idle>((resolve, reject) => {
+			resolveIdle = (value) => {
+				settled = true;
+				resolve(value);
+			};
 			rejectIdle = reject;
 		});
 		idle.catch(() => {});
@@ -770,15 +791,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					if (!run) return;
 					await cancelRun(harness, run.id, input.reason);
 					await finish(run, undefined);
-					return;
-				}
-				case "child": {
-					const result = cloneJson(input.result) as unknown as JsonObject;
-					await harness.commit(async (tx) => {
-						(await tx.doc(ChildResults)).results[input.executionId] ??= result;
-					}, context);
-					for (const resolve of waiters.get(input.executionId) ?? []) resolve(result);
-					waiters.delete(input.executionId);
 					return;
 				}
 				case "cancel": {
@@ -1077,29 +1089,25 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				await run.conversation.submit({ type: "write", entry: { kind: "fabrial.wake" } }, context);
 		}
 
-		/**
-		 * No work, or every running task waits on a workflow other than a short effect (or on a subagent that does): the
-		 * Session can close.
-		 */
-		async function closeable() {
-			if (inflight || [...runs.values()].some((run) => !run.started)) return false;
+		/** No work, or every running task waits on a workflow (or on a subagent that does). */
+		async function idleState(): Promise<Idle["kind"] | undefined> {
+			if (inflight || [...runs.values()].some((run) => !run.started)) return undefined;
 			const inspection = await harness.inspect(context);
 			const live = inspection.tasks.filter((task) => !task.record.background);
 			if (!live.length && !inspection.submissions.length)
-				return !(await backgroundPending(harness, context));
+				return (await backgroundPending(harness, context)) ? undefined : "done";
 			const runners = live.filter((task) => task.state.kind === "running");
-			// A short managed effect (a thread post) is waited out; only workflows release the Session.
-			const workflow = (id: number) => frame.children.has(id) && !frame.children.get(id)!.effect;
+			const workflow = (id: number) => frame.children.has(id);
 			const parked = (id: number) => workflow(id) || frame.waiting.has(id);
-			return (
-				runners.some((task) => workflow(task.record.id)) &&
+			return runners.some((task) => workflow(task.record.id)) &&
 				live.every(
 					(task) =>
 						task.state.kind === "waiting" ||
 						task.state.kind === "completing" ||
 						(task.state.kind === "running" && parked(task.record.id)),
 				)
-			);
+				? "parked"
+				: undefined;
 		}
 
 		async function tick() {
@@ -1114,7 +1122,19 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				await evaluate(run);
 			}
 			if (runs.size !== before) return schedule();
-			if (!scheduled && (await closeable())) resolveIdle();
+			if (scheduled || settled) return;
+			const state = await idleState();
+			if (state === "done") resolveIdle({ kind: "done" });
+			if (state !== "parked") return;
+			// Every wait has its own name, so a resumed execution never reuses an earlier wait's winner.
+			const n = await harness.commit(async (tx) => (await tx.doc(Suspensions)).count++, context);
+			resolveIdle({
+				kind: "parked",
+				n,
+				children: new Map(
+					[...frame.children].map(([taskId, child]) => [taskId, child.executionId]),
+				),
+			});
 		}
 
 		storage.onCommit = schedule;
@@ -1144,6 +1164,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		return {
 			idle,
 			async handle(input) {
+				if (settled) missed = true;
 				inflight++;
 				try {
 					await serial(() => apply(input));
@@ -1168,6 +1189,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						joined();
 					}
 				}
+				return missed;
 			},
 		};
 	}
@@ -1272,17 +1294,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		const context = BACKGROUND_CONTEXT;
 		const run = (await harness.snapshot(Runs, context))?.runs[runId];
 		if (!run) return;
-		// Even a start whose receipt was lost has a durable cancellation relationship.
+		// The workflows its tools started; one whose start receipt was lost is cancelled with the Session's execution.
 		for (const key of run.intents ?? []) {
 			const intent = await harness.snapshot(ChildIntents, key, context);
-			if (!intent || intent.detached) continue;
-			const child =
-				intent.executionId ??
-				(await host.runtime.invoke(intent.workflow, intent.input, {
-					metadata: intent.metadata,
-					dedupeKey: intent.dedupeKey,
-				}));
-			await host.runtime.cancel(child, reason);
+			if (intent?.executionId && !intent.detached)
+				await host.runtime.cancel(intent.executionId, reason);
 		}
 		for (const child of Object.values(run.children))
 			if (!child.detached) await host.runtime.cancel(child.executionId, reason);
@@ -1492,15 +1508,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			);
 		},
 		async settled(executionId, metadata, result) {
-			if (metadata.piSession && metadata.piChild === null) return;
-			// A workflow a tool started reports to its Session, which resumes the tool waiting on it.
-			if (typeof metadata.piChild === "string")
-				await signalSession(
-					metadata.piChild,
-					`fabrial.child:${executionId}`,
-					{ kind: "child", executionId, result },
-					metadata,
-				);
 			if (result.status !== "cancelled") return;
 			// A cancelled caller cancels its calls (unless detached) in the Sessions they reached.
 			const known = await options.sql<{ key: string }[]>`SELECT key FROM fabrial_pi.sessions

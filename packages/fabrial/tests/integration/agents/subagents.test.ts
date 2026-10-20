@@ -1013,7 +1013,7 @@ it.each([
 	},
 );
 
-it("a background child waiting for approval releases the Session: a new message is answered meanwhile, and the click resumes the child", async () => {
+it("a background child waiting for approval suspends the Session: a new message is answered meanwhile, and the click resumes the child", async () => {
 	const alice = defineUser({
 		id: `alice-${short()}`,
 		name: "Alice",
@@ -1114,12 +1114,18 @@ it("a background child waiting for approval releases the Session: a new message 
 		await send("Fix the row");
 		await expect.poll(posts, { timeout: 30_000 }).toEqual(["On it."]);
 		await until("the approval card", async () => (approve ? true : undefined));
-		// Every live task waits on the approval: the Session's execution returned and its lease is free.
+		// Every live task waits on the approval: the Session's execution suspended on it and its lease is free.
 		await expect
-			.poll(() => open(runtime.queue, "fabrial.session"), { timeout: 30_000 })
-			.toEqual([]);
-		const storage = await PostgresStorage.open(sql(), session);
-		await storage.close(BACKGROUND_CONTEXT);
+			.poll(
+				async () => {
+					if ((await open(runtime.queue, "fabrial.session")).length !== 1) return false;
+					const storage = await PostgresStorage.open(sql(), session).catch(() => undefined);
+					await storage?.close(BACKGROUND_CONTEXT);
+					return !!storage;
+				},
+				{ timeout: 30_000 },
+			)
+			.toBe(true);
 		await send("Status?");
 		await expect
 			.poll(posts, { timeout: 30_000 })
