@@ -368,6 +368,7 @@ async function background(
 				name: child.name,
 				run,
 				report: null,
+				request: requestId,
 			};
 			work.slots[api.conversationId]![id] = child.name;
 			return id;

@@ -38,6 +38,7 @@ import {
 	stateDraft,
 	Runs,
 	Invocation,
+	SubagentWork,
 	ChildIntents,
 	EFFECT_WORKFLOW,
 	type ChildIntent,
@@ -258,8 +259,8 @@ export async function fields(
 }
 
 /**
- * The request a conversation's current run acts for: the request of its first input, or its binding. A subagent's
- * input has no invocation of its own, so it acts for the lead request bound when it was called.
+ * The request a conversation's current run acts for: the request of its first input, the lead request a background
+ * child's input was sent for, or its binding (the lead request a foreground child was called for).
  */
 export async function currentRequest(
 	bridge: BridgeFrame,
@@ -276,6 +277,12 @@ export async function currentRequest(
 	const requestId = (await submission?.status(context))?.requestId;
 	if (requestId && (await bridge.harness.snapshot(Invocation, requestId, context)))
 		return requestId;
+	// A background child's task acts for the lead request that sent it, recorded before it was submitted.
+	const reporter = /^fabrial\.subagent:(\d+)$/.exec(requestId ?? "")?.[1];
+	const sent = reporter
+		? (await bridge.harness.snapshot(SubagentWork, context))?.reporters[reporter]?.request
+		: undefined;
+	if (sent && (await bridge.harness.snapshot(Invocation, sent, context))) return sent;
 	if (!(await bridge.harness.snapshot(Invocation, binding.requestId, context)))
 		throw new Error(`Missing Fabrial invocation ${binding.requestId}`);
 	return binding.requestId;

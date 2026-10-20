@@ -75,7 +75,15 @@ export const SubagentWork = defineDoc({
 		calls: Record<string, number>;
 		reporters: Record<
 			string,
-			{ lead: number; child: number; name: string; run: string; report: number | null }
+			{
+				lead: number;
+				child: number;
+				name: string;
+				run: string;
+				report: number | null;
+				/** The lead request this task acts for; the child's submission resolves to it. */
+				request?: string;
+			}
 		>;
 		reported: Record<string, number[]>;
 	} => ({ slots: {}, calls: {}, reporters: {}, reported: {} }),

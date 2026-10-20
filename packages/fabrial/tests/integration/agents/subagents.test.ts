@@ -1210,3 +1210,97 @@ function hooked(integration: { agents: { settled?: AgentSettled } }, workflows: 
 	}));
 }
 type AgentSettled = NonNullable<import("../../../src/runtime.ts").AgentPort["settled"]>;
+
+it("continuing a background child from another actor and thread runs its tools for the new request", async () => {
+	const users = ["alice", "bob"].map((id) =>
+		defineUser({
+			id: `${id}-${short()}`,
+			name: id,
+			identities: [{ provider: "slack-test", installationId: "w", subjectId: `${id}${short()}` }],
+		}),
+	);
+	const g = createFabrial({ plugins: [], identity: users });
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const model = `${faux.provider.id}/${faux.getModel().id}`;
+	const seen: string[] = [];
+	const whoami = g.defineTool({
+		name: "whoami",
+		description: "Reports who asked",
+		input: z.object({}),
+		run: async (_input, ctx) => {
+			const replyTo = ctx.interaction.replyTo;
+			seen.push(`${ctx.actor?.id}@${replyTo?.kind === "thread" ? replyTo.threadId : ""}`);
+			return "noted";
+		},
+	});
+	const researcher = g.defineAgent({
+		name: `researcher-${short()}`,
+		description: "Notes who asked.",
+		model,
+		tools: [whoami],
+	});
+	const lead = g.defineAgent({
+		name: `lead-${short()}`,
+		description: "Leads.",
+		model,
+		subagents: [researcher],
+	});
+	const tool = toolName(researcher.name);
+	const session = `ticket-${short()}`;
+	const ask = g.defineWorkflow({
+		name: `ask-${short()}`,
+		input: z.object({ text: z.string() }),
+		run: async (input, ctx) => {
+			await ctx.send("ask", lead, { session, input: input.text });
+		},
+	});
+	faux.setResponses(
+		Array.from({ length: 20 }, () => (context: TranscriptContext) => {
+			const text = lastText(context);
+			if (text === "First" || text === "Second") return use("whoami", {});
+			if (text === "noted") return say("Noted.");
+			if (text.includes("Go")) return use(tool, { task: "First", background: true });
+			if (text.includes("Again")) return use(tool, { task: "Second", name: `${tool}-1` });
+			return say("ok");
+		}),
+	);
+	const runtime = new MemoryRuntime();
+	const app = testApp(g, {
+		workflows: [ask],
+		runtime,
+		chat: new FakeChat(),
+		agents: pi({ models, sql, settings: { retry: { enabled: false } } }),
+	});
+	await app.start();
+	const threads = [randomUUID(), randomUUID()];
+	const send = (text: string, index: number) =>
+		runtime.invoke(
+			ask.name,
+			{ text },
+			{
+				metadata: {
+					interactionId: randomUUID(),
+					origin: null,
+					replyTo: { kind: "thread", provider: "slack-test", threadId: threads[index]! },
+					requestedBy: { id: users[index]!.id, known: true, identities: [] },
+					ownerWorkflow: null,
+					triggerEvent: null,
+				},
+			},
+		);
+	try {
+		await send("Go", 0);
+		await expect
+			.poll(async () => (await runtime.flush(), seen.length), { timeout: 10_000 })
+			.toBe(1);
+		await send("Again", 1);
+		await expect
+			.poll(async () => (await runtime.flush(), seen.length), { timeout: 10_000 })
+			.toBe(2);
+		expect(seen).toEqual([`${users[0]!.id}@${threads[0]}`, `${users[1]!.id}@${threads[1]}`]);
+	} finally {
+		await app.stop();
+	}
+});
