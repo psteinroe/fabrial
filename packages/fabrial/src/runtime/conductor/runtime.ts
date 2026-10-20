@@ -17,6 +17,7 @@ import {
 	type EventFilter,
 } from "../../index.ts";
 import { matchesFilter } from "../../internal.ts";
+import { ExecutionError } from "../../runtime.ts";
 import {
 	Conductor,
 	Orchestrator,
@@ -140,7 +141,7 @@ function duration(ms: number): number {
 	return ms;
 }
 
-// PHASE2(task 11): the cursor race behind `waitForEvent`, used only by the `ctx.agent` settlement wait.
+// PHASE2(task 12): the cursor race behind `waitForEvent`, used only by adapter tests since task 11.
 type CursorBranch =
 	| { kind: "event"; event: string; filter?: EventFilter; after?: EventCursor }
 	| { kind: "timer"; at: number };
@@ -798,16 +799,5 @@ class ConductorRuntime implements DurableRuntime {
 		});
 		if (!saved) return release(raw, 0);
 		return winner;
-	}
-}
-
-/** A child terminal failure, distinguishable from ordinary handler failures. */
-export class ExecutionError extends Error {
-	constructor(
-		readonly executionId: string,
-		readonly result: Exclude<ExecutionResult, { status: "completed" }>,
-	) {
-		super(result.status === "cancelled" ? result.reason : result.error);
-		this.name = "ExecutionError";
 	}
 }

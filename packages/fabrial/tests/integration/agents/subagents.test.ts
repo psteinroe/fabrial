@@ -26,10 +26,6 @@ import { SubagentWork } from "../../../src/agents/documents.ts";
 import { FakeChat } from "../../../src/testing.ts";
 import { until } from "../../conductor/helper.ts";
 import { useAgents } from "./setup.ts";
-import { AGENT_SETTLED_EVENT } from "../../../src/runtime.ts";
-
-/** Events core registers for its own waits; these fixtures register with the runtime directly. */
-const internalEvents: RuntimeEvent[] = [{ name: AGENT_SETTLED_EVENT, filterable: ["requestId"] }];
 
 const definitions = createFabrial({ plugins: [] });
 const { defineAgent, defineTool, defineWorkflow } = definitions;
@@ -38,7 +34,7 @@ const { defineAgent, defineTool, defineWorkflow } = definitions;
  * The Pi integration connected to a bare host on real Conductor, in real time; apps built with `launch`
  * for the tests that route through core.
  */
-const { db, sql, launch, idle, open } = useAgents();
+const { db, sql, launch, idle, open, all } = useAgents();
 
 function fixture() {
 	const runtime = db.runtime();
@@ -98,8 +94,8 @@ function fixture() {
 			handler: (_input, execution) => integration.agents.run(execution, "agent", agent, { input }),
 		};
 		runtime.register({
-			workflows: hooked(integration, [workflow, ...integration.workflows, ...others]),
-			events: [...events, ...internalEvents],
+			workflows: [workflow, ...integration.workflows, ...others],
+			events,
 		});
 		await integration.start();
 		await runtime.start();
@@ -350,7 +346,7 @@ it("limits.concurrent turns away calls beyond the limit with an error the model 
 	await f.integration.stop();
 });
 
-it("aborting the lead aborts the child through Pi ownership", async () => {
+it("cancelling the lead's caller aborts the child's tool; no further model calls", async () => {
 	const f = fixture();
 	let started!: () => void;
 	const blocking = new Promise<void>((resolve) => (started = resolve));
@@ -390,20 +386,9 @@ it("aborting the lead aborts the child through Pi ownership", async () => {
 	await blocking;
 	await f.runtime.cancel(id, "Stopped");
 	expect(await settled()).toMatchObject({ status: "cancelled" });
+	// The call's Session execution is cancelled with its caller; the child's running tool is aborted in process.
+	await cancelledCall(f);
 	expect(aborted).toBe(true);
-	// The `cancel` signal aborts the lead's run in its Session; Pi's cascade aborts the child's tasks through ownership.
-	const tasks = [
-		...new Map(
-			(await f.writes()).flatMap((write) =>
-				write.type === "task" ? [[write.value.id, write.value] as const] : [],
-			),
-		).values(),
-	];
-	expect(tasks.map((task) => task.kind)).toEqual(
-		expect.arrayContaining(["pi.generation", "pi.tool"]),
-	);
-	expect(new Set(tasks.map((task) => task.conversationId)).size).toBe(2);
-	expect(tasks.every((task) => task.state.status === "terminal" || task.abortRequested)).toBe(true);
 	await f.integration.stop();
 });
 
@@ -525,13 +510,6 @@ const requests = async (f: Fixture, prefix: string) => [
 				: [],
 		),
 	),
-];
-const latestTasks = async (f: Fixture) => [
-	...new Map(
-		(await f.writes()).flatMap((write) =>
-			write.type === "task" ? [[write.value.id, write.value] as const] : [],
-		),
-	).values(),
 ];
 function gate() {
 	let open!: () => void;
@@ -801,6 +779,7 @@ it("limits.concurrent counts a running background child durably across driver at
 it("cancelling the interaction aborts its background children", async () => {
 	const f = fixture();
 	const started = gate();
+	let aborted = false;
 	const slow = defineTool({
 		name: "slow",
 		description: "Slow work",
@@ -808,7 +787,14 @@ it("cancelling the interaction aborts its background children", async () => {
 		run: (_input, ctx) => {
 			started.open();
 			return new Promise<never>((_resolve, reject) =>
-				ctx.signal.addEventListener("abort", () => reject(ctx.signal.reason), { once: true }),
+				ctx.signal.addEventListener(
+					"abort",
+					() => {
+						aborted = true;
+						reject(ctx.signal.reason);
+					},
+					{ once: true },
+				),
 			);
 		},
 	});
@@ -825,13 +811,9 @@ it("cancelling the interaction aborts its background children", async () => {
 	await started.opened;
 	await f.runtime.cancel(id, "Stopped");
 	expect(await settled()).toMatchObject({ status: "cancelled" });
-	const tasks = await latestTasks(f);
-	const reporter = tasks.find((task) => task.kind === "fabrial.subagent-reporter")!;
-	expect(reporter.abortRequested || reporter.state.status === "terminal").toBe(true);
-	// The child's work is aborted through the background boundary.
-	const child = tasks.filter((task) => task.conversationId !== reporter.conversationId);
-	expect(child.length).toBeGreaterThan(0);
-	expect(child.every((task) => task.state.status === "terminal" || task.abortRequested)).toBe(true);
+	// The background child dies with the call's Session execution: its tool is aborted, and it never reports.
+	await cancelledCall(f);
+	expect(aborted).toBe(true);
 	await f.integration.stop();
 });
 
@@ -944,7 +926,8 @@ it.each([
 				name: workflow.name,
 				triggers: [],
 				handler: async (_input, execution) => {
-					await execution.waitForEvent("wait", { event: `go-${workflow.name}` });
+					const go = await execution.subscribe("go", { event: `go-${workflow.name}` });
+					await execution.waitForAny("wait", { go });
 					return `${who} went`;
 				},
 			};
@@ -1187,6 +1170,19 @@ it("a child's answer frees its concurrency slot as it settles, and its status li
 	await f.integration.stop();
 });
 
+/**
+ * The latest call's Session execution was cancelled with its caller: the lease is free, and no model request
+ * follows (the count stays put for a while).
+ */
+async function cancelledCall(f: Fixture) {
+	const [call] = await all(f.runtime.queue, "fabrial.session");
+	expect((await db.execution(call!).settled()).status).toBe("cancelled");
+	await leaseFreed(f.key());
+	const requests = f.contexts.length;
+	await new Promise((resolve) => setTimeout(resolve, 1_000));
+	expect(f.contexts).toHaveLength(requests);
+}
+
 /** Waits until no execution hosts the Session: it closes once every live task waits on a workflow. */
 async function leaseFreed(key: string) {
 	await expect
@@ -1196,18 +1192,6 @@ async function leaseFreed(key: string) {
 		)
 		.toBeNull();
 }
-
-/** Core calls the agent port on every settlement; these fixtures register workflows with the runtime directly. */
-function hooked(integration: { agents: { settled?: AgentSettled } }, workflows: RuntimeWorkflow[]) {
-	return workflows.map((workflow) => ({
-		...workflow,
-		onSettled: async (...args: Parameters<AgentSettled>) => {
-			await workflow.onSettled?.(...args);
-			await integration.agents.settled?.(...args);
-		},
-	}));
-}
-type AgentSettled = NonNullable<import("../../../src/runtime.ts").AgentPort["settled"]>;
 
 it("continuing a background child from another actor and thread runs its tools for the new request", async () => {
 	const users = ["alice", "bob"].map((id) =>

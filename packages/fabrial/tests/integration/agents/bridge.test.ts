@@ -7,13 +7,6 @@ import {
 	fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
 import {
-	createRegistry,
-	createSession,
-	Harness,
-	LiveDoc,
-	GenerationTask,
-} from "@earendil-works/pi-durable";
-import {
 	createFabrial,
 	type DurableExecution,
 	type FabrialHost,
@@ -24,16 +17,12 @@ import {
 } from "../../../src/index.ts";
 import { FakeChat } from "../../../src/testing.ts";
 import { expect, it, vi } from "vitest";
-import { ChildIntents, Runs } from "../../../src/agents/documents.ts";
 import { z } from "zod";
 import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { until } from "../../conductor/helper.ts";
 import { useAgents } from "./setup.ts";
-import { AGENT_SETTLED_EVENT } from "../../../src/runtime.ts";
 
-/** Events core registers for its own waits; these fixtures register with the runtime directly. */
-const internalEvents: RuntimeEvent[] = [{ name: AGENT_SETTLED_EVENT, filterable: ["requestId"] }];
 const definitions = createFabrial({ plugins: [] });
 const { defineWorkflow } = definitions;
 const { defineAgent, defineTool, defineToolkit, defineState } = definitions;
@@ -93,8 +82,8 @@ function runtimeRegister(
 	events: RuntimeEvent[] = [],
 ) {
 	f.runtime.register({
-		workflows: hooked(f.integration, [workflow, ...f.integration.workflows, ...others]),
-		events: [...events, ...internalEvents],
+		workflows: [workflow, ...f.integration.workflows, ...others],
+		events,
 	});
 }
 
@@ -383,7 +372,8 @@ it.each([[false], [true]])(
 					name: child.name,
 					triggers: [],
 					handler: async (_input, execution) => {
-						await execution.waitForEvent("approval", { event: approved.name });
+						const decision = await execution.subscribe("decision", { event: approved.name });
+						await execution.waitForAny("approval", { decision });
 						return "approved";
 					},
 				},
@@ -401,7 +391,7 @@ it.each([[false], [true]])(
 		);
 		await tool.suspended("approval");
 		await f.runtime.cancel(id, "User stopped");
-		// The cancelled caller signals `cancel` to the Session its call reached.
+		// The call's Session execution is the caller's child: cancelled with it unless detached.
 		expect((await db.execution(id).settled()).status).toBe("cancelled");
 		if (detached) {
 			// The run outlives its caller: the workflow tool finishes and the agent answers.
@@ -417,6 +407,12 @@ it.each([[false], [true]])(
 			await until("the agent to answer", async () =>
 				f.faux.state.callCount === 2 ? true : undefined,
 			);
+			// The detached call's Session execution still settles with the answer.
+			const [call] = await all(f.runtime.queue, "fabrial.session");
+			expect(await db.execution(call!).settled()).toEqual({
+				status: "completed",
+				output: { status: "completed", output: "approved" },
+			});
 		} else {
 			expect((await tool.settled()).status).toBe("cancelled");
 		}
@@ -428,6 +424,72 @@ it.each([[false], [true]])(
 		await f.integration.stop();
 	},
 );
+
+it("a timed-out agent call cancels its attached Session execution and the call's workflow tools", async () => {
+	// A permanently failed caller cancels it the same way: the call is an attached child (cancelWithParent).
+	const f = fixture();
+	const child = defineWorkflow({ name: randomUUID(), run: async () => null });
+	(f.host.workflows as unknown as (typeof child)[]).push(child);
+	const agent = defineAgent({
+		name: randomUUID(),
+		description: "Answers test questions.",
+		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
+		tools: [child],
+	});
+	f.faux.setResponses([
+		fauxAssistantMessage(fauxToolCall(child.name.replaceAll(/[^a-zA-Z0-9_]/g, "_"), {}), {
+			stopReason: "toolUse",
+		}),
+		fauxAssistantMessage("never"),
+	]);
+	const workflow: RuntimeWorkflow = {
+		name: randomUUID(),
+		triggers: [],
+		retries: { maxAttempts: 1 },
+		handler: (_input, execution) =>
+			f.integration.agents.run(execution, "agent", agent, { input: "Wait", timeout: "3s" }),
+	};
+	runtimeRegister(
+		f,
+		workflow,
+		[
+			{
+				name: child.name,
+				triggers: [],
+				handler: async (_input, execution) => {
+					const never = await execution.subscribe("never", { event: `never-${child.name}` });
+					await execution.waitForAny("approval", { never });
+					return "approved";
+				},
+			},
+		],
+		[{ name: `never-${child.name}`, filterable: [] }],
+	);
+	await f.integration.start();
+	await f.runtime.start();
+	const id = await f.runtime.invoke(workflow.name, null, { metadata: f.metadata });
+	const tool = db.execution(
+		await until(
+			"the workflow tool to start",
+			async () => (await all(f.runtime.queue, child.name))[0],
+		),
+	);
+	await tool.suspended("approval");
+	expect(await db.execution(id).settled()).toMatchObject({
+		status: "failed",
+		error: expect.stringMatching(/timed out/),
+	});
+	// The call's Session execution and its tool's are cancelled with the caller; the agent never resumes.
+	const [call] = await all(f.runtime.queue, "fabrial.session");
+	expect((await db.execution(call!).settled()).status).toBe("cancelled");
+	expect((await tool.settled()).status).toBe("cancelled");
+	await idle(f.runtime.queue);
+	expect(f.faux.state.callCount).toBe(1);
+	const [lease] =
+		await sql()`SELECT owner FROM fabrial_pi.sessions WHERE key = ${callSession(id, "agent")}`;
+	expect(lease?.owner).toBeNull();
+	await f.integration.stop();
+});
 
 it("installs plugin observers globally but does not select unrequested plugin toolkits", async () => {
 	let requests = 0;
@@ -733,107 +795,6 @@ it("replays a workflow state update after a lost runtime receipt without applyin
 	expect(await f.integration.state.get(execution, "read", state)).toEqual({ count: 11 });
 });
 
-it("delayed cancellation skips lost start receipts and leaves a newer conversation run intact", async () => {
-	const f = fixture();
-	// Runs until the Session's cancellation reaches it.
-	const childWorkflow: RuntimeWorkflow = {
-		name: randomUUID(),
-		triggers: [],
-		handler: (_input, execution) =>
-			new Promise((_resolve, reject) =>
-				execution.signal.addEventListener("abort", () => reject(execution.signal.reason), {
-					once: true,
-				}),
-			),
-	};
-	f.runtime.register({
-		workflows: hooked(f.integration, [childWorkflow, ...f.integration.workflows]),
-		events: internalEvents,
-	});
-	await f.integration.start();
-	await f.runtime.start();
-	const key = "fabrial:pi:lost-start";
-	const dedupeKey = JSON.stringify([callSession("old", "agent"), key]);
-	const storage = await PostgresStorage.open(sql(), callSession("old", "agent"));
-	const harness = await Harness.open(
-		storage,
-		{ models: createModels(), registry: createRegistry() },
-		BACKGROUND_CONTEXT,
-	);
-	const conversation = await harness.createConversation(
-		{ ownership: { kind: "ownerless" } },
-		BACKGROUND_CONTEXT,
-	);
-	const oldRequest = "old-request";
-	const current = await harness.commit(async (tx) => {
-		const live = await tx.doc(LiveDoc, conversation.id);
-		const runs = await tx.doc(Runs);
-		await tx.doc(ChildIntents, key, {
-			workflow: childWorkflow.name,
-			input: null,
-			metadata: f.metadata,
-			dedupeKey,
-			detached: false,
-			executionId: null,
-		});
-		const old = await tx.createSubmission({
-			conversationId: conversation.id,
-			requestId: oldRequest,
-			type: "input",
-			status: "queued",
-		});
-		const entry = await tx.appendEntry(conversation.id, {
-			kind: "pi.user",
-			model: [{ role: "user", content: "new request", timestamp: Date.now() }],
-		});
-		const submission = await tx.createSubmission({
-			conversationId: conversation.id,
-			requestId: "new-request",
-			type: "input",
-			status: "placed",
-			entry: entry.id,
-		});
-		const task = await tx.createTask(
-			GenerationTask,
-			{},
-			{ conversationId: conversation.id, ownership: { kind: "conversation" } },
-		);
-		live.run = { taskId: task, inputs: [submission.id] };
-		runs.runs.old = {
-			conversationId: conversation.id,
-			children: {},
-			call: { requestId: oldRequest, caller: "old", detached: false },
-			intents: [key],
-			requests: { [oldRequest]: { content: "old", submissionId: old.id } },
-		};
-		return { task, submission: submission.id, old: old.id };
-	}, BACKGROUND_CONTEXT);
-	await harness.close(BACKGROUND_CONTEXT);
-	// The caller "old" settled cancelled: the Session receives a `cancel` signal for its call.
-	await f.integration.agents.settled!("old", f.metadata, {
-		status: "cancelled",
-		reason: "late cancellation",
-	});
-	await idle(f.runtime.queue);
-	// A start whose receipt was lost is cancelled with the Session's execution, not started to be cancelled.
-	expect(await all(f.runtime.queue, childWorkflow.name)).toHaveLength(0);
-	const reopened = await PostgresStorage.open(sql(), callSession("old", "agent"));
-	const session = createSession(reopened);
-	try {
-		// The Session went on to run the newer request (it has no model here), but never aborted it.
-		expect((await reopened.task(current.task, BACKGROUND_CONTEXT))?.abortRequested).toBe(false);
-		expect(await reopened.submission(current.submission, BACKGROUND_CONTEXT)).not.toMatchObject({
-			reason: expect.stringMatching(/abort/i),
-		});
-		expect((await reopened.submission(current.old, BACKGROUND_CONTEXT))?.status).toBe("unanswered");
-		expect(await session.snapshot(Runs, BACKGROUND_CONTEXT)).toMatchObject({
-			runs: { old: { done: true } },
-		});
-	} finally {
-		await session.close(BACKGROUND_CONTEXT);
-	}
-});
-
 it("stop joins driver routing cleanup after the harness has closed", async () => {
 	const f = fixture();
 	const agent = defineAgent({
@@ -901,15 +862,3 @@ it("does not install agents from an unrelated Fabrial catalog", async () => {
 	await f.integration.start();
 	await f.integration.stop();
 });
-
-/** Core calls the agent port on every settlement; these fixtures register workflows with the runtime directly. */
-function hooked(integration: { agents: { settled?: AgentSettled } }, workflows: RuntimeWorkflow[]) {
-	return workflows.map((workflow) => ({
-		...workflow,
-		onSettled: async (...args: Parameters<AgentSettled>) => {
-			await workflow.onSettled?.(...args);
-			await integration.agents.settled?.(...args);
-		},
-	}));
-}
-type AgentSettled = NonNullable<import("../../../src/runtime.ts").AgentPort["settled"]>;

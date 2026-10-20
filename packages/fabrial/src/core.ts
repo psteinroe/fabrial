@@ -21,7 +21,7 @@ import {
 } from "./send.ts";
 import type { AnyWorkflow, ExecutionInfo, WorkflowContext } from "./workflow.ts";
 import type { Json, JsonObject } from "./json.ts";
-import { AGENT_SETTLED_EVENT, EXECUTION_SETTLED_EVENT } from "./runtime.ts";
+import { EXECUTION_SETTLED_EVENT } from "./runtime.ts";
 import type {
 	AgentRef,
 	DurableExecution,
@@ -427,7 +427,6 @@ export function buildApp(config: CoreConfig): App {
 		metadata: InvocationMetadata,
 		result: ExecutionResult,
 	) {
-		await agents?.agents.settled?.(executionId, metadata, result);
 		await runtime.emit(
 			EXECUTION_SETTLED_EVENT,
 			{ executionId, result: result as unknown as Json },
@@ -528,7 +527,6 @@ export function buildApp(config: CoreConfig): App {
 			{ name: INGRESS_EVENT, filterable: [] },
 			{ name: APPROVAL_DECIDED_EVENT, filterable: ["approvalId"] },
 			{ name: EXECUTION_SETTLED_EVENT, filterable: ["executionId"] },
-			{ name: AGENT_SETTLED_EVENT, filterable: ["requestId"] },
 		],
 	});
 	return {

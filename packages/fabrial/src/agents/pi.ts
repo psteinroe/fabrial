@@ -33,8 +33,9 @@ import {
 	parseSchema,
 	type AgentPort,
 	type AgentRef,
-	AGENT_SETTLED_EVENT,
 	type DurableExecution,
+	ExecutionError,
+	isCancelled,
 	type WaitBranch,
 	type FabrialHost,
 	type InvocationMetadata,
@@ -109,6 +110,7 @@ import {
 import { newErrorId, sentErrorReply, WAITING_STATUS } from "./errors.ts";
 import { createEvaluator } from "./evaluate.ts";
 import { LeaseLost, PostgresStorage, SessionBusy } from "./storage.ts";
+import { duration } from "../internal.ts";
 import type { AgentIntegration, Logger } from "../app.ts";
 
 const SESSION_WORKFLOW = "fabrial.session";
@@ -129,11 +131,13 @@ type SessionInput =
 			requestId: string;
 			content: string;
 			metadata: InvocationMetadata;
-			caller: string;
-			detached: boolean;
 	  }
-	| { kind: "stop"; agent: string; reason: string }
-	| { kind: "cancel"; caller: string; reason: string };
+	| { kind: "stop"; agent: string; reason: string };
+
+/** A `ctx.agent` call's Session execution returns its outcome: the answer, or why there is none. */
+type CallOutcome =
+	| { status: "completed"; output: Json }
+	| { status: "failed"; error: string; executionId: string };
 
 /** A run of one conversation in the hosted Session: the requests it answers, until Pi has finished them. */
 interface HostedRun {
@@ -508,13 +512,19 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	 * reopens Pi, and the waiting tools run again with their workflows' outcomes. Signals arriving while it opens or
 	 * closes wait for the next opening (and win the wait); a signal delivered after the handler returned is sent again,
 	 * which re-queues the execution.
+	 *
+	 * A `ctx.agent` call's Session execution is a child of its caller and returns the call's outcome. Cancelled while
+	 * running, it aborts the call's Pi run before closing Pi; cancelled while suspended, nothing runs: its workflow tools
+	 * are cancelled with it, and the call's Pi Session is left as it is (never reopened, its storage retained).
 	 */
 	async function hostSession(input: Json, execution: DurableExecution): Promise<Json> {
 		if (!started) throw new Error("Start the Pi integration before running agents");
-		const key = (input as { session: string }).session;
+		const { session: key, call } = input as { session: string; call?: SessionInput };
 		let phase: "opening" | "open" | "closing" | "returned" = "opening";
 		let hosted: SessionHost | undefined;
 		const late: { payload: SessionInput; id: string; done: (error?: unknown) => void }[] = [];
+		// A `ctx.agent` call arrives as the input of its own Session's execution, a child of the caller.
+		if (call?.kind === "call") late.push({ payload: call, id: call.requestId, done: () => {} });
 		// Registered before any wait: a signal still being handled when the wait registers wins it.
 		execution.onSignal("input", async (payload, { id }) => {
 			const input = payload as unknown as SessionInput;
@@ -553,7 +563,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					await execution.waitForAny(`idle:${idle.n}`, branches);
 					continue;
 				}
-				if (!late.length) return null;
+				if (late.length) continue;
+				if (call?.kind !== "call") return null;
+				const outcome = session.outcomes.get(call.requestId);
+				if (!outcome) throw new Error(`Agent call ${call.requestId} ended without an outcome`);
+				return outcome as unknown as Json;
 			}
 		} catch (error) {
 			for (const each of late.splice(0)) each.done(error);
@@ -572,6 +586,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		idle: Promise<Idle>;
 		/** Closes Pi; true when input was handled after `idle` resolved, so Pi has work again. */
 		close(): Promise<boolean>;
+		/** Outcomes of the calls this Session finished, by request id. */
+		outcomes: Map<string, CallOutcome>;
 	}
 
 	async function openSession(key: string, execution: DurableExecution): Promise<SessionHost> {
@@ -584,6 +600,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			{ conversation: Conversation; offered: readonly ToolRegistration[] }
 		>();
 		const latest = () => [...runs.values()].findLast((run) => run.started);
+		const outcomes = new Map<string, CallOutcome>();
 		const frame: BridgeFrame = {
 			host,
 			execution,
@@ -719,20 +736,14 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			return run;
 		}
 
-		async function createRun(
-			id: string,
-			agentName: string,
-			call?: { requestId: string; caller: string; detached: boolean; metadata: InvocationMetadata },
-		) {
+		async function createRun(id: string, agentName: string, call?: HostedRun["call"]) {
 			const run = await attach(id, agentName, call);
 			await harness.commit(async (tx) => {
 				(await tx.doc(Runs)).runs[id] ??= {
 					conversationId: run.conversation.id,
 					agent: agentName,
 					children: {},
-					...(call
-						? { call: { requestId: call.requestId, caller: call.caller, detached: call.detached } }
-						: {}),
+					...(call ? { call: { requestId: call.requestId } } : {}),
 				};
 			}, context);
 			return run;
@@ -792,21 +803,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					await cancelRun(harness, run.id, input.reason);
 					await finish(run, undefined);
 					return;
-				}
-				case "cancel": {
-					// Durable records, not hosted runs: a run whose agent is gone is cancelled too.
-					const records = (await harness.snapshot(Runs, context))?.runs ?? {};
-					for (const [id, record] of Object.entries(records)) {
-						if (record.done || record.call?.caller !== input.caller || record.call.detached)
-							continue;
-						await cancelRun(harness, id, input.reason);
-						const run = runs.get(id);
-						if (run) await finish(run, undefined);
-						else
-							await harness.commit(async (tx) => {
-								(await tx.doc(Runs)).runs[id]!.done = true;
-							}, context);
-					}
 				}
 			}
 		}
@@ -1020,18 +1016,15 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			return { settled, queued };
 		}
 
-		/** Settle a run: a call's answer becomes the event its caller waits for. */
-		async function finish(run: HostedRun, result: JsonObject | undefined) {
-			// Emitted before the run is marked done, so a crash in between emits again (deduped by request id).
-			if (run.call && result)
-				await execution.emit(
-					AGENT_SETTLED_EVENT,
-					{ requestId: run.call.requestId, ...result },
-					{ id: run.call.requestId },
-				);
+		/** Settle a run: a call's outcome becomes its Session execution's result. */
+		async function finish(run: HostedRun, outcome: CallOutcome | undefined) {
+			// A call that failed still settles its execution: the caller throws, and nothing retries the run.
 			await harness.commit(async (tx) => {
-				(await tx.doc(Runs)).runs[run.id]!.done = true;
+				const record = (await tx.doc(Runs)).runs[run.id]!;
+				record.done = true;
+				if (run.call && outcome) record.outcome = cloneJson(outcome);
 			}, context);
+			if (run.call && outcome) outcomes.set(run.call.requestId, outcome);
 			runs.delete(run.id);
 			await run.ui?.stop();
 			if (run.io && run.call) await run.io.setStatus(null).catch(() => {});
@@ -1079,7 +1072,12 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			if (complete && !failed && ((await backgroundPending(harness, context)) || (await live())))
 				complete = false;
 			if (complete) {
-				if (failed) return finish(run, { status: "failed", error: `Pi run unanswered: ${failed}` });
+				if (failed)
+					return finish(run, {
+						status: "failed",
+						error: `Pi run unanswered: ${failed}`,
+						executionId: execution.executionId,
+					});
 				answer = (await reportedAnswer(harness, run.id, run.conversation.id, context)) ?? answer;
 				return finish(run, { status: "completed", output: run.call ? (answer ?? "") : null });
 			}
@@ -1142,6 +1140,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			for (const [id, record] of Object.entries(
 				(await harness.snapshot(Runs, context))?.runs ?? {},
 			)) {
+				if (record.call && record.outcome) outcomes.set(record.call.requestId, record.outcome);
 				if (record.done || !record.agent) continue;
 				const invocation = record.call
 					? ((await harness.snapshot(Invocation, record.call.requestId, context)) as
@@ -1163,6 +1162,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		schedule();
 		return {
 			idle,
+			outcomes,
 			async handle(input) {
 				if (settled) missed = true;
 				inflight++;
@@ -1177,6 +1177,18 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				closed = true;
 				signal.removeEventListener("abort", onLost);
 				try {
+					// A cancelled call (its caller was cancelled or failed) stops its Pi run before Pi closes, so no further
+					// model calls happen. Best effort: a call cancelled while suspended runs nothing, and its Session is never
+					// reopened (its workflow tools are cancelled with the Session's execution).
+					if (isCancelled(execution.signal))
+						for (const run of runs.values())
+							if (run.call)
+								await cancelRun(harness, run.id, "Cancelled").catch((error: unknown) =>
+									host.logger.warn("Could not abort a cancelled agent call", {
+										run: run.id,
+										error,
+									}),
+								);
 					await queue;
 					for (const run of runs.values()) await run.ui?.stop();
 				} finally {
@@ -1446,15 +1458,12 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		},
 		async run(execution, id, agent: AgentRef, request) {
 			// A call has its own Session, keyed by the workflow run: it never shares a transcript with a thread's
-			// conversation and never follows a thread.
+			// conversation and never follows a thread. Its Session execution is a child of the caller, so cancelling or
+			// failing the caller cancels it (and the workflows its tools started), unless detached.
 			const metadata = execution.metadata;
 			const key = callSession(execution.executionId, id);
 			const requestId = `${execution.executionId}:${id}`;
-			// Taken before the input is sent, so the answer is never emitted before the wait.
-			const cursor = await execution.cursor(`fabrial:pi:cursor:${id}`);
 			const content = await execution.step(`fabrial:pi:origin:${id}`, async () => {
-				// A cancelled caller finds the Session it may have reached (see `settled`).
-				await options.sql`INSERT INTO fabrial_pi.sessions (key) VALUES (${key}) ON CONFLICT DO NOTHING`;
 				const sections = metadata.origin
 					? await Promise.all(
 							host.plugins.map(async (plugin) =>
@@ -1472,32 +1481,26 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					.filter(Boolean)
 					.join("\n\n");
 			});
-			const input: SessionInput = {
+			const call: SessionInput = {
 				kind: "call",
 				agent: agent.name,
 				requestId,
 				content,
 				metadata: cloneJson({ ...metadata, piSession: key }),
-				caller: execution.executionId,
-				detached: !!request.detached,
 			};
-			await execution.signalWithStart(`fabrial:pi:call:${id}`, {
-				workflow: SESSION_WORKFLOW,
-				key,
-				signal: { name: "input", id: requestId, payload: input as unknown as Json },
-				input: { session: key },
-				metadata: sessionMetadata(key),
-			});
-			const settled = await execution.waitForEvent(`fabrial:pi:settled:${id}`, {
-				event: AGENT_SETTLED_EVENT,
-				filter: { requestId: [requestId] },
-				after: cursor,
-			});
-			if (settled?.payload.status !== "completed") {
-				const error = settled?.payload.error ?? "Agent run did not settle";
-				throw new Error(typeof error === "string" ? error : JSON.stringify(error));
-			}
-			const answer = settled.payload.output ?? null;
+			const outcome = (await execution.invoke(
+				`fabrial:pi:call:${id}`,
+				SESSION_WORKFLOW,
+				{ session: key, call } as unknown as Json,
+				{
+					metadata: sessionMetadata(key),
+					detached: !!request.detached,
+					...(request.timeout !== undefined ? { timeoutMs: duration(request.timeout) } : {}),
+				},
+			)) as unknown as CallOutcome;
+			if (outcome.status !== "completed")
+				throw new ExecutionError(outcome.executionId, { status: "failed", error: outcome.error });
+			const answer = outcome.output ?? null;
 			if (!request.output) return answer;
 			return execution.step(`fabrial:pi:output:${id}`, async () =>
 				parseSchema(
@@ -1506,19 +1509,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					`agent ${agent.name} output`,
 				),
 			);
-		},
-		async settled(executionId, metadata, result) {
-			if (result.status !== "cancelled") return;
-			// A cancelled caller cancels its calls (unless detached) in the Sessions they reached.
-			const known = await options.sql<{ key: string }[]>`SELECT key FROM fabrial_pi.sessions
-				WHERE starts_with(key, ${callSession(executionId, "")})`;
-			for (const { key } of known)
-				await signalSession(
-					key,
-					`fabrial.cancel:${executionId}`,
-					{ kind: "cancel", caller: executionId, reason: result.reason },
-					metadata,
-				);
 		},
 	};
 	const state: StatePort = {

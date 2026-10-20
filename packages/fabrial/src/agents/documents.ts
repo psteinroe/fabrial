@@ -137,10 +137,14 @@ export const Runs = defineDoc({
 				conversationId: number;
 				/** The agent whose conversation runs; missing on runs of the removed per-request drivers. */
 				agent?: string;
-				/** A `ctx.agent` call: its request, the calling execution, and whether it outlives it. */
-				call?: { requestId: string; caller: string; detached: boolean };
-				/** Settled: its call's answer was emitted, or it was cancelled. */
+				/** A `ctx.agent` call: its request. The call's Session execution is a child of the caller. */
+				call?: { requestId: string };
+				/** Settled: answered, failed, or stopped. */
 				done?: boolean;
+				/** A settled call's outcome: its Session execution's result. */
+				outcome?:
+					| { status: "completed"; output: Json }
+					| { status: "failed"; error: string; executionId: string };
 				children: Record<string, { executionId: string; detached: boolean }>;
 				intents?: string[];
 				/** Error ids of failed runs, by the request whose thread got the error reply; assigned once. */

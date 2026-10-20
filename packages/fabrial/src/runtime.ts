@@ -31,7 +31,7 @@ export type DurationInput = string | number;
  * Opaque, durable position in the event stream (Conductor item 1). Events emitted after a cursor satisfy
  * waits that pass it as `after`, even if they were emitted before the wait registered. Every consumed
  * event returns its own cursor, so successive waits can continue exactly after the last consumed event.
- * PHASE2(task 11): only the `ctx.agent` settlement wait still uses cursors.
+ * PHASE2(task 12): no Fabrial code uses cursors since `ctx.agent` became a child execution; only adapter tests do.
  */
 export type EventCursor = string;
 
@@ -61,6 +61,27 @@ export type ExecutionResult =
 	| { status: "failed"; error: string }
 	| { status: "cancelled"; reason: string };
 
+/** The abort reason of a cancelled execution's `signal` (Conductor's). */
+const CANCELLED = "cancelled";
+
+/** True when an execution's `signal` aborted because the execution was cancelled, not because its attempt ended. */
+export function isCancelled(signal: AbortSignal): boolean {
+	return (
+		signal.aborted && (signal.reason as { reason?: unknown } | undefined)?.reason === CANCELLED
+	);
+}
+
+/** A child terminal failure, distinguishable from ordinary handler failures. */
+export class ExecutionError extends Error {
+	constructor(
+		readonly executionId: string,
+		readonly result: Exclude<ExecutionResult, { status: "completed" }>,
+	) {
+		super(result.status === "cancelled" ? result.reason : result.error);
+		this.name = "ExecutionError";
+	}
+}
+
 /**
  * Data sent to one execution (Conductor item 12). `id` dedupes: sending an id to an execution again stores
  * it once. Delivery is at least once per id, so handlers must be idempotent by `id`.
@@ -89,7 +110,10 @@ export interface DurableExecution {
 	readonly executionId: string;
 	readonly workflow: string;
 	readonly metadata: InvocationMetadata;
-	/** Aborted on cancellation (cooperative; checked at the next durable operation). */
+	/**
+	 * Aborted on cancellation (cooperative; checked at the next durable operation), and when the attempt ends
+	 * otherwise (shutdown, suspension). `isCancelled(signal)` tells a cancellation apart.
+	 */
 	readonly signal: AbortSignal;
 	/**
 	 * Operation ids: core reserves the `fabrial:` prefix for framework operations and the `#` character for
@@ -103,7 +127,7 @@ export interface DurableExecution {
 	/**
 	 * Wait for one matching event emitted after `after` (or after registration when omitted), until the
 	 * absolute `deadline` (epoch ms). Returns null on timeout (Conductor item 1).
-	 * PHASE2(task 11): only the `ctx.agent` settlement wait uses it; everything else subscribes.
+	 * PHASE2(task 12): unused by Fabrial (adapter tests only); everything subscribes.
 	 */
 	waitForEvent(
 		id: string,
@@ -219,8 +243,6 @@ export interface RuntimeEvent {
 
 /** Event emitted by core when any Fabrial execution reaches a terminal state. */
 export const EXECUTION_SETTLED_EVENT = "fabrial.execution.settled";
-/** Emitted by an agent Session when a `ctx.agent` call's run settles; `requestId` names the call. */
-export const AGENT_SETTLED_EVENT = "fabrial.agent.settled";
 
 export interface DurableRuntime {
 	/** Optional clock, primarily for deterministic tests. Defaults to Date.now in core. */
@@ -319,8 +341,10 @@ export interface ChatPort {
 
 export interface AgentRunOptions {
 	input: Json;
-	/** Let the agent execution survive cancellation of its caller. */
+	/** Let the agent execution survive cancellation of its caller (and a timeout). */
 	detached?: boolean;
+	/** Stop waiting after this long; an attached call is cancelled, a detached one keeps running. */
+	timeout?: DurationInput;
 	/** Standard Schema for a typed structured result. */
 	output?: unknown;
 }
@@ -342,12 +366,6 @@ export interface AgentPort {
 		agent: AgentRef,
 		request: import("./send.ts").SendRequest,
 	): Promise<import("./send.ts").SendReceipt>;
-	/** Called for every terminal settlement: a cancelled caller cancels its calls. */
-	settled?(
-		executionId: string,
-		metadata: InvocationMetadata,
-		result: ExecutionResult,
-	): Promise<void>;
 	/** Deliver input from ingress, outside any execution: `signalWithStart` to the conversation's Session. */
 	deliver?(
 		agent: AgentRef,

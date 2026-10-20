@@ -20,7 +20,7 @@ import {
 	type ThreadRef,
 } from "../../../src/index.ts";
 import { toolName } from "../../../src/agent.ts";
-import { pi, PostgresStorage } from "../../../src/agents/index.ts";
+import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { conductor } from "../../../src/runtime/conductor/index.ts";
 import { FakeChat, testApp } from "../../../src/testing.ts";
 
@@ -175,10 +175,12 @@ const thread = (): ThreadRef => ({
 	threadId: randomUUID(),
 });
 
-/** Session executions: how many exist and how many run (are locked by a worker) now. */
+/** Session executions: how many exist, how many run (are locked by a worker) now, and which ended (returned or failed). */
 async function sessionExecutions() {
+	// A cancelled execution fails: it never completes.
 	const rows = await sql<{ id: string; running: boolean; done: boolean }[]>`
-		select id, locked_by is not null as running, completed_at is not null as done
+		select id, locked_by is not null as running,
+			completed_at is not null or failed_at is not null as done
 		from pgconductor._private_executions where task_key = ${SESSION}`;
 	return rows;
 }
@@ -219,12 +221,18 @@ async function only(): Promise<string> {
 	expect(rows).toHaveLength(1);
 	return rows[0]!.key;
 }
-/** Every Session execution has returned, and the Session's lease is free. */
+/** Every Session execution has ended, and the Session's lease is free. */
 async function released(key: string) {
 	await expect
 		.poll(async () => (await sessionExecutions()).every((row) => row.done), poll)
 		.toBe(true);
 	expect(await lease(key)).toBeNull();
+}
+
+/** No model request arrives for a while after a settlement: there are still `count`. */
+async function quiet(count: number) {
+	await new Promise((resolve) => setTimeout(resolve, 1_000));
+	expect(requests).toHaveLength(count);
 }
 
 /** The Session's execution suspended on its tools and inputs: it has not ended, and the lease is free. */
@@ -357,7 +365,7 @@ it("a message is answered while only a background child works; the child's repor
 });
 
 for (const from of ["the same", "another"] as const)
-	it(`cancelling a ctx.agent caller on ${from} instance aborts the run in Pi and settles the call cancelled`, async () => {
+	it(`cancelling a ctx.agent caller on ${from} instance cancels the call and aborts its model call`, async () => {
 		const lead = f.defineAgent({ name: `lead-${short()}`, description: "Answers.", model });
 		const ask = f.defineWorkflow({
 			name: `ask-${short()}`,
@@ -365,10 +373,8 @@ for (const from of ["the same", "another"] as const)
 			run: (input, ctx) => ctx.agent("answer", lead, { input }),
 		});
 		const held = gate();
-		let aborted = false;
 		script = async ({ signal }) => {
 			await held.pass(signal);
-			aborted = !!signal?.aborted;
 			return say("too late");
 		};
 		const a = await launch("a", [ask]);
@@ -377,11 +383,15 @@ for (const from of ["the same", "another"] as const)
 		await held.entered;
 		const canceller = from === "another" ? (await launch("b", [ask])).runtime : a.runtime;
 		await canceller.cancel(caller, "user cancelled");
-		await expect.poll(() => aborted, poll).toBe(true);
 		await expect.poll(() => execution(caller), poll).toMatchObject({ cancelled: true });
-		await released(metadata.interactionId);
+		// The call's Session execution is the caller's child: cancelled with it, it aborts the held model call.
+		const [call] = await sessionExecutions();
+		await expect.poll(() => execution(call!.id), poll).toMatchObject({ cancelled: true });
+		await expect.poll(() => requests[0]!.signal?.aborted, poll).toBe(true);
+		await released(callSession(caller, "answer"));
+		await quiet(1);
 		expect(requests.map((request) => request.instance)).toEqual(["a"]);
-		// The run is done: a later call in the Session gets a fresh run and answers.
+		// A later call of the same interaction runs in its own Session and answers.
 		script = () => say("fresh");
 		const next = await a.runtime.invoke(ask.name, "Again", { metadata });
 		await expect.poll(() => execution(next), poll).toMatchObject({ done: true, cancelled: false });
@@ -649,8 +659,44 @@ it("cancelling a run suspended on a workflow tool cancels the tool's execution",
 	await suspended(key);
 	const [tool] = await sql<{ id: string }[]>`
 		select id from pgconductor._private_executions where task_key = ${runSql.name}`;
+	const [session] = await sessionExecutions();
 	await a.runtime.cancel(caller, "User stopped");
+	await expect.poll(() => execution(caller), poll).toMatchObject({ cancelled: true });
+	// The suspended Session execution and its tool's are cancelled natively; nothing reopens the Session.
+	await expect.poll(() => execution(session!.id), poll).toMatchObject({ cancelled: true });
 	await expect.poll(() => execution(tool!.id), poll).toMatchObject({ cancelled: true });
 	await released(key);
-	expect(requests).toHaveLength(1);
+	await quiet(1);
+});
+
+it("a ctx.agent call that times out on a workflow tool fails its caller and cancels the call and the tool", async () => {
+	// A caller fails while its call is pending only through the call's timeout: it runs no code meanwhile.
+	const { runSql } = approvalTool();
+	const lead = f.defineAgent({
+		name: `lead-${short()}`,
+		description: "Runs SQL.",
+		model,
+		tools: [runSql],
+	});
+	const ask = f.defineWorkflow({
+		name: `ask-${short()}`,
+		input: z.string(),
+		retries: { maxAttempts: 1 },
+		run: (input, ctx) => ctx.agent("answer", lead, { input, timeout: "3s" }),
+	});
+	const a = await launch("a", [runSql, ask]);
+	const card = await approvals(a);
+	const caller = await a.runtime.invoke(ask.name, "Fix the row", { metadata: metadataOf() });
+	await expect.poll(() => !!card.action, poll).toBe(true);
+	const key = await only();
+	const [tool] = await sql<{ id: string }[]>`
+		select id from pgconductor._private_executions where task_key = ${runSql.name}`;
+	const [session] = await sessionExecutions();
+	await expect
+		.poll(() => execution(caller), poll)
+		.toMatchObject({ failed: true, cancelled: false });
+	await expect.poll(() => execution(session!.id), poll).toMatchObject({ cancelled: true });
+	await expect.poll(() => execution(tool!.id), poll).toMatchObject({ cancelled: true });
+	await released(key);
+	await quiet(1);
 });
