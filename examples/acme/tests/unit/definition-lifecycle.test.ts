@@ -1,5 +1,5 @@
 import { createFabrial } from "fabrial";
-import { MemoryRuntime, testApp } from "fabrial/testing";
+import { StubRuntime, testApp } from "fabrial/testing";
 import postgres from "postgres";
 import { afterEach, expect, it, vi } from "vitest";
 import { databasePlugin } from "../../src/database.ts";
@@ -29,7 +29,7 @@ it("creates the application pool only on start, closes it on stop, and can resta
 	const options = { max: 2 };
 	const plugin = databasePlugin(url, options);
 	const app = testApp(createFabrial({ plugins: [plugin] }), {
-		runtime: new MemoryRuntime(),
+		runtime: new StubRuntime(),
 		workflows: [],
 	});
 	const client = app.host.clients().database;
@@ -48,7 +48,7 @@ it("creates the application pool only on start, closes it on stop, and can resta
 
 it("defers missing application URL validation until startup", async () => {
 	const app = testApp(createFabrial({ plugins: [databasePlugin(undefined)] }), {
-		runtime: new MemoryRuntime(),
+		runtime: new StubRuntime(),
 		workflows: [],
 	});
 	await expect(app.start()).rejects.toThrow("APP_DATABASE_URL");

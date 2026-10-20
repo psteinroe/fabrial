@@ -1,13 +1,11 @@
 import { createFabrial, trigger, type InvocationMetadata } from "fabrial";
-import { FakeChat, MemoryRuntime, testApp } from "fabrial/testing";
+import { createTestApp } from "fabrial/testing";
 import { expect, it } from "vitest";
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
 // Pi clears the driver's trigger markers for tool children. The real-Pi integration
 // scenarios also assert this metadata and the requester's card in the origin thread.
 it("a tool child retains its response thread without inheriting trigger ownership", async () => {
-	const runtime = new MemoryRuntime();
-	const chat = new FakeChat();
 	const child = defineWorkflow({
 		name: "tool-child",
 		async run(_input, ctx) {
@@ -21,7 +19,10 @@ it("a tool child retains its response thread without inheriting trigger ownershi
 			return null;
 		},
 	});
-	const app = testApp(createFabrial({ plugins: [] }), { runtime, chat, workflows: [owner, child] });
+	const { app, runtime, settled, stop } = createTestApp(createFabrial({ plugins: [] }), {
+		database: process.env.DATABASE_URL!,
+		workflows: [owner, child],
+	});
 	const metadata: InvocationMetadata = {
 		interactionId: "interaction",
 		origin: null,
@@ -33,9 +34,8 @@ it("a tool child retains its response thread without inheriting trigger ownershi
 	try {
 		await app.start();
 		const id = await runtime.invoke(child.name, null, { metadata });
-		await runtime.flush();
-		expect(runtime.result(id)).toEqual({ status: "completed", output: { hasThread: true } });
+		expect(await settled(id)).toEqual({ status: "completed", output: { hasThread: true } });
 	} finally {
-		await app.stop();
+		await stop();
 	}
 });

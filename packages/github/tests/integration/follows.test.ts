@@ -1,6 +1,6 @@
 import { createFabrial, trigger, type JsonObject, type ResourceKind } from "fabrial";
-import { FakeChat, MemoryRuntime, fakeAgents, testApp } from "fabrial/testing";
-import { describe, expect, it, vi } from "vitest";
+import { createTestApp, fakeAgents, StubRuntime, testApp, FakeChat } from "fabrial/testing";
+import { afterEach, describe, expect, inject, it, vi } from "vitest";
 import { github, parsePullRequest, pullRequest } from "../../src/index.ts";
 import { options } from "../helper.ts";
 import { bot, deliver, outsider, webhooks } from "../webhooks.ts";
@@ -16,7 +16,7 @@ const prThread = { kind: "thread", provider: "github", threadId: "github:acme/ap
 
 /** The event a webhook emits. */
 async function emitted(hook: { event: string; payload: unknown }) {
-	const runtime = new MemoryRuntime();
+	const runtime = new StubRuntime();
 	const app = testApp(createFabrial({ plugins: [plugin()] }), {
 		runtime,
 		chat: new FakeChat(),
@@ -111,6 +111,10 @@ describe("pull request resources", () => {
 });
 
 describe("follows in an app", () => {
+	const apps: ReturnType<typeof createTestApp>[] = [];
+	afterEach(async () => {
+		for (const each of apps.splice(0)) await each.stop();
+	});
 	async function setup() {
 		const f = createFabrial({ plugins: [plugin()] });
 		const agent = f.defineAgent({ name: "dev", description: "Answers test questions." });
@@ -133,6 +137,7 @@ describe("follows in an app", () => {
 		});
 		const orphan = f.defineWorkflow({
 			name: "orphan",
+			retries: { maxAttempts: 1 },
 			async run(_input, ctx) {
 				await ctx.follow("watch", pr);
 			},
@@ -156,25 +161,24 @@ describe("follows in an app", () => {
 				observed(input);
 			},
 		});
-		const runtime = new MemoryRuntime();
 		const agents = fakeAgents();
-		const app = testApp(f, {
-			runtime,
-			chat: new FakeChat(),
+		const t = createTestApp(f, {
+			database: inject("fabrialDatabaseUrl" as never) as string,
 			agents,
 			workflows: [watch, unwatch, orphan, owner, sendAndWatch],
 		});
+		apps.push(t);
+		const { app } = t;
 		await app.start();
-		const start = async (workflow: string, input: JsonObject | null = null) => {
-			const id = await runtime.invoke(workflow, input, {
-				metadata: { interactionId: workflow, origin: null, replyTo: null, requestedBy: null },
-			});
-			await runtime.flush();
-			return runtime.result(id)!;
-		};
+		const start = async (workflow: string, input: JsonObject | null = null) =>
+			t.settled(
+				await t.runtime.invoke(workflow, input, {
+					metadata: { interactionId: workflow, origin: null, replyTo: null, requestedBy: null },
+				}),
+			);
 		const send = async (hook: { event: string; payload: unknown }, delivery: string) => {
 			expect((await app.fetch(deliver(hook, delivery))).status).toBe(200);
-			await runtime.flush();
+			await t.idle();
 		};
 		const records = async () =>
 			(await (await app.host.chat()!.thread(prThread as never)).getState())?.resourceFollows;

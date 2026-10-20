@@ -1,8 +1,8 @@
 import { createHmac } from "node:crypto";
 import { GitHubAdapter } from "@chat-adapter/github";
-import { createFabrial, type WorkflowContext } from "fabrial";
-import { FakeChat, MemoryRuntime, testApp } from "fabrial/testing";
-import { describe, expect, it, vi } from "vitest";
+import { createFabrial, definePlugin, type WorkflowContext } from "fabrial";
+import { createTestApp, FakeChat } from "fabrial/testing";
+import { describe, expect, inject, it, vi } from "vitest";
 import { github, pullRequestOpened, issueOpened } from "../../src/index.ts";
 import { alice, options, repository, request } from "../helper.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
@@ -22,13 +22,26 @@ const payload = (event: string, action = "opened") => ({
 	[event === "issues" ? "issue" : "pull_request"]: conversation,
 });
 
+/** Every attempt of an app workflow, with its invocation metadata. */
+const executions: { workflow: string; metadata: unknown }[] = [];
+const recorder = definePlugin({
+	id: "recorder",
+	hooks: {
+		workflow: [
+			async (execution, ctx, next) => {
+				executions.push(execution);
+				return next(ctx);
+			},
+		],
+	},
+});
+
 describe("GitHub lifecycle webhooks", () => {
 	it.each(["pull_request", "issues"])(
 		"ingests %s with dedupe, origin, actor, thread and observers",
 		async (event) => {
 			const plugin = github(options);
 			vi.spyOn(plugin.identity!, "lookup").mockResolvedValue({ name: "Alice" });
-			const runtime = new MemoryRuntime();
 			const chat = new FakeChat();
 			const trigger = event === "issues" ? issueOpened : pullRequestOpened;
 			const run = vi.fn(async (_input: unknown, ctx: WorkflowContext) => {
@@ -37,8 +50,8 @@ describe("GitHub lifecycle webhooks", () => {
 			const observer = vi.fn(async (_input: unknown, ctx: WorkflowContext) => {
 				expect(ctx.thread).toBeUndefined();
 			});
-			const app = testApp(createFabrial({ plugins: [plugin] }), {
-				runtime,
+			const { app, idle, stop } = createTestApp(createFabrial({ plugins: [plugin, recorder] }), {
+				database: inject("fabrialDatabaseUrl" as never) as string,
 				chat,
 				workflows: [
 					defineWorkflow({ name: "owner", triggers: [trigger({ repo: "acme/app" })], run }),
@@ -57,16 +70,18 @@ describe("GitHub lifecycle webhooks", () => {
 				};
 				expect((await app.fetch(make())).status).toBe(200);
 				expect((await app.fetch(make())).status).toBe(200);
-				await runtime.flush();
+				await idle();
 				expect(run).toHaveBeenCalledTimes(1);
 				expect(observer).toHaveBeenCalledTimes(1);
 				const threadId = event === "issues" ? "github:acme/app:issue:5" : "github:acme/app:5";
-				expect(runtime.emitted.filter((entry) => entry.name.startsWith("github."))).toHaveLength(1);
-				expect(runtime.emitted[0]).toMatchObject({
-					name: `github.${event === "issues" ? "issueOpened" : "pullRequestOpened"}`,
-					payload: { repo: "acme/app", number: 5, authorId: "1", authorLogin: "alice", threadId },
+				expect(run.mock.calls[0]![0]).toMatchObject({
+					repo: "acme/app",
+					number: 5,
+					authorId: "1",
+					authorLogin: "alice",
+					threadId,
 				});
-				expect(runtime.executions("owner")[0]!.metadata).toMatchObject({
+				expect(executions.findLast((each) => each.workflow === "owner")!.metadata).toMatchObject({
 					origin: {
 						provider: "github",
 						installationId: "default",
@@ -80,7 +95,7 @@ describe("GitHub lifecycle webhooks", () => {
 					},
 				});
 			} finally {
-				await app.stop();
+				await stop();
 			}
 		},
 	);

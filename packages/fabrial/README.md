@@ -164,37 +164,25 @@ Runtimes must provide race-safe correlated event retention: a click or presentat
 
 ## Testing
 
-`fabrial/testing` has two levels. `createTestApp` runs workflows in memory, without models or a database:
+`fabrial/testing` runs apps on real Conductor; there is no in-memory engine. Tests need a Postgres: start one per test run in Vitest's `globalSetup` (e.g. `new PostgreSqlContainer("postgres:17").start()` from `@testcontainers/postgresql`, passed on with `project.provide`) or point at an existing database URL. Apps share the database; each test app runs on a queue of its own. `createTestApp` runs workflows with fake chat and agents, without models:
 
 ```ts
-import { createFabrial, trigger } from "fabrial";
 import { createTestApp } from "fabrial/testing";
 
-const f = createFabrial({ plugins: [] });
-const workflow = f.defineWorkflow({
-	name: "hello",
-	triggers: [trigger({ event: "demo.hello" })],
-	async run(_input, ctx) {
-		await ctx.sleep("pause", "1h");
-		return "hello";
-	},
-});
-const { app, runtime, chat } = createTestApp(f, {
-	now: new Date("2026-01-05T00:00:00Z"),
-	workflows: [workflow],
+const { app, chat, runtime, clock, settled, idle, stop } = createTestApp(f, {
+	database: process.env.DATABASE_URL!,
+	workflows: [hello],
 });
 await app.start();
-await app.emit("demo.hello", {}, { id: "one" });
-await runtime.flush(); // runs handlers until all are settled or suspended
-await runtime.advanceBy(3_600_000);
-console.log(runtime.executions("hello")[0]?.result);
-await app.stop();
+const id = await runtime.invoke("hello", {}, { metadata });
+console.log(await settled(id)); // { status: "completed", output: … }
+await stop();
 ```
 
-- `createTestApp(f, { workflows, now?, agents? })`: isolated app with a memory runtime, fake chat, and fake agents. Spy on `app.host.clients()` or its client methods for fakes.
-- `MemoryRuntime`: `flush`, `advanceBy`, `now`, `executions`, `result`, `stepIds`, and inspectable `emitted`. Replays handlers from the top, memoizes receipts, queues children, propagates structured cancellation, supports detached invokes/independent starts, timers, event races, workflow concurrency, mutexes, emit dedupe, and settlement-hook redelivery. Event retention starts at execution creation; stale events predating the execution are excluded, and each event is delivered at most once per execution. Cron schedules are registered but not automatically driven; invoke scheduled workflows explicitly in tests.
-- `FakeChat`: inspect `threads`, their `posts`/`updates`/`messages`/`statuses`, and `ephemeral`. `receive(message, { events, dedupeId })`, `click(receipt, actionId, identity)`, and `cancel(thread, identity)` go through the host. Channel locators are genuinely provisional until posted. State expiry uses the injected clock. Atomic updates and cloned state preserve optional routing fields, idle tombstones, and reservation timestamps just like the live port.
-- `fakeAgents({ run?, evaluate?, state?, workflows? })`: injectable ports, default durable echo agent and empty classifier, and schema-checked in-memory state exposed as `values`.
+- `createTestApp(f, { database, workflows, agents?, routedAgents?, chat? })`: an app on Conductor with a `FakeChat` and `fakeAgents()`, fast polling, and one connection. `settled(id)` waits for an execution's outcome and `result(id)` reads it; `idle()` waits until every emitted event was dispatched and every execution of the app settled, for asserting that something did not happen. `clock` is Conductor's test clock: `clock.set(date)` freezes the app's time and `clock.advance(ms)` moves it; advance only after the wait it should end is registered. `stop()` stops the app and closes its connection. Spy on `app.host.clients()` or its client methods for fakes.
+- `FakeChat`: inspectable threads, posts, DMs, and ephemeral notices, with `receive`, `click`, and `cancel` for ingress.
+- `StubRuntime`: a runtime port for unit tests that run no workflow; it records registrations and emitted events.
+- `testApp(f, { runtime, chat?, agents?, workflows })`: an app on explicit ports.
 
 `createIntegrationApp(f, { workflows, models, logger? })` runs the real runtime, agents, and chat against the instance's `database` (e.g. Postgres from testcontainers) with scripted models instead of credentials:
 

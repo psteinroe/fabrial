@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
-import { createFabrial, type WorkflowContext } from "fabrial";
-import { FakeChat, MemoryRuntime, testApp } from "fabrial/testing";
-import { describe, expect, it, vi } from "vitest";
+import { createFabrial, definePlugin, type WorkflowContext } from "fabrial";
+import { createTestApp, FakeChat } from "fabrial/testing";
+import { describe, expect, inject, it, vi } from "vitest";
 import { linear, issueCreated, issueUpdated } from "../../src/index.ts";
 import { options, request } from "../helper.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
@@ -25,20 +25,33 @@ const payload = (action = "create") => ({
 	updatedFrom: action === "update" ? { title: "Old title" } : {},
 });
 
+/** Every attempt of an app workflow, with its invocation metadata. */
+const executions: { workflow: string; metadata: unknown }[] = [];
+const recorder = definePlugin({
+	id: "recorder",
+	hooks: {
+		workflow: [
+			async (execution, ctx, next) => {
+				executions.push(execution);
+				return next(ctx);
+			},
+		],
+	},
+});
+
 describe("Linear lifecycle webhooks", () => {
 	it.each(["create", "update"])(
 		"ingests %s with origin, actor, reply destination and durable dedupe",
 		async (action) => {
 			const plugin = linear(options);
 			vi.spyOn(plugin.identity!, "lookup").mockResolvedValue({ name: "Alice" });
-			const runtime = new MemoryRuntime();
 			const chat = new FakeChat();
 			const trigger = action === "create" ? issueCreated : issueUpdated;
 			const run = vi.fn(async (_input: unknown, ctx: WorkflowContext) => {
 				await ctx.thread!.post("reply", "Thanks!");
 			});
-			const app = testApp(createFabrial({ plugins: [plugin] }), {
-				runtime,
+			const { app, idle, stop } = createTestApp(createFabrial({ plugins: [plugin, recorder] }), {
+				database: inject("fabrialDatabaseUrl" as never) as string,
 				chat,
 				workflows: [
 					defineWorkflow({
@@ -54,20 +67,16 @@ describe("Linear lifecycle webhooks", () => {
 					new Request("https://example.com/linear/webhook", request(payload(action)));
 				expect((await app.fetch(make())).status).toBe(200);
 				expect((await app.fetch(make())).status).toBe(200);
-				await runtime.flush();
+				await idle();
 				expect(run).toHaveBeenCalledTimes(1);
-				expect(runtime.emitted.filter((entry) => entry.name.startsWith("linear."))).toHaveLength(1);
-				expect(runtime.emitted[0]).toMatchObject({
-					name: `linear.${action === "create" ? "issueCreated" : "issueUpdated"}`,
-					payload: {
-						issueId: "issue",
-						teamKey: "ENG",
-						stateType: "started",
-						threadId: "linear:issue",
-						updatedFrom: action === "update" ? { title: "Old title" } : {},
-					},
+				expect(run.mock.calls[0]![0]).toMatchObject({
+					issueId: "issue",
+					teamKey: "ENG",
+					stateType: "started",
+					threadId: "linear:issue",
+					updatedFrom: action === "update" ? { title: "Old title" } : {},
 				});
-				expect(runtime.executions("owner")[0]!.metadata).toMatchObject({
+				expect(executions.findLast((each) => each.workflow === "owner")!.metadata).toMatchObject({
 					origin: {
 						provider: "linear",
 						installationId: "org",
@@ -87,7 +96,7 @@ describe("Linear lifecycle webhooks", () => {
 					},
 				});
 			} finally {
-				await app.stop();
+				await stop();
 			}
 		},
 	);

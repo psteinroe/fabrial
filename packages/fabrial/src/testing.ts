@@ -11,7 +11,7 @@ import type { AgentIntegration, ChatIntegration, FabrialHost } from "./app.ts";
 import type { Evaluator } from "./evaluate.ts";
 import type { ExternalIdentity } from "./identity.ts";
 import { identityKey } from "./directory.ts";
-import { matchesFilter, THREAD_TTL } from "./internal.ts";
+import { THREAD_TTL } from "./internal.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type {
 	AgentPort,
@@ -21,14 +21,10 @@ import type {
 	ExecutionResult,
 	InvocationMetadata,
 	RuntimeEvent,
-	RuntimeSignal,
 	RuntimeWorkflow,
-	SignalWithStartOptions,
 	StatePort,
 	ThreadIO,
 	ThreadRoutingState,
-	WaitBranch,
-	WaitForAnyResult,
 } from "./runtime.ts";
 import { conversationReference } from "./send.ts";
 import { parseSchema } from "./schema.ts";
@@ -36,598 +32,49 @@ import type { ChatMessage, MessageRef, OutboundMessage, Surface, ThreadRef } fro
 
 /** Conductor's test clock; pass it as `conductor(..., { clock })` over a single-connection pool. */
 export { createTestClock, type TestClock } from "pgconductor-js/testing";
+import { createTestClock, type TestClock } from "pgconductor-js/testing";
+import { Conductor, TaskSchemas } from "pgconductor-js";
+import postgres from "postgres";
+import { conductor } from "./runtime/conductor/index.ts";
 
 const clone = <T>(value: T): T => structuredClone(value);
-class Suspension extends Error {}
-class Cancellation extends Error {}
-interface RecordedEvent {
-	name: string;
-	payload: JsonObject;
-	sequence: number;
-	time: number;
-}
-interface Run {
-	id: string;
-	workflow: RuntimeWorkflow;
-	input: Json;
-	metadata: InvocationMetadata;
-	controller: AbortController;
-	cache: Map<string, unknown>;
-	waits: Map<string, { branches: Record<string, WaitBranch>; sequence: number }>;
-	children: Set<string>;
-	attempts: number;
-	status: "pending" | "running" | "suspended" | "settled";
-	result?: ExecutionResult;
-	settledAt?: number;
-	mutex?: string;
-	/** Set by signalWithStart; held in `keys` until settlement. */
-	key?: string;
-	signals: (RuntimeSignal & { delivered: boolean })[];
-	inbox?: Inbox;
-}
-type SignalHandler = (payload: Json, info: { id: string }) => Promise<void> | void;
 
-/** Delivers one attempt's signals to its handlers, one at a time in stored order (Conductor's SignalInbox). */
-class Inbox {
-	readonly handlers = new Map<string, SignalHandler>();
-	failure?: Error;
-	private pumping?: Promise<void>;
-	private closed = false;
-	constructor(private readonly run: Run) {}
-	listen(name: string, handler: SignalHandler): void {
-		if (this.closed)
-			throw new Error(`Cannot listen for signal "${name}" after the handler returned`);
-		if (this.handlers.has(name))
-			throw new Error(`A handler for signal "${name}" is already registered`);
-		this.handlers.set(name, handler);
-		this.pump();
-	}
-	/** Undelivered signals this attempt listens for. */
-	pending(): boolean {
-		return this.run.signals.some((signal) => !signal.delivered && this.handlers.has(signal.name));
-	}
-	pump(): void {
-		if (this.pumping || this.closed || !this.pending()) return;
-		this.pumping = (async () => {
-			let signal;
-			while (
-				!this.closed &&
-				(signal = this.run.signals.find((s) => !s.delivered && this.handlers.has(s.name)))
-			) {
-				try {
-					await this.handlers.get(signal.name)!(clone(signal.payload), { id: signal.id });
-				} catch (error) {
-					this.failure ??= new Error(
-						`Signal handler for "${signal.name}" failed: ${error instanceof Error ? error.message : String(error)}`,
-					);
-					this.closed = true;
-					return;
-				}
-				signal.delivered = true;
-			}
-		})().finally(() => {
-			this.pumping = undefined;
-			this.pump();
-		});
-	}
-	/** Stop delivering after the running handler returns. */
-	async close(): Promise<void> {
-		this.closed = true;
-		await this.pumping;
-	}
-}
-
-/** Replaying, in-memory port implementation. Emit/invoke enqueue work; await flush() to run until idle,
- * and advanceBy(ms) to drive timers. No wall-clock timers or database are used. */
-export class MemoryRuntime implements DurableRuntime {
+/**
+ * A runtime port for unit tests that never run a workflow: it records registrations and emitted events
+ * and keeps the time. Starting work (`invoke`, `signal`, …) throws.
+ */
+export class StubRuntime implements DurableRuntime {
 	readonly workflows = new Map<string, RuntimeWorkflow>();
-	readonly events = new Map<string, RuntimeEvent>();
-	readonly emitted: RecordedEvent[] = [];
-	private readonly runs = new Map<string, Run>();
-	private readonly emitKeys = new Set<string>();
-	private readonly invocationKeys = new Map<string, string>();
-	private readonly mutexes = new Map<string, string>();
-	/** (workflow, key) → its non-terminal execution. */
-	private readonly keys = new Map<string, string>();
-	private readonly queue = new Set<string>();
-	private readonly settlements = new Set<string>();
-	/** Settlement hooks started while a batch runs: like Conductor, they don't wait for running executions. */
-	private readonly hooks = new Set<Promise<void>>();
-	/** Wakes a drain waiting for running executions when work is queued. */
-	private wake: (() => void) | undefined;
-	private hookFailure: unknown;
-	private enqueue(id: string): void {
-		this.queue.add(id);
-		this.wake?.();
-	}
-	private clock: number;
-	private nextId = 1;
-	private flushing?: Promise<void>;
-	private active = false;
-	private readonly idPrefix: string;
-	/** `idPrefix` keeps execution ids unique across runtimes that share a database. */
-	constructor(options: { now?: number | Date; idPrefix?: string } = {}) {
-		this.idPrefix = options.idPrefix ?? "execution";
-		this.clock =
-			options.now instanceof Date
-				? options.now.getTime()
-				: (options.now ?? Date.parse("2026-01-05T00:00:00Z"));
-	}
+	readonly events: RuntimeEvent[] = [];
+	readonly emitted: { name: string; payload: JsonObject; metadata: InvocationMetadata }[] = [];
+	constructor(public time = Date.now()) {}
 	now(): number {
-		return this.clock;
+		return this.time;
 	}
 	register(definition: { workflows: RuntimeWorkflow[]; events: RuntimeEvent[] }): void {
-		for (const workflow of definition.workflows) {
-			if (
-				workflow.concurrency !== undefined &&
-				(!Number.isInteger(workflow.concurrency) || workflow.concurrency < 1)
-			)
-				throw new Error("Workflow concurrency must be a positive integer");
-			if (this.workflows.has(workflow.name))
-				throw new Error(`Duplicate workflow: ${workflow.name}`);
-			this.workflows.set(workflow.name, workflow);
-		}
-		for (const event of definition.events) this.events.set(event.name, event);
+		for (const workflow of definition.workflows) this.workflows.set(workflow.name, workflow);
+		this.events.push(...definition.events);
 	}
-	async start(): Promise<void> {
-		this.active = true;
-	}
-	async stop(): Promise<void> {
-		await this.flushing;
-		this.active = false;
-	}
+	async start(): Promise<void> {}
+	async stop(): Promise<void> {}
 	async emit(
 		name: string,
 		payload: JsonObject,
 		options: Parameters<DurableRuntime["emit"]>[2],
 	): Promise<void> {
-		const key = options.id === undefined ? undefined : JSON.stringify([name, options.id]);
-		if (key && this.emitKeys.has(key)) return;
-		if (key) this.emitKeys.add(key);
-		this.emitted.push({
-			name,
-			payload: clone(payload),
-			sequence: this.emitted.length,
-			time: this.clock,
-		});
-		for (const run of this.runs.values())
-			if (
-				(run.status === "suspended" || run.status === "running") &&
-				[...run.waits.values()].some((wait) =>
-					Object.values(wait.branches).some(
-						(branch) =>
-							branch.kind === "event" &&
-							branch.event === name &&
-							matchesFilter(payload, branch.filter),
-					),
-				)
-			)
-				this.enqueue(run.id);
-		for (const workflow of this.workflows.values()) {
-			const matching = workflow.triggers.filter(
-				(t) =>
-					t.event === name &&
-					matchesFilter(payload, t.filter) &&
-					(t.role === "observer" || workflow.name === options.owner),
-			);
-			if (!matching.length) continue;
-			if (
-				options.dispatchOwner?.workflow === workflow.name &&
-				(options.dispatchOwner.event !== name || options.owner !== workflow.name)
-			)
-				continue;
-			const owns = matching.some((t) => t.role === "owner" && workflow.name === options.owner);
-			await this.invoke(workflow.name, payload, {
-				metadata: {
-					...options.metadata,
-					replyTo: owns ? options.metadata.replyTo : null,
-				},
-				dedupeKey: options.dispatchId
-					? `dispatch:${options.dispatchId}:${workflow.name}`
-					: undefined,
-			});
-		}
+		this.emitted.push(clone({ name, payload, metadata: options.metadata }));
 	}
-	async invoke(
-		workflow: string,
-		input: Json,
-		options: { metadata: InvocationMetadata; dedupeKey?: string },
-	): Promise<string> {
-		return this.create(workflow, input, options);
+	invoke(): never {
+		throw new Error("StubRuntime runs no workflows");
 	}
-	/** Synchronous, so that signalWithStart's lookup and start are atomic. */
-	private create(
-		workflow: string,
-		input: Json,
-		options: { metadata: InvocationMetadata; dedupeKey?: string; key?: string },
-	): string {
-		const invocationKey =
-			options.dedupeKey === undefined ? undefined : JSON.stringify([workflow, options.dedupeKey]);
-		if (invocationKey !== undefined && this.invocationKeys.has(invocationKey))
-			return this.invocationKeys.get(invocationKey)!;
-		const definition = this.workflows.get(workflow);
-		if (!definition) throw new Error(`Unknown workflow: ${workflow}`);
-		const id = `${this.idPrefix}-${this.nextId++}`;
-		const run: Run = {
-			id,
-			workflow: definition,
-			input: clone(input),
-			metadata: clone(options.metadata),
-			controller: new AbortController(),
-			cache: new Map(),
-			waits: new Map(),
-			children: new Set(),
-			attempts: 0,
-			status: "pending",
-			key: options.key,
-			signals: [],
-		};
-		// Like Conductor, keyed starts ignore the workflow mutex: the key serializes them.
-		if (options.key === undefined) run.mutex = definition.mutex?.(input, options.metadata);
-		this.runs.set(id, run);
-		this.enqueue(id);
-		if (invocationKey !== undefined) this.invocationKeys.set(invocationKey, id);
-		return id;
+	cancel(): never {
+		throw new Error("StubRuntime runs no workflows");
 	}
-	async cancel(id: string, reason = "Cancelled"): Promise<boolean> {
-		const run = this.runs.get(id);
-		if (!run || run.result) return false;
-		run.controller.abort(reason);
-		for (const child of run.children) await this.cancel(child, reason);
-		if (run.status !== "running") await this.settle(run, { status: "cancelled", reason });
-		return true;
+	signalWithStart(): never {
+		throw new Error("StubRuntime runs no workflows");
 	}
-	async signal(executionId: string, signal: RuntimeSignal): Promise<boolean> {
-		const run = this.runs.get(executionId);
-		if (!run || run.result) return false;
-		this.store(run, signal);
-		return true;
-	}
-	async signalWithStart(
-		options: SignalWithStartOptions & { metadata: InvocationMetadata },
-	): Promise<string> {
-		if (!options.key.trim()) throw new Error("signalWithStart requires a non-empty key");
-		if (!this.workflows.has(options.workflow))
-			throw new Error(`Unknown workflow: ${options.workflow}`);
-		const key = JSON.stringify([options.workflow, options.key]);
-		let id = this.keys.get(key);
-		if (id === undefined) {
-			id = this.create(options.workflow, options.input ?? null, {
-				metadata: options.metadata,
-				key: options.key,
-			});
-			this.keys.set(key, id);
-		}
-		this.store(this.runs.get(id)!, options.signal);
-		return id;
-	}
-	private store(run: Run, signal: RuntimeSignal): void {
-		if (run.signals.some((stored) => stored.id === signal.id)) return;
-		run.signals.push({ ...clone(signal), delivered: false });
-		if (run.status === "running") run.inbox?.pump();
-	}
-	/** Signals stored for an execution, in delivery order. */
-	signals(executionId: string): (RuntimeSignal & { delivered: boolean })[] {
-		return clone(this.runs.get(executionId)?.signals ?? []);
-	}
-	result(id: string): ExecutionResult | undefined {
-		return clone(this.runs.get(id)?.result);
-	}
-	executions(workflow?: string): {
-		executionId: string;
-		workflow: string;
-		status: Run["status"];
-		metadata: InvocationMetadata;
-		result?: ExecutionResult;
-	}[] {
-		return [...this.runs.values()]
-			.filter((r) => !workflow || r.workflow.name === workflow)
-			.map((r) => ({
-				executionId: r.id,
-				workflow: r.workflow.name,
-				status: r.status,
-				metadata: clone(r.metadata),
-				result: clone(r.result),
-			}));
-	}
-	stepIds(id: string): string[] {
-		return [...(this.runs.get(id)?.cache.keys() ?? [])];
-	}
-	async advanceBy(ms: number): Promise<void> {
-		if (ms < 0 || !Number.isFinite(ms))
-			throw new Error("Clock must advance by a finite nonnegative duration");
-		this.clock += ms;
-		for (const run of this.runs.values())
-			if (
-				(run.status === "suspended" || run.status === "running") &&
-				[...run.waits.values()].some((wait) =>
-					Object.values(wait.branches).some(
-						(branch) => branch.kind === "timer" && branch.at <= this.clock,
-					),
-				)
-			)
-				this.enqueue(run.id);
-		await this.flush();
-	}
-	async flush(): Promise<void> {
-		if (this.flushing) return this.flushing;
-		if (!this.active) return;
-		this.flushing = this.drain();
-		try {
-			await this.flushing;
-		} finally {
-			this.flushing = undefined;
-		}
-	}
-	/** Runs queued executions as they become runnable, without waiting for the ones already running (like workers). */
-	private async drain() {
-		const running = new Map<string, Promise<void>>();
-		const concurrency = new Map<string, number>();
-		for (;;) {
-			if (this.hookFailure !== undefined) {
-				const failure = this.hookFailure;
-				this.hookFailure = undefined;
-				throw failure;
-			}
-			for (const id of this.settlements) {
-				const run = this.runs.get(id)!;
-				await run.workflow.onSettled?.(id, clone(run.metadata), clone(run.result!));
-				this.settlements.delete(id);
-			}
-			for (const id of this.queue) {
-				const run = this.runs.get(id)!;
-				if (run.result) {
-					this.queue.delete(id);
-					continue;
-				}
-				if (running.has(id) || (run.mutex && this.mutexes.has(run.mutex))) continue;
-				const active = concurrency.get(run.workflow.name) ?? 0;
-				if (active >= (run.workflow.concurrency ?? Infinity)) continue;
-				concurrency.set(run.workflow.name, active + 1);
-				this.queue.delete(id);
-				if (run.mutex) this.mutexes.set(run.mutex, id);
-				running.set(
-					id,
-					this.attempt(run).finally(() => {
-						running.delete(id);
-						concurrency.set(run.workflow.name, concurrency.get(run.workflow.name)! - 1);
-					}),
-				);
-			}
-			if (!running.size && !this.hooks.size && !this.settlements.size) {
-				// Queued work that cannot run yet (a held mutex) waits for the next flush, as before.
-				break;
-			}
-			const woken = new Promise<void>((resolve) => (this.wake = resolve));
-			await Promise.race([...running.values(), ...this.hooks, woken]);
-			this.wake = undefined;
-		}
-	}
-	private async settle(run: Run, result: ExecutionResult) {
-		if (run.result) return;
-		run.result = clone(result);
-		run.settledAt = this.clock;
-		run.status = "settled";
-		run.waits.clear();
-		this.queue.delete(run.id);
-		if (this.flushing) {
-			const hook = (async () => {
-				try {
-					await run.workflow.onSettled?.(run.id, clone(run.metadata), clone(run.result!));
-				} catch (error) {
-					// Redelivered by the next flush, which this one fails.
-					this.settlements.add(run.id);
-					this.hookFailure ??= error;
-				}
-			})().finally(() => this.hooks.delete(hook));
-			this.hooks.add(hook);
-			this.wake?.();
-		} else this.settlements.add(run.id);
-		if (run.key !== undefined) {
-			const key = JSON.stringify([run.workflow.name, run.key]);
-			if (this.keys.get(key) === run.id) this.keys.delete(key);
-		}
-		for (const waiting of this.runs.values())
-			if (
-				(waiting.status === "suspended" || waiting.status === "running") &&
-				[...waiting.waits.values()].some((wait) =>
-					Object.values(wait.branches).some(
-						(branch) => branch.kind === "execution" && branch.executionId === run.id,
-					),
-				)
-			)
-				this.enqueue(waiting.id);
-	}
-	private async attempt(run: Run) {
-		run.status = "running";
-		const inbox = (run.inbox = new Inbox(run));
-		try {
-			let output;
-			try {
-				output = await run.workflow.handler(clone(run.input), this.execution(run));
-			} finally {
-				await inbox.close();
-			}
-			if (inbox.failure) throw inbox.failure;
-			// Listened-for signals that arrived while the handler returned re-queue it, not as an attempt.
-			if (!run.controller.signal.aborted && inbox.pending()) {
-				run.status = "pending";
-				this.enqueue(run.id);
-				return;
-			}
-			await this.settle(
-				run,
-				run.controller.signal.aborted
-					? { status: "cancelled", reason: String(run.controller.signal.reason) }
-					: { status: "completed", output: output ?? null },
-			);
-		} catch (caught) {
-			const error = inbox.failure ?? caught;
-			if (error instanceof Suspension) run.status = "suspended";
-			else if (error instanceof Cancellation || run.controller.signal.aborted)
-				await this.settle(run, {
-					status: "cancelled",
-					reason: String(run.controller.signal.reason),
-				});
-			else if (++run.attempts < (run.workflow.retries?.maxAttempts ?? 1)) {
-				run.status = "pending";
-				this.enqueue(run.id);
-			} else
-				await this.settle(run, {
-					status: "failed",
-					error: error instanceof Error ? error.message : String(error),
-				});
-		} finally {
-			if (run.mutex) this.mutexes.delete(run.mutex);
-			run.inbox = undefined;
-		}
-	}
-	private execution(run: Run): DurableExecution {
-		const boundary = () => {
-			if (run.controller.signal.aborted) throw new Cancellation();
-			if (run.inbox?.failure) throw run.inbox.failure;
-		};
-		const step: DurableExecution["step"] = async (id, fn) => {
-			boundary();
-			if (run.cache.has(id)) return clone(run.cache.get(id)) as never;
-			const value = await fn();
-			run.cache.set(id, clone(value));
-			return clone(value);
-		};
-		const wait = async (
-			id: string,
-			branches: Record<string, WaitBranch>,
-		): Promise<WaitForAnyResult> => {
-			boundary();
-			if (!Object.keys(branches).length) throw new Error("waitForAny needs at least one branch");
-			for (const branch of Object.values(branches)) {
-				if (branch.kind === "timer" && !Number.isFinite(branch.at))
-					throw new Error("Invalid timer deadline");
-				if (branch.kind === "execution" && !this.runs.has(branch.executionId))
-					throw new Error(`Unknown execution: ${branch.executionId}`);
-			}
-			if (run.cache.has(id)) return clone(run.cache.get(id)) as WaitForAnyResult;
-			let registration = run.waits.get(id);
-			if (!registration) {
-				registration = { branches: clone(branches), sequence: this.emitted.length };
-				run.waits.set(id, registration);
-			}
-			const candidates: {
-				time: number;
-				sequence: number;
-				result: WaitForAnyResult;
-			}[] = [];
-			for (const [key, branch] of Object.entries(registration.branches)) {
-				if (branch.kind === "timer") {
-					const due = branch.at;
-					if (due <= this.clock)
-						candidates.push({ time: due, sequence: Infinity, result: { key, kind: "timer" } });
-				} else if (branch.kind === "execution") {
-					const child = this.runs.get(branch.executionId);
-					if (child?.result)
-						candidates.push({
-							time: child.settledAt!,
-							sequence: -1,
-							result: { key, kind: "execution", result: child.result },
-						});
-				} else {
-					const event = this.emitted.find(
-						(e) =>
-							e.sequence >=
-								(branch.after === undefined ? registration.sequence : Number(branch.after)) &&
-							e.name === branch.event &&
-							matchesFilter(e.payload, branch.filter),
-					);
-					if (event)
-						candidates.push({
-							time: event.time,
-							sequence: event.sequence,
-							result: {
-								key,
-								kind: "event",
-								event: { name: event.name, payload: event.payload },
-								cursor: String(event.sequence + 1),
-							},
-						});
-				}
-			}
-			candidates.sort((a, b) => a.time - b.time || a.sequence - b.sequence);
-			const winner = candidates[0];
-			if (!winner) throw new Suspension();
-			run.cache.set(id, clone(winner.result));
-			run.waits.delete(id);
-			return clone(winner.result);
-		};
-		const start: DurableExecution["start"] = async (id, workflow, input, options = {}) =>
-			step(id, async () => {
-				const childId = await this.invoke(workflow, input, {
-					metadata: { ...run.metadata, ...options.metadata } as InvocationMetadata,
-					dedupeKey: options.dedupeKey ?? `${run.id}:${id}`,
-				});
-				if (options.mutex) this.runs.get(childId)!.mutex = options.mutex;
-				return childId;
-			});
-		return {
-			executionId: run.id,
-			workflow: run.workflow.name,
-			metadata: clone(run.metadata),
-			signal: run.controller.signal,
-			step,
-			cursor: (id) => step(id, () => String(this.emitted.length)),
-			sleep: async (id, ms) => {
-				const at = await step(`fabrial:${id}:deadline`, () => this.clock + ms);
-				await wait(id, { timer: { kind: "timer", at } });
-			},
-			waitForAny: wait,
-			waitForEvent: async (id, options) => {
-				const branches: Record<string, WaitBranch> = {
-					event: {
-						kind: "event",
-						event: options.event,
-						filter: options.filter,
-						after: options.after,
-					},
-				};
-				if (options.deadline !== undefined)
-					branches.timeout = { kind: "timer", at: options.deadline };
-				const result = await wait(id, branches);
-				return result.kind === "event" ? { ...result.event, cursor: result.cursor } : null;
-			},
-			start,
-			invoke: async (id, workflow, input, options = {}) => {
-				const childId = await start(`fabrial:${id}:start`, workflow, input, options);
-				if (!options.detached) run.children.add(childId);
-				const branches: Record<string, WaitBranch> = {
-					child: { kind: "execution", executionId: childId },
-				};
-				if (options.timeoutMs !== undefined)
-					branches.timeout = {
-						kind: "timer",
-						at: await step(`fabrial:${id}:deadline`, () => this.clock + options.timeoutMs!),
-					};
-				const result = await wait(`fabrial:${id}:result`, branches);
-				if (result.kind !== "execution") throw new Error("Child invocation timed out");
-				if (result.result.status !== "completed")
-					throw new Error(
-						result.result.status === "failed" ? result.result.error : result.result.reason,
-					);
-				return result.result.output;
-			},
-			onSignal: (name, handler) => run.inbox!.listen(name, handler),
-			signalWithStart: (id, { metadata, ...options }) =>
-				step(id, () =>
-					this.signalWithStart({
-						...options,
-						metadata: { ...run.metadata, ...metadata } as InvocationMetadata,
-					}),
-				),
-			emit: (event, payload, options = {}) =>
-				this.emit(event, payload, {
-					...options,
-					metadata: { ...run.metadata, ...options.metadata } as InvocationMetadata,
-				}),
-			cancel: (id, reason) => this.cancel(id, reason),
-		};
+	signal(): never {
+		throw new Error("StubRuntime runs no workflows");
 	}
 }
 
@@ -922,13 +369,7 @@ export function fakeAgents(
 	};
 }
 
-export function createTestRuntime(
-	options: ConstructorParameters<typeof MemoryRuntime>[0] = {},
-): MemoryRuntime {
-	return new MemoryRuntime(options);
-}
-
-/** Build an app from an instance with explicit test ports (in-memory runtime, fake or real chat, agents). */
+/** Build an app from an instance with explicit test ports (a runtime, fake or real chat, agents). */
 export function testApp<const P extends readonly import("./plugin.ts").AnyPlugin[]>(
 	instance: import("./instance.ts").Fabrial<P>,
 	config: Omit<import("./instance.ts").AppConfig, "agents"> & {
@@ -949,25 +390,146 @@ function internal(instance: object): import("./instance.ts").InternalInstance {
 	return value;
 }
 
-/** Build an isolated in-memory app from the same typed catalog as production. */
+export interface TestAppConfig extends Omit<import("./instance.ts").AppConfig, "agents"> {
+	/**
+	 * Postgres connection string for Conductor's tables, e.g. from a testcontainers `PostgreSqlContainer`
+	 * started in Vitest's `globalSetup`. Apps share the database; each runs on a queue of its own.
+	 */
+	database: string;
+	/** Defaults to `fakeAgents()`. */
+	agents?: AgentIntegration;
+	/** `f.app({ agents })`: agents whose triggers receive events. */
+	routedAgents?: import("./instance.ts").AppConfig["agents"];
+	/** Defaults to a `FakeChat` on the app's clock. */
+	chat?: FakeChat;
+}
+
+export interface TestApp<C> {
+	readonly app: import("./app.ts").App<C>;
+	readonly chat: FakeChat;
+	readonly runtime: DurableRuntime;
+	/**
+	 * Conductor's test clock for the app's workers and database: `set` freezes time, `advance` moves it.
+	 * Advance only after the wait it should end is registered.
+	 */
+	readonly clock: TestClock;
+	/** The execution's outcome once it settles; `undefined` while it runs or waits. */
+	result: (executionId: string) => Promise<ExecutionResult | undefined>;
+	/** Wait until the execution settles (default timeout 30s). */
+	settled: (executionId: string, options?: { timeoutMs?: number }) => Promise<ExecutionResult>;
+	/**
+	 * Wait until every event emitted so far was dispatched and every execution of this app settled,
+	 * suspended waits included: for asserting that something did not happen.
+	 */
+	idle: (options?: { timeoutMs?: number }) => Promise<void>;
+	/** Stop the app and close its connection. */
+	stop: () => Promise<void>;
+}
+
+const silent = { debug() {}, info() {}, warn() {}, error() {} };
+
+/**
+ * Build an app on real Conductor from the same typed catalog as production, with fake chat and agents
+ * and fast polling. Start it with `app.start()`; drive it through `chat`, `app.fetch` or
+ * `runtime.invoke`, and wait for outcomes with `settled`.
+ */
 export function createTestApp<const P extends readonly import("./plugin.ts").AnyPlugin[]>(
 	instance: import("./instance.ts").Fabrial<P>,
-	config: Omit<import("./instance.ts").AppConfig, "agents"> & {
-		now?: number | Date;
-		agents?: AgentIntegration;
-		routedAgents?: import("./instance.ts").AppConfig["agents"];
-	},
-) {
-	const { now, ...appConfig } = config;
-	const runtime = new MemoryRuntime({ now });
-	const chat = new FakeChat(() => runtime.now());
+	config: TestAppConfig,
+): TestApp<import("./instance.ts").ClientsOf<P>> {
+	const { database, chat: fake, ...appConfig } = config;
+	// The test clock is a session setting: it holds for queries on this one connection.
+	const sql = postgres(database, { max: 1, onnotice: () => {} });
+	const queue = `test_${crypto.randomUUID().replaceAll("-", "")}`;
+	const clock = createTestClock(sql);
+	const runtime = conductor(
+		{ sql },
+		{
+			logger: silent,
+			queue,
+			clock,
+			pollIntervalMs: 100,
+			worker: { concurrency: 8, pollIntervalMs: 20, flushIntervalMs: 20, fetchBatchSize: 10 },
+		},
+	);
+	const chat = fake ?? new FakeChat(() => runtime.now!());
 	const app = testApp(instance, {
 		...appConfig,
 		runtime,
 		chat,
 		agents: config.agents ?? fakeAgents(),
 	});
-	return { app, runtime, chat };
+	// Reads any execution by id; runs no tasks.
+	const inspector = Conductor.create({
+		sql,
+		tasks: TaskSchemas.fromSchema([]),
+		context: {},
+		logger: silent,
+		telemetry: false,
+	}) as unknown as Conductor;
+	const result = async (id: string): Promise<ExecutionResult | undefined> => {
+		const info = await inspector.getExecution(id);
+		if (!info) throw new Error(`Unknown execution: ${id}`);
+		if (info.status === "completed")
+			return {
+				status: "completed",
+				output: (info.result as { output: Json } | null)?.output ?? null,
+			};
+		if (info.status === "failed")
+			return { status: "failed", error: info.error ?? "Execution failed" };
+		if (info.status === "cancelled")
+			return { status: "cancelled", reason: info.error ?? "Cancelled" };
+		return undefined;
+	};
+	const until = async (description: string, probe: () => Promise<boolean>, timeoutMs = 30_000) => {
+		const deadline = Date.now() + timeoutMs;
+		while (!(await probe())) {
+			if (Date.now() > deadline) throw new Error(`Timed out waiting for ${description}`);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+	};
+	// Conductor's tables: the public API lists no executions.
+	const unsettled = async (queue: string) =>
+		(
+			await sql`select 1 from pgconductor._private_executions
+				where queue = ${queue} and completed_at is null and failed_at is null
+					and task_key != 'pgconductor.maintenance' limit 1`
+		).length > 0;
+	return {
+		app,
+		chat,
+		runtime,
+		clock,
+		result,
+		async idle(options = {}) {
+			await until(
+				"events to dispatch",
+				async () => !(await unsettled("pgconductor.internal")),
+				options.timeoutMs,
+			);
+			await until(
+				"the app's executions to settle",
+				async () => !(await unsettled(queue)),
+				options.timeoutMs,
+			);
+		},
+		async settled(id, options = {}) {
+			const deadline = Date.now() + (options.timeoutMs ?? 30_000);
+			for (;;) {
+				const settled = await result(id);
+				if (settled) return settled;
+				if (Date.now() > deadline) throw new Error(`Timed out waiting for ${id} to settle`);
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			}
+		},
+		async stop() {
+			try {
+				await app.stop();
+			} finally {
+				await sql.end();
+			}
+		},
+	};
 }
 
 /** A scripted model reply, built with `reply.text()` or `reply.toolCall()`. */
