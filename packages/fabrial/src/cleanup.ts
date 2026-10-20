@@ -39,32 +39,44 @@ export async function cleanup(
 			filter: { approvalId: [data.approvalId] },
 		};
 	const refs: MessageRef[] = [];
+	// A decided approval names its label; anything else settling first cancels the cards.
+	let label = "Cancelled";
 	for (let attempt = 0; ; attempt++) {
 		const winner = await execution.waitForAny(`fabrial:wait:${attempt}`, branches);
 		if (winner.kind === "event")
 			for (const branch of Object.values(branches))
 				if (branch.kind === "event") branch.after = winner.cursor;
-		if (winner.key === "closed") return;
 		if (winner.key === "presented" && winner.kind === "event") {
 			refs.push(winner.event.payload.ref as unknown as MessageRef);
 			continue;
 		}
+		if (winner.key === "closed" && winner.kind === "event")
+			label = winner.event.payload.label as string;
 		break;
 	}
-	await execution.step("fabrial:cleanup", async () => {
-		const chat = host.chat();
-		if (!chat) return;
-		for (const ref of refs) {
-			const io = await chat.thread({
-				kind: "thread",
-				provider: ref.provider,
-				threadId: ref.threadId,
-			});
-			// Only approval cards register a presentation with this watcher.
-			if (data.approvalId)
-				await io.update(ref, {
-					card: { title: data.title as string, text: "Cancelled", actions: [] },
+	// Only approval cards register a presentation with this watcher.
+	const chat = host.chat();
+	if (!data.approvalId || !chat) return;
+	// Each card updates on its own: a deleted card or provider error doesn't block the others, and a
+	// retry of this workflow repeats only the cards that failed.
+	let failures = 0;
+	for (const [index, ref] of refs.entries())
+		try {
+			await execution.step(`fabrial:cleanup:${index}`, async () => {
+				const io = await chat.thread({
+					kind: "thread",
+					provider: ref.provider,
+					threadId: ref.threadId,
 				});
+				await io.update(ref, { card: { title: data.title as string, text: label, actions: [] } });
+			});
+		} catch (error) {
+			failures++;
+			host.logger.warn("Approval card update failed", {
+				approvalId: data.approvalId,
+				messageId: ref.messageId,
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
-	});
+	if (failures) throw new Error(`${failures} approval card update(s) failed`);
 }

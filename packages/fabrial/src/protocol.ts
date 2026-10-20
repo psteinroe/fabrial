@@ -145,34 +145,28 @@ export async function createApproval(
 		}),
 		...(status ? [status] : []),
 	]);
-	const cards: MessageRef[] = [];
-	for (const delivery of deliveries) {
-		if (delivery.status === "fulfilled") cards.push(delivery.value);
-	}
 	const failed = deliveries.find((delivery) => delivery.status === "rejected");
 	if (failed?.status === "rejected") throw failed.reason;
 
-	const render = async (decision: ApprovalDecision, reason?: string) => {
-		const label =
-			decision.status === "approved"
-				? `Approved by ${decision.decidedBy?.name ?? decision.decidedBy?.id}`
-				: decision.status === "rejected"
-					? `Rejected by ${decision.decidedBy?.name ?? decision.decidedBy?.id}`
-					: decision.status === "expired"
-						? "Expired"
-						: reason === "superseded"
-							? "Superseded"
-							: "Cancelled";
-		for (const card of cards)
-			await (
-				await chat.thread({ kind: "thread", provider: card.provider, threadId: card.threadId })
-			).update(card, { card: { title: request.title, text: label, actions: [] } });
-	};
+	const label = (decision: ApprovalDecision, reason?: string) =>
+		decision.status === "approved"
+			? `Approved by ${decision.decidedBy?.name ?? decision.decidedBy?.id}`
+			: decision.status === "rejected"
+				? `Rejected by ${decision.decidedBy?.name ?? decision.decidedBy?.id}`
+				: decision.status === "expired"
+					? "Expired"
+					: reason === "superseded"
+						? "Superseded"
+						: "Cancelled";
 	let resolution: ApprovalDecision | undefined;
+	/** Record the decision first; the cleanup watcher then relabels each card on its own. */
 	const finish = async (decision: ApprovalDecision, reason?: string): Promise<ApprovalDecision> => {
 		const result = await execution.step(`fabrial:${id}:resolved`, async () => {
-			await render(decision, reason);
-			await execution.emit(APPROVAL_CLOSED_EVENT, { approvalId }, { id: approvalId });
+			await execution.emit(
+				APPROVAL_CLOSED_EVENT,
+				{ approvalId, label: label(decision, reason) },
+				{ id: approvalId },
+			);
 			return decision as unknown as JsonObject;
 		});
 		resolution = result as unknown as ApprovalDecision;

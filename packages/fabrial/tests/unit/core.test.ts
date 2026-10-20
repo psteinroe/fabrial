@@ -832,6 +832,49 @@ describe("approval edge cases", () => {
 				expect(post.content).toMatchObject({ card: { text: "Approved by Alice", actions: [] } });
 			}
 	});
+	it("records a decision whose approver card was deleted and relabels the remaining cards", async () => {
+		const warnings: string[] = [];
+		const logger = { debug() {}, info() {}, error() {}, warn: (m: string) => warnings.push(m) };
+		const test = setup([approvalWorkflow()], { logger });
+		await enter(test);
+		const aliceDM = await test.chat.openDM(alice.identities[0]!);
+		aliceDM.posts.splice(0);
+		const bobDM = await test.chat.openDM(bob.identities[0]!);
+		const approve = (bobDM.posts[0]!.content as { card: { actions: { id: string }[] } }).card
+			.actions[0]!.id;
+		await test.chat.click(bobDM.posts[0]!.ref, approve, bob.identities[0]!);
+		await test.runtime.flush();
+		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "approved" });
+		expect(bobDM.posts[0]!.content).toMatchObject({ card: { text: "Approved by Bob" } });
+		expect((await test.chat.thread(surface)).posts[0]!.content).toMatchObject({
+			card: { text: "Approved by Bob", actions: [] },
+		});
+		expect(warnings).toContain("Approval card update failed");
+	});
+	it("resumes card updates after an interruption without repeating or cancelling them", async () => {
+		const test = setup([approvalWorkflow()]);
+		await enter(test);
+		const c = await card(test);
+		const bobDM = await test.chat.openDM(bob.identities[0]!);
+		const update = bobDM.update.bind(bobDM);
+		let interrupted = false;
+		bobDM.update = async (...args) => {
+			if (!interrupted) {
+				interrupted = true;
+				throw new Error("interrupted");
+			}
+			return update(...args);
+		};
+		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
+		await test.runtime.flush();
+		expect(interrupted).toBe(true);
+		expect(test.runtime.executions("owner")[0]!.result).toMatchObject({ output: "approved" });
+		for (const thread of test.chat.threads.values())
+			for (const post of thread.posts) {
+				expect(post.updates).toHaveLength(1);
+				expect(post.content).toMatchObject({ card: { text: "Approved by Alice", actions: [] } });
+			}
+	});
 	it("updates cards when a workflow fails or abandons an unawaited approval", async () => {
 		const test = setup([
 			workflow(async (_i, ctx) => {
