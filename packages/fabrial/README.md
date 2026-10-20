@@ -166,7 +166,7 @@ Runtimes must provide race-safe correlated event retention: a click or presentat
 
 ## Testing
 
-`fabrial/testing` runs apps on real Conductor; there is no in-memory engine. Tests need a Postgres: start one per test run in Vitest's `globalSetup` (e.g. `new PostgreSqlContainer("postgres:17").start()` from `@testcontainers/postgresql`, passed on with `project.provide`) or point at an existing database URL. Apps share the database; each test app runs on a queue of its own. `createTestApp` runs workflows with fake chat and agents, without models:
+`fabrial/testing` runs apps on real Conductor; there is no in-memory engine. Tests need a Postgres: start one per test run in Vitest's `globalSetup` (e.g. `new PostgreSqlContainer("postgres:17").start()` from `@testcontainers/postgresql`, passed on with `project.provide`) or point at an existing database URL. Each test app runs on a queue of its own, but ingress is database-wide: give each test file its own database (e.g. `create database` in `beforeAll`), or apps running at once in other files route its events. `createTestApp` runs workflows with fake chat and agents, without models:
 
 ```ts
 import { createTestApp } from "fabrial/testing";
@@ -185,6 +185,8 @@ await stop();
 - `FakeChat`: inspectable threads, posts, DMs, and ephemeral notices, with `receive`, `click`, and `cancel` for ingress.
 - `StubRuntime`: a runtime port for unit tests that run no workflow; it records registrations and emitted events.
 - `testApp(f, { runtime, chat?, agents?, workflows })`: an app on explicit ports.
+
+**Test reliability.** Ingress events, their dedupe, and routing span the database: an app's router also receives the events of other apps on it, fails on plugin events it doesn't know, and retries with backoff, so a shared database stalls `idle()` and routes events twice. Wait on the concrete effect a test asserts (`settled(id)`, a post, `expect.poll`); `idle()` waits for every event of the database and every execution of the app, so any unrelated retry delays it. Use `idle()` only to assert that something did not happen.
 
 `createIntegrationApp(f, { workflows, models, logger? })` runs the real runtime, agents, and chat against the instance's `database` (e.g. Postgres from testcontainers) with scripted models instead of credentials:
 

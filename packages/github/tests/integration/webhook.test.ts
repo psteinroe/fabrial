@@ -2,9 +2,13 @@ import { createHmac } from "node:crypto";
 import { GitHubAdapter } from "@chat-adapter/github";
 import { createFabrial, definePlugin, type WorkflowContext } from "fabrial";
 import { createTestApp, FakeChat } from "fabrial/testing";
-import { describe, expect, inject, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { github, pullRequestOpened, issueOpened } from "../../src/index.ts";
 import { alice, options, repository, request } from "../helper.ts";
+import { useDatabase } from "../../../fabrial/tests/conductor/helper.ts";
+
+// Ingress is database-wide: apps of other test files running at once would route this file's events.
+const db = useDatabase();
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
 const conversation = {
@@ -51,7 +55,7 @@ describe("GitHub lifecycle webhooks", () => {
 				expect(ctx.thread).toBeUndefined();
 			});
 			const { app, idle, stop } = createTestApp(createFabrial({ plugins: [plugin, recorder] }), {
-				database: inject("fabrialDatabaseUrl" as never) as string,
+				database: db.url,
 				chat,
 				workflows: [
 					defineWorkflow({ name: "owner", triggers: [trigger({ repo: "acme/app" })], run }),

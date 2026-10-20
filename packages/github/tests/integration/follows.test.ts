@@ -1,9 +1,13 @@
 import { createFabrial, trigger, type JsonObject, type ResourceKind } from "fabrial";
 import { createTestApp, fakeAgents, StubRuntime, testApp, FakeChat } from "fabrial/testing";
-import { afterEach, describe, expect, inject, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { github, parsePullRequest, pullRequest } from "../../src/index.ts";
 import { options } from "../helper.ts";
 import { bot, deliver, outsider, webhooks } from "../webhooks.ts";
+import { useDatabase } from "../../../fabrial/tests/conductor/helper.ts";
+
+// Ingress is database-wide: apps of other test files running at once would route this file's events.
+const db = useDatabase();
 
 /** The plugin without profile lookups (ingress resolves the actor). */
 function plugin() {
@@ -168,7 +172,7 @@ describe("follows in an app", () => {
 		});
 		const agents = fakeAgents();
 		const t = createTestApp(f, {
-			database: inject("fabrialDatabaseUrl" as never) as string,
+			database: db.url,
 			agents,
 			workflows: [watch, unwatch, orphan, owner, sendAndWatch],
 		});

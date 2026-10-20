@@ -10,6 +10,8 @@ import type {
 } from "../../src/index.ts";
 import { conductor, type ConductorConfig } from "../../src/runtime/conductor/index.ts";
 import { createTestClock, type TestClock } from "../../src/testing.ts";
+// Declares the `fabrialDatabaseUrl` the global setup provides, also for other packages' tests.
+import type {} from "./global-setup.ts";
 
 /**
  * Real Conductor for Fabrial's tests: one Postgres per Vitest run (`global-setup.ts`), one database per
@@ -108,6 +110,42 @@ function settlement(info: ExecutionInfo): ExecutionResult | undefined {
 	if (info.status === "cancelled")
 		return { status: "cancelled", reason: info.error ?? "Cancelled by user" };
 	return undefined;
+}
+
+/**
+ * Create a database for this test file, for apps that bring their own connection (`createTestApp`); call
+ * once at the top of the file. Ingress events, their dedupe and routing are database-wide: apps running at
+ * once on one database route each other's events.
+ */
+export function useDatabase(): { readonly url: string } {
+	const database = `fabrial_${crypto.randomUUID().replaceAll("-", "")}`;
+	const server = () => postgres(inject("fabrialDatabaseUrl"), { max: 1, onnotice: () => {} });
+	let url: string | undefined;
+	beforeAll(async () => {
+		const admin = server();
+		try {
+			await admin.unsafe(`create database ${database}`);
+		} finally {
+			await admin.end();
+		}
+		const location = new URL(inject("fabrialDatabaseUrl"));
+		location.pathname = `/${database}`;
+		url = location.toString();
+	});
+	afterAll(async () => {
+		const admin = server();
+		try {
+			await admin.unsafe(`drop database if exists ${database} with (force)`);
+		} finally {
+			await admin.end();
+		}
+	});
+	return {
+		get url() {
+			if (url === undefined) throw new Error("useDatabase() is only usable inside tests");
+			return url;
+		},
+	};
 }
 
 /** Create this test file's database and Conductor test clock; call once at the top of the file. */
