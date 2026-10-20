@@ -441,8 +441,8 @@ export interface TestApp<C> {
 	/** Wait until the execution settles (default timeout 30s). */
 	settled: (executionId: string, options?: { timeoutMs?: number }) => Promise<ExecutionResult>;
 	/**
-	 * Wait until every event emitted so far was dispatched and every execution of this app settled,
-	 * suspended waits included: for asserting that something did not happen.
+	 * Wait until every event emitted on the database so far was dispatched and every execution of this
+	 * app settled, suspended waits included: for asserting that something did not happen.
 	 */
 	idle: (options?: { timeoutMs?: number }) => Promise<void>;
 	/** Stop the app and close its connection. */
@@ -504,20 +504,36 @@ export function createTestApp<const P extends readonly import("./plugin.ts").Any
 			return { status: "cancelled", reason: info.error ?? "Cancelled" };
 		return undefined;
 	};
-	const until = async (description: string, probe: () => Promise<boolean>, timeoutMs = 30_000) => {
+	// Conductor's tables: the public API lists no executions.
+	const pending = (queue: string, limit: number) =>
+		sql<
+			{
+				id: string;
+				task_key: string;
+				attempts: number;
+				run_at: Date;
+				locked: boolean;
+				waiting: string | null;
+				last_error: string | null;
+			}[]
+		>`
+			select id, task_key, attempts, run_at, locked_at is not null as locked,
+				coalesce(waiting_step_key, waiting_on_execution_id::text) as waiting, last_error
+			from pgconductor._private_executions
+			where queue = ${queue} and completed_at is null and failed_at is null
+				and task_key != 'pgconductor.maintenance'
+			limit ${limit}`;
+	const drained = async (description: string, queue: string, timeoutMs = 30_000) => {
 		const deadline = Date.now() + timeoutMs;
-		while (!(await probe())) {
-			if (Date.now() > deadline) throw new Error(`Timed out waiting for ${description}`);
+		while ((await pending(queue, 1)).length > 0) {
+			if (Date.now() > deadline) {
+				// Say what is stuck: a retry backing off, a wait nobody ends, or work no worker claims.
+				const rows = await pending(queue, 10);
+				throw new Error(`Timed out waiting for ${description}; unsettled ${JSON.stringify(rows)}`);
+			}
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}
 	};
-	// Conductor's tables: the public API lists no executions.
-	const unsettled = async (queue: string) =>
-		(
-			await sql`select 1 from pgconductor._private_executions
-				where queue = ${queue} and completed_at is null and failed_at is null
-					and task_key != 'pgconductor.maintenance' limit 1`
-		).length > 0;
 	return {
 		app,
 		chat,
@@ -525,16 +541,8 @@ export function createTestApp<const P extends readonly import("./plugin.ts").Any
 		clock,
 		result,
 		async idle(options = {}) {
-			await until(
-				"events to dispatch",
-				async () => !(await unsettled("pgconductor.internal")),
-				options.timeoutMs,
-			);
-			await until(
-				"the app's executions to settle",
-				async () => !(await unsettled(queue)),
-				options.timeoutMs,
-			);
+			await drained("events to dispatch", "pgconductor.internal", options.timeoutMs);
+			await drained("the app's executions to settle", queue, options.timeoutMs);
 		},
 		async settled(id, options = {}) {
 			const deadline = Date.now() + (options.timeoutMs ?? 30_000);
