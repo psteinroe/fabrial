@@ -409,8 +409,9 @@ export interface TestApp<C> {
 	readonly chat: FakeChat;
 	readonly runtime: DurableRuntime;
 	/**
-	 * Conductor's test clock for the app's workers and database: `set` freezes time, `advance` moves it.
-	 * Advance only after the wait it should end is registered.
+	 * Conductor's test clock for the app's workers and database: `set` moves time to a date, from which
+	 * it keeps running, and `advance` jumps it forward. Advance only after the wait it should end is
+	 * registered.
 	 */
 	readonly clock: TestClock;
 	/** The execution's outcome once it settles; `undefined` while it runs or waits. */

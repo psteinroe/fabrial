@@ -20,11 +20,11 @@ import {
 	Conductor,
 	Orchestrator,
 	TaskSchemas,
-	EventSchemas,
 	type TaskContext,
 	type AnyTask,
 	type Logger,
 	type EventDefinition,
+	type TaskDefinition,
 	type Middleware,
 	type WorkerConfig,
 } from "pgconductor-js";
@@ -232,15 +232,6 @@ class ConductorRuntime implements DurableRuntime {
 			// SHIM(conductor#2): metadata lives in a reserved field; payload filters remain top-level.
 			filterable: [...event.filterable, "__fabrialOwner"],
 		}));
-		const schemas = [...this.definitions.keys()].flatMap((name) => [
-			{ name, queue: this.queue, payload: {} as JsonObject, returns: {} as JsonObject },
-			{
-				name: `fabrial.route:${name}`,
-				queue: this.queue,
-				payload: {} as JsonObject,
-				returns: {} as JsonObject,
-			},
-		]);
 		// Per-attempt hooks run as native middleware: its `next` settles when the attempt suspends.
 		const attempt: Middleware<TaskContext> = async ({ execution, ctx }, next) => {
 			const definition =
@@ -255,8 +246,9 @@ class ConductorRuntime implements DurableRuntime {
 		};
 		const client = Conductor.create({
 			sql: this.sql,
-			tasks: TaskSchemas.fromSchema(schemas),
-			events: EventSchemas.fromSchema(this.eventDefinitions),
+			// Type-only: Fabrial validates workflow input itself, so Conductor has no schema to check.
+			tasks: TaskSchemas.fromUnion<TaskDefinition<string, JsonObject, JsonObject, string>>(),
+			events: this.eventDefinitions,
 			context: {},
 			middleware: [attempt] as never,
 			logger: this.config.logger,
@@ -414,11 +406,12 @@ class ConductorRuntime implements DurableRuntime {
 			const rows = await sql<{ id: string }[]>`
 				insert into pgconductor._private_executions (task_key, queue, payload, metadata, dedupe_key)
 				values (${task}, ${queue}, ${sql.json(payload)}, ${sql.json(metadata)}, ${dedupe ?? null})
-				on conflict (task_key, dedupe_key, queue) do nothing returning id
+				on conflict (task_key, dedupe_key, queue) where singleton_on is null do nothing returning id
 			`;
 			if (rows[0]) return rows[0].id;
 			const [existing] = await sql<{ id: string }[]>`
-				select id from pgconductor._private_executions where task_key = ${task} and queue = ${queue} and dedupe_key = ${dedupe!}
+				select id from pgconductor._private_executions
+				where task_key = ${task} and queue = ${queue} and dedupe_key = ${dedupe!} and singleton_on is null
 			`;
 			if (!existing) throw new Error("Execution receipt was removed concurrently");
 			return existing.id;
