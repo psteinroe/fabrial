@@ -1,7 +1,7 @@
 // oxlint-disable typescript/unbound-method -- Referenced host methods are Vitest mocks.
 import type { GitHubAdapter } from "@chat-adapter/github";
 import type { ResourceKind } from "fabrial";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { github } from "../../src/index.ts";
 import { alice, connect, options, request } from "../helper.ts";
 import { bot, outsider, webhooks } from "../webhooks.ts";
@@ -86,6 +86,9 @@ describe("GitHub author policy", () => {
 	});
 
 	it("recognizes its own bot from the SDK's detected identity, not only botUserId", async () => {
+		// The SDK falls back to GITHUB_BOT_USER_ID, which the examples' global setup sets for the whole run.
+		vi.stubEnv("GITHUB_BOT_USER_ID", "");
+		onTestFinished(() => void vi.unstubAllEnvs());
 		const { plugin, adapter, emit, lifecycle } = setup({ botUserId: undefined });
 		const detect = vi
 			.spyOn(adapter.octokit.users, "getAuthenticated")
