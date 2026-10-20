@@ -445,79 +445,91 @@ it.each(["notification", "message"] as const)(
 	},
 );
 
-it.each(["notification", "message"] as const)(
-	"a %s queued behind a failed run is still answered",
-	async (kind) => {
-		const t = await setup();
-		const other = await t.launch();
-		const session = kind === "message" ? `chat:channel:${t.channel}` : `app:ops-${t.channel}`;
-		const seen: string[] = [];
-		t.respond([
-			async () => {
-				// The steer queues behind this generation, which then fails: Pi leaves it in its inbox.
-				if (kind === "message")
-					expect(await other.chat.receive(t.message("m2", "t2", "queued steer"))).toBe("accepted");
-				else
-					await other.runtime.invoke(
-						t.notify.name,
-						{ text: "queued steer", priority: "urgent" },
-						{
-							metadata: {
-								interactionId: randomUUID(),
-								origin: { provider: "github" },
-								replyTo: null,
-								requestedBy: null,
-							},
+const queuedBehindFailedRun = async (kind: "notification" | "message") => {
+	const t = await setup();
+	const other = await t.launch();
+	const session = kind === "message" ? `chat:channel:${t.channel}` : `app:ops-${t.channel}`;
+	const seen: string[] = [];
+	// Asserted after settling: a throw inside the response would only fail the generation, which
+	// this test expects anyway, so a missed steer could still end in a passing run.
+	let steerQueued = false;
+	t.respond([
+		async () => {
+			// The steer queues behind this generation, which then fails: Pi leaves it in its inbox.
+			if (kind === "message")
+				expect(await other.chat.receive(t.message("m2", "t2", "queued steer"))).toBe("accepted");
+			else
+				await other.runtime.invoke(
+					t.notify.name,
+					{ text: "queued steer", priority: "urgent" },
+					{
+						metadata: {
+							interactionId: randomUUID(),
+							origin: { provider: "github" },
+							replyTo: null,
+							requestedBy: null,
 						},
-					);
-				await expect
-					.poll(async () => (await submitted(session)).length, { timeout: 10_000 })
-					.toBe(2);
-				return fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded" });
-			},
-			(context) => {
-				seen.push(text(context.messages));
-				return fauxAssistantMessage("answered");
-			},
-		]);
-		if (kind === "message") await t.chat.receive(t.message("m1", "t1"));
-		else
-			await t.runtime.invoke(
-				t.notify.name,
-				{ text: "first", priority: "normal" },
-				{
-					metadata: {
-						interactionId: randomUUID(),
-						origin: { provider: "github" },
-						replyTo: null,
-						requestedBy: null,
 					},
+				);
+			steerQueued = await expect
+				.poll(async () => (await submitted(session)).length, { timeout: 10_000 })
+				.toBe(2)
+				.then(
+					() => true,
+					() => false,
+				);
+			return fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded" });
+		},
+		(context) => {
+			seen.push(text(context.messages));
+			return fauxAssistantMessage("answered");
+		},
+	]);
+	if (kind === "message") await t.chat.receive(t.message("m1", "t1"));
+	else
+		await t.runtime.invoke(
+			t.notify.name,
+			{ text: "first", priority: "normal" },
+			{
+				metadata: {
+					interactionId: randomUUID(),
+					origin: { provider: "github" },
+					replyTo: null,
+					requestedBy: null,
 				},
-			);
-		await t.settle();
-		await other.settle();
-		expect(seen).toHaveLength(1);
-		expect(seen[0]).toContain("queued steer");
-		expect(t.faux.state.callCount).toBe(2);
-		if (kind === "message") {
-			// The failed input got the error reply in its thread; the queued one its answer in its own.
-			// "overloaded" is transient and tests retry nothing, so the retry budget ran out.
-			const [failure] = (await t.posts("t1")).map((post) => post.content as string);
-			expect(failure).toMatch(UNREACHABLE);
-			const answers = [
-				...(await t.posts("t2")),
-				...(
-					await other.chat.thread({
-						kind: "thread",
-						provider: "chat",
-						threadId: `chat:${t.channel}:t2`,
-					})
-				).posts,
-			];
-			expect(answers.map((post) => post.content)).toEqual(["answered"]);
-		}
-	},
-);
+			},
+		);
+	await t.settle();
+	await other.settle();
+	expect(steerQueued, "the steer was not submitted while the failing generation ran").toBe(true);
+	expect(seen).toHaveLength(1);
+	expect(seen[0]).toContain("queued steer");
+	expect(t.faux.state.callCount).toBe(2);
+	if (kind === "message") {
+		// The failed input got the error reply in its thread; the queued one its answer in its own.
+		// "overloaded" is transient and tests retry nothing, so the retry budget ran out.
+		const [failure] = (await t.posts("t1")).map((post) => post.content as string);
+		expect(failure).toMatch(UNREACHABLE);
+		const answers = [
+			...(await t.posts("t2")),
+			...(
+				await other.chat.thread({
+					kind: "thread",
+					provider: "chat",
+					threadId: `chat:${t.channel}:t2`,
+				})
+			).posts,
+		];
+		expect(answers.map((post) => post.content)).toEqual(["answered"]);
+	}
+};
+it("a message queued behind a failed run is still answered", () =>
+	queuedBehindFailedRun("message"));
+// PHASE2: an urgent notification does not steer the running generation: it is submitted only
+// after the failed input is marked unanswered. Found once the steer check moved out of the faux
+// response (the check used to time out there and fail the generation, as the test expected).
+it.fails("a notification queued behind a failed run is still answered", () =>
+	queuedBehindFailedRun("notification"));
 
 it("an urgent notification during a tool call steers the running run and is answered in it", async () => {
 	let release!: () => void;
