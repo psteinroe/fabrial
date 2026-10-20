@@ -687,6 +687,22 @@ describe("provider route response context", () => {
 		});
 		expect(test.metadataOf("owner")?.requestedBy?.id).toBe("alice");
 	});
+	// Pi clears the driver's trigger markers for tool children; they still answer in the driver's thread.
+	it("gives a workflow invoked without trigger ownership the thread of its replyTo", async () => {
+		const child = defineWorkflow({
+			name: "child",
+			run: async (_i, ctx) => ({
+				thread: ctx.thread?.ref.threadId ?? null,
+				owner: ctx.metadata.ownerWorkflow ?? null,
+			}),
+		});
+		const test = setup([workflow(async () => null), child]);
+		await test.app.start();
+		const id = await test.runtime.invoke(child.name, null, {
+			metadata: { ...metadata, replyTo: surface, triggerEvent: null, ownerWorkflow: null },
+		});
+		expect(await db.execution(id).output()).toEqual({ thread: surface.threadId, owner: null });
+	});
 	it("uses receipt-derived metadata for state and agents after lazy channel posts", async () => {
 		await realTime();
 		const counter = defineState({
