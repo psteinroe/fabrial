@@ -179,6 +179,17 @@ export function useCoreApp() {
 		const post = await until("alice's approval card", async () => dm.posts[0]);
 		if (typeof post.content !== "object" || !("card" in post.content))
 			throw new Error("Missing card");
+		// The decision computes its timeout from the deadline when its wait registers: tests advance the
+		// clock only after that, or after the decision settled.
+		await until("the approval decision to wait", async () => {
+			const [row] = await db.sql<{ ready: boolean }[]>`
+				select (completed_at is not null or failed_at is not null
+					or (waiting_step_key = 'decision' and locked_by is null)) as ready
+				from pgconductor._private_executions
+				where queue = ${test.runtime.queue} and task_key = 'fabrial.approval.decision'
+				order by created_at desc limit 1`;
+			return row?.ready ? true : undefined;
+		});
 		return {
 			post,
 			approve: post.content.card.actions![0]!.id,
