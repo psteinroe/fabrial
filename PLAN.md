@@ -849,6 +849,18 @@ Recorded as open questions are resolved.
   - The conversation stays usable, and later input still drives. `ctx.agent` (call) is unchanged: the calling workflow receives the error.
 - **Permissions only on tools.** Agents are offered every tool their definition lists, regardless of who is talking. There are no access lists on workflows, triggers, or tools (`access.invoke` is removed); a tool that needs permission asks its fixed approvers. This keeps shared conversations unambiguous: participants shape proposals, approvers authorize actions.
 
+## Review decisions (2026-10-20)
+
+A full review against the goal (Fabrial is glue over Chat SDK, Pi Durable, and Conductor; custom logic only where none of them can own it) settled these. Each bug was checked for whether it belongs in Conductor; none did. Where earlier sections disagree, these win; the sections are rewritten as the work lands.
+
+- **Approval clicks are authorized at ingress.** The routing workflow checks the clicker against the approval's assignment and current group membership and emits only valid decisions, so an approval waits on one Conductor subscription. No event cursors.
+- **Notifications reply where the follow started.** A follow record keeps the thread it was created from; for thread sessions that is the conversation's thread. `home:` applies only to triggers whose events have no thread. Follows made by a subagent's tools belong to the root conversation, with the subagent's input thread as their origin.
+- **Approval cards show what is authorized.** Every card shows the exact proposal and the verified requester and source thread; custom content adds to it and never replaces it. An optional rejection reason (modal) and an optional destination (default: approvers' DMs; a destination never grants authority). First eligible decision wins; no quorum, no editing a proposal (cancel and request again).
+- **Final replies are at-least-once.** Chat SDK posts have no idempotency key; a crash after a post and before its receipt can repeat it. Runs wait for their final post and surface failures.
+- **Ingress verifies and emits; one workflow routes.** Webhooks verify, normalize, and emit one event with a dedupe key (retained about one to two days). An internal routing workflow resolves followers, triggers, and approval clicks and signals Sessions; Conductor retries it. No pending receipts in thread state.
+- **Tests run on real Conductor** with its test clock; the in-memory runtime engine is removed. Fake chat, scripted models, and pure unit tests stay.
+- **Conductor stays a submodule** pinned to `main` until a version is published.
+
 ## Conductor issues
 
 Most of what Fabrial needed from Conductor has landed (race-safe subscriptions, metadata, middleware, start without waiting, idempotent emit, signals and keyed executions); a Node build is in progress. Still needed, so the adapter uses public APIs only, with no polling or private access ([PGCONDUCTOR.md](./PGCONDUCTOR.md) has the full spec and acceptance criteria):
