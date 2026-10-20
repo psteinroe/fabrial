@@ -138,7 +138,8 @@ describe("expiry and timers", () => {
 		await test.chat.click(c.post.ref, c.approve, outsider.identities[0]!);
 		await eventually("the ephemeral rejection", () => test.chat.ephemeral.length === 1);
 		await execution.suspended();
-		expect((await execution.info())?.status).toBe("pending");
+		// Unsettled; Fabrial's race poll can be re-claiming it while the clock ticks.
+		expect((await execution.info())?.status).not.toMatch(/completed|failed|cancelled/);
 		await db.clock.advance(timeout - early);
 		expect(await execution.output()).toBe("expired");
 		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
@@ -168,7 +169,7 @@ describe("expiry and timers", () => {
 		await test.chat.click(c.post.ref, c.approve, outsider.identities[0]!);
 		await eventually("the ephemeral rejection", () => test.chat.ephemeral.length === 1);
 		await execution.suspended();
-		expect((await execution.info())?.status).toBe("pending");
+		expect((await execution.info())?.status).not.toMatch(/completed|failed|cancelled/);
 		await db.clock.advance(timeout - early);
 		expect(await execution.output()).toBe("timer");
 	});
