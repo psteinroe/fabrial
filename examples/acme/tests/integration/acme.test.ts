@@ -342,7 +342,7 @@ it("requester Cancel request updates the card to Cancelled without writing SQL",
 	await expect.poll(statusCard, poll).toBeDefined();
 	const status = statusCard()!;
 	expect(status.args.thread_ts).toBe("1700000000.000001");
-	const [child] = await sql`SELECT payload -> '__fabrial' -> 'metadata' AS metadata
+	const [child] = await sql`SELECT metadata
 		FROM pgconductor._private_executions WHERE task_key = 'run-sql'`;
 	expect(child?.metadata).toMatchObject({
 		requestedBy: { id: "alice" },
@@ -511,7 +511,7 @@ it("signed GitHub PR opened webhook has one PR-thread owner plus a changelog obs
 		}, poll)
 		.toBe(2);
 	const runs = await sql`SELECT task_key,
-		payload -> '__fabrial' -> 'metadata' -> 'replyTo' ->> 'provider' AS reply_provider
+		metadata -> 'replyTo' ->> 'provider' AS reply_provider
 		FROM pgconductor._private_executions WHERE task_key IN ('pr-review', 'changelog') ORDER BY task_key`;
 	expect(runs).toEqual([
 		{ task_key: "changelog", reply_provider: null },

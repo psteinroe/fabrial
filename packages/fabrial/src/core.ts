@@ -4,7 +4,7 @@ import { filtersOverlap, matchesFilter } from "./internal.ts";
 import { definedAgents, type Agent } from "./agent.ts";
 import { addFollow, confirmIngress, hasIngress, ingress, rememberIngress } from "./routing.ts";
 import { conversationSession, follow, isChatMessage, prepareInput, threadSession } from "./send.ts";
-import type { AnyWorkflow } from "./workflow.ts";
+import type { AnyWorkflow, ExecutionInfo, WorkflowContext } from "./workflow.ts";
 import type { Json } from "./json.ts";
 import { AGENT_SETTLED_EVENT, EXECUTION_SETTLED_EVENT } from "./runtime.ts";
 import type {
@@ -364,6 +364,18 @@ export function buildApp(config: CoreConfig): App {
 		);
 	}
 	const middleware = config.plugins.flatMap((p) => p.hooks?.workflow ?? []);
+	/** Plugin middleware around one attempt; the innermost `next` hands its context to the handler. */
+	const wrap = (
+		info: ExecutionInfo,
+		context: WorkflowContext,
+		next: (context: WorkflowContext) => Promise<void>,
+	): Promise<void> => {
+		const run = (index: number, ctx: WorkflowContext): Promise<void> =>
+			index < middleware.length
+				? middleware[index]!(info, ctx, (inner) => run(index + 1, inner))
+				: next(ctx);
+		return run(0, context);
+	};
 	const workflows: RuntimeWorkflow[] = config.workflows.map((workflow) => ({
 		name: workflow.name,
 		triggers: (workflow.definition.triggers ?? []).map((t: TriggerSpec) => ({
@@ -379,21 +391,19 @@ export function buildApp(config: CoreConfig): App {
 		concurrency: workflow.definition.concurrency,
 		retries: workflow.definition.retries,
 		onSettled: settled,
-		async handler(input, execution) {
+		async attempt(execution, next) {
 			const observer =
 				!!execution.metadata.triggerEvent && execution.metadata.ownerWorkflow !== workflow.name;
 			const metadata = observer ? { ...execution.metadata, replyTo: null } : execution.metadata;
 			const context = await createContext({ host, execution, metadata, agents, now });
-			const run = (index: number, ctx: typeof context): Promise<Json | void> =>
-				index < middleware.length
-					? middleware[index]!(
-							{ executionId: execution.executionId, workflow: workflow.name, metadata },
-							ctx,
-							(next) => run(index + 1, next),
-						)
-					: workflow.definition.run(input, ctx);
-			return run(0, context);
+			await wrap(
+				{ executionId: execution.executionId, workflow: workflow.name, metadata },
+				context,
+				next,
+			);
 		},
+		handler: (input, _execution, context) =>
+			workflow.definition.run(input, context as WorkflowContext),
 	}));
 	const extraWorkflows = new Map((agents?.agents.workflows() ?? []).map((w) => [w.name, w]));
 	for (const workflow of agents?.workflows ?? []) extraWorkflows.set(workflow.name, workflow);
@@ -410,7 +420,7 @@ export function buildApp(config: CoreConfig): App {
 				await workflow.onSettled?.(id, metadata, result);
 				await settled(id, metadata, result);
 			},
-			handler: async (input, execution) => {
+			attempt: async (execution, next) => {
 				const context = await createContext({
 					host,
 					execution,
@@ -418,20 +428,17 @@ export function buildApp(config: CoreConfig): App {
 					agents,
 					now,
 				});
-				const run = (index: number, ctx: typeof context): Promise<Json | void> =>
-					index < middleware.length
-						? middleware[index]!(
-								{
-									executionId: execution.executionId,
-									workflow: workflow.name,
-									metadata: execution.metadata,
-								},
-								ctx,
-								(next) => run(index + 1, next),
-							)
-						: workflow.handler(input, execution);
-				return run(0, context);
+				await wrap(
+					{
+						executionId: execution.executionId,
+						workflow: workflow.name,
+						metadata: execution.metadata,
+					},
+					context,
+					next,
+				);
 			},
+			handler: (input, execution) => workflow.handler(input, execution),
 		});
 	runtime.register({
 		workflows,

@@ -23,7 +23,7 @@ const waiter = (handler: RuntimeWorkflow["handler"]): RuntimeWorkflow => ({
 	handler,
 });
 
-it("enforces a mutex and workflow concurrency", async () => {
+it("enforces workflow concurrency", async () => {
 	let active = 0;
 	let max = 0;
 	const work = async () => {
@@ -34,26 +34,17 @@ it("enforces a mutex and workflow concurrency", async () => {
 	};
 	const runtime = await db.start([
 		{
-			name: "locked",
-			triggers: [],
-			mutex: () => "key",
-			handler: (_input, execution) => execution.step("work", work),
-		},
-		{
 			name: "limited",
 			triggers: [],
 			concurrency: 1,
 			handler: (_input, execution) => execution.step("work", work),
 		},
 	]);
-	for (const name of ["locked", "limited"]) {
-		max = 0;
-		const ids = await Promise.all(
-			Array.from({ length: 3 }, () => runtime.invoke(name, {}, { metadata })),
-		);
-		for (const id of ids) await db.execution(id).output();
-		expect(max).toBe(1);
-	}
+	const ids = await Promise.all(
+		Array.from({ length: 3 }, () => runtime.invoke("limited", {}, { metadata })),
+	);
+	for (const id of ids) await db.execution(id).output();
+	expect(max).toBe(1);
 });
 
 it("redelivers failed settlement hooks without replaying terminal handlers", async () => {

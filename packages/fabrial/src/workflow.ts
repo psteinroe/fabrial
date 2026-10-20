@@ -83,11 +83,15 @@ export interface ExecutionInfo {
 	readonly metadata: InvocationMetadata;
 }
 
+/**
+ * Wraps every attempt of a run, including each resume after a suspension. `next` settles when the
+ * attempt ends: it resolves when the run returns, suspends or is cancelled, and rejects when it throws.
+ */
 export type WorkflowMiddleware = (
 	execution: ExecutionInfo,
 	ctx: WorkflowContext,
-	next: (ctx: WorkflowContext) => Promise<Json | void>,
-) => Promise<Json | void>;
+	next: (ctx: WorkflowContext) => Promise<void>,
+) => Promise<void>;
 
 export interface WorkflowDefinition<
 	TName extends string,

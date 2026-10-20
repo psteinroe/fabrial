@@ -69,7 +69,7 @@ export interface RuntimeSignal {
  * Signal the non-terminal execution of `workflow` for `key`, or start one that receives the signal first.
  * At most one non-terminal execution exists per (workflow, key); a settled one releases its key. `input`
  * and `metadata` are used only when an execution starts. Keyed starts are independent (not cancelled with
- * the caller) and ignore the workflow's `mutex`: the key already serializes them.
+ * the caller).
  */
 export interface SignalWithStartOptions {
 	workflow: string;
@@ -112,8 +112,8 @@ export interface DurableExecution {
 		options?: {
 			metadata?: Partial<InvocationMetadata>;
 			detached?: boolean;
+			/** On timeout the call throws; an attached child is cancelled, a detached one keeps running. */
 			timeoutMs?: number;
-			mutex?: string;
 		},
 	): Promise<Json>;
 	/** Start an independent execution without waiting; idempotent per id (Conductor item 7). Returns its id. */
@@ -121,7 +121,7 @@ export interface DurableExecution {
 		id: string,
 		workflow: string,
 		input: Json,
-		options?: { metadata?: Partial<InvocationMetadata>; dedupeKey?: string; mutex?: string },
+		options?: { metadata?: Partial<InvocationMetadata>; dedupeKey?: string },
 	): Promise<string>;
 	/**
 	 * Listen for signals by name, once per name and attempt; register again on every replay. Signals stored
@@ -158,9 +158,16 @@ export interface RuntimeWorkflow {
 	cron?: { schedule: string; name: string; replyTo?: Surface }[];
 	concurrency?: number;
 	retries?: { maxAttempts?: number };
-	/** Strict per-key mutual exclusion (Conductor item 4); key computed from input + metadata. */
-	mutex?: (input: Json, metadata: InvocationMetadata) => string | undefined;
-	handler: (input: Json, execution: DurableExecution) => Promise<Json | void>;
+	/**
+	 * Wraps every attempt, including each resume (Conductor middleware). `next` settles when the attempt
+	 * ends: it resolves when the handler returns, suspends or is cancelled, and rejects when it throws.
+	 * The value passed to `next` reaches `handler` as `attempt`.
+	 */
+	attempt?: (
+		execution: DurableExecution,
+		next: (attempt: unknown) => Promise<void>,
+	) => Promise<void>;
+	handler: (input: Json, execution: DurableExecution, attempt?: unknown) => Promise<Json | void>;
 	/** Runtime calls this after terminal settlement (success, failure, cancellation), never suspension.
 	 * Must be retried after restart on delivery failure; implementations must be idempotent. */
 	onSettled?: (

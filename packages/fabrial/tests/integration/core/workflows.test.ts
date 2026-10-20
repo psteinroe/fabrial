@@ -191,10 +191,9 @@ describe("durability and context", () => {
 		await owner.suspended("pause");
 		await db.clock.advance(1);
 		await owner.output();
-		// PHASE2: expect two full rounds once workflow middleware is Conductor middleware (task 6). Fabrial's
-		// wrapper runs inside the task handler, which Conductor leaves pending when the attempt suspends, so
-		// the suspended attempt's middleware never returns; Conductor's own `next` settles on suspension.
-		expect(seen).toEqual(["a:before", "b:before", "a:before", "b:before", "b:after", "a:after"]);
+		// Conductor middleware: `next` settles when the attempt suspends, so every attempt is a full round.
+		const round = ["a:before", "b:before", "b:after", "a:after"];
+		expect(seen).toEqual([...round, ...round]);
 	});
 	it("memoizes evaluation, agents, and shared state", async () => {
 		let evaluations = 0;

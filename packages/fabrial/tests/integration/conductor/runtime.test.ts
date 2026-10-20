@@ -559,11 +559,17 @@ test("invoke/start/emit inherit metadata; overrides affect only the child; start
 	let invokes = 0;
 	let childId: string | undefined;
 	const emitted: InvocationMetadata[] = [];
+	const resumed: InvocationMetadata[] = [];
 	const runtime = await setup([
 		workflow("child", async (input, ctx) => {
 			seen.push(ctx.metadata);
 			starts++;
 			return input;
+		}),
+		workflow("resumed", async (_input, ctx) => {
+			resumed.push(ctx.metadata);
+			await ctx.sleep("pause", 30);
+			return null;
 		}),
 		workflow("parent", async (_input, ctx) => {
 			invokes++;
@@ -584,6 +590,7 @@ test("invoke/start/emit inherit metadata; overrides affect only the child; start
 				{ key: "override" },
 				{ id: `${ctx.executionId}:override-emit`, metadata: { interactionId: "emit-override" } },
 			);
+			await ctx.invoke("resume", "resumed", {}, { metadata: { interactionId: "resumed" } });
 			await ctx.sleep("replay", 30);
 			return null;
 		}),
@@ -616,6 +623,13 @@ test("invoke/start/emit inherit metadata; overrides affect only the child; start
 	});
 	expect(await runtime.invoke("parent", {}, { metadata, dedupeKey: "parent" })).toBe(ids[0]);
 	expect(await completed(childId!)).toBe(true);
+	// Native metadata is replayed on every attempt, including the resume after a sleep.
+	expect(resumed.length).toBeGreaterThanOrEqual(2);
+	for (const attempt of resumed) expect(attempt).toEqual({ ...metadata, interactionId: "resumed" });
+	const [row] = await sql<
+		{ payload: Record<string, unknown> }[]
+	>`select payload from pgconductor._private_executions where task_key = 'resumed'`;
+	expect(row?.payload).toEqual({ input: {} });
 });
 
 for (const winner of ["first", "second", "child", "timer"] as const) {
@@ -701,6 +715,7 @@ for (const detached of [false, true]) {
 test("cancel via execution, distinguish failed/cancelled child results, timeout, and independent start survival", async () => {
 	let caught: unknown;
 	let timeoutError: string | undefined;
+	let timedOutChild: string | undefined;
 	const runtime = await setup([
 		workflow("suspended", async (_input, ctx) => {
 			await ctx.waitForEvent("wait", { event: "test.event" });
@@ -726,9 +741,14 @@ test("cancel via execution, distinguish failed/cancelled child results, timeout,
 			}
 			return null;
 		}),
+		workflow("timed-out", async (_input, ctx) => {
+			timedOutChild = ctx.executionId;
+			await ctx.waitForEvent("wait", { event: "test.event" });
+			return null;
+		}),
 		workflow("timeout-call", async (_input, ctx) => {
 			try {
-				await ctx.invoke("child", "suspended", {}, { timeoutMs: 100 });
+				await ctx.invoke("child", "timed-out", {}, { timeoutMs: 100 });
 			} catch (error) {
 				timeoutError = (error as Error).message;
 			}
@@ -753,6 +773,10 @@ test("cancel via execution, distinguish failed/cancelled child results, timeout,
 	const timeout = await runtime.invoke("timeout-call", {}, { metadata });
 	await expect.poll(() => completed(timeout), poll).toBe(true);
 	expect(timeoutError).toBe("Child execution timed out after 100ms");
+	// A native result timeout leaves the child running; an attached call cancels it.
+	await expect
+		.poll(() => terminal(timedOutChild!), poll)
+		.toEqual({ failed: true, cancelled: true });
 	const parent = await runtime.invoke("starter", {}, { metadata });
 	await waiting(parent);
 	const [independent] = await sql<
@@ -761,39 +785,6 @@ test("cancel via execution, distinguish failed/cancelled child results, timeout,
 	await waiting(independent!.id);
 	await runtime.cancel(parent);
 	expect(await terminal(independent!.id)).toEqual({ failed: false, cancelled: false });
-});
-
-test("soft mutex group excludes concurrent invocations on one worker", async () => {
-	let active = 0;
-	let maximum = 0;
-	let finished = 0;
-	const runtime = await setup([
-		workflow(
-			"locked",
-			async (_input, ctx) => {
-				await ctx.step("critical", async () => {
-					active++;
-					maximum = Math.max(maximum, active);
-					try {
-						await sql`select pg_sleep(0.03)`;
-					} finally {
-						active--;
-					}
-					finished++;
-				});
-				return null;
-			},
-			{ mutex: () => "session" },
-		),
-	]);
-	const ids = await Promise.all(
-		Array.from({ length: 10 }, () => runtime.invoke("locked", {}, { metadata })),
-	);
-	await expect.poll(() => finished, poll).toBe(10);
-	await expect
-		.poll(async () => (await Promise.all(ids.map(completed))).every(Boolean), poll)
-		.toBe(true);
-	expect(maximum).toBe(1);
 });
 
 test("restart preserves native wait subscriptions and memoized effects", async () => {
@@ -1063,6 +1054,64 @@ test("structured cancellation is recursive, removes waits, and reports cancelled
 	});
 });
 
+test("cancelling a pending execution marks it cancelled without running it", async () => {
+	let ran = 0;
+	const runtime = await setup([
+		workflow("idle", async () => {
+			ran++;
+			return null;
+		}),
+	]);
+	// Scheduled in the future: still pending when cancelled.
+	const [pending] = await sql<{ id: string }[]>`
+		insert into pgconductor._private_executions (task_key, queue, payload, run_at)
+		values ('idle', 'default', ${sql.json({ input: {} })}, now() + interval '1 hour') returning id`;
+	expect(await runtime.cancel(pending!.id, "not needed")).toBe(true);
+	expect(await terminal(pending!.id)).toEqual({ failed: true, cancelled: true });
+	expect(await runtime.cancel(pending!.id)).toBe(false);
+	expect(ran).toBe(0);
+});
+
+test("a permanently failed parent cancels its attached child, not its detached one", async () => {
+	const children: Record<string, string> = {};
+	const runtime = await setup([
+		workflow("child", async (input, ctx) => {
+			children[input as string] = ctx.executionId;
+			await ctx.waitForEvent("wait", { event: "test.event", filter: { key: [input as string] } });
+			return null;
+		}),
+		workflow(
+			"parent",
+			async (_input, ctx) => {
+				await ctx.start("detached", "child", "detached");
+				await ctx.waitForAny("attached", {
+					timer: { kind: "timer", at: await ctx.step("deadline", () => Date.now() + 200) },
+					child: {
+						kind: "execution",
+						// The attached call's child, started without waiting through the raw context.
+						executionId: await (ctx as ConductorExecution).raw.invoke(
+							"attached",
+							{ name: "child" } as never,
+							{ input: "attached" } as never,
+							{ cancelWithParent: true },
+						),
+					},
+				});
+				throw new Error("parent broke");
+			},
+			{ retries: { maxAttempts: 1 } },
+		),
+	]);
+	const parent = await runtime.invoke("parent", {}, { metadata });
+	await expect.poll(() => terminal(parent), poll).toEqual({ failed: true, cancelled: false });
+	await expect
+		.poll(() => terminal(children.attached!), poll)
+		.toEqual({ failed: true, cancelled: true });
+	expect(await terminal(children.detached!)).toEqual({ failed: false, cancelled: false });
+	await runtime.emit("test.event", { key: "detached" }, { metadata });
+	await expect.poll(() => completed(children.detached!), poll).toBe(true);
+});
+
 test("detached invoke timeout leaves the child running", async () => {
 	let childId: string | undefined;
 	let timedOut = false;
@@ -1190,83 +1239,12 @@ test("emit dedupe is event-scoped and retains the first payload across restart",
 		{ key: "different" },
 		{ metadata: { ...metadata, interactionId: "different" }, id: "same" },
 	);
-	const rows = await sql<
-		{ payload: { payload: { key: string; __fabrial: { metadata: InvocationMetadata } } } }[]
-	>`
-		select payload from pgconductor._private_executions where task_key = 'pgconductor.event-dispatch' order by created_at
+	const rows = await sql<{ payload: { payload: { key: string } }; metadata: InvocationMetadata }[]>`
+		select payload, metadata from pgconductor._private_executions where task_key = 'pgconductor.event-dispatch' order by created_at
 	`;
 	expect(rows).toHaveLength(2);
 	expect(rows[0]?.payload.payload.key).toBe("first");
-	expect(rows[0]?.payload.payload.__fabrial.metadata).toEqual(metadata);
-});
-
-test("start/invoke mutex overrides share the per-task group", async () => {
-	let active = 0;
-	let maximum = 0;
-	let finished = 0;
-	const runtime = await setup([
-		workflow(
-			"locked",
-			async (_input, ctx) => {
-				await ctx.step("effect", async () => {
-					active++;
-					maximum = Math.max(maximum, active);
-					try {
-						await sql`select pg_sleep(0.02)`;
-					} finally {
-						active--;
-					}
-					finished++;
-				});
-				return true;
-			},
-			{ mutex: () => "default-key" },
-		),
-		workflow("parent", async (_input, ctx) => {
-			for (let i = 0; i < 6; i++)
-				await ctx.start(`start:${i}`, "locked", {}, { mutex: "override-key" });
-			return ctx.invoke("last", "locked", {}, { mutex: "override-key" });
-		}),
-	]);
-	const parent = await runtime.invoke("parent", {}, { metadata });
-	await expect.poll(() => finished, poll).toBe(7);
-	await expect.poll(() => completed(parent), poll).toBe(true);
-	expect(maximum).toBe(1);
-	const groups = await sql<
-		{ group: string }[]
-	>`select "group" from pgconductor._private_executions where task_key = 'locked'`;
-	expect(groups).toHaveLength(7);
-	expect(groups.every((row) => row.group === "override-key")).toBe(true);
-});
-
-test("restart repairs a partially cancelled child tree even if a settlement hook keeps failing", async () => {
-	let childId: string | undefined;
-	const definitions = [
-		workflow("child", async (_input, ctx) => {
-			childId = ctx.executionId;
-			await ctx.waitForEvent("wait", { event: "test.event" });
-			return null;
-		}),
-		workflow("parent", async (_input, ctx) => ctx.invoke("call", "child", {}), {
-			onSettled: async () => {
-				throw new Error("unavailable");
-			},
-		}),
-	];
-	const first = await setup(definitions);
-	const parent = await first.invoke("parent", {}, { metadata });
-	await expect.poll(() => childId, poll).toBeDefined();
-	await waiting(childId!);
-	await first.stop();
-	runtimes = runtimes.filter((entry) => entry !== first);
-	// Simulate process loss after the parent cancellation commits but before child propagation.
-	await sql.begin(async (transaction) => {
-		await transaction`select pgconductor.cancel_execution(${parent}::uuid, 'interrupted cancellation')`;
-		await transaction`update pgconductor._private_executions set cancelled = true where id = ${parent}::uuid`;
-	});
-	expect(await terminal(childId!)).toEqual({ failed: false, cancelled: false });
-	await setup(definitions);
-	await expect.poll(() => terminal(childId!), poll).toEqual({ failed: true, cancelled: true });
+	expect(rows[0]?.metadata).toEqual(metadata);
 });
 
 test("dispatchId dedupes a workflow across event categories and restart without merging event receipts", async () => {
@@ -1478,9 +1456,9 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 			...definition,
 			workflows: definition.workflows.map((workflow) => ({
 				...workflow,
-				handler: (input, execution) => {
+				handler: (input, execution, attempt) => {
 					executions.set(execution.executionId, execution);
-					return workflow.handler(input, execution);
+					return workflow.handler(input, execution, attempt);
 				},
 			})),
 		});
@@ -1492,7 +1470,16 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 	await app.start();
 	await app.emit("test.begin", { key: "go" }, { id: "delivery", replyTo: surface });
 	await expect.poll(() => parentId, poll).toBeDefined();
-	await waiting(parentId!);
+	// The child's result wait is a native subscription too: wait for the reply wait itself.
+	await expect
+		.poll(async () => {
+			const [row] = await sql<{ count: number }[]>`
+				select count(*)::int as count from pgconductor._private_custom_event_subscriptions s
+				join pgconductor._private_executions e on e.id = s.execution_id
+				where s.execution_id = ${parentId!}::uuid and s.step_key like '__fabrial:any:reply:%' and e.locked_by is null`;
+			return row?.count;
+		}, poll)
+		.toBe(1);
 	const thread = await chat.thread(surface);
 	expect(thread.posts).toHaveLength(1);
 	// With no after cursor this wait intentionally starts at registration.

@@ -25,6 +25,7 @@ import {
 	type AnyTask,
 	type Logger,
 	type EventDefinition,
+	type Middleware,
 	type WorkerConfig,
 } from "pgconductor-js";
 
@@ -39,13 +40,15 @@ const emptyMetadata = (interactionId: string): InvocationMetadata => ({
 	requestedBy: null,
 });
 
+// PHASE2: task 7 replaces the dispatch envelope with one routing workflow.
 type Carrier = {
-	metadata: InvocationMetadata;
 	owner?: string;
 	dispatchId?: string;
 	dispatchOwner?: { workflow: string; event: string };
-	parent?: string;
 };
+/** Set by the attempt middleware on the native context; the handler reuses its execution. */
+const ATTEMPT = Symbol("fabrial.attempt");
+type Attempt = { execution: ConductorExecution; value: unknown };
 type NativeExecution = {
 	id: string;
 	locked_by: string;
@@ -80,7 +83,10 @@ async function rawOutput(sql: postgres.Sql, ctx: TaskContext, output: Json): Pro
 		on conflict (execution_id, key) do update set result = excluded.result`;
 }
 function carrier(payload: JsonObject): Carrier {
-	return payload[RESERVED] as unknown as Carrier;
+	return (payload[RESERVED] ?? {}) as unknown as Carrier;
+}
+function metadataOf(ctx: TaskContext): InvocationMetadata {
+	return (ctx.metadata as InvocationMetadata | undefined) ?? emptyMetadata(ctx.executionId);
 }
 function clean(payload: JsonObject): JsonObject {
 	const { [RESERVED]: ignored, __fabrialOwner: owner, ...result } = payload;
@@ -114,6 +120,7 @@ type TerminalRow = {
 	id: string;
 	task_key: string;
 	payload: JsonObject;
+	metadata: InvocationMetadata | null;
 	cancelled: boolean;
 	last_error: string | null;
 	failed_at: Date | null;
@@ -234,11 +241,24 @@ class ConductorRuntime implements DurableRuntime {
 				returns: {} as JsonObject,
 			},
 		]);
+		// Per-attempt hooks run as native middleware: its `next` settles when the attempt suspends.
+		const attempt: Middleware<TaskContext> = async ({ execution, ctx }, next) => {
+			const definition =
+				execution.queue === this.queue ? this.definitions.get(execution.task_key) : undefined;
+			if (!definition?.attempt) return next({});
+			const durable = this.execution(definition.name, ctx, metadataOf(ctx));
+			let result: Awaited<ReturnType<typeof next>> | undefined;
+			await definition.attempt(durable, async (value) => {
+				result = await next({ [ATTEMPT]: { execution: durable, value } satisfies Attempt });
+			});
+			return result ?? next({});
+		};
 		const client = Conductor.create({
 			sql: this.sql,
 			tasks: TaskSchemas.fromSchema(schemas),
 			events: EventSchemas.fromSchema(this.eventDefinitions),
 			context: {},
+			middleware: [attempt] as never,
 			logger: this.config.logger,
 			clock: this.config.clock,
 			telemetry: false,
@@ -268,14 +288,17 @@ class ConductorRuntime implements DurableRuntime {
 						queue: this.queue,
 						maxAttempts: definition.retries?.maxAttempts,
 						concurrency: definition.concurrency,
-						// SHIM(conductor#4): soft, per (queue, task, group), NOT a cross-task strict lock.
-						groupConcurrency: 1,
 					},
 					[{ invocable: true }],
 					async (event, ctx) => {
-						const payload = event.payload!;
-						const execution = this.execution(definition.name, ctx, carrier(payload).metadata);
-						const output = await definition.handler(payload.input!, execution);
+						const attempt = (ctx as unknown as { [ATTEMPT]?: Attempt })[ATTEMPT];
+						const execution =
+							attempt?.execution ?? this.execution(definition.name, ctx, metadataOf(ctx));
+						const output = await definition.handler(
+							event.payload!.input!,
+							execution,
+							attempt?.value,
+						);
 						await rawOutput(this.sql, ctx, output ?? null);
 						return { output: output ?? null };
 					},
@@ -301,9 +324,8 @@ class ConductorRuntime implements DurableRuntime {
 						triggers,
 						async (event, ctx) => {
 							const payload = event.payload;
-							const inherited = payload
-								? carrier(payload).metadata
-								: emptyMetadata(ctx.executionId);
+							// Events carry native metadata, which the dispatcher passes to triggered executions.
+							const inherited = metadataOf(ctx);
 							const isOwner =
 								payload &&
 								carrier(payload).owner === definition.name &&
@@ -328,18 +350,23 @@ class ConductorRuntime implements DurableRuntime {
 							};
 							const input: Json = payload ? clean(payload) : { name: event.name };
 							// Multiple matching subscriptions of one workflow collapse to one actual invocation.
+							// PHASE2: task 7 replaces per-workflow routing tasks and this private lookup.
 							const [source] = await this.sql<{ parent_execution_id: string | null }[]>`
 					select parent_execution_id from pgconductor._private_executions where id = ${ctx.executionId}::uuid
 				`;
-							await this.launch(
-								definition.name,
-								input,
-								metadata,
-								// SHIM(conductor#8): one ingress can emit several event categories. The
-								// shared dispatch ID dedupes the actual workflow, not the event receipt.
-								payload && carrier(payload).dispatchId !== undefined
-									? `__fabrial:dispatch:${JSON.stringify([carrier(payload).dispatchId, definition.name])}`
-									: `event:${source?.parent_execution_id ?? ctx.executionId}:${definition.name}`,
+							await ctx.invoke(
+								"__fabrial:route",
+								{ name: definition.name, queue: this.queue },
+								{ input },
+								{
+									metadata,
+									// SHIM(conductor#8): one ingress can emit several event categories. The
+									// shared dispatch ID dedupes the actual workflow, not the event receipt.
+									dedupe_key:
+										payload && carrier(payload).dispatchId !== undefined
+											? `__fabrial:dispatch:${JSON.stringify([carrier(payload).dispatchId, definition.name])}`
+											: `event:${source?.parent_execution_id ?? ctx.executionId}:${definition.name}`,
+								},
 							);
 							return {};
 						},
@@ -372,19 +399,21 @@ class ConductorRuntime implements DurableRuntime {
 
 	// SHIM(conductor#7): Conductor.invoke's dedupe UPDATES/reinvokes existing executions. An
 	// INSERT ... DO NOTHING receipt instead keeps the original execution, including after completion.
+	// PHASE2: only client invocations (task 10 deletes cancelRun's recovery) and event receipts with
+	// cursors (tasks 9 and 12) still insert directly.
 	private async insert(
 		task: string,
 		queue: string,
 		payload: JsonObject,
+		metadata: InvocationMetadata,
 		dedupe?: string,
-		group?: string,
 		isEvent = false,
 	): Promise<string> {
 		return this.sql.begin(async (sql) => {
 			if (isEvent) payload = { ...payload, __fabrialCursor: await this.position(sql) };
 			const rows = await sql<{ id: string }[]>`
-				insert into pgconductor._private_executions (task_key, queue, payload, dedupe_key, "group")
-				values (${task}, ${queue}, ${sql.json(payload)}, ${dedupe ?? null}, ${group ?? null})
+				insert into pgconductor._private_executions (task_key, queue, payload, metadata, dedupe_key)
+				values (${task}, ${queue}, ${sql.json(payload)}, ${sql.json(metadata)}, ${dedupe ?? null})
 				on conflict (task_key, dedupe_key, queue) do nothing returning id
 			`;
 			if (rows[0]) return rows[0].id;
@@ -412,32 +441,14 @@ class ConductorRuntime implements DurableRuntime {
 	private captureCursor(): Promise<EventCursor> {
 		return this.sql.begin((sql) => this.position(sql));
 	}
-	private async launch(
-		name: string,
-		input: Json,
-		metadata: InvocationMetadata,
-		dedupe?: string,
-		mutex?: string,
-		parent?: string,
-	): Promise<string> {
-		const definition = this.definition(name);
-		const group = mutex ?? definition.mutex?.(input, metadata);
-		return this.insert(
-			name,
-			this.queue,
-			{ input, [RESERVED]: { metadata, ...(parent ? { parent } : {}) } },
-			dedupe,
-			group,
-		);
-	}
-
 	async invoke(
 		workflow: string,
 		input: Json,
 		options: { metadata: InvocationMetadata; dedupeKey?: string },
 	): Promise<string> {
 		this.assertReady();
-		return this.launch(workflow, input, options.metadata, options.dedupeKey);
+		this.definition(workflow);
+		return this.insert(workflow, this.queue, { input }, options.metadata, options.dedupeKey);
 	}
 	async emit(
 		event: string,
@@ -462,7 +473,6 @@ class ConductorRuntime implements DurableRuntime {
 				payload: {
 					...payload,
 					[RESERVED]: {
-						metadata: options.metadata,
 						...(options.owner ? { owner: options.owner } : {}),
 						...(options.dispatchId !== undefined ? { dispatchId: options.dispatchId } : {}),
 						...(options.dispatchOwner ? { dispatchOwner: options.dispatchOwner } : {}),
@@ -470,31 +480,16 @@ class ConductorRuntime implements DurableRuntime {
 					__fabrialOwner: options.owner ?? null,
 				},
 			},
+			options.metadata,
 			options.id === undefined ? undefined : JSON.stringify([event, options.id]),
-			undefined,
 			true,
 		);
 	}
 
 	async cancel(executionId: string, reason = "Cancelled by user"): Promise<boolean> {
 		this.assertReady();
-		// SHIM(conductor#5): structured children are persisted in the metadata envelope. Detached
-		// calls/start have no parent link. Mark pending native cancellations too (upstream omits it).
-		const cancelled = await this.sql.begin(async (sql) => {
-			const [row] = await sql<{ cancelled: boolean }[]>`
-				select pgconductor.cancel_execution(${executionId}::uuid, ${reason}) as cancelled
-			`;
-			if (!row?.cancelled) return false;
-			await sql`update pgconductor._private_executions set cancelled = true where id = ${executionId}::uuid`;
-			return true;
-		});
-		if (!cancelled) return false;
-		const children = await this.sql<{ id: string }[]>`
-			select id from pgconductor._private_executions where payload -> ${RESERVED} ->> 'parent' = ${executionId}
-			and completed_at is null and failed_at is null and not cancelled
-		`;
-		for (const child of children) await this.cancel(child.id, reason);
-		return true;
+		// Attached children (`cancelWithParent`) are cancelled with it, transitively.
+		return this.client!.cancel(executionId, { reason });
 	}
 
 	async signal(executionId: string, signal: RuntimeSignal): Promise<boolean> {
@@ -505,17 +500,15 @@ class ConductorRuntime implements DurableRuntime {
 		options: SignalWithStartOptions & { metadata: InvocationMetadata },
 	): Promise<string> {
 		this.assertReady();
-		return this.client!.signalWithStart(this.keyedStart(options, options.metadata));
-	}
-	private keyedStart(options: SignalWithStartOptions, metadata: InvocationMetadata) {
 		this.definition(options.workflow);
-		return {
+		return this.client!.signalWithStart({
 			task: options.workflow,
 			queue: this.queue,
 			key: options.key,
 			signal: options.signal,
-			input: { input: options.input ?? null, [RESERVED]: { metadata } },
-		} as unknown as Parameters<Conductor["signalWithStart"]>[0];
+			input: { input: options.input ?? null },
+			metadata: options.metadata,
+		} as unknown as Parameters<Conductor["signalWithStart"]>[0]);
 	}
 
 	async start(): Promise<void> {
@@ -556,15 +549,6 @@ class ConductorRuntime implements DurableRuntime {
 		// SHIM(conductor#5): settle failures/cancellations the core wrapper cannot observe, even after
 		// restart. Prefer the core settlement hook; without it, success notifications belong to core.
 		// Receipts live only in Conductor's tables. Settlement hooks must be idempotent.
-		const orphans = await this.sql<{ id: string; last_error: string | null }[]>`
-			select child.id, parent.last_error
-			from pgconductor._private_executions child
-			join pgconductor._private_executions parent on parent.id::text = child.payload -> ${RESERVED} ->> 'parent'
-			where child.queue = ${this.queue} and child.completed_at is null and child.failed_at is null and not child.cancelled
-			and (parent.cancelled or parent.failed_at is not null)
-		`;
-		for (const child of orphans)
-			if (this.running) await this.cancel(child.id, child.last_error ?? "Parent execution ended");
 		const rows = await this.sql<TerminalRow[]>`
 			select e.*, s.result from pgconductor._private_executions e
 			left join pgconductor._private_steps s on s.execution_id = e.id and s.key = '__fabrial:output'
@@ -582,7 +566,7 @@ class ConductorRuntime implements DurableRuntime {
 			this.settlementCursor = row.id;
 			try {
 				const result = resultOf(row)!;
-				const metadata = carrier(row.payload).metadata;
+				const metadata = row.metadata ?? emptyMetadata(row.id);
 				const hook = this.definition(row.task_key).onSettled;
 				if (hook) await hook(row.id, metadata, result);
 				else if (result.status !== "completed")
@@ -608,16 +592,18 @@ class ConductorRuntime implements DurableRuntime {
 		metadata: InvocationMetadata,
 	): ConductorExecution {
 		const executionId = raw.executionId;
-		const start: DurableExecution["start"] = (id, name, input, options) =>
-			raw.step(operationId(id), () =>
-				this.launch(
-					name,
-					input,
-					mergeMetadata(metadata, options?.metadata),
-					options?.dedupeKey ?? `__fabrial:start:${JSON.stringify([executionId, id])}`,
-					options?.mutex,
-				),
+		const start: DurableExecution["start"] = (id, name, input, options) => {
+			this.definition(name);
+			return raw.invoke(
+				operationId(id),
+				{ name, queue: this.queue },
+				{ input },
+				{
+					metadata: mergeMetadata(metadata, options?.metadata),
+					...(options?.dedupeKey !== undefined ? { dedupe_key: options.dedupeKey } : {}),
+				},
 			);
+		};
 		return {
 			executionId,
 			workflow,
@@ -654,46 +640,40 @@ class ConductorRuntime implements DurableRuntime {
 			invoke: async (id, name, input, options) => {
 				operationId(id);
 				if (options?.timeoutMs !== undefined) duration(options.timeoutMs);
-				// SHIM(conductor#5): independent deduped submission plus a persisted structured link
-				// replaces native invoke so detached calls can wait without cancellation propagation.
-				const child = await raw.step(`__fabrial:invoke:${id}`, () =>
-					this.launch(
-						name,
-						input,
-						mergeMetadata(metadata, options?.metadata),
-						`__fabrial:invoke:${JSON.stringify([executionId, id])}`,
-						options?.mutex,
-						options?.detached ? undefined : executionId,
-					),
+				this.definition(name);
+				// Not invokeAndWait: a failed child must reach the caller's catch as an ExecutionError.
+				const child = await raw.invoke(
+					`__fabrial:invoke:${id}`,
+					{ name, queue: this.queue },
+					{ input },
+					{
+						metadata: mergeMetadata(metadata, options?.metadata),
+						cancelWithParent: !options?.detached,
+					},
 				);
-				const branches: Record<string, WaitBranch> = {
-					child: { kind: "execution", executionId: child },
-				};
-				if (options?.timeoutMs !== undefined)
-					branches.timeout = {
-						kind: "timer",
-						at: await raw.step(`__fabrial:invoke:${id}:deadline`, async () => {
-							const [row] = await this.sql<
-								{ at: number }[]
-							>`select extract(epoch from pgconductor._private_current_time())::double precision * 1000 as at`;
-							return row!.at + options.timeoutMs!;
-						}),
-					};
-				const winner = await this.waitForAny(raw, id, branches);
-				if (winner.kind === "timer") {
+				const outcome = await raw.waitForResult<{ output: Json }>(
+					id,
+					child,
+					options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : undefined,
+				);
+				if (outcome.status === "timeout") {
+					// A native timeout leaves the child running; an attached call owns its child.
 					if (!options?.detached) await this.cancel(child, "Parent invocation timed out");
 					throw new Error(`Child execution timed out after ${options?.timeoutMs}ms`);
 				}
-				if (winner.kind !== "execution") throw new Error("Invalid child result");
-				if (winner.result.status === "completed") return winner.result.output;
-				throw new ExecutionError(child, winner.result);
+				if (outcome.status === "completed") return outcome.result.output;
+				throw new ExecutionError(child, outcome);
 			},
 			onSignal: (name, handler) =>
 				raw.onSignal(name, (payload, info) => handler(payload as Json, { id: info.id })),
+			// PHASE2: ctx.signalWithStart only inherits this execution's metadata, so the client call
+			// runs in a step instead (at-least-once: a lost receipt can signal again).
 			signalWithStart: (id, options) =>
-				raw.signalWithStart(
-					operationId(id),
-					this.keyedStart(options, mergeMetadata(metadata, options.metadata)),
+				raw.step(operationId(id), () =>
+					this.signalWithStart({
+						...options,
+						metadata: mergeMetadata(metadata, options.metadata),
+					}),
 				),
 			emit: (event, payload, options) =>
 				this.emit(event, payload, {
