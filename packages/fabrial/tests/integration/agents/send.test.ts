@@ -1,3 +1,4 @@
+import type { FakeChat } from "../../../src/testing.ts";
 import { randomUUID } from "node:crypto";
 import { createModels } from "@earendil-works/pi-ai/models";
 import type { Message } from "@earendil-works/pi-ai";
@@ -113,10 +114,12 @@ async function setup(
 		run: (input, ctx) => ctx.agent("ask", agent, { input: input.question }),
 	});
 	// Another process on the same database: its driver waits for the Session lease.
-	const launch = async () => {
+	/** Another instance: by default another deployment (its own queue and chat); `peer` shares both. */
+	const launch = async (peer?: { queue: string; chat: FakeChat }) => {
 		const { runtime, chat, app } = await start(
 			f,
 			{
+				...peer,
 				workflows: [notify, ask],
 				routedAgents: [agent],
 				agents: pi({
@@ -447,7 +450,9 @@ it.each(["notification", "message"] as const)(
 
 const queuedBehindFailedRun = async (kind: "notification" | "message") => {
 	const t = await setup();
-	const other = await t.launch();
+	// Another instance of the same app: on another queue, its Session execution would be a second one,
+	// waiting for the lease, and its effects would post through its own chat.
+	const other = await t.launch({ queue: t.runtime.queue, chat: t.chat });
 	const session = kind === "message" ? `chat:channel:${t.channel}` : `app:ops-${t.channel}`;
 	const seen: string[] = [];
 	// Asserted after settling: a throw inside the response would only fail the generation, which
@@ -510,25 +515,12 @@ const queuedBehindFailedRun = async (kind: "notification" | "message") => {
 		// "overloaded" is transient and tests retry nothing, so the retry budget ran out.
 		const [failure] = (await t.posts("t1")).map((post) => post.content as string);
 		expect(failure).toMatch(UNREACHABLE);
-		const answers = [
-			...(await t.posts("t2")),
-			...(
-				await other.chat.thread({
-					kind: "thread",
-					provider: "chat",
-					threadId: `chat:${t.channel}:t2`,
-				})
-			).posts,
-		];
-		expect(answers.map((post) => post.content)).toEqual(["answered"]);
+		expect((await t.posts("t2")).map((post) => post.content)).toEqual(["answered"]);
 	}
 };
 it("a message queued behind a failed run is still answered", () =>
 	queuedBehindFailedRun("message"));
-// PHASE2: an urgent notification does not steer the running generation: it is submitted only
-// after the failed input is marked unanswered. Found once the steer check moved out of the faux
-// response (the check used to time out there and fail the generation, as the test expected).
-it.fails("a notification queued behind a failed run is still answered", () =>
+it("a notification queued behind a failed run is still answered", () =>
 	queuedBehindFailedRun("notification"));
 
 it("an urgent notification during a tool call steers the running run and is answered in it", async () => {
