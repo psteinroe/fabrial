@@ -1,13 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
 	fauxAssistantMessage,
 	fauxProvider,
 	fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
-import postgres, { type Sql } from "postgres";
-import { afterAll, beforeAll, expect, it, vi } from "vitest";
+import type { StorageWrite } from "@earendil-works/pi-durable";
+import { expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
 	createFabrial,
@@ -20,20 +19,13 @@ import {
 	type ThreadRoutingState,
 } from "../../../src/index.ts";
 import { pi } from "../../../src/agents/index.ts";
-import { FakeChat, MemoryRuntime, testApp } from "../../../src/testing.ts";
+import { FakeChat } from "../../../src/testing.ts";
 import { github } from "../../../../github/src/index.ts";
 import { deliver, outsider, webhooks } from "../../../../github/tests/webhooks.ts";
+import { until } from "../../conductor/helper.ts";
+import { useAgents } from "./setup.ts";
 
-let sql: Sql;
-let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;
-beforeAll(async () => {
-	container = await new PostgreSqlContainer("postgres:17-alpine").start();
-	sql = postgres(container.getConnectionUri(), { onnotice: () => {} });
-});
-afterAll(async () => {
-	await sql?.end();
-	await container?.stop();
-});
+const { sql, launch: start, idle } = useAgents();
 
 const chatPlugin = definePlugin({
 	id: "chat",
@@ -92,35 +84,33 @@ const lead = f.defineAgent({
 });
 
 /** Chat SDK state outlives app restarts (Postgres in production); one fake chat stands in for it. */
-let runtime: MemoryRuntime;
-const chat = new FakeChat(() => runtime.now());
+const chat = new FakeChat();
 
-async function launch(routedAgents = [developer]) {
-	runtime = new MemoryRuntime({ idPrefix: randomUUID() });
-	const app = testApp(f, {
+/** Start the app, or restart it on the queue of a stopped one. */
+async function launch(routedAgents = [developer], queue?: string) {
+	const { app, runtime } = await start(f, {
 		workflows: [],
 		routedAgents,
-		runtime,
 		chat,
-		agents: pi({ models, sql, settings: { retry: { enabled: false } } }),
+		queue,
+		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
 	});
-	await app.start();
-	const settle = async () => {
-		await expect
-			.poll(
-				async () => {
-					await runtime.flush();
-					return runtime.executions().every((e) => e.status === "settled");
-				},
-				{ timeout: 10_000 },
-			)
-			.toBe(true);
-	};
+	const settle = () => idle(runtime.queue);
 	const webhook = async (hook: { event: string; payload: unknown }, delivery: string) => {
 		expect((await app.fetch(deliver(hook, delivery))).status).toBe(200);
 		await settle();
 	};
-	return { app, settle, webhook };
+	return { app, runtime, settle, webhook };
+}
+/** Request ids Pi accepted in a Session, read from its commit log without taking the lease. */
+async function submitted(session: string): Promise<string[]> {
+	const rows =
+		await sql()`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${session} ORDER BY seq`;
+	const ids = new Set<string>();
+	for (const row of rows)
+		for (const write of JSON.parse(String(row.writes)) as StorageWrite[])
+			if (write.type === "submission" && write.value.requestId) ids.add(write.value.requestId);
+	return [...ids];
 }
 
 const prThread = { kind: "thread" as const, provider: "github", threadId: "github:acme/app:5" };
@@ -182,7 +172,7 @@ it("a chat conversation follows its PR: tool follow, restart, review wakes the a
 
 	// Restart between the follow and the first event: the record is in thread state.
 	await t.app.stop();
-	t = await launch();
+	t = await launch([developer], t.runtime.queue);
 	await t.webhook(webhooks.review("changes_requested"), "review-1");
 	expect(faux.state.callCount).toBe(3);
 	expect(contexts[0]).toContain("requested changes on acme/app#5");
@@ -201,10 +191,10 @@ it("a chat conversation follows its PR: tool follow, restart, review wakes the a
 	// An urgent review steers the busy run: it joins the run's next model call, with no run of its own.
 	const waiting = new Promise<void>((resolve) => (started = resolve));
 	expect(await chat.receive(message(threadId, "m2", "Wait for CI"))).toBe("follow");
-	// The run blocks in its tool, so flushing only completes after the release below.
-	const running = runtime.flush();
+	// The run blocks in its tool until the release below.
 	await waiting;
 	expect(faux.state.callCount).toBe(4);
+	const accepted = (await submitted(`chat:${threadId}`)).length;
 	const second = webhooks.review("changes_requested");
 	const review = (second.payload as { review: JsonObject }).review;
 	expect(
@@ -220,9 +210,10 @@ it("a chat conversation follows its PR: tool follow, restart, review wakes the a
 			)
 		).status,
 	).toBe(200);
-	await new Promise((resolve) => setTimeout(resolve, 200));
+	await until("the review to reach the busy Session", async () =>
+		(await submitted(`chat:${threadId}`)).length > accepted ? true : undefined,
+	);
 	release();
-	await running;
 	await t.settle();
 	expect(faux.state.callCount).toBe(5);
 	expect(contexts[1]).toContain("CI passed");
@@ -282,9 +273,16 @@ it("orchestrator: a channel lead starts a background worker per message; reports
 			})
 		).posts.map((post) => post.content);
 	const t = await launch([lead]);
+	// A background worker reports after the lead's run returned: wait for each report.
 	await ask("t1", "m1", "The first request");
+	await until("the first report", async () =>
+		(await posts("t1")).includes("Reported first.") ? true : undefined,
+	);
 	await t.settle();
 	await ask("t2", "m2", "The second request");
+	await until("the second report", async () =>
+		(await posts("t2")).includes("Reported second.") ? true : undefined,
+	);
 	await t.settle();
 	// Each worker's report is answered in the thread of the message that started it.
 	expect(await posts("t1")).toContain("Reported first.");
