@@ -1,8 +1,12 @@
 import type { ApprovalDecision, ApprovalHandle, ApprovalOptions } from "./approval.ts";
 import type { ContextOptions, InternalAwaitable } from "./context.ts";
-import type { ExternalIdentity, Principal } from "./identity.ts";
+import {
+	APPROVAL_DECIDED_EVENT,
+	APPROVAL_REQUEST_WORKFLOW,
+	type ApprovalRequest,
+} from "./approval-workflows.ts";
+import { definedGroup, type Principal } from "./identity.ts";
 import { APPROVAL_CLOSED_EVENT, CLEANUP_WORKFLOW, PRESENTATION_EVENT } from "./cleanup.ts";
-import { samePrincipal } from "./directory.ts";
 import { boundedTimeout } from "./internal.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { Awaitable, MessageRef, OutboundMessage } from "./thread.ts";
@@ -31,39 +35,60 @@ export async function createApproval(
 	const { host, execution, metadata, now } = ctx;
 	const chat = host.chat();
 	if (!chat) throw new Error("Approvals require a chat integration");
-	const approvalId = `${execution.executionId}:${id}`;
 	const originatingProvider = metadata.origin?.provider ?? metadata.replyTo?.provider;
 	const targets = Array.isArray(options.approvers) ? options.approvers : [options.approvers];
-	const request = await execution.step(`fabrial:${id}:request`, async () => {
+	const request = (await execution.step(`fabrial:${id}:request`, async () => {
 		const resolved: Principal[] = [];
+		const users: Principal[] = [];
 		for (const target of targets) {
-			if (target.kind === "fabrial.group") resolved.push(...(await host.directory.members(target)));
-			else
-				resolved.push(
-					...(await host.directory.members({
-						kind: "fabrial.group",
-						id: `approval:${target.id}`,
-						members: [target],
-					})),
-				);
+			if (target.kind === "fabrial.group") {
+				// Clicks are checked against the group's members then, by its id: it must name this group.
+				if (definedGroup(target.id) !== target)
+					throw new Error(
+						`Approval group ${target.id} must be defined once with defineGroup to be assigned`,
+					);
+				resolved.push(...(await host.directory.members(target)));
+			} else {
+				const [user] = await host.directory.members({
+					kind: "fabrial.group",
+					id: `approval:${target.id}`,
+					members: [target],
+				});
+				users.push(user!);
+				resolved.push(user!);
+			}
 		}
 		const approvers = [...new Map(resolved.map((p) => [p.id, p])).values()];
 		if (!approvers.length) throw new Error("Approval requires at least one approver");
 		return {
-			approvers: approvers as unknown as Json,
+			callerId: execution.executionId,
+			operationId: id,
+			assigned: {
+				users,
+				groups: targets.flatMap((t) => (t.kind === "fabrial.group" ? [t.id] : [])),
+			},
+			approvers,
+			requester: metadata.requestedBy,
 			deadline: now() + boundedTimeout(options.timeout),
 			title: options.title,
 			details: options.details,
 			requesterControls: options.requesterControls ?? true,
 			card: options.card ? (options.card as unknown as Json) : null,
-		};
-	});
+		} satisfies ApprovalRequest as unknown as Json;
+	})) as unknown as ApprovalRequest;
 	if (request.title !== options.title || canonical(request.details) !== canonical(options.details))
 		throw new Error(
 			`Approval ${id} proposal changed: title/details must match the persisted request`,
 		);
+	// The request's own execution: its result is what the routing workflow authorizes clicks against.
+	const approvalId = await execution.start(
+		`fabrial:${id}:record`,
+		APPROVAL_REQUEST_WORKFLOW,
+		request as unknown as Json,
+		{ metadata: { ...metadata, replyTo: null, ownerWorkflow: null, triggerEvent: null } },
+	);
 	const after = await execution.cursor(`fabrial:${id}:cursor`);
-	const approvers = request.approvers as unknown as Principal[];
+	const approvers = request.approvers;
 	await execution.start(
 		`fabrial:${id}:cleanup`,
 		CLEANUP_WORKFLOW,
@@ -177,65 +202,30 @@ export async function createApproval(
 		kind: "fabrial.awaitable",
 		branch: {
 			kind: "event",
-			event: "fabrial.approval.decided",
+			event: APPROVAL_DECIDED_EVENT,
 			filter: { approvalId: [approvalId] },
 			after,
 		},
 		deadline: request.deadline,
 		prepare: async () => ({ ready: !!resolution, value: (resolution as unknown as Json) ?? null }),
-		accept: async (waitId, value) => {
+		// Only authorized decisions reach the approval: the routing workflow checks every click.
+		accept: async (_waitId, value) => {
 			if (value === null)
-				return {
-					accepted: true,
-					value: (await finish({
-						status: "expired",
-						approved: false,
-						decidedBy: null,
-						decidedAt: new Date(now()).toISOString(),
-					})) as unknown as Json,
-				};
+				return (await finish({
+					status: "expired",
+					approved: false,
+					decidedBy: null,
+					decidedAt: new Date(now()).toISOString(),
+				})) as unknown as Json;
 			const event = value as JsonObject;
-			const actor = event.actor as unknown as Principal | null;
-			const cancelled = event.status === "cancelled";
-			const eligible = await execution.step(`${waitId}:eligible`, async () => {
-				if (event.internal === execution.executionId && cancelled) return true;
-				if (!actor) return false;
-				if (cancelled)
-					return (
-						request.requesterControls !== false &&
-						!!metadata.requestedBy &&
-						samePrincipal(actor, metadata.requestedBy)
-					);
-				if (!approvers.some((p) => samePrincipal(p, actor))) return false;
-				for (const target of targets) {
-					if (target.kind === "fabrial.user" && target.id === actor.id) return true;
-					if (target.kind === "fabrial.group" && (await host.directory.isMember(actor, target)))
-						return true;
-				}
-				return false;
-			});
-			if (!eligible) {
-				await execution.step(`${waitId}:notice`, async () => {
-					if (event.identity && event.thread)
-						await chat.postEphemeral(
-							event.thread as unknown as import("./thread.ts").ThreadRef,
-							event.identity as unknown as ExternalIdentity,
-							"You are not authorized to decide this approval.",
-						);
-				});
-				return { accepted: false, value: null };
-			}
 			const decision: ApprovalDecision = {
 				status: event.status as ApprovalDecision["status"],
 				approved: event.status === "approved",
-				decidedBy: actor,
+				decidedBy: event.actor as unknown as Principal | null,
 				decidedAt: new Date(now()).toISOString(),
 				...(typeof event.comment === "string" ? { comment: event.comment } : {}),
 			};
-			return {
-				accepted: true,
-				value: (await finish(decision, event.reason as string | undefined)) as unknown as Json,
-			};
+			return (await finish(decision, event.reason as string | undefined)) as unknown as Json;
 		},
 	};
 	return {
@@ -250,7 +240,7 @@ export async function createApproval(
 			if (resolution) return;
 			await execution.step(key, async () => {
 				await execution.emit(
-					"fabrial.approval.decided",
+					APPROVAL_DECIDED_EVENT,
 					{ approvalId, status: "cancelled", actor: null, internal: execution.executionId, reason },
 					{ id: `${approvalId}:cancel` },
 				);

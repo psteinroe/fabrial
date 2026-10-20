@@ -15,7 +15,8 @@ export interface InternalAwaitable extends Awaitable {
 	deadline?: number;
 	timerMs?: number;
 	prepare?: (id: string) => Promise<{ ready: boolean; value: Json }>;
-	accept?: (id: string, value: Json) => Promise<{ accepted: boolean; value: Json }>;
+	/** Turn the winning branch's value (null for a timeout) into the awaitable's value. */
+	accept?: (id: string, value: Json) => Promise<Json>;
 }
 
 export interface ContextOptions {
@@ -101,35 +102,26 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 			const prepared = await awaitable.prepare?.(`fabrial:${id}:prepare:${key}`);
 			if (prepared?.ready) return { key, value: prepared.value };
 		}
-		for (let attempt = 0; ; attempt++) {
-			const branches: Record<string, WaitBranch> = {};
-			for (const [key, awaitable] of entries) {
-				branches[key] = eventBranches[key]!;
-				if (awaitable.deadline !== undefined)
-					branches[`fabrial:timeout:${key}`] = {
-						kind: "timer",
-						at: awaitable.deadline,
-					};
-			}
-			const winner = await execution.waitForAny(`fabrial:${id}:wait:${attempt}`, branches);
-			if (winner.kind === "event")
-				for (const [key, branch] of Object.entries(eventBranches))
-					if (branch.kind === "event") eventBranches[key] = { ...branch, after: winner.cursor };
-			const timeout = winner.key.startsWith("fabrial:timeout:");
-			const key = timeout ? winner.key.slice("fabrial:timeout:".length) : winner.key;
-			const awaitable = entries.find(([k]) => k === key)![1];
-			const value =
-				winner.kind === "event"
-					? winner.event.payload
-					: winner.kind === "execution"
-						? (winner.result as unknown as Json)
-						: null;
-			const accepted = (await awaitable.accept?.(`fabrial:${id}:accept:${attempt}`, value)) ?? {
-				accepted: true,
-				value,
-			};
-			if (accepted.accepted) return { key, value: accepted.value };
+		const branches: Record<string, WaitBranch> = {};
+		for (const [key, awaitable] of entries) {
+			branches[key] = eventBranches[key]!;
+			if (awaitable.deadline !== undefined)
+				branches[`fabrial:timeout:${key}`] = { kind: "timer", at: awaitable.deadline };
 		}
+		const winner = await execution.waitForAny(`fabrial:${id}:wait`, branches);
+		const timeout = winner.key.startsWith("fabrial:timeout:");
+		const key = timeout ? winner.key.slice("fabrial:timeout:".length) : winner.key;
+		const awaitable = entries.find(([k]) => k === key)![1];
+		const value =
+			winner.kind === "event"
+				? winner.event.payload
+				: winner.kind === "execution"
+					? (winner.result as unknown as Json)
+					: null;
+		return {
+			key,
+			value: awaitable.accept ? await awaitable.accept(`fabrial:${id}:accept`, value) : value,
+		};
 	};
 	const surface = metadata.replyTo as Surface | null;
 	const thread: Thread | undefined =

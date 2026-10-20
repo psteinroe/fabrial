@@ -63,7 +63,7 @@ describe("approvals", () => {
 	});
 	it("requires assigned approvers to still be members", async () => {
 		let members = [alice, bob];
-		const rotation = defineGroup({ id: "rotation", resolve: () => members });
+		const rotation = defineGroup({ id: "rotation-removed", resolve: () => members });
 		const test = setup([
 			workflow(
 				async (_i, ctx) =>
@@ -138,30 +138,30 @@ describe("approval edge cases", () => {
 		const owner = await enter(test);
 		expect(await owner.output()).toBe("approved");
 	});
-	it("keeps assigned approvers fixed through replay and excludes newly rotated-in members", async () => {
+	it("authorizes the group's current members: a member added after the request may approve", async () => {
 		let members = [alice];
-		const group = defineGroup({ id: "rotation", resolve: () => members });
+		const group = defineGroup({ id: "rotation-added", resolve: () => members });
 		const test = setup([
-			workflow(
-				async (_i, ctx) =>
-					(
-						await ctx.waitForApproval("approval", {
-							title: "Proposal",
-							details: {},
-							approvers: group,
-							timeout: "1h",
-						})
-					).status,
-			),
+			workflow(async (_i, ctx) => {
+				const decision = await ctx.waitForApproval("approval", {
+					title: "Proposal",
+					details: {},
+					approvers: group,
+					timeout: "1h",
+				});
+				return [decision.status, decision.decidedBy?.id ?? null];
+			}),
 		]);
 		const owner = await enter(test);
 		const c = await card(test);
-		members = [alice, bob];
-		await test.chat.click(c.post.ref, c.approve, bob.identities[0]!);
-		await eventually("the ephemeral rejection", () => test.chat.ephemeral.length === 1);
+		await owner.suspended();
+		members = [bob];
+		// Cards went to the members when the request was made; authority follows the group.
 		expect((await test.chat.openDM(bob.identities[0]!)).posts).toHaveLength(0);
 		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
-		expect(await owner.output()).toBe("approved");
+		await eventually("the ephemeral rejection", () => test.chat.ephemeral.length === 1);
+		await test.chat.click(c.post.ref, c.approve, bob.identities[0]!);
+		expect(await owner.output()).toEqual(["approved", "bob"]);
 	});
 	it("returns the same decision on repeated handle waits and does not cancel it afterwards", async () => {
 		const test = setup([
@@ -427,5 +427,127 @@ describe("approval edge cases", () => {
 		const owner = await enter(test);
 		expect(await owner.output()).toEqual(["approved", "approved"]);
 		expect(dm.posts).toHaveLength(2);
+	});
+});
+
+describe("approval authorization", () => {
+	const decidedBy = () =>
+		workflow(async (_i, ctx) => {
+			const decision = await ctx.waitForApproval("approval", {
+				title: "Proposal",
+				details: {},
+				approvers: team,
+				timeout: "1h",
+			});
+			return [decision.status, decision.decidedBy?.id ?? null];
+		});
+
+	it("decides with the first authorized click, after an unauthorized one", async () => {
+		const test = setup([decidedBy()]);
+		const owner = await enter(test);
+		const c = await card(test);
+		await test.chat.click(c.post.ref, c.reject, outsider.identities[0]!, { dedupeId: "outsider" });
+		await eventually("the ephemeral rejection", () => test.chat.ephemeral.length === 1);
+		await test.chat.click(c.post.ref, c.approve, bob.identities[0]!, { dedupeId: "bob" });
+		await test.chat.click(c.post.ref, c.reject, alice.identities[0]!, { dedupeId: "alice" });
+		expect(await owner.output()).toEqual(["approved", "bob"]);
+		// The router decided each click once: an unauthorized one never reaches the approval.
+		const decisions = await db.sql<{ count: number }[]>`
+			select count(*)::int as count from pgconductor._private_executions
+			where task_key = 'pgconductor.event-dispatch' and payload ->> 'eventKey' = 'fabrial.approval.decided'
+			and payload -> 'payload' ->> 'actor' is not null and payload -> 'payload' -> 'actor' ->> 'id' = 'outsider'`;
+		expect(decisions[0]!.count).toBe(0);
+	});
+
+	it("denies forged and unknown approval ids without deciding the approval", async () => {
+		const test = setup([decidedBy()]);
+		const owner = await enter(test);
+		const c = await card(test);
+		const forged = [
+			"fabrial.approval.approve:not-a-uuid",
+			"fabrial.approval.approve:00000000-0000-4000-8000-000000000000",
+			// An execution, but not an approval request.
+			`fabrial.approval.approve:${owner.id}`,
+			`fabrial.approval.cancel:${owner.id}`,
+		];
+		for (const [index, action] of forged.entries())
+			await test.chat.click(c.post.ref, action, alice.identities[0]!, {
+				dedupeId: `forged-${index}`,
+			});
+		await eventually("every denial", () => test.chat.ephemeral.length === forged.length);
+		await owner.suspended();
+		// Unsettled; Fabrial's race poll can be re-claiming it.
+		expect((await owner.info())?.status).not.toMatch(/completed|failed|cancelled/);
+		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
+		expect(await owner.output()).toEqual(["approved", "alice"]);
+	});
+
+	it("authorizes a click after a restart between the request and the click", async () => {
+		const first = setup([decidedBy()]);
+		const owner = await enter(first);
+		const c = await card(first);
+		await owner.suspended();
+		await first.app.stop();
+		const second = setup([decidedBy()], {
+			runtime: db.runtime({ queue: first.runtime.queue }),
+			chat: first.chat,
+		});
+		await second.app.start();
+		await first.chat.click(c.post.ref, c.approve, outsider.identities[0]!);
+		await eventually("the ephemeral rejection", () => first.chat.ephemeral.length === 1);
+		await first.chat.click(c.post.ref, c.approve, bob.identities[0]!);
+		expect(await owner.output()).toEqual(["approved", "bob"]);
+	});
+
+	it("fails an approval assigned to a group id defined more than once", async () => {
+		const one = defineGroup({ id: "twice", members: [alice] });
+		defineGroup({ id: "twice", members: [outsider] });
+		const test = setup([
+			workflow(async (_i, ctx) => {
+				await ctx.waitForApproval("approval", { title: "Proposal", details: {}, approvers: one });
+			}),
+		]);
+		const owner = await enter(test);
+		expect(await owner.settled()).toMatchObject({
+			status: "failed",
+			error: expect.stringContaining("defined once with defineGroup"),
+		});
+	});
+
+	it("keeps the request readable past the longest approval", async () => {
+		const test = setup([decidedBy()]);
+		const owner = await enter(test);
+		const c = await card(test);
+		const approvalId = c.approve.slice("fabrial.approval.approve:".length);
+		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
+		expect(await owner.output()).toEqual(["approved", "alice"]);
+		const request = await test.runtime.getExecution(approvalId);
+		expect(request).toMatchObject({
+			workflow: "fabrial.approval.request",
+			result: {
+				status: "completed",
+				output: {
+					callerId: owner.id,
+					operationId: "approval",
+					assigned: { users: [], groups: ["team"] },
+					requester: { id: "alice" },
+					title: "Proposal",
+				},
+			},
+		});
+		const [retention] = await db.sql<{ complete: number | null; fail: number | null }[]>`
+			select remove_on_complete_days as complete, remove_on_fail_days as fail
+			from pgconductor._private_tasks where key = 'fabrial.approval.request' and queue = ${test.runtime.queue}`;
+		// Approvals last below 30 days; waits and clicks on the request must find it until then.
+		expect(retention!.complete).toBeGreaterThan(30);
+		expect(retention!.fail).toBeGreaterThan(30);
+	});
+
+	it("rejects ingested events in Fabrial's namespace", async () => {
+		const test = setup([decidedBy()]);
+		await test.app.start();
+		await expect(
+			test.app.emit("fabrial.approval.decided", { approvalId: "x", status: "approved" }),
+		).rejects.toThrow("Reserved event name");
 	});
 });

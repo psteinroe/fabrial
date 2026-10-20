@@ -35,6 +35,14 @@ import { createContext } from "./context.ts";
 import { APPROVAL_CLOSED_EVENT, CLEANUP_WORKFLOW, PRESENTATION_EVENT, cleanup } from "./cleanup.ts";
 import type { TriggerSpec } from "./trigger.ts";
 import { notifyFollowers } from "./follows.ts";
+import {
+	APPROVAL_DECIDED_EVENT,
+	APPROVAL_REQUEST_WORKFLOW,
+	approvalRequestWorkflow,
+	authorized,
+	loadRequest,
+	type ApprovalAction,
+} from "./approval-workflows.ts";
 
 const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -168,37 +176,51 @@ export function buildApp(config: CoreConfig): App {
 				: null
 		) as InvocationMetadata["requestedBy"];
 		if (ingress.kind === "action") {
-			// PHASE2: task 8 authorizes the click here; until then the waiting approval checks it.
+			// Only authorized clicks reach the waiting approval, deduped by the click's id.
 			const action = ingress.payload as {
 				actionId: string;
 				value: string | null;
 				messageId: string;
 			};
-			const match = /^fabrial\.approval\.(approve|reject|cancel):(.+)$/.exec(action.actionId)!;
+			const [, verb, approvalId] = /^fabrial\.approval\.(approve|reject|cancel):(.+)$/.exec(
+				action.actionId,
+			)!;
+			const request = await loadRequest(host, execution, approvalId!);
+			const allowed = await execution.step(
+				"authorize",
+				async () => !!request && (await authorized(host, request, verb as ApprovalAction, actor)),
+			);
+			if (!allowed) {
+				await execution.step("denied", async () => {
+					if (ingress.actor && ingress.replyTo)
+						await chat?.port.postEphemeral(
+							ingress.replyTo as ThreadRef,
+							ingress.actor,
+							"You are not authorized to decide this approval.",
+						);
+				});
+				return { authorized: false };
+			}
 			await execution.emit(
-				"fabrial.approval.decided",
+				APPROVAL_DECIDED_EVENT,
 				{
-					approvalId: match[2]!,
-					status:
-						match[1] === "approve" ? "approved" : match[1] === "reject" ? "rejected" : "cancelled",
+					approvalId: approvalId!,
+					status: verb === "approve" ? "approved" : verb === "reject" ? "rejected" : "cancelled",
 					actor: actor as unknown as Json,
-					identity: ingress.actor,
-					thread: ingress.replyTo,
 					messageId: action.messageId,
 					comment: action.value,
-					dedupeId: ingress.id,
 				},
 				{
 					id: ingress.id,
 					metadata: {
-						interactionId: match[2]!,
+						interactionId: approvalId!,
 						origin: { provider: ingress.actor!.provider },
 						replyTo: null,
 						requestedBy: actor,
 					},
 				},
 			);
-			return null;
+			return { authorized: true };
 		}
 		if (ingress.kind === "stop") {
 			const io = await chat?.port.thread(ingress.replyTo as ThreadRef);
@@ -327,8 +349,10 @@ export function buildApp(config: CoreConfig): App {
 		clients,
 		chat: () => chat?.port,
 		resolvePrincipal: (identity) => directory.resolveIdentity(identity),
-		ingest: (event, payload, options) =>
-			accept(
+		ingest: (event, payload, options) => {
+			// The routing workflow re-emits ingested events; only Fabrial emits its own.
+			if (event.startsWith("fabrial.")) throw new Error(`Reserved event name: ${event}`);
+			return accept(
 				{
 					id: options.id ?? crypto.randomUUID(),
 					kind: "event",
@@ -339,7 +363,8 @@ export function buildApp(config: CoreConfig): App {
 					actor: (options.requestedBy ?? null) as IngressEvent["actor"],
 				},
 				options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID()),
-			),
+			);
+		},
 		async receiveMessage(message, options) {
 			if (message.author.isBot) return "ignored";
 			const events = [...new Set(options.events ?? (options.event ? [options.event] : []))];
@@ -444,6 +469,7 @@ export function buildApp(config: CoreConfig): App {
 	}));
 	const extraWorkflows = new Map((agents?.agents.workflows() ?? []).map((w) => [w.name, w]));
 	for (const workflow of agents?.workflows ?? []) extraWorkflows.set(workflow.name, workflow);
+	extraWorkflows.set(APPROVAL_REQUEST_WORKFLOW, approvalRequestWorkflow());
 	extraWorkflows.set(CLEANUP_WORKFLOW, {
 		name: CLEANUP_WORKFLOW,
 		triggers: [],
@@ -494,7 +520,7 @@ export function buildApp(config: CoreConfig): App {
 				})),
 			),
 			{ name: INGRESS_EVENT, filterable: [] },
-			{ name: "fabrial.approval.decided", filterable: ["approvalId"] },
+			{ name: APPROVAL_DECIDED_EVENT, filterable: ["approvalId"] },
 			{ name: APPROVAL_CLOSED_EVENT, filterable: ["approvalId"] },
 			{ name: PRESENTATION_EVENT, filterable: ["presentationId"] },
 			{ name: EXECUTION_SETTLED_EVENT, filterable: ["executionId"] },

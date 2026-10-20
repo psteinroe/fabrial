@@ -1390,11 +1390,10 @@ test("core approval accepts an authenticated click during card delivery, before 
 				action.id.startsWith("fabrial.approval.approve:"),
 			);
 			if (action) {
-				const approvalId = action.id.slice("fabrial.approval.approve:".length);
 				const [row] = await sql<
 					{ count: number }[]
 				>`select count(*)::int as count from pgconductor._private_custom_event_subscriptions
-					where execution_id = ${approvalId.split(":")[0]!}::uuid and event_key = 'fabrial.approval.decided'`;
+					where execution_id = ${parentId!}::uuid and event_key = 'fabrial.approval.decided'`;
 				expect(row?.count).toBe(0);
 				clicks++;
 				await chat.click(ref, action.id, alice.identities[0]!, { dedupeId: "fast-click" });

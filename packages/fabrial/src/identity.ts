@@ -53,12 +53,26 @@ export interface GroupDefinition<TClients = Record<string, unknown>> {
 		| readonly (UserDefinition | ExternalIdentity | Principal)[];
 }
 
+/**
+ * Groups by id, registered when they are defined (also by plugins, e.g. Slack user groups), so any
+ * process can check a stored group id against the group's current members. An id defined twice maps
+ * to `null`: approvals assigned to it fail closed.
+ */
+const definedGroups = new Map<string, GroupDefinition | null>();
+
 export function defineGroup<TClients = Record<string, unknown>>(
 	definition:
 		| { id: string; members: UserDefinition[] }
 		| { id: string; resolve: GroupDefinition<TClients>["resolve"] & {} },
 ): GroupDefinition<TClients> {
-	return { kind: "fabrial.group", ...definition };
+	const group: GroupDefinition<TClients> = { kind: "fabrial.group", ...definition };
+	definedGroups.set(group.id, definedGroups.has(group.id) ? null : (group as GroupDefinition));
+	return group;
+}
+
+/** The group defined with `id`; undefined when no group or more than one group has that id. */
+export function definedGroup(id: string): GroupDefinition | undefined {
+	return definedGroups.get(id) ?? undefined;
 }
 
 /**

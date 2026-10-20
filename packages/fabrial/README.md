@@ -156,7 +156,7 @@ Channel surfaces remain unresolved until a post. The first durable post receipt 
 
 ## Approvals and terminal cleanup
 
-Requests persist the proposal, assigned approvers, controls, and absolute expiry in a step. Assigned approvers must still belong to an eligible group when they decide. Requester cancellation is separate from approval authority; free text never changes an approval. Reply and approval timeouts must be below the 30-day routing-state TTL.
+Each request is its own execution (`fabrial.approval.request`), whose result stores the proposal, the assigned users and group ids, the requester, controls, and absolute expiry. The routing workflow checks every click against it before the waiting approval sees it: assigned users, and the current members of assigned groups (resolved when the click arrives, by the group defined once with `defineGroup`; an unknown or duplicate group id grants nothing). Unauthorized clicks get an ephemeral notice and never reach the approval. Requester cancellation is separate from approval authority; free text never changes an approval. Reply and approval timeouts must be below the 30-day routing-state TTL.
 
 The runtime's `RuntimeWorkflow.onSettled` hook must deliver success, failure, and cancellation, including cancellation while suspended, and retry failed delivery across restarts. Core emits `fabrial.execution.settled` from this hook. Independent `fabrial.cleanup` executions collect durable `fabrial.presentation` events to clear channel bindings and pending cards even when a parent stops partway through delivery. `fabrial.approval.closed` prevents cleanup from overwriting a resolved decision. These workflows/events are framework internals, not application APIs.
 

@@ -625,7 +625,9 @@ describe("ingress dedupe", () => {
 				dedupeId: "click",
 			});
 		await test.route(1);
-		expect(await emitted("fabrial.approval.decided")).toBe(1);
+		// No such approval: the click is denied, once, and decides nothing.
+		expect(await emitted("fabrial.approval.decided")).toBe(0);
+		expect(test.chat.ephemeral).toHaveLength(1);
 		expect(await test.routes()).toHaveLength(2);
 	});
 });
