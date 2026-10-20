@@ -1025,6 +1025,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			let queued = false;
 			let failed: string | undefined;
 			let answer: Json | undefined;
+			// Read before the reports: a reporter records its report as it ends, so one that ended by now is among them.
+			const background = await backgroundPending(harness, context);
 			const sent = await postAnswers(run);
 			complete = sent.settled;
 			queued = sent.queued;
@@ -1059,8 +1061,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			const live = async () => (await harness.snapshot(LiveDoc, run.conversation.id, context))?.run;
 			// Background children keep the run: their reports arrive as follow-ups the lead answers, and a call settles
 			// only once the lead has answered the last of them.
-			if (complete && !failed && ((await backgroundPending(harness, context)) || (await live())))
-				complete = false;
+			if (complete && !failed && (background || (await live()))) complete = false;
 			if (complete) {
 				if (failed)
 					return finish(run, {
