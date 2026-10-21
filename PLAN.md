@@ -51,7 +51,7 @@ App authors see one programming model: workflows, agents, tools, toolkits, state
 | Provider events → triggers, context reconstruction, clients     | Plugins (`definePlugin`)                 | Fabrial                           |
 | Workflow ↔ agent bridges, approvals, response context, identity | `ctx.*`, `f.defineGroup`                 | Fabrial                           |
 
-Everything lives in the one configured Postgres database, in the runtimes' schemas: Conductor step results, events, and metadata; Pi Sessions and documents; and Chat SDK thread state, which holds follow records and status message refs. Fabrial owns no tables. Conductor's per-Session queue is the only inbox (see [Delivery](#delivery)).
+Everything lives in the one configured Postgres database, in the runtimes' schemas: Conductor step results, events, and metadata; Pi Sessions and documents; and Chat SDK thread state, which holds follow records and status message refs. Fabrial owns no tables. Inputs reach a Session as Conductor signals and Pi orders them; Fabrial keeps no inbox (see [Delivery](#delivery)).
 
 ## Public API
 
@@ -252,10 +252,12 @@ await ctx.state(Findings).update((s) => {
 | `agent`  | one agent's conversation          | that agent only; forks and rewinds with it | conversation doc       |
 
 - A workflow's own local state is just its variables, made durable through steps.
-- Workflow `get`/`update` briefly acquire the thread's Pi Session (strict per-key lock). They can wait behind an agent that is running in the same thread.
+- Workflow `get`/`update` go through the thread's Session: the workflow signals the Session's execution (starting it if closed) with a state request and waits for its response event, so it never opens Pi itself and never waits behind a running agent. The host answers between Pi's passes, also while the Session is suspended on an approval.
+- `update` is optimistic: the updater runs in the workflow (closures can't travel in signals), and the Session applies the result only if the state's revision is still the one read; otherwise the workflow reads again, up to 20 times, then fails with a clear error. Every operation has a stable id; the Session keeps its response as a receipt, so a resent or duplicated request gets the same answer and applies once. Tools change state directly in the Session's commit and advance the same revision.
+- State names resolve against the instance's definitions on both sides; an unknown or agent-scoped definition fails clearly in a workflow.
 - `render` is how state becomes model context. Agents only see the states listed in `defineAgent.state`.
 - Schema changes follow Pi document `version` + migration.
-- Fabrial ships an internal `fabrial.invocation` document (per request ID: actor, replyTo, origin) and a `ChatBinding` document. Forked conversations get **no** outbound chat binding by default.
+- Fabrial keeps a few internal Session documents: `fabrial.invocation` (per request ID: actor, replyTo, origin), `fabrial.binding` (the request a conversation acts for), and `fabrial.obligations` (what Fabrial still owes per request: a reply, a call outcome, cancellation links). Forked conversations get **no** outbound chat binding.
 
 ### Runtime bridges
 
@@ -639,7 +641,7 @@ Request ids derive from the source event (Slack event id, GitHub delivery id), s
 
 #### Workflows and agents
 
-- `ctx.agent(id, agent, { input, output?, detached? })` calls an agent and returns its answer; nothing is posted. It runs in a Session of its own, `run:<executionId>:<id>`, and never follows a thread, so replies in the workflow's thread don't reach it. Its progress still shows on the workflow's thread. Thread-scoped state belongs to the thread's Session: the call's tools see the call Session's state.
+- `ctx.agent(id, agent, { input, output?, detached? })` calls an agent and returns its answer; nothing is posted. It is a child execution of the caller (cancelled with it unless detached) and runs in a Session of its own, `run:<executionId>:<id>`, whose storage is reclaimed 7 days after the call settled, and never follows a thread, so replies in the workflow's thread don't reach it. Its progress still shows on the workflow's thread. Thread-scoped state belongs to the thread's Session: the call's tools see the call Session's state.
 - `ctx.send(id, agent, { input, home?, session?, priority? })` hands an event to an agent and returns. The conversation is found by session key from the input's thread (or `home`), exactly as if the agent's trigger had matched. This is how a routing workflow picks an agent; it replaces `ctx.handoff`.
 - Workflows don't hold conversations in chat: they post (`ctx.thread.post`), send cards, and wait for approvals. `ctx.thread.waitForReply`, `ask`, `nextReply`, and `ctx.handoff` are removed.
 
@@ -661,27 +663,28 @@ export const router = f.defineWorkflow({
 
 #### Delivery
 
-Each Session is hosted by one Conductor execution while Pi has work, addressed by the Session key. Every input for a conversation (a trigger match, a followed thread or resource, `ctx.send`, a subagent report, a cancel) is a Conductor signal sent with `signalWithStart` (Conductor item 12): it reaches the running execution in process, or starts one with the signal queued.
+Each Session is hosted by one keyed Conductor execution (`fabrial.session`, keyed by the Session key) while Pi has work. Every input for a conversation (a trigger match, a followed thread or resource, `ctx.send`, a stop, a workflow's state request) is a Conductor signal sent with `signalWithStart`: it reaches the running execution in process, or starts one with the signal queued.
 
 ```ts
 // Every input:
-await conductor.signalWithStart({
-	task: "fabrial.session",
+await runtime.signalWithStart({
+	workflow: "fabrial.session",
 	key: session,
 	signal: { name: "input", id: requestId, payload },
 });
 
-// The Session execution:
-ctx.onSignal("input", (input) =>
-	input.kind === "cancel" ? abortRun(harness, input.run) : submit(harness, input),
-);
+// The Session execution, registered before any wait:
+execution.onSignal("input", (input) => hosted.handle(input)); // submit, stop, or state
 ```
 
-- **Steering is native Pi.** A signal submits to Pi in process (`steer`, `followUp`, or `write`); Pi places it at its next turn boundary. Ownership never moves, and nothing is handed over, polled, or stored outside Pi and Conductor.
-- **Cancelling** is a signal: the execution aborts the run in Pi (owned and background work included) and keeps hosting the Session.
-- **Ending.** The execution closes the Session when Pi reports no active work (this Pi build has no `Harness.wake()`: `harness.inspect()` plus the release rule, re-checked after every storage commit), including while only waits on workflows such as approvals remain; the workflow's completion is another signal. A short managed effect like a thread post (a final reply) keeps the Session open, and a run ends only after its final replies posted. Conductor re-queues an execution that received signals while finishing, so no input is lost.
+- **Pi owns admission.** The host commits the request's invocation and obligation, then submits to Pi with the request id (`steer`, `followUp`, or `write`). Pi dedupes by request id and owns ordering, steering, follow-ups, settlement, and recovery; Fabrial keeps no run records or scheduler. A crash between commit and submit leaves the obligation for the redelivered signal.
+- **Obligations.** Per request, Fabrial records only what Pi can't know: whether a reply or a call outcome is owed, the request a background child acts for, the error id, the reply posts, and the workflows its tools started (so a stop can cancel them). The host reconciles them with Pi's submissions by request id and fulfils them.
+- **Suspending.** When every live task waits on a workflow (an approval) or only reply posts are pending, the host closes Pi and the execution waits on any of: an `input` signal, a `child` signal, a waited-on tool workflow's execution (`task:<id>`), or a pending post (`delivery:<executionId>`). Whichever wins, the next pass reopens Pi; waiting tools resume with their workflows' outcomes. When Pi has no work left the execution returns; Conductor re-queues one that received signals while finishing, so no input is lost.
+- **Stopping** is a signal: the host aborts the conversation in Pi (queued inputs withdrawn, live tasks aborted), cancels the workflows its outstanding requests' tools started, and aborts background children acting for them.
 - **Dedupe.** Signal ids are request ids derived from the source event; Conductor stores a signal once and Pi submits a request id once.
-- **Leases.** The Session's lease and fencing stay. `storage.lost` closes the harness, so a stalled owner whose lease was taken over can't send a duplicate model request.
+- **Leases.** The Session's storage lease and fencing stay. `storage.lost` closes the harness, so a stalled owner whose lease was taken over can't send a duplicate model request; a crashed owner's lease delays the next opening until it expires, and Conductor retries.
+- **Failed runs.** Pi places queued input only at a run boundary or with the next submission; after a failed run the host submits an invisible write so queued input proceeds (see [Upstream suggestions](#upstream-suggestions)).
+- **Startup.** Live Pi tasks whose kind is no longer installed (a removed toolkit) are aborted at start: the commit log finds candidate Sessions without leases, and Pi's `inspect()` decides what is live.
 
 #### Use cases
 
@@ -741,7 +744,8 @@ Each entry is an agent, `"self"` (a copy of the lead), or `{ agent, context?, ba
 - Children act under the lead's request context: workflow tools they call (approvals included) see the same actor, thread, and approvers.
 - Child output is data: it is escaped inside the `<subagent>` tag. A failed child reports `status="failed"` with a generic message; provider errors go to logs, as in [Errors in sent runs](#decisions).
 - Limits: with `depth: 1` (default) children get no subagent tools; reaching `concurrent` returns a tool error the model can act on. A slot frees in the commit that settles the child's answer.
-- Lease: a driver keeps the Session while background children work, but releases it whenever every live task (the lead's or a child's) waits on a workflow, and resumes when any of them completes; other input to the Session is processed meanwhile.
+- Hosting: the Session's execution stays open while background children work, suspends whenever every live task (the lead's or a child's) waits on a workflow, and resumes when any of them completes; other input to the Session is processed meanwhile.
+- A fork starts at the entry before the delegating response, found from Pi's tool task input (`assistant`) with one bounded entry query, however long the history.
 - Work that waits for days, such as an approval, is still a workflow in `tools`. Orchestration from code is `ctx.agent`; there is no separate API.
 - Background children are owned by tasks in the lead's Session, so their work continues through ordinary deliveries; a report is an input to the lead like any other. Cancelling a run aborts the background children that run started or continued; aborting only the lead's Pi run does not. A stopped child reports nothing. Continuing a background child keeps it in the background, even without `background: true`.
 
@@ -799,9 +803,9 @@ Recorded as open questions are resolved.
 - **Conductor gaps are tracked, not worked around up front.** Fabrial assumes the Conductor behavior it needs. Gaps go in [Conductor issues](#conductor-issues) and get fixed in Conductor later, if they still exist by then.
 - **Context via execution metadata + middleware (the Temporal/Hatchet/Inngest/Trigger.dev pattern).** Fabrial stores its serializable invocation context (`replyTo`, `origin`, `requestedBy`) as Conductor execution metadata, which propagates event → run → child automatically. Fabrial middleware rebuilds `ctx.thread`, `ctx.clients`, and `ctx.actor` from that metadata on every start and resume. Payloads stay clean, with no Fabrial envelope.
 - **Pi Session per thread by default, in Postgres, opened on demand.** Agents choose other Session keys with `session` (see [Conversations](#conversations)). Fabrial ships a Postgres storage backend for Pi (validated with Pi's `registerStorageConformance`) that holds one logical Session per key: `<provider>:<threadId>` for chat, `run:<executionId>:<id>` for a `ctx.agent` call. Agents in the same thread are separate conversations in that Session, chosen by `[installationId, threadId, agentName]`.
-  - `ctx.agent` drives the harness inside a Conductor execution grouped by Session ID under a strict limit of 1 (Conductor issue 4), so only one worker owns a Session at a time. That execution opens the harness, submits with a stable request ID, runs Pi's scheduler until idle or a result arrives, then closes the harness and releases the worker.
+  - One keyed Conductor execution per Session key (`fabrial.session`) hosts the harness, so only one worker owns a Session at a time. It submits inputs to Pi with stable request IDs, lets Pi run until idle or suspended, then closes the harness. A `ctx.agent` call is a child execution of its caller with a Session of its own.
   - **Fencing**: each open takes a lease epoch, and every commit checks it, so a stale worker can't commit after a takeover.
-  - Long tool calls (e.g. a workflow tool waiting days for approval) close the harness. When the child completes, a Conductor execution reopens the Session, and the `pi.tool` task reconnects through its invocation key.
+  - Long tool calls (e.g. a workflow tool waiting days for approval) close the harness; the execution suspends on the child's execution. When the child completes, the execution reopens the Session, and the tool task reconnects through its operation key.
 - **Explicit IDs for every durable operation (Inngest model).** `ctx.thread.post("ack", …)`, `ctx.agent("investigate", …)`, `ctx.evaluate("route", …)`, `ctx.waitForApproval("approve-repair", …)`, and so on. Repeated IDs get automatic suffixes. Deploys are tolerated by ID: new IDs run and missing ones are ignored. There is no call-order determinism or version pinning. This is the most robust option across deploys, at the cost of some verbosity.
 - **Cancellation is structured by default, with a per-call `detached` opt-out.** Cancelling an execution cancels every call it made: `ctx.agent` (Pi conversation abort), `ctx.invoke`, and workflows called as tools, recursively. A pending `waitForApproval` updates its card to "Cancelled" and rejects later clicks. Opt out per call with `{ detached: true }`. Cancellation is cooperative: a running step finishes and its result is recorded, and cancellation takes effect at the next durable operation. A "stop" in a thread cancels the current run of every conversation that follows it.
 - **`run(input, ctx)` for workflows and tools.** For triggered runs, `input` is the typed trigger event (a union for multiple triggers). For `ctx.invoke` and tool calls it is the workflow's typed input.
@@ -844,7 +848,7 @@ Recorded as open questions are resolved.
 - **Orphaned agent work is aborted at startup.** When a deploy removes a toolkit that pending agent work still needs, `app.start()` aborts that work and logs it instead of failing the deploy.
 - **Webhooks wait for durable ingress.** Chat and plugin routes respond only after the event is stored. There is no `waitUntil`: ingress is a fast insert, and acknowledging earlier risks losing events.
 - **Errors in agent runs (modeled on Eve's `turn.failed` handling).** Pi retries transient model errors (overload, rate limits, 5xx, network) durably. In production the backoff spans about 5 minutes: failed attempt n is retried while n ≤ 9, after min(2 s · 2^(n−1), 60 s), i.e. 2+4+8+16+32+60+60+60+60 = 302 s (`MODEL_RETRY` in `production.ts`; tests keep retries off unless they opt in). Context overflow compacts and retries. While a retry waits, the sent run's status reads "Waiting for the model provider…". When sent input still settles `unanswered`:
-  - `model_error` or `no_model`: the driver posts one error reply to the request's `replyTo` through the managed effect path, keyed by request id, so redeliveries and restarts reuse the same post (at-least-once; the run waits for it). It reads "I couldn't reach the model provider while handling your request. Please try again in a few minutes." when the error text is transient (the retry budget ran out), and otherwise "I hit an error while handling your request. Please try again, rephrase, or reach out if it keeps failing.", followed by `_Error id: \`<id>\`_`. The provider's text is only logged, with the same generated error id. The progress status is cleared.
+  - `model_error` or `no_model`: the Session's host posts one error reply to the request's `replyTo` through the managed effect path, keyed by request id, so redeliveries and restarts reuse the same post (at-least-once; the run waits for it). It reads "I couldn't reach the model provider while handling your request. Please try again in a few minutes." when the error text is transient (the retry budget ran out), and otherwise "I hit an error while handling your request. Please try again, rephrase, or reach out if it keeps failing.", followed by `_Error id: \`<id>\`_`. The provider's text is only logged, with the same generated error id. The progress status is cleared.
   - `aborted`, `reset`, `stale`: the input was ended on purpose; no reply.
   - The conversation stays usable, and later input still drives. `ctx.agent` (call) is unchanged: the calling workflow receives the error.
 - **Permissions only on tools.** Agents are offered every tool their definition lists, regardless of who is talking. There are no access lists on workflows, triggers, or tools (`access.invoke` is removed); a tool that needs permission asks its fixed approvers. This keeps shared conversations unambiguous: participants shape proposals, approvers authorize actions.
@@ -856,11 +860,23 @@ A full review against the goal (Fabrial is glue over Chat SDK, Pi Durable, and C
 - **Approval clicks are authorized at ingress.** The routing workflow checks the clicker against the approval's assignment and current group membership and emits only valid decisions, so an approval waits on one Conductor subscription. No event cursors.
 - **Notifications reply where the follow started.** A follow record keeps the thread it was created from; for thread sessions that is the conversation's thread. `home:` applies only to triggers whose events have no thread. Follows made by a subagent's tools belong to the root conversation, with the subagent's input thread as their origin.
 - **Approval cards show what is authorized.** Every card shows the exact proposal and the verified requester and source thread; custom content adds to it and never replaces it. An optional rejection reason (modal) and an optional destination (default: approvers' DMs; a destination never grants authority). First eligible decision wins; no quorum, no editing a proposal (cancel and request again).
-- **Final replies are at-least-once.** Chat SDK posts have no idempotency key; a crash after a post and before its receipt can repeat it. Runs wait for their final post and surface failures.
+- **Final replies are at-least-once.** Chat SDK posts have no idempotency key; a crash after a post and before its receipt can repeat it. A request's obligation is fulfilled only once its final post settled; a failed post is logged, never answered with another error reply.
 - **Ingress verifies and emits; one workflow routes.** Webhooks verify, normalize, and emit one event with a dedupe key (retained about one to two days). An internal routing workflow resolves followers, triggers, and approval clicks and signals Sessions; Conductor retries it. No pending receipts in thread state.
-- **Conductor runs everything internally.** Fabrial's durable behavior is Conductor tasks and workflows: ingress emits, internal workflows route, authorize approval clicks, clean up cards, supervise workflow tools, and watch `ctx.agent` callers. Fabrial keeps no custom receipts, monitors, cursors, or polling loops.
+- **Conductor runs everything internally.** Fabrial's durable behavior is Conductor tasks and workflows: ingress emits, internal workflows route, authorize approval clicks, and clean up cards; Session executions wait on their workflow tools' executions, and a `ctx.agent` call is a child execution of its caller. Fabrial keeps no custom monitors, cursors, or polling loops; its receipts are Pi documents committed with the change they record.
+- **Pi owns admission (2026-10-21).** Inputs are submitted straight to Pi with their request ids; Pi orders, steers, settles, and recovers them. Fabrial keeps only obligations (a reply, a call outcome, cancellation links) and no run records or scheduler.
+- **Workflow state goes through the Session (2026-10-21).** Workflows send state requests to the Session's execution instead of leasing the Session themselves; updates are optimistic with a revision check, a bounded number of conflict retries, and per-operation receipts.
+- **Call Sessions are reclaimed (2026-10-21).** A daily `fabrial.sessions.reclaim` deletes the storage of `ctx.agent` Sessions whose execution settled at least 7 days ago; thread, channel, and app Sessions are kept.
 - **Tests run on real Conductor** with its test clock; the in-memory runtime engine is removed. Fake chat, scripted models, and pure unit tests stay.
 - **Conductor stays a submodule** pinned to `main` until a version is published.
+
+## Upstream suggestions
+
+Pi Durable gaps Fabrial works around today:
+
+- **Failed-run inbox wake.** After a failed run Pi leaves queued inputs until another submission; Fabrial submits an invisible write to place them. A native drain or wake would remove it.
+- **Atomic tool settlement.** `afterTool` runs before the transcript append without a transaction callback, so tool state changes commit with a Fabrial receipt, not atomically with the tool result.
+- **Atomic admission with host metadata.** `submit` takes no transaction callback, so Fabrial commits the invocation and obligation first and relies on signal redelivery to submit after a crash.
+- **Physical deletion.** Pi has no whole-storage deletion (`retireDoc` is logical); Fabrial deletes finished call Sessions as their storage backend. A call cancelled while suspended runs no cleanup of its own (a Conductor lifecycle gap); reclaim covers it later.
 
 ## Conductor issues
 
