@@ -277,13 +277,15 @@ async function finalReply(text: string) {
 		(c) => c.method === "chat.postMessage" && String(c.args.text).includes(text),
 	)!;
 	expect(reply.args.thread_ts).toBe("1700000000.000001");
-	const thread = await app.host
-		.chat()!
-		.thread({ kind: "thread", provider: "slack", threadId: "slack:C_SUPPORT:1700000000.000001" });
+	const thread = {
+		kind: "thread",
+		provider: "slack",
+		threadId: "slack:C_SUPPORT:1700000000.000001",
+	} as const;
 	// The support agent follows the thread; every routed message was delivered.
 	await expect
 		.poll(async () => {
-			const state = await thread.getState();
+			const state = await app.routing(thread);
 			const [routing] =
 				await sql`SELECT count(*)::int AS count FROM pgconductor._private_executions WHERE task_key = 'fabrial.route' AND completed_at IS NULL`;
 			return {
@@ -497,11 +499,9 @@ it("signed GitHub PR opened webhook has one PR-thread owner plus a changelog obs
 	await expect
 		.poll(async () => (await applicationSql`SELECT * FROM acme_changelog`).length, poll)
 		.toBe(1);
-	const thread = await app.host
-		.chat()!
-		.thread({ kind: "thread", provider: "github", threadId: "github:acme/app:7" });
+	const thread = { kind: "thread", provider: "github", threadId: "github:acme/app:7" } as const;
 	// Lifecycle ingress emits directly; unlike chat messages it creates no routing tombstone.
-	await expect.poll(() => thread.getState(), poll).toBeNull();
+	await expect.poll(() => app.routing(thread), poll).toBeNull();
 	await expect
 		.poll(async () => {
 			const [row] =
@@ -539,11 +539,13 @@ it("#bugs: the router investigates inline with ctx.agent and posts the analysis;
 			poll,
 		)
 		.toBe(1);
-	const thread = await app.host
-		.chat()!
-		.thread({ kind: "thread", provider: "slack", threadId: "slack:C_BUGS:1700000000.000001" });
+	const thread = {
+		kind: "thread",
+		provider: "slack",
+		threadId: "slack:C_BUGS:1700000000.000001",
+	} as const;
 	// The investigation ran in the call's own Session: the thread has no follower.
-	expect((await thread.getState())?.follows).toBeUndefined();
+	expect((await app.routing(thread))?.follows).toBeUndefined();
 	expect(calls.some((c) => String(c.args.text).includes("I'll investigate this bug report"))).toBe(
 		true,
 	);
@@ -628,10 +630,8 @@ it("signed Linear issue created webhook posts a triage comment", async () => {
 		issueId: "issue-1",
 		body: expect.stringContaining("ENG-1"),
 	});
-	const thread = await app.host
-		.chat()!
-		.thread({ kind: "thread", provider: "linear", threadId: "linear:issue-1" });
-	await expect.poll(() => thread.getState(), poll).toBeNull();
+	const thread = { kind: "thread", provider: "linear", threadId: "linear:issue-1" } as const;
+	await expect.poll(() => app.routing(thread), poll).toBeNull();
 });
 it("read-only query cannot escape its transaction with multiple statements", async () => {
 	await expect(app.clients().database.query("org-acme", `COMMIT; ${repair}`)).rejects.toMatchObject(
@@ -740,13 +740,8 @@ it("dev thread: the agent opens a PR and follows it; a requested change is answe
 	expect(create).toHaveBeenCalledOnce();
 	// The follow is a record in the PR thread's Chat SDK state; notifications reply to the Slack home.
 	const follows = async () =>
-		(
-			await (
-				await app.host
-					.chat()!
-					.thread({ kind: "thread", provider: "github", threadId: "github:acme/app:42" })
-			).getState()
-		)?.resourceFollows ?? [];
+		(await app.routing({ kind: "thread", provider: "github", threadId: "github:acme/app:42" }))
+			?.resourceFollows ?? [];
 	await expect.poll(follows, poll).toEqual([
 		{
 			session: `slack:slack:C_DEV:${ts}`,

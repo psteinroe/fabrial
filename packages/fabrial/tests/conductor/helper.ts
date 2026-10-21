@@ -9,7 +9,7 @@ import type {
 	RuntimeWorkflow,
 } from "../internals.ts";
 import { conductor, type ConductorConfig } from "../../src/runtime/conductor/index.ts";
-import { createTestClock, type TestClock } from "../../src/testing.ts";
+import { createTestClock, type TestClock } from "../../src/testing-internal.ts";
 // Declares the `fabrialDatabaseUrl` the global setup provides, also for other packages' tests.
 import type {} from "./global-setup.ts";
 

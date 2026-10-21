@@ -1,7 +1,7 @@
 import { expect, expectTypeOf, it, vi } from "vitest";
 import { createFabrial, definePlugin, defineUser } from "../internals.ts";
-import { testApp } from "fabrial/testing";
-import { StubRuntime } from "fabrial/testing";
+import { testApp } from "../../src/testing-internal.ts";
+import { StubRuntime } from "../../src/testing-internal.ts";
 
 const database = definePlugin((value: string) => ({
 	id: "database",

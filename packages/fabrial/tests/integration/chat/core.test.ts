@@ -10,7 +10,7 @@ import {
 	type WorkflowContext,
 } from "../../internals.ts";
 import { z } from "zod";
-import { testApp } from "../../../src/testing.ts";
+import { testApp } from "../../../src/testing-internal.ts";
 import { expect, it, vi } from "vitest";
 import { chat, chatTrigger } from "../../../src/chat/index.ts";
 import { setup } from "../../chat/helper.ts";

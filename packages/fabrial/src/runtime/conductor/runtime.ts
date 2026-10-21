@@ -68,7 +68,7 @@ export interface ConductorConfig {
 	worker?: Partial<WorkerConfig>;
 	/**
 	 * Time source for workers (cron, sleeps, time windows) and `now()`. Tests pass
-	 * `createTestClock(sql)` from `fabrial/testing`, with `sql` a single-connection pool (`max: 1`).
+	 * `createTestClock(sql)` from `fabrial/internal/testing`, with `sql` a single-connection pool (`max: 1`).
 	 */
 	clock?: { now(): Date };
 }

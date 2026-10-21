@@ -1,3 +1,4 @@
+// `fabrial/testing`: apps on real Conductor with fake chat or scripted models.
 import type { AssistantMessage, MutableModels } from "@earendil-works/pi-ai";
 import { createModels as createPiModels } from "@earendil-works/pi-ai/models";
 import {
@@ -6,565 +7,33 @@ import {
 	fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
 import { parseModel } from "./agent.ts";
-import { INTERNAL } from "./instance.ts";
-import type { AgentIntegration, ChatIntegration, FabrialHost } from "./app.ts";
-import type { Evaluator } from "./evaluate.ts";
-import type { ExternalIdentity } from "./identity.ts";
-import { identityKey } from "./directory.ts";
-import { THREAD_TTL } from "./internal.ts";
-import type { Json, JsonObject } from "./json.ts";
-import type {
-	AgentPort,
-	ChatPort,
-	DurableExecution,
-	DurableRuntime,
-	ExecutionResult,
-	InvocationMetadata,
-	RuntimeEvent,
-	RuntimeWorkflow,
-	StatePort,
-	ThreadIO,
-	ThreadRoutingState,
-} from "./runtime.ts";
-import { conversationReference } from "./send.ts";
-import { parseSchema } from "./schema.ts";
-import type { ChatMessage, MessageRef, OutboundMessage, Surface, ThreadRef } from "./thread.ts";
+import type { AppConfig, ClientsOf, Fabrial } from "./instance.ts";
+import type { JsonObject } from "./json.ts";
+import type { AnyPlugin } from "./plugin.ts";
+import {
+	createTestApp as create,
+	internal,
+	testingApp,
+	type TestApp,
+	type TestAppConfig,
+	type TestingApp,
+} from "./testing-internal.ts";
 
-/** Conductor's test clock; pass it as `conductor(..., { clock })` over a single-connection pool. */
-export { createTestClock, type TestClock } from "pgconductor-js/testing";
-import { createTestClock, type TestClock } from "pgconductor-js/testing";
-import { Conductor, TaskSchemas } from "pgconductor-js";
-import postgres from "postgres";
-import { conductor } from "./runtime/conductor/index.ts";
-
-const clone = <T>(value: T): T => structuredClone(value);
-
-/**
- * A runtime port for unit tests that never run a workflow: it records registrations and emitted events
- * and keeps the time. Starting work (`invoke`, `signal`, …) throws.
- */
-export class StubRuntime implements DurableRuntime {
-	readonly workflows = new Map<string, RuntimeWorkflow>();
-	readonly events: RuntimeEvent[] = [];
-	readonly emitted: { name: string; payload: JsonObject; metadata: InvocationMetadata }[] = [];
-	constructor(public time = Date.now()) {}
-	now(): number {
-		return this.time;
-	}
-	register(definition: { workflows: RuntimeWorkflow[]; events: RuntimeEvent[] }): void {
-		for (const workflow of definition.workflows) this.workflows.set(workflow.name, workflow);
-		this.events.push(...definition.events);
-	}
-	async start(): Promise<void> {}
-	async stop(): Promise<void> {}
-	async emit(
-		name: string,
-		payload: JsonObject,
-		options: Parameters<DurableRuntime["emit"]>[2],
-	): Promise<void> {
-		this.emitted.push(clone({ name, payload, metadata: options.metadata }));
-	}
-	invoke(): never {
-		throw new Error("StubRuntime runs no workflows");
-	}
-	cancel(): never {
-		throw new Error("StubRuntime runs no workflows");
-	}
-	signalWithStart(): never {
-		throw new Error("StubRuntime runs no workflows");
-	}
-	signal(): never {
-		throw new Error("StubRuntime runs no workflows");
-	}
-	async getExecution(): Promise<null> {
-		return null;
-	}
-}
-
-function messageText(content: OutboundMessage): string {
-	return typeof content === "string"
-		? content
-		: "markdown" in content
-			? content.markdown
-			: [content.card.title, content.card.text].filter(Boolean).join("\n");
-}
-
-export interface FakePost {
-	ref: MessageRef;
-	content: OutboundMessage;
-	updates: OutboundMessage[];
-}
-class FakeThread implements ThreadIO {
-	readonly posts: FakePost[] = [];
-	readonly messages: ChatMessage[] = [];
-	readonly statuses: (string | null)[] = [];
-	/** Whether the thread is subscribed (Chat SDK delivers its messages as subscribed messages). */
-	subscribed = false;
-	private state: ThreadRoutingState | null = null;
-	private expires = 0;
-	constructor(
-		readonly ref: ThreadRef,
-		readonly channelId: string,
-		readonly isDM: boolean,
-		private readonly owner: FakeChat,
-	) {}
-	async post(content: OutboundMessage): Promise<MessageRef> {
-		const ref = {
-			provider: this.ref.provider,
-			threadId: this.ref.threadId,
-			messageId: `message-${this.owner.nextMessageId++}`,
-		};
-		this.posts.push({ ref, content: clone(content), updates: [] });
-		this.messages.push({
-			provider: ref.provider,
-			threadId: ref.threadId,
-			channelId: this.channelId,
-			messageId: ref.messageId,
-			text: messageText(content),
-			author: {
-				identity: { provider: ref.provider, installationId: "testing", subjectId: "bot" },
-				name: "Fabrial",
-				isBot: true,
-			},
-			isMention: false,
-			isDM: this.isDM,
-			sentAt: new Date(this.owner.now()).toISOString(),
-		});
-		return ref;
-	}
-	async update(ref: MessageRef, content: OutboundMessage): Promise<void> {
-		const post = this.posts.find((p) => p.ref.messageId === ref.messageId);
-		if (!post) throw new Error(`Unknown message ${ref.messageId}`);
-		post.content = clone(content);
-		post.updates.push(clone(content));
-		const message = this.messages.find((message) => message.messageId === ref.messageId);
-		if (message) message.text = messageText(content);
-	}
-	async setStatus(text: string | null): Promise<void> {
-		this.statuses.push(text);
-	}
-	async history(options: { limit?: number; sinceLastBotReply?: boolean }): Promise<ChatMessage[]> {
-		const lastBot = options.sinceLastBotReply
-			? this.messages.findLastIndex((m) => m.author.isBot)
-			: -1;
-		return clone(this.messages.slice(lastBot + 1).slice(-(options.limit ?? 50)));
-	}
-	async subscribe(): Promise<void> {
-		this.subscribed = true;
-	}
-	async getState(): Promise<ThreadRoutingState | null> {
-		return this.owner.now() >= this.expires ? null : clone(this.state);
-	}
-	async updateState(
-		fn: (state: ThreadRoutingState | null) => ThreadRoutingState | null,
-	): Promise<ThreadRoutingState | null> {
-		// No await between read and write: atomic within this in-memory process.
-		this.state = clone(fn(this.owner.now() >= this.expires ? null : clone(this.state)));
-		this.expires = this.owner.now() + THREAD_TTL;
-		// Like Chat SDK state writes, a stored state subscribes the thread.
-		if (this.state) this.subscribed = true;
-		return clone(this.state);
-	}
-}
-
-class FakeChannelThread implements ThreadIO {
-	private actual?: FakeThread;
-	constructor(
-		private readonly surface: Extract<Surface, { kind: "channel" }>,
-		private readonly owner: FakeChat,
-	) {}
-	get ref(): ThreadRef {
-		return (
-			this.actual?.ref ?? {
-				kind: "thread",
-				provider: this.surface.provider,
-				threadId: `provisional:${this.surface.channelId}`,
-			}
-		);
-	}
-	get channelId(): string {
-		return this.surface.channelId;
-	}
-	get isDM(): boolean {
-		return false;
-	}
-	async post(content: OutboundMessage): Promise<MessageRef> {
-		this.actual ??= await this.owner.thread({
-			kind: "thread",
-			provider: this.surface.provider,
-			threadId: `channel:${this.surface.channelId}:root-${this.owner.nextThreadId++}`,
-		});
-		return this.actual.post(content);
-	}
-	async update(ref: MessageRef, content: OutboundMessage): Promise<void> {
-		await (
-			await this.owner.thread({ kind: "thread", provider: ref.provider, threadId: ref.threadId })
-		).update(ref, content);
-	}
-	async setStatus(text: string | null): Promise<void> {
-		await this.actual?.setStatus(text);
-	}
-	async history(options: { limit?: number; sinceLastBotReply?: boolean }): Promise<ChatMessage[]> {
-		return this.actual ? this.actual.history(options) : [];
-	}
-	async subscribe(): Promise<void> {
-		if (!this.actual) throw new Error("Cannot subscribe a provisional channel thread");
-		await this.actual.subscribe();
-	}
-	async getState(): Promise<ThreadRoutingState | null> {
-		return this.actual ? this.actual.getState() : null;
-	}
-	async updateState(
-		fn: (state: ThreadRoutingState | null) => ThreadRoutingState | null,
-	): Promise<ThreadRoutingState | null> {
-		if (!this.actual)
-			throw new Error("Cannot persist routing state for a provisional channel thread");
-		return this.actual.updateState(fn);
-	}
-}
-
-/** Fake chat integration with inspectable posts/DMs/ephemeral notices and authenticated ingress helpers. */
-export class FakeChat implements ChatPort, ChatIntegration {
-	readonly kind = "fabrial.chat" as const;
-	readonly threads = new Map<string, FakeThread>();
-	readonly ephemeral: { thread: ThreadRef; identity: ExternalIdentity; text: string }[] = [];
-	readonly routes: Record<string, (request: Request) => Promise<Response>> = {};
-	nextMessageId = 1;
-	nextThreadId = 1;
-	private host?: FabrialHost;
-	constructor(readonly now: () => number = Date.now) {}
-	connect(host: FabrialHost): ReturnType<ChatIntegration["connect"]> {
-		this.host = host;
-		return { port: this, routes: this.routes };
-	}
-	async thread(ref: ThreadRef): Promise<FakeThread> {
-		const key = `${ref.provider}:${ref.threadId}`;
-		let thread = this.threads.get(key);
-		if (!thread) {
-			thread = new FakeThread(
-				clone(ref),
-				ref.threadId.split(":")[1] ?? ref.threadId,
-				ref.threadId.startsWith("dm:"),
-				this,
-			);
-			this.threads.set(key, thread);
-		}
-		return thread;
-	}
-	async resolve(surface: Surface): Promise<ThreadIO> {
-		return surface.kind === "thread" ? this.thread(surface) : new FakeChannelThread(surface, this);
-	}
-	async openDM(identity: ExternalIdentity): Promise<FakeThread> {
-		return this.thread({
-			kind: "thread",
-			provider: identity.provider,
-			threadId: `dm:${identityKey(identity)}`,
-		});
-	}
-	async permalink(thread: ThreadRef): Promise<string | null> {
-		return `https://chat.test/${thread.provider}/${thread.threadId}`;
-	}
-	async postEphemeral(thread: ThreadRef, identity: ExternalIdentity, text: string): Promise<void> {
-		this.ephemeral.push(clone({ thread, identity, text }));
-	}
-	async receive(
-		message: ChatMessage,
-		options: { events?: readonly string[]; event?: string; dedupeId?: string } = {},
-	): Promise<"accepted" | "ignored"> {
-		if (!this.host) throw new Error("FakeChat must be connected to an app");
-		const thread = await this.thread({
-			kind: "thread",
-			provider: message.provider,
-			threadId: message.threadId,
-		});
-		if (!thread.messages.some((m) => m.messageId === message.messageId))
-			thread.messages.push(clone(message));
-		return this.host.receiveMessage(message, {
-			events: options.events ?? [options.event ?? `${message.provider}.message`],
-			dedupeId: options.dedupeId ?? message.messageId,
-		});
-	}
-	async cancel(
-		thread: ThreadRef,
-		actor: ExternalIdentity,
-		dedupeId: string = crypto.randomUUID(),
-	): Promise<void> {
-		if (!this.host) throw new Error("FakeChat must be connected to an app");
-		await this.host.receiveCancellation({ thread, actor, dedupeId });
-	}
-	async click(
-		ref: MessageRef,
-		actionId: string,
-		actor: ExternalIdentity,
-		options: { value?: string; dedupeId?: string } = {},
-	): Promise<void> {
-		if (!this.host) throw new Error("FakeChat must be connected to an app");
-		await this.host.receiveAction({
-			actionId,
-			value: options.value,
-			actor,
-			thread: { kind: "thread", provider: ref.provider, threadId: ref.threadId },
-			messageId: ref.messageId,
-			dedupeId: options.dedupeId ?? crypto.randomUUID(),
-		});
-	}
-}
-
-/** Injectable agent/evaluator hooks and memoized, schema-checked state for core/adapter unit tests. */
-export function fakeAgents(
-	options: {
-		run?: AgentPort["run"];
-		send?: AgentPort["send"];
-		evaluate?: Evaluator["evaluate"];
-		state?: StatePort;
-		workflows?: RuntimeWorkflow[];
-	} = {},
-): AgentIntegration & {
-	values: Map<string, JsonObject>;
-	/** Inputs delivered with `ctx.send`, in order (default `send` only). */
-	sent: (import("./send.ts").SendRequest & { agent: string })[];
-} {
-	const values = new Map<string, JsonObject>();
-	const sent: (import("./send.ts").SendRequest & { agent: string })[] = [];
-	const key = (execution: DurableExecution, state: { name: string; scope: string }) =>
-		`${state.scope}:${state.scope === "session" ? (execution.metadata.replyTo?.kind === "thread" ? execution.metadata.replyTo.threadId : execution.metadata.requestId) : state.scope === "agent" ? execution.executionId : execution.metadata.requestId}:${state.name}`;
-	const state: StatePort = {
-		get: (execution, id, definition) =>
-			execution.step(id, async () => {
-				const value = await parseSchema(
-					definition.schema,
-					clone(values.get(key(execution, definition)) ?? definition.initial()),
-				);
-				values.set(key(execution, definition), clone(value));
-				return value;
-			}) as never,
-		update: (execution, id, definition, fn) =>
-			execution.step(id, async () => {
-				const draft = clone(values.get(key(execution, definition)) ?? definition.initial());
-				const value = await parseSchema(definition.schema, fn(draft as never) ?? draft);
-				values.set(key(execution, definition), clone(value));
-				return value;
-			}) as never,
-	};
-	return {
-		kind: "fabrial.agents",
-		values,
-		sent,
-		connect: () => ({
-			agents: {
-				workflows: () => options.workflows ?? [],
-				run: options.run ?? ((execution, id, _agent, opts) => execution.step(id, () => opts.input)),
-				send:
-					options.send ??
-					((execution, id, agent, request) =>
-						execution.step(`fabrial:fake:send:${id}`, () => {
-							sent.push({ ...request, agent: agent.name });
-							return {
-								requestId: request.requestId,
-								conversation: conversationReference(agent.name, request.session),
-							};
-						})),
-				async deliver(agent, request) {
-					// Like a conversation, dedupe a redelivered request per session.
-					if (
-						!sent.some(
-							(s) =>
-								s.requestId === request.requestId &&
-								s.agent === agent.name &&
-								s.session === request.session,
-						)
-					)
-						sent.push(clone({ ...request, agent: agent.name }));
-					return {
-						requestId: request.requestId,
-						conversation: conversationReference(agent.name, request.session),
-					};
-				},
-			},
-			state: options.state ?? state,
-			evaluator: {
-				evaluate:
-					options.evaluate ??
-					(async (request) => ({ stopReason: "stop", answers: {}, model: request.model })),
-			},
-			workflows: options.workflows ?? [],
-			async start() {},
-			async stop() {},
-		}),
-	};
-}
-
-/** Build an app from an instance with explicit test ports (a runtime, fake or real chat, agents). */
-export function testApp<const P extends readonly import("./plugin.ts").AnyPlugin[]>(
-	instance: import("./instance.ts").Fabrial<P>,
-	config: Omit<import("./instance.ts").AppConfig, "agents"> & {
-		runtime: DurableRuntime;
-		chat?: ChatIntegration;
-		agents?: AgentIntegration;
-		/** `f.app({ agents })`: agents whose triggers receive events. */
-		routedAgents?: import("./instance.ts").AppConfig["agents"];
-	},
-): import("./app.ts").HostedApp<import("./instance.ts").ClientsOf<P>> {
-	const { workflows, routedAgents, logger, ...overrides } = config;
-	return internal(instance).app({ workflows, agents: routedAgents, logger }, overrides) as never;
-}
-
-function internal(instance: object): import("./instance.ts").InternalInstance {
-	const value = (instance as { [INTERNAL]?: import("./instance.ts").InternalInstance })[INTERNAL];
-	if (!value) throw new Error("Expected an instance from createFabrial()");
-	return value;
-}
-
-export interface TestAppConfig extends Omit<import("./instance.ts").AppConfig, "agents"> {
-	/**
-	 * Postgres connection string for Conductor's tables, e.g. from a testcontainers `PostgreSqlContainer`
-	 * started in Vitest's `globalSetup`. Apps share the database; each runs on a queue of its own.
-	 */
-	database: string;
-	/** Defaults to `fakeAgents()`. */
-	agents?: AgentIntegration;
-	/** `f.app({ agents })`: agents whose triggers receive events. */
-	routedAgents?: import("./instance.ts").AppConfig["agents"];
-	/** Defaults to a `FakeChat` on the app's clock. */
-	chat?: FakeChat;
-}
-
-export interface TestApp<C> {
-	readonly app: import("./app.ts").HostedApp<C>;
-	readonly chat: FakeChat;
-	readonly runtime: DurableRuntime;
-	/**
-	 * Conductor's test clock for the app's workers and database: `set` moves time to a date, from which
-	 * it keeps running, and `advance` jumps it forward. Advance only after the wait it should end is
-	 * registered.
-	 */
-	readonly clock: TestClock;
-	/** The execution's outcome once it settles; `undefined` while it runs or waits. */
-	result: (executionId: string) => Promise<ExecutionResult | undefined>;
-	/** Wait until the execution settles (default timeout 30s). */
-	settled: (executionId: string, options?: { timeoutMs?: number }) => Promise<ExecutionResult>;
-	/**
-	 * Wait until every event emitted on the database so far was dispatched and every execution of this
-	 * app settled, suspended waits included: for asserting that something did not happen.
-	 */
-	idle: (options?: { timeoutMs?: number }) => Promise<void>;
-	/** Stop the app and close its connection. */
-	stop: () => Promise<void>;
-}
-
-const silent = { debug() {}, info() {}, warn() {}, error() {} };
+export { FakeChat, type FakePost } from "./fake-chat.ts";
+export type { TestApp, TestAppConfig, TestingApp, ThreadRouting } from "./testing-internal.ts";
+/** Conductor's test clock, as `TestApp.clock`. */
+export type { TestClock } from "pgconductor-js/testing";
 
 /**
  * Build an app on real Conductor from the same typed catalog as production, with fake chat and agents
  * and fast polling. Start it with `app.start()`; drive it through `chat`, `app.fetch` or
  * `runtime.invoke`, and wait for outcomes with `settled`.
  */
-export function createTestApp<const P extends readonly import("./plugin.ts").AnyPlugin[]>(
-	instance: import("./instance.ts").Fabrial<P>,
+export function createTestApp<const P extends readonly AnyPlugin[]>(
+	instance: Fabrial<P>,
 	config: TestAppConfig,
-): TestApp<import("./instance.ts").ClientsOf<P>> {
-	const { database, chat: fake, ...appConfig } = config;
-	// The test clock is a session setting: it holds for queries on this one connection.
-	const sql = postgres(database, { max: 1, onnotice: () => {} });
-	const queue = `test_${crypto.randomUUID().replaceAll("-", "")}`;
-	const clock = createTestClock(sql);
-	const runtime = conductor(
-		{ sql },
-		{
-			logger: silent,
-			queue,
-			clock,
-			worker: { concurrency: 8, pollIntervalMs: 20, flushIntervalMs: 20, fetchBatchSize: 10 },
-		},
-	);
-	const chat = fake ?? new FakeChat(() => runtime.now!());
-	const app = testApp(instance, {
-		...appConfig,
-		runtime,
-		chat,
-		agents: config.agents ?? fakeAgents(),
-	});
-	// Reads any execution by id; runs no tasks.
-	const inspector = Conductor.create({
-		sql,
-		tasks: TaskSchemas.fromSchema([]),
-		context: {},
-		logger: silent,
-		telemetry: false,
-	}) as unknown as Conductor;
-	const result = async (id: string): Promise<ExecutionResult | undefined> => {
-		const info = await inspector.getExecution(id);
-		if (!info) throw new Error(`Unknown execution: ${id}`);
-		if (info.status === "completed")
-			return {
-				status: "completed",
-				output: (info.result as { output: Json } | null)?.output ?? null,
-			};
-		if (info.status === "failed")
-			return { status: "failed", error: info.error ?? "Execution failed" };
-		if (info.status === "cancelled")
-			return { status: "cancelled", reason: info.error ?? "Cancelled" };
-		return undefined;
-	};
-	// Conductor's tables: the public API lists no executions.
-	const pending = (queue: string, limit: number) =>
-		sql<
-			{
-				id: string;
-				task_key: string;
-				attempts: number;
-				run_at: Date;
-				locked: boolean;
-				waiting: string | null;
-				last_error: string | null;
-			}[]
-		>`
-			select id, task_key, attempts, run_at, locked_at is not null as locked,
-				coalesce(waiting_step_key, waiting_on_execution_id::text) as waiting, last_error
-			from pgconductor._private_executions
-			where queue = ${queue} and completed_at is null and failed_at is null
-				and task_key != 'pgconductor.maintenance'
-				-- a cron's next occurrence waits for its schedule, not on the app
-				and not (cron_expression is not null and attempts = 0 and locked_at is null)
-			limit ${limit}`;
-	const drained = async (description: string, queue: string, timeoutMs = 30_000) => {
-		const deadline = Date.now() + timeoutMs;
-		while ((await pending(queue, 1)).length > 0) {
-			if (Date.now() > deadline) {
-				// Say what is stuck: a retry backing off, a wait nobody ends, or work no worker claims.
-				const rows = await pending(queue, 10);
-				throw new Error(`Timed out waiting for ${description}; unsettled ${JSON.stringify(rows)}`);
-			}
-			await new Promise((resolve) => setTimeout(resolve, 20));
-		}
-	};
-	return {
-		app,
-		chat,
-		runtime,
-		clock,
-		result,
-		async idle(options = {}) {
-			await drained("events to dispatch", "pgconductor.internal", options.timeoutMs);
-			await drained("the app's executions to settle", queue, options.timeoutMs);
-		},
-		async settled(id, options = {}) {
-			const deadline = Date.now() + (options.timeoutMs ?? 30_000);
-			for (;;) {
-				const settled = await result(id);
-				if (settled) return settled;
-				if (Date.now() > deadline) throw new Error(`Timed out waiting for ${id} to settle`);
-				await new Promise((resolve) => setTimeout(resolve, 20));
-			}
-		},
-		async stop() {
-			try {
-				await app.stop();
-			} finally {
-				await sql.end();
-			}
-		},
-	};
+): TestApp<ClientsOf<P>> {
+	return create(instance, config);
 }
 
 /** A scripted model reply, built with `reply.text()` or `reply.toolCall()`. */
@@ -672,25 +141,38 @@ export function scriptedModels(): ScriptedModels {
 	return result;
 }
 
+const defined = <T extends object>(value: T): Partial<T> =>
+	Object.fromEntries(Object.entries(value).filter(([, v]) => v !== undefined)) as Partial<T>;
+
+/**
+ * Durable retries of transient model errors: failed attempt n retries while n <= `maxRetries`, after
+ * min(`baseDelayMs` * 2^(n-1), `maxDelayMs`). Unset fields keep production's policy.
+ */
+export interface ModelRetryOptions {
+	maxRetries?: number;
+	baseDelayMs?: number;
+	maxDelayMs?: number;
+}
+
 /**
  * Build the real app (Postgres, workflows, agents, chat state on the instance's database) with scripted
  * models instead of credentials, model retries off, and fast polling.
  */
-export function createIntegrationApp<const P extends readonly import("./plugin.ts").AnyPlugin[]>(
-	instance: import("./instance.ts").Fabrial<P>,
-	config: import("./instance.ts").AppConfig & {
+export function createIntegrationApp<const P extends readonly AnyPlugin[]>(
+	instance: Fabrial<P>,
+	config: AppConfig & {
 		models: ScriptedModels;
-		/** Durable model retries: off by default; `true` for production's policy, or a policy override (e.g. tiny delays). */
-		modelRetries?: boolean | Partial<import("@earendil-works/pi-durable").ConversationRetryPolicy>;
+		/** Durable model retries: off by default; `true` for production's policy, or overrides of it (e.g. tiny delays). */
+		modelRetries?: boolean | ModelRetryOptions;
 		/** Worker and wait polling interval. Default 20ms. */
 		pollIntervalMs?: number;
 		/** Concurrent workflow executions per worker. Default 8. */
 		concurrency?: number;
 	},
-): import("./app.ts").HostedApp<import("./instance.ts").ClientsOf<P>> {
+): TestingApp<ClientsOf<P>> {
 	const { workflows, agents: routed, logger, models, modelRetries = false } = config;
 	const poll = config.pollIntervalMs ?? 20;
-	return internal(instance).app(
+	const app = internal(instance).app(
 		{ workflows, agents: routed, logger },
 		{
 			models: scripted.get(models),
@@ -698,7 +180,14 @@ export function createIntegrationApp<const P extends readonly import("./plugin.t
 				retry:
 					typeof modelRetries === "boolean"
 						? { enabled: modelRetries }
-						: { enabled: true, ...modelRetries },
+						: {
+								enabled: true,
+								...defined({
+									maxRetries: modelRetries.maxRetries,
+									baseDelayMs: modelRetries.baseDelayMs,
+									maxAgentDelayMs: modelRetries.maxDelayMs,
+								}),
+							},
 			},
 			conductor: {
 				worker: {
@@ -709,5 +198,6 @@ export function createIntegrationApp<const P extends readonly import("./plugin.t
 				},
 			},
 		},
-	) as never;
+	);
+	return testingApp(app) as never;
 }

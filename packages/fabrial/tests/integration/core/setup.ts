@@ -20,7 +20,7 @@ import type {
 } from "../../internals.ts";
 import type { CoreConfig } from "../../../src/app.ts";
 import type { ExecutionInfo } from "../../../src/workflow.ts";
-import { FakeChat, testApp } from "../../../src/testing.ts";
+import { FakeChat, testApp } from "../../../src/testing-internal.ts";
 import { until, useConductor } from "../../conductor/helper.ts";
 
 export const { defineState, defineWorkflow } = createFabrial({ plugins: [] });

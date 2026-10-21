@@ -12,7 +12,7 @@ import {
 	type ExternalIdentity,
 	type JsonObject,
 } from "../../internals.ts";
-import { FakeChat, fakeAgents, testApp } from "../../../src/testing.ts";
+import { FakeChat, fakeAgents, testApp } from "../../../src/testing-internal.ts";
 import { useConductor } from "../../conductor/helper.ts";
 
 // App-level runs on real Conductor and real time: instances, follow records.

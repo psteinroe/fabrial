@@ -2,7 +2,7 @@ import { metadataOf } from "../../../src/context.ts";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineEvent, definePlugin, trigger, type Json } from "../../internals.ts";
-import { fakeAgents } from "../../../src/testing.ts";
+import { fakeAgents } from "../../../src/testing-internal.ts";
 import { until } from "../../conductor/helper.ts";
 import {
 	alice,

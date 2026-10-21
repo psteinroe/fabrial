@@ -16,7 +16,7 @@ import {
 	type WaitBranch,
 } from "../../internals.ts";
 import type { EventFilter } from "../../../src/events.ts";
-import { FakeChat, testApp } from "../../../src/testing.ts";
+import { FakeChat, testApp } from "../../../src/testing-internal.ts";
 import { z } from "zod";
 import type { AnyTask, Conductor } from "pgconductor-js";
 import { conductor, ExecutionError } from "../../../src/runtime/conductor/index.ts";

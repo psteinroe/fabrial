@@ -15,7 +15,8 @@
 	"exports": {
 		".": "./src/index.ts",
 		"./plugin": "./src/plugin-api.ts",
-		"./testing": "./src/testing.ts"
+		"./testing": "./src/testing.ts",
+		"./internal/testing": "./src/testing-internal.ts"
 	},
 	"publishConfig": {
 		"exports": {

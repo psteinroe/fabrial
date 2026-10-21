@@ -23,7 +23,7 @@ import {
 import { toolName } from "../../../src/agent.ts";
 import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { conductor } from "../../../src/runtime/conductor/index.ts";
-import { FakeChat, testApp } from "../../../src/testing.ts";
+import { FakeChat, testApp } from "../../../src/testing-internal.ts";
 
 /**
  * Sessions hosted in keyed Conductor executions: every case runs the real runtime, and the cross-process cases two

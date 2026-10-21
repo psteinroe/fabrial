@@ -10,7 +10,7 @@ import {
 	weeklyRotation,
 } from "../internals.ts";
 import type { AnyWorkflow, EventFilter, ExternalIdentity } from "../internals.ts";
-import { FakeChat, StubRuntime, testApp } from "fabrial/testing";
+import { FakeChat, StubRuntime, testApp } from "../../src/testing-internal.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
 const identity = (subjectId: string): ExternalIdentity => ({

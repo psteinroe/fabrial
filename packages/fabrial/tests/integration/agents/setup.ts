@@ -3,7 +3,7 @@ import { afterAll, afterEach, beforeAll } from "vitest";
 import type { HostedApp } from "../../../src/app.ts";
 import type { RuntimeWorkflow } from "../../internals.ts";
 import { PostgresStorage } from "../../../src/agents/index.ts";
-import { FakeChat, testApp } from "../../../src/testing.ts";
+import { FakeChat, testApp } from "../../../src/testing-internal.ts";
 import { until, useConductor } from "../../conductor/helper.ts";
 
 type Config = Parameters<typeof testApp>[1];

@@ -1,6 +1,12 @@
 import { createFabrial, type JsonObject } from "fabrial";
 import { trigger, type ResourceKind } from "fabrial/plugin";
-import { createTestApp, fakeAgents, StubRuntime, testApp, FakeChat } from "fabrial/testing";
+import {
+	createTestApp,
+	fakeAgents,
+	StubRuntime,
+	testApp,
+	FakeChat,
+} from "fabrial/internal/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { github, parsePullRequest, pullRequest } from "../../src/index.ts";
 import { options } from "../helper.ts";
@@ -192,8 +198,7 @@ describe("follows in an app", () => {
 			expect((await app.fetch(deliver(hook, `${scope}:${delivery}`))).status).toBe(200);
 			await t.idle();
 		};
-		const records = async () =>
-			(await (await app.host.chat()!.thread(prThread as never)).getState())?.resourceFollows;
+		const records = async () => (await app.routing(prThread as never))?.resourceFollows;
 		return { app, agents, start, send, observed, slackThread, records };
 	}
 
