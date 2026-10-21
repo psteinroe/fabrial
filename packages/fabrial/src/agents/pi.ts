@@ -60,6 +60,7 @@ import { instructionsSection, jsonSchemaOf, piToolOf, toJsonSchema } from "./too
 import {
 	abortBackground,
 	backgroundPending,
+	activityOf,
 	reportedAnswer,
 	stopTool,
 	subagentsSection,
@@ -1416,14 +1417,12 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	) {
 		let progress = io;
 		let progressRequest: string | undefined;
-		let lastStatus = 0;
 		let waiting = false;
 		let childStatus: string | undefined;
 		const shown = new Set<ThreadIO>();
 		const showStatus = async (text: string) => {
 			if (!progress) return;
 			shown.add(progress);
-			lastStatus = Date.now();
 			await progress.setStatus(text).catch(() => {});
 		};
 		const thinking = () => showStatus(waiting ? WAITING_STATUS : "Thinking…");
@@ -1438,16 +1437,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				await thinking();
 				return;
 			}
-			if (waiting || !progress || Date.now() - lastStatus < 750) return;
-			// A subagent call's details update; the child shows its own activity.
-			if (batch.every((event) => event.type === "tool_execution_update")) return;
-			const tool = batch.find((event) => event.type === "tool_execution_start");
-			const text =
-				tool?.type === "tool_execution_start"
-					? ((await conversation.agent(context)).tools.find((each) => each.name === tool.toolName)
-							?.description ?? "Using a tool…")
-					: "Thinking…";
-			await showStatus(text);
+			// The chat thread throttles statuses.
+			if (waiting || !progress) return;
+			const text = activityOf(batch, (await conversation.agent(context)).tools);
+			if (text) await showStatus(text);
 		});
 		await thinking();
 		return {

@@ -647,6 +647,22 @@ async function newestEntry(
 		: undefined;
 }
 
+/**
+ * The status a batch of a conversation's Pi events shows: the newest started tool's description, or "Thinking…". None
+ * for only a subagent call's detail updates: the child shows its own activity.
+ */
+export function activityOf(
+	batch: readonly { type: string }[],
+	tools: readonly { name: string; description?: string }[],
+): string | undefined {
+	if (batch.every((event) => event.type === "tool_execution_update")) return undefined;
+	const tool = batch.findLast((event) => event.type === "tool_execution_start") as
+		| { toolName: string }
+		| undefined;
+	if (!tool) return "Thinking…";
+	return tools.find((each) => each.name === tool.toolName)?.description ?? "Using a tool…";
+}
+
 /** Shows a child's activity on the lead's status ("researcher: Thinking…") until the returned stop is called. */
 async function watchActivity(
 	bridge: BridgeFrame,
@@ -659,13 +675,8 @@ async function watchActivity(
 	const tools = (await (await bridge.harness.conversation(child, context))!.agent(context)).tools;
 	const events = await watchEvents(bridge.harness, child, context);
 	events.start(async (batch) => {
-		if (batch.every((event) => event.type === "tool_execution_update")) return;
-		const tool = batch.findLast((event) => event.type === "tool_execution_start");
-		const text =
-			tool?.type === "tool_execution_start"
-				? (tools.find((each) => each.name === tool.toolName)?.description ?? "Using a tool…")
-				: "Thinking…";
-		await status(`${label}: ${text}`);
+		const text = activityOf(batch, tools);
+		if (text) await status(`${label}: ${text}`);
 	});
 	await status(`${label}: Thinking…`);
 	return async () => {
