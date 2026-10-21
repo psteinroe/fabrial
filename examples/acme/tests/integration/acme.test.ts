@@ -878,13 +878,16 @@ it("dev thread: the developer asks its researcher in the foreground and the back
 		},
 	});
 	expect(response.status).toBe(200);
+	// Both replies, each exactly once, in the thread. The background report can finish before the
+	// foreground reply posts, so the two may arrive in either order: compare them sorted.
 	const replies = () =>
 		calls
 			.filter((c) => c.method === "chat.postMessage" && c.args.channel === "C_DEV")
-			.map((c) => [c.args.thread_ts, c.args.text]);
+			.map((c) => [c.args.thread_ts, c.args.text])
+			.sort(([, a], [, b]) => String(a).localeCompare(String(b)));
 	await expect.poll(replies, poll).toEqual([
-		[ts, "It is tests/flaky.test.ts; checking CI."],
 		[ts, "CI: it failed 3 of the last 10 runs."],
+		[ts, "It is tests/flaky.test.ts; checking CI."],
 	]);
 	expect(search).toHaveBeenCalledOnce();
 });
