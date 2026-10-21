@@ -36,7 +36,7 @@ const recorder = definePlugin({
 		workflow: [
 			async (execution, ctx, next) => {
 				executions.push({ workflow: execution.workflow, metadata: metadataOf(ctx) });
-				return next(ctx);
+				return next();
 			},
 		],
 	},

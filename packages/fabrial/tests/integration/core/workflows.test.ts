@@ -1,7 +1,13 @@
 import { metadataOf } from "../../../src/context.ts";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { defineEvent, definePlugin, trigger, type Json } from "../../internals.ts";
+import {
+	defineEvent,
+	definePlugin,
+	trigger,
+	type Json,
+	type WorkflowContext,
+} from "../../internals.ts";
 import { reply, scriptedModels } from "../../../src/testing.ts";
 import { until } from "../../conductor/helper.ts";
 import {
@@ -126,11 +132,11 @@ describe("routing and lifecycle", () => {
 });
 
 describe("durability and context", () => {
-	it("suffixes repeated ids and memoizes effects across replay", async () => {
+	it("memoizes effects across replay; loops pass distinct keys", async () => {
 		let effects = 0;
 		const test = setup([
 			workflow(async (_input, ctx) => {
-				for (let i = 0; i < 3; i++) await ctx.step("x", () => ++effects);
+				for (let i = 0; i < 3; i++) await ctx.step(`x:${i}`, () => ++effects);
 				const ref = await ctx.thread!.post("post", "hello");
 				await ctx.thread!.update("update", ref, "updated");
 				await ctx.sleep("sleep", "1h");
@@ -145,23 +151,6 @@ describe("durability and context", () => {
 		const posts = (await test.chat.thread(surface)).posts;
 		expect(posts).toHaveLength(1);
 		expect(posts[0]!.updates).toEqual(["updated"]);
-	});
-	it("handles generated-id collisions deterministically without repeating effects", async () => {
-		let effects = 0;
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx.step("x", () => ++effects);
-				await ctx.step("x:1", () => ++effects);
-				await ctx.step("x", () => ++effects);
-				await ctx.sleep("sleep", "1h");
-				return effects;
-			}),
-		]);
-		const owner = await enter(test);
-		await owner.suspended("sleep");
-		await db.clock.advance("1h");
-		expect(await owner.output()).toBe(3);
-		expect(effects).toBe(3);
 	});
 	const outputs = (output: z.ZodType<Json>, result: Json) =>
 		defineWorkflow({
@@ -185,7 +174,7 @@ describe("durability and context", () => {
 	});
 	it("invokes an inputless workflow without an argument; it runs with input null", async () => {
 		const child = defineWorkflow({ name: "child", run: async (input) => ({ input }) });
-		const test = setup([workflow(async (_i, ctx) => ctx.invoke("child", child)), child]);
+		const test = setup([workflow(async (_i, ctx) => ctx.invokeAndWait("child", child)), child]);
 		expect(await (await enter(test)).settled()).toEqual({
 			status: "completed",
 			output: { input: null },
@@ -195,15 +184,77 @@ describe("durability and context", () => {
 		const test = setup([workflow(async (_i, ctx) => ctx.step("", () => 1))]);
 		expect(await (await enter(test)).settled()).toMatchObject({
 			status: "failed",
-			error: expect.stringContaining("explicit id"),
+			error: expect.stringContaining("explicit key"),
 		});
 	});
-	it.each(["fabrial:receipt", "x#1"])("rejects reserved operation id %s", async (id) => {
-		const test = setup([workflow(async (_i, ctx) => ctx.step(id, () => 1))]);
+	it.each([
+		["step", (ctx: WorkflowContext) => ctx.step("fabrial:receipt", () => 1)],
+		["sleep", (ctx: WorkflowContext) => ctx.sleep("fabrial:wait", 1)],
+	] as const)("rejects the reserved fabrial: key namespace (%s)", async (_name, run) => {
+		const test = setup([workflow(async (_i, ctx) => run(ctx))]);
 		expect(await (await enter(test)).settled()).toMatchObject({
 			status: "failed",
 			error: expect.stringContaining("reserved"),
 		});
+	});
+	it("addresses one operation per key: a repeated key replays its receipt", async () => {
+		let runs = 0;
+		const test = setup([
+			workflow(async (_i, ctx) => [
+				await ctx.step("x#1", () => ++runs),
+				await ctx.step("x#1", () => ++runs),
+			]),
+		]);
+		expect(await (await enter(test)).output()).toEqual([1, 1]);
+	});
+	it.each([
+		["emit", (ctx: WorkflowContext) => ctx.emit("fabrial.ingress", {})],
+		[
+			"invoke",
+			(ctx: WorkflowContext) => ctx.invoke("call", { name: "fabrial.approval.request" } as never),
+		],
+		[
+			"signalWithStart",
+			(ctx: WorkflowContext) =>
+				ctx.signalWithStart("call", {
+					task: { name: "fabrial.approval.decision" } as never,
+					key: "k",
+					signal: { name: "s", id: "1" },
+				}),
+		],
+		[
+			"sendSignal",
+			(ctx: WorkflowContext) =>
+				ctx.sendSignal(ctx.executionId, { name: "fabrial.approval.cancel", id: "1" }),
+		],
+	] as const)("rejects reserved destinations before persisting (%s)", async (_name, run) => {
+		const test = setup([workflow(async (_i, ctx) => run(ctx))]);
+		expect(await (await enter(test)).settled()).toMatchObject({
+			status: "failed",
+			error: expect.stringMatching(/Reserved|reserved/),
+		});
+		expect(test.ids("fabrial.approval.request")).toHaveLength(0);
+		expect(test.ids("fabrial.approval.decision")).toHaveLength(0);
+	});
+	it("a failed child is catchable: invoke, then waitForResult", async () => {
+		const child = defineWorkflow({
+			name: "child",
+			run: async () => {
+				throw new Error("boom");
+			},
+			retries: { maxAttempts: 1 },
+		});
+		const test = setup([
+			workflow(async (_i, ctx) => {
+				const outcome = await ctx.waitForResult(
+					"result",
+					await ctx.invoke("child", child, null, { cancelWithParent: true }),
+				);
+				return outcome.status;
+			}),
+			child,
+		]);
+		expect(await (await enter(test)).output()).toBe("failed");
 	});
 	it("runs middleware in plugin order on every resume", async () => {
 		const seen: string[] = [];
@@ -215,7 +266,7 @@ describe("durability and context", () => {
 						async (_execution, ctx, next) => {
 							seen.push(`${id}:before`);
 							try {
-								return await next(ctx);
+								return await next();
 							} finally {
 								seen.push(`${id}:after`);
 							}
@@ -354,8 +405,8 @@ describe("children", () => {
 		});
 		const test = setup([
 			workflow(async (_i, ctx) => {
-				const result = await ctx.invoke("child", child, { value: 3 });
-				const executionId = await ctx.start("background", child, { value: 4 });
+				const result = await ctx.invokeAndWait("child", child, { value: 3 });
+				const executionId = await ctx.invoke("background", child, { value: 4 });
 				return { result, executionId };
 			}),
 			child,
@@ -365,24 +416,27 @@ describe("children", () => {
 		expect(await db.execution(output.executionId).output()).toBe(8);
 		expect(test.ids("child")).toHaveLength(2);
 	});
-	it.each(["invoke", "start"] as const)("validates %s input before starting", async (method) => {
-		const child = defineWorkflow({
-			name: "child",
-			input: z.object({ value: z.number() }),
-			run: async () => {},
-		});
-		const test = setup([
-			workflow(async (_i, ctx) => {
-				await ctx[method]("call", child, { value: "bad" } as never);
-			}),
-			child,
-		]);
-		expect(await (await enter(test)).settled()).toMatchObject({
-			status: "failed",
-			error: expect.stringContaining("Invalid child input"),
-		});
-		expect(test.ids("child")).toHaveLength(0);
-	});
+	it.each(["invokeAndWait", "invoke"] as const)(
+		"validates %s input before starting",
+		async (method) => {
+			const child = defineWorkflow({
+				name: "child",
+				input: z.object({ value: z.number() }),
+				run: async () => {},
+			});
+			const test = setup([
+				workflow(async (_i, ctx) => {
+					await ctx[method]("call", child, { value: "bad" } as never);
+				}),
+				child,
+			]);
+			expect(await (await enter(test)).settled()).toMatchObject({
+				status: "failed",
+				error: expect.stringContaining("Invalid child input"),
+			});
+			expect(test.ids("child")).toHaveLength(0);
+		},
+	);
 	it("does not permit an alternate workflow object to bypass registered input validation", async () => {
 		const registered = defineWorkflow({
 			name: "registered",
@@ -394,7 +448,10 @@ describe("children", () => {
 			input: z.object({}),
 			run: async () => "fake",
 		});
-		const test = setup([workflow(async (_i, ctx) => ctx.invoke("call", impostor, {})), registered]);
+		const test = setup([
+			workflow(async (_i, ctx) => ctx.invokeAndWait("call", impostor, {})),
+			registered,
+		]);
 		expect(await (await enter(test)).settled()).toMatchObject({
 			status: "failed",
 			error: expect.stringContaining("Invalid registered input"),
@@ -407,11 +464,12 @@ describe("children", () => {
 			input: z.object({}),
 			run: async () => "secret",
 		});
-		const test = setup([workflow(async (_i, ctx) => ctx.invoke("other", other, {})), other]);
+		const test = setup([workflow(async (_i, ctx) => ctx.invokeAndWait("other", other, {})), other]);
 		expect(await (await enter(test)).output()).toBe("secret");
 		expect(test.ids("other")).toHaveLength(1);
 	});
 	it.each([false, true])("structured cancellation, detached=%s", async (detached) => {
+		// Native invoke: an attached child (`cancelWithParent`) is cancelled with its parent.
 		const child = defineWorkflow({
 			name: "child",
 			input: z.object({}),
@@ -421,7 +479,10 @@ describe("children", () => {
 			},
 		});
 		const test = setup([
-			workflow(async (_i, ctx) => ctx.invoke("invoke", child, {}, { detached })),
+			workflow(async (_i, ctx) => {
+				const id = await ctx.invoke("invoke", child, {}, { cancelWithParent: !detached });
+				return ctx.waitForResult("result", id);
+			}),
 			child,
 		]);
 		const owner = await enter(test);
@@ -435,7 +496,7 @@ describe("children", () => {
 			expect(await execution.settled()).toMatchObject({ status: "completed" });
 		} else expect(await execution.settled()).toMatchObject({ status: "cancelled" });
 	});
-	it("start survives parent cancellation, while recursive invokes do not", async () => {
+	it("an independent child survives parent cancellation, attached ones do not", async () => {
 		const grandchild = defineWorkflow({
 			name: "grandchild",
 			input: z.object({}),
@@ -446,7 +507,11 @@ describe("children", () => {
 		const child = defineWorkflow({
 			name: "child",
 			input: z.object({}),
-			run: async (_i, ctx) => ctx.invoke("grandchild", grandchild, {}),
+			run: async (_i, ctx) =>
+				ctx.waitForResult(
+					"result",
+					await ctx.invoke("grandchild", grandchild, {}, { cancelWithParent: true }),
+				),
 		});
 		const background = defineWorkflow({
 			name: "background",
@@ -457,8 +522,11 @@ describe("children", () => {
 		});
 		const test = setup([
 			workflow(async (_i, ctx) => {
-				await ctx.start("background", background, {});
-				return ctx.invoke("child", child, {});
+				await ctx.invoke("background", background, {});
+				return ctx.waitForResult(
+					"result",
+					await ctx.invoke("child", child, {}, { cancelWithParent: true }),
+				);
 			}),
 			child,
 			grandchild,
@@ -736,7 +804,7 @@ describe("provider route response context", () => {
 						await ctx.state(counter).update("update", (draft) => {
 							draft.count++;
 						});
-						return ctx.invoke("child", child, {});
+						return ctx.invokeAndWait("child", child, {});
 					},
 				});
 				return [owner, child];
@@ -757,7 +825,7 @@ describe("Pi workflows", () => {
 				workflow: [
 					async (execution, ctx, next) => {
 						seen.push(execution.workflow);
-						return next(ctx);
+						return next();
 					},
 				],
 			},

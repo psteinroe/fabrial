@@ -1,9 +1,10 @@
 import type { ApprovalDecision, ApprovalHandle, ApprovalOptions } from "./approval.ts";
 import type { EvaluateQuestion, EvaluateRequest, EvaluateResult } from "./evaluate.ts";
 import type { GroupDefinition, Principal } from "./identity.ts";
-import type { Json } from "./json.ts";
+import type { Json, JsonObject } from "./json.ts";
 import type { Origin } from "./events.ts";
-import type { AgentRef, AgentResult, AgentRunOptions } from "./runtime.ts";
+import type { AgentRef, AgentResult, AgentRunOptions, InvocationMetadata } from "./runtime.ts";
+import type { TaskContext } from "pgconductor-js";
 import type { Schema } from "./schema.ts";
 import type { SendOptions, SendReceipt } from "./send.ts";
 import type { ResourceRef } from "./plugin.ts";
@@ -13,18 +14,109 @@ import type { StateDefinition, WorkflowStateHandle } from "./state.ts";
 import type { Awaitable, Thread } from "./thread.ts";
 import type { TriggerPayload, TriggerSpec } from "./trigger.ts";
 
-export interface WorkflowContext<TClients = Record<string, unknown>> {
-	/** For diagnostics: the durable execution running this workflow. */
-	readonly executionId: string;
+/** Conductor's context methods Fabrial wraps (typed for Fabrial workflows below) or keeps to itself. */
+type WrappedNative =
+	| "invoke"
+	| "invokeAndWait"
+	| "waitForResult"
+	| "schedule"
+	| "unschedule"
+	| "sendSignal"
+	| "signalWithStart"
+	| "emit"
+	| "subscribe"
+	| "waitForEvent"
+	| "step"
+	| "sleep";
+
+/** Fabrial's override of a child's metadata: merged onto this execution's (routing-only fields cleared). */
+export type ChildMetadata =
+	| Partial<InvocationMetadata>
+	| ((metadata: InvocationMetadata) => Partial<InvocationMetadata>);
+
+export type ResultOutcome<T = Json> =
+	| { status: "completed"; result: T }
+	| { status: "failed"; error: string }
+	| { status: "cancelled"; reason: string }
+	| { status: "timeout" };
+
+/**
+ * A workflow's `ctx`: Conductor's `TaskContext` (durable steps, sleeps, waits, signals, child executions)
+ * plus Fabrial's fields. Operation keys are Conductor's: a repeated key addresses the same operation, so
+ * loops pass distinct keys; keys beginning with `fabrial:` are reserved. Children and events inherit this
+ * execution's invocation metadata; internal workflows and `fabrial.*` events are not destinations.
+ */
+export interface WorkflowContext<TClients = Record<string, unknown>> extends Omit<
+	TaskContext,
+	WrappedNative
+> {
 	/** The thread this execution replies into. Absent for observers and executions without a surface. */
 	readonly thread: Thread | undefined;
 	readonly clients: TClients;
 	/** Who asked for this work. */
 	readonly actor: Principal | null;
-	readonly signal: AbortSignal;
 
-	step<T extends Json | void>(id: string, fn: () => Promise<T> | T): Promise<T>;
-	sleep(id: string, duration: string | number): Promise<void>;
+	step<T extends Json | void>(key: string, fn: () => Promise<T> | T): Promise<T>;
+	sleep(key: string, duration: string | number): Promise<void>;
+	/** Conductor `subscribe`, by event name. */
+	subscribe(
+		key: string,
+		options: { event: string; filter?: Record<string, unknown> },
+	): Promise<{ key: string; wait(options?: { timeout?: string | number }): Promise<unknown> }>;
+	waitForEvent(
+		key: string,
+		options: { event: string; filter?: Record<string, unknown>; timeout?: string | number },
+	): Promise<{ name: string; payload: JsonObject }>;
+	/** Start a workflow without waiting (Conductor `invoke`); returns its execution id. */
+	invoke<W extends AnyWorkflow>(
+		key: string,
+		workflow: W,
+		...args: WorkflowArgs<
+			W,
+			[options?: { cancelWithParent?: boolean; dedupe_key?: string; metadata?: ChildMetadata }]
+		>
+	): Promise<string>;
+	/**
+	 * Start a workflow and wait for its output (Conductor `invokeAndWait`). A failed child fails this
+	 * execution; to handle it, `invoke` then `waitForResult`.
+	 */
+	invokeAndWait<W extends AnyWorkflow>(
+		key: string,
+		workflow: W,
+		...args: WorkflowArgs<W, [options?: { timeout?: string | number; metadata?: ChildMetadata }]>
+	): Promise<WorkflowOutput<W>>;
+	/** Wait until an execution settles; its outcome, with the workflow's output as `result`. */
+	waitForResult(
+		key: string,
+		executionId: string,
+		options?: { timeout?: string | number },
+	): Promise<ResultOutcome>;
+	schedule<W extends AnyWorkflow>(
+		workflow: W,
+		name: string,
+		options: { cron: string },
+		...args: WorkflowArgs<W>
+	): Promise<void>;
+	unschedule(workflow: AnyWorkflow, name: string): Promise<void>;
+	sendSignal(
+		executionId: string,
+		signal: { name: string; id: string; payload?: Json },
+	): Promise<boolean>;
+	signalWithStart<W extends AnyWorkflow>(
+		key: string,
+		options: {
+			task: W;
+			key: string;
+			signal: { name: string; id: string; payload?: Json };
+			input?: WorkflowInput<W>;
+			metadata?: ChildMetadata;
+		},
+	): Promise<string>;
+	emit(
+		event: string,
+		payload: JsonObject,
+		options?: { dedupe_key?: string; metadata?: ChildMetadata },
+	): Promise<string>;
 
 	/** Call: submit to the agent and wait for its answer. */
 	agent<O extends Schema | undefined = undefined>(
@@ -63,17 +155,13 @@ export interface WorkflowContext<TClients = Record<string, unknown>> {
 	race<R extends Record<string, Awaitable>>(id: string, awaitables: R): Promise<RaceResult<R>>;
 	/** Timer awaitable for `race`. */
 	timer(duration: string | number): Awaitable<null>;
-
-	/** Call another workflow and return its result. Cancelled with this execution unless `detached`. */
-	invoke<W extends AnyWorkflow>(
-		id: string,
-		workflow: W,
-		...args: WorkflowArgs<W, [options?: { detached?: boolean }]>
-	): Promise<WorkflowOutput<W>>;
-	/** Start an independent execution without waiting; returns its execution id. */
-	start<W extends AnyWorkflow>(id: string, workflow: W, ...args: WorkflowArgs<W>): Promise<string>;
 	/** True when `principal` is a member of `group` (resolved now). */
 	isMember(principal: Principal, group: GroupDefinition): Promise<boolean>;
+	/** For Fabrial's own helpers: Conductor's unwrapped methods and this execution's metadata. */
+	readonly fabrial: {
+		readonly native: Pick<TaskContext, WrappedNative | "waitForAny">;
+		readonly metadata: InvocationMetadata;
+	};
 }
 
 export type RaceResult<R extends Record<string, Awaitable>> = {
@@ -91,13 +179,14 @@ export interface ExecutionInfo {
 }
 
 /**
- * Wraps every attempt of a run, including each resume after a suspension. `next` settles when the
- * attempt ends: it resolves when the run returns, suspends or is cancelled, and rejects when it throws.
+ * Wraps every attempt of a run, including each resume after a suspension (Conductor middleware). `next`
+ * settles when the attempt ends: it resolves when the run returns, suspends or is cancelled, and rejects
+ * when it throws. `ctx` is the run's context; middleware may add fields to it, not replace its methods.
  */
 export type WorkflowMiddleware = (
 	execution: ExecutionInfo,
 	ctx: WorkflowContext,
-	next: (ctx: WorkflowContext) => Promise<void>,
+	next: () => Promise<void>,
 ) => Promise<void>;
 
 export interface WorkflowDefinition<
@@ -110,7 +199,7 @@ export interface WorkflowDefinition<
 	name: TName;
 	/** Shown to agents that list this workflow in `tools`. */
 	description?: string;
-	/** Input schema for `invoke`, `start`, and agent tool calls. */
+	/** Input schema for `invoke`, `invokeAndWait`, and agent tool calls. */
 	input?: Schema<TInput>;
 	output?: Schema<TOutput>;
 	triggers?: TTriggers;
@@ -137,7 +226,7 @@ export interface Workflow<
 export type AnyWorkflow = Workflow<string, any, any>;
 export type WorkflowInput<W> = W extends Workflow<string, infer I, any> ? I : never;
 export type WorkflowOutput<W> = W extends Workflow<string, any, infer O> ? O : never;
-/** The arguments of `invoke` and `start`: a workflow without `input` takes none, and runs with input `null`. */
+/** The arguments of `invoke` and `invokeAndWait`: a workflow without `input` takes none, and runs with input `null`. */
 export type WorkflowArgs<W, Rest extends unknown[] = []> = [WorkflowInput<W>] extends [never]
 	? [input?: null, ...Rest]
 	: [input: WorkflowInput<W>, ...Rest];

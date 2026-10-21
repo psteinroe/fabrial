@@ -799,7 +799,7 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 				async (info, ctx, next) => {
 					attempts.set(info.workflow, (attempts.get(info.workflow) ?? 0) + 1);
 					expect(metadataOf(ctx).requestId).toBe("test.begin:delivery");
-					return next(ctx);
+					return next();
 				},
 			],
 		},
@@ -823,7 +823,7 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 				effects++;
 			});
 			await ctx.thread!.post("ack", "working");
-			const output = await ctx.invoke("child", child, input.key);
+			const output = await ctx.invokeAndWait("child", child, input.key);
 			// Runtime operations are internal; this test captures them from the runtime port.
 			const execution = executions.get(ctx.executionId)!;
 			const event = await waitForEvent(execution, "reply", {

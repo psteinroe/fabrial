@@ -141,7 +141,7 @@ export function useCoreApp() {
 				workflow: [
 					async (execution, ctx, next) => {
 						attempts.push({ ...execution, metadata: metadataOf(ctx) });
-						return next(ctx);
+						return next();
 					},
 				],
 			},

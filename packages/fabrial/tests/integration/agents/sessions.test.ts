@@ -41,7 +41,7 @@ const interrupter = definePlugin({
 	hooks: {
 		workflow: [
 			async (info, ctx, next) => {
-				await next(ctx);
+				await next();
 				afterAttempt(info.workflow);
 			},
 		],

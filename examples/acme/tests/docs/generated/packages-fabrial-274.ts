@@ -1,4 +1,4 @@
-// Generated from packages/fabrial/README.md:273 by ../snippets.ts. Do not edit.
+// Generated from packages/fabrial/README.md:275 by ../snippets.ts. Do not edit.
 /* oxlint-disable */
 import { f, z } from "../prelude.ts";
 const Notes = f.defineState({

@@ -23,7 +23,17 @@ import { parseSchema } from "./schema.ts";
 import { follow, prepareSend } from "./send.ts";
 import { followResource, storedFollowOptions, unfollowResource } from "./follows.ts";
 import type { Awaitable, MessageRef, OutboundMessage, Thread, Surface } from "./thread.ts";
-import type { AnyWorkflow, WorkflowContext } from "./workflow.ts";
+import type { AnyWorkflow } from "./workflow.ts";
+import type { TaskContext } from "pgconductor-js";
+import { CHILD_SIGNAL } from "./agents/documents.ts";
+import type { AgentRef, AgentRunOptions } from "./runtime.ts";
+import type { SendOptions } from "./send.ts";
+import type { ResourceRef } from "./plugin.ts";
+import type { FollowOptions } from "./follows.ts";
+import type { EvaluateRequest } from "./evaluate.ts";
+import type { StateDefinition } from "./state.ts";
+import type { ApprovalOptions } from "./approval.ts";
+import type { GroupDefinition, Principal } from "./identity.ts";
 
 /** An awaitable is a native wait branch, or a timer that starts when its race first runs. */
 export interface InternalAwaitable extends Awaitable {
@@ -36,6 +46,8 @@ export interface InternalAwaitable extends Awaitable {
 export interface ContextOptions {
 	host: FabrialHost;
 	execution: DurableExecution;
+	/** Conductor's context of the attempt: Fabrial's fields are merged onto it. */
+	raw: TaskContext;
 	metadata: InvocationMetadata;
 	agents: Agents;
 	now: () => number;
@@ -56,22 +68,66 @@ export function metadataOf(ctx: object): InvocationMetadata {
 	return metadata;
 }
 
-export async function createContext(options: ContextOptions): Promise<WorkflowContext> {
-	const { host, execution, metadata, agents, now } = options;
-	const ids = new Map<string, number>();
-	const used = new Set<string>();
-	const op = (id: string): string => {
-		if (!id || typeof id !== "string")
-			throw new Error("Durable operations require a non-empty explicit id");
-		if (id.startsWith("fabrial:") || id.includes("#"))
-			throw new Error("Operation ids beginning with fabrial: or containing # are reserved");
-		let count = ids.get(id) ?? 0;
-		let key = count === 0 ? id : `${id}#${count}`;
-		while (used.has(key)) key = `${id}#${++count}`;
-		ids.set(id, count + 1);
-		used.add(key);
-		return key;
-	};
+/** Operation keys beginning with `fabrial:` are Fabrial's; Conductor derives its own keys from a key and a suffix. */
+export function userKey(key: string): string {
+	if (!key || typeof key !== "string")
+		throw new Error("Durable operations require a non-empty explicit key");
+	if (key.startsWith("fabrial:"))
+		throw new Error("Operation keys beginning with fabrial: are reserved");
+	return key;
+}
+
+type Native = Pick<
+	TaskContext,
+	| "step"
+	| "sleep"
+	| "subscribe"
+	| "waitForEvent"
+	| "waitForAny"
+	| "waitForResult"
+	| "invoke"
+	| "invokeAndWait"
+	| "schedule"
+	| "unschedule"
+	| "sendSignal"
+	| "signalWithStart"
+	| "emit"
+>;
+
+const NATIVE = [
+	"step",
+	"sleep",
+	"subscribe",
+	"waitForEvent",
+	"waitForAny",
+	"waitForResult",
+	"invoke",
+	"invokeAndWait",
+	"schedule",
+	"unschedule",
+	"sendSignal",
+	"signalWithStart",
+	"emit",
+] as const;
+
+/** Conductor's own methods of a context, from its prototype: unaffected by wrappers merged onto it. */
+export function nativeMethods(ctx: TaskContext): Native {
+	const proto = Object.getPrototypeOf(ctx) as Record<string, (...args: unknown[]) => unknown>;
+	return Object.fromEntries(NATIVE.map((name) => [name, proto[name]!.bind(ctx)])) as Native;
+}
+
+/** Signals Fabrial's internal executions listen for: user code cannot send them. */
+const INTERNAL_SIGNALS = new Set(["input", CHILD_SIGNAL]);
+
+/**
+ * The context of one attempt: Conductor's `TaskContext` plus Fabrial's fields, merged onto it by the attempt
+ * middleware (`next(additions)`). Native methods are wrapped for Fabrial's policy (operation keys, metadata,
+ * reserved destinations); `fabrial.native` keeps the originals for Fabrial's own helpers.
+ */
+export async function createContext(options: ContextOptions) {
+	const { host, execution, raw, metadata, agents, now } = options;
+	const native = nativeMethods(raw);
+	const op = userKey;
 	const chat = host.chat();
 	// The thread replies go to. A channel destination stays lazy until its first post, whose receipt
 	// (also on replay) names the thread later posts and child executions use.
@@ -186,19 +242,56 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 						execution.step(op(id), async () => (bound ? fetchHistory(chat, bound, opts) : [])),
 				}
 			: undefined;
-	const checkInput = async (workflow: AnyWorkflow, input: Json): Promise<Json> => {
-		const registered = host.workflows.find((w) => w.name === workflow.name);
-		if (!registered) throw new Error(`Unregistered workflow: ${workflow.name}`);
-		return registered.definition.input
-			? parseSchema(registered.definition.input, input, `${workflow.name} input`)
-			: input;
+	/** An app workflow: internal tasks (routing, approvals, sessions, …) are not destinations for user code. */
+	const target = (workflow: AnyWorkflow | { name: string } | string) => {
+		const name = typeof workflow === "string" ? workflow : workflow.name;
+		const registered = host.workflows.find((w) => w.name === name);
+		if (!registered) throw new Error(`Unknown or reserved workflow: ${name}`);
+		return { registered, task: { name, queue: raw.queue } };
 	};
-	// After a lazy post, `metadata.replyTo` is the thread it created.
-	const childMetadata = (): Partial<InvocationMetadata> => ({
-		...metadata,
-		ownerWorkflow: null,
-		triggerEvent: null,
+	const input = async (
+		key: string,
+		workflow: AnyWorkflow,
+		value: Json = null,
+	): Promise<JsonObject> => {
+		const { registered } = target(workflow);
+		const checked = await native.step(`fabrial:${key}:input`, () =>
+			registered.definition.input
+				? (parseSchema(
+						registered.definition.input,
+						value,
+						`${workflow.name} input`,
+					) as Promise<Json>)
+				: value,
+		);
+		return { input: checked };
+	};
+	// Children inherit this execution's metadata (after a lazy post, `replyTo` is the thread it created),
+	// minus routing-only fields; an explicit override merges onto it.
+	const childMetadata = (override?: unknown) => (): InvocationMetadata => {
+		const base: InvocationMetadata = { ...metadata, ownerWorkflow: null, triggerEvent: null };
+		const extra =
+			typeof override === "function" ? override(base) : (override as Partial<InvocationMetadata>);
+		return { ...base, ...extra };
+	};
+	const event = (name: string) => {
+		if (name.startsWith("fabrial.")) throw new Error(`Reserved event name: ${name}`);
+		return name;
+	};
+	const eventOf = (definition: { event: string | { name: string } }) => ({
+		...definition,
+		event: {
+			name: event(typeof definition.event === "string" ? definition.event : definition.event.name),
+		},
 	});
+	const output = <R>(outcome: R): R => {
+		const completed = outcome as { status?: string; result?: { output?: Json } | null };
+		return (
+			completed.status === "completed"
+				? { ...completed, result: completed.result?.output ?? null }
+				: outcome
+		) as R;
+	};
 	const surfaces = () => ({
 		current: metadata.replyTo,
 		channelId: async () => {
@@ -206,25 +299,104 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 			return channelOfSurface(chat, metadata.replyTo);
 		},
 	});
-	const ctx: WorkflowContext = {
-		executionId: execution.executionId,
+	const additions = {
 		thread,
 		clients: host.clients(),
 		actor: metadata.requestedBy,
-		signal: execution.signal,
-		step: (id, fn) => execution.step(op(id), fn),
-		sleep: (id, value) => execution.sleep(op(id), duration(value)),
-		agent: async (id, agent, opts) => {
-			return (await agents.run(execution, op(id), agent, opts)) as never;
+		step: (key: string, fn: () => Promise<Json | void> | Json | void) => native.step(op(key), fn),
+		sleep: (key: string, value: string | number) => native.sleep(op(key), duration(value)),
+		subscribe: (key: string, options: { event: string | { name: string }; filter?: object }) =>
+			native.subscribe(op(key), eventOf(options) as never),
+		waitForEvent: (
+			key: string,
+			options: { event: string | { name: string }; filter?: object; timeout?: number | string },
+		) => native.waitForEvent(op(key), eventOf(options) as never),
+		// Not native.waitForResult: Conductor's calls ctx.waitForAny, which plugin middleware may wrap.
+		waitForResult: async (key: string, executionId: string, opts?: object) => {
+			const winner = await native.waitForAny(
+				op(key),
+				{ result: { execution: executionId } },
+				opts as never,
+			);
+			return winner.key === "timeout" ? { status: "timeout" } : output(winner.outcome);
 		},
-		send: async (id, agent, opts) => {
+		invoke: async (
+			key: string,
+			workflow: AnyWorkflow,
+			value?: Json,
+			opts?: { metadata?: unknown },
+		) =>
+			native.invoke(op(key), target(workflow).task, await input(key, workflow, value), {
+				...opts,
+				metadata: childMetadata(opts?.metadata),
+			} as never),
+		invokeAndWait: async (
+			key: string,
+			workflow: AnyWorkflow,
+			value?: Json,
+			opts?: { metadata?: unknown },
+		) =>
+			(
+				(await native.invokeAndWait(
+					op(key),
+					target(workflow).task,
+					await input(key, workflow, value),
+					{
+						...opts,
+						metadata: childMetadata(opts?.metadata),
+					} as never,
+				)) as { output: Json }
+			).output,
+		schedule: async (workflow: AnyWorkflow, name: string, opts: { cron: string }, value?: Json) =>
+			native.schedule(
+				target(workflow).task,
+				name,
+				opts as never,
+				{ input: value ?? null } as never,
+			),
+		unschedule: (workflow: AnyWorkflow, name: string) =>
+			native.unschedule(target(workflow).task, name),
+		sendSignal: (executionId: string, signal: { name: string; id: string; payload?: Json }) => {
+			if (signal.name.startsWith("fabrial.") || INTERNAL_SIGNALS.has(signal.name))
+				throw new Error(`Reserved signal name: ${signal.name}`);
+			return native.sendSignal(executionId, signal as never);
+		},
+		signalWithStart: (
+			key: string,
+			opts: {
+				task: AnyWorkflow | string;
+				key: string;
+				signal: { name: string; id: string; payload?: Json };
+				input?: Json;
+				metadata?: unknown;
+			},
+		) =>
+			native.signalWithStart(op(key), {
+				...opts,
+				task: target(opts.task).task.name,
+				queue: raw.queue,
+				input: { input: opts.input ?? null },
+				metadata: childMetadata(opts.metadata),
+			} as never),
+		emit: (name: string, payload: JsonObject, opts?: { dedupe_key?: string; metadata?: unknown }) =>
+			native.emit(
+				event(name) as never,
+				payload as never,
+				{
+					...opts,
+					metadata: childMetadata(opts?.metadata),
+				} as never,
+			),
+		agent: async (id: string, agent: AgentRef, opts: AgentRunOptions) =>
+			agents.run(execution, op(id), agent, opts),
+		send: async (id: string, agent: AgentRef, opts: SendOptions) => {
 			const key = op(id);
-			const request = await execution.step(`fabrial:${key}:send`, async () => {
+			const request = await native.step(`fabrial:${key}:send`, async () => {
 				const prepared = await prepareSend(
 					host,
 					metadata,
 					surfaces(),
-					`${execution.executionId}:${key}`,
+					`${raw.executionId}:${key}`,
 					agent,
 					opts,
 				);
@@ -234,59 +406,37 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 			});
 			return agents.send(execution, key, agent, request);
 		},
-		follow: (id, resource, opts) =>
-			execution.step(op(id), () =>
+		follow: (id: string, resource: ResourceRef<any>, opts?: FollowOptions) =>
+			native.step(op(id), () =>
 				followResource(host, metadata, surfaces(), resource, storedFollowOptions(opts)),
 			),
-		unfollow: (id, resource, opts) =>
-			execution.step(op(id), () =>
+		unfollow: (id: string, resource: ResourceRef<any>, opts?: Pick<FollowOptions, "to">) =>
+			native.step(op(id), () =>
 				unfollowResource(host, metadata, surfaces(), resource, storedFollowOptions(opts)),
 			),
-		evaluate: async (id, request) => {
-			return (await execution.step(
+		evaluate: async (id: string, request: EvaluateRequest<any>) =>
+			native.step(
 				op(id),
-				async () => (await agents.evaluator.evaluate(request, execution.signal)) as unknown as Json,
-			)) as never;
-		},
-		state: (state) => ({
-			get: (id) => {
-				return agents.state.get(execution, op(id), state);
-			},
-			update: (id, fn) => {
-				return agents.state.update(execution, op(id), state, fn);
-			},
+				async () => (await agents.evaluator.evaluate(request, raw.signal)) as unknown as Json,
+			),
+		state: (state: StateDefinition<any, "session">) => ({
+			get: (id: string) => agents.state.get(execution, op(id), state),
+			update: (id: string, fn: never) => agents.state.update(execution, op(id), state, fn),
 		}),
-		requestApproval: async (id, opts) => createApproval(op(id), opts, { ...options, race, op }),
-		waitForApproval: async (id, opts) => {
+		requestApproval: async (id: string, opts: ApprovalOptions) =>
+			createApproval(op(id), opts, { ...options, race, op }),
+		waitForApproval: async (id: string, opts: ApprovalOptions) => {
 			const key = op(id);
 			const approval = await createApproval(key, opts, { ...options, race, op });
-			return (await race(`${key}:decision`, { decision: approval.decision() })).value as never;
+			return (await race(`${key}:decision`, { decision: approval.decision() })).value;
 		},
-		race: async (id, awaitables) => (await race(op(id), awaitables)) as never,
-		timer: (value) =>
-			({
-				kind: "fabrial.awaitable",
-				timerMs: duration(value),
-			}) as InternalAwaitable as Awaitable<null>,
-		invoke: (async (
-			id: string,
-			workflow: AnyWorkflow,
-			input: Json = null,
-			opts?: { detached?: boolean },
-		) => {
-			const key = op(id);
-			const value = await execution.step(`fabrial:${key}:input`, () => checkInput(workflow, input));
-			return execution.invoke(key, workflow.name, value, {
-				...opts,
-				metadata: childMetadata(),
-			});
-		}) as WorkflowContext["invoke"],
-		start: (async (id: string, workflow: AnyWorkflow, input: Json = null) => {
-			const key = op(id);
-			const value = await execution.step(`fabrial:${key}:input`, () => checkInput(workflow, input));
-			return execution.start(key, workflow.name, value, { metadata: childMetadata() });
-		}) as WorkflowContext["start"],
-		isMember: (principal, group) => host.directory.isMember(principal, group),
+		race: async (id: string, awaitables: Record<string, Awaitable>) => race(op(id), awaitables),
+		timer: (value: string | number) =>
+			({ kind: "fabrial.awaitable", timerMs: duration(value) }) as InternalAwaitable,
+		isMember: (principal: Principal, group: GroupDefinition) =>
+			host.directory.isMember(principal, group),
+		fabrial: { native, metadata },
 	};
-	return bindMetadata(ctx, metadata);
+	bindMetadata(raw, metadata);
+	return additions;
 }

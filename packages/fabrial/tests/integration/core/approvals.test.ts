@@ -38,10 +38,10 @@ function paused(at: "start" | "cards") {
 			? definition
 			: {
 					...definition,
-					handler: async (input, execution) => {
+					handler: async (input, execution, ctx) => {
 						if (at === "start") {
 							await pause();
-							return definition.handler(input, execution);
+							return definition.handler(input, execution, ctx);
 						}
 						// After the cards started, before the decision's wait computes its timeout.
 						const start: DurableExecution["start"] = async (id, ...rest) => {
@@ -51,6 +51,7 @@ function paused(at: "start" | "cards") {
 						return definition.handler(
 							input,
 							Object.assign(Object.create(execution) as DurableExecution, { start }),
+							ctx,
 						);
 					},
 				};
@@ -462,14 +463,19 @@ describe("approval edge cases", () => {
 			expect(attempts.slice(0, 2)).toEqual(["github", "slack"]);
 		},
 	);
-	it("waitForApproval accepts framework-generated repetition suffixes without relaxing user id validation", async () => {
+	it("waitForApproval in a loop takes a distinct key per approval", async () => {
 		const test = setup([
 			workflow(async (_i, ctx) => {
 				const decisions = [];
 				for (let i = 0; i < 2; i++)
 					decisions.push(
-						(await ctx.waitForApproval("a", { title: "Proposal", details: {}, approvers: alice }))
-							.status,
+						(
+							await ctx.waitForApproval(`a:${i}`, {
+								title: "Proposal",
+								details: {},
+								approvers: alice,
+							})
+						).status,
 					);
 				return decisions;
 			}),

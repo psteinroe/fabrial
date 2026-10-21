@@ -199,14 +199,15 @@ export interface RuntimeWorkflow {
 	/**
 	 * Wraps every attempt, including each resume (Conductor middleware). `next` settles when the attempt
 	 * ends: it resolves when the handler returns, suspends or is cancelled, and rejects when it throws.
-	 * The value passed to `next` reaches `handler` as `attempt`.
+	 * The object passed to `next` is merged onto Conductor's context (`ctx`), which reaches `handler`.
 	 */
 	attempt?: (
 		execution: DurableExecution,
-		next: (attempt: unknown) => Promise<void>,
+		next: (additions: object) => Promise<void>,
+		ctx: unknown,
 	) => Promise<void>;
 	/** Its return value is the execution's native result (`getExecution`, result waits). */
-	handler: (input: Json, execution: DurableExecution, attempt?: unknown) => Promise<Json | void>;
+	handler: (input: Json, execution: DurableExecution, ctx: unknown) => Promise<Json | void>;
 }
 
 export interface RuntimeEvent {
@@ -218,7 +219,12 @@ export interface RuntimeEvent {
 export interface DurableRuntime {
 	/** Optional clock, primarily for deterministic tests. Defaults to Date.now in core. */
 	now?(): number;
-	register(definition: { workflows: RuntimeWorkflow[]; events: RuntimeEvent[] }): void;
+	register(definition: {
+		workflows: RuntimeWorkflow[];
+		events: RuntimeEvent[];
+		/** Conductor middleware after Fabrial's attempt hooks (plugin workflow middleware). */
+		middleware?: unknown[];
+	}): void;
 	/**
 	 * Emit an event (Conductor `emit`). `id` is its native dedupe key: it dedupes redeliveries per event
 	 * name across the whole database, for as long as Conductor retains the event's dispatch (one day).

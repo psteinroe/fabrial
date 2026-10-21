@@ -1,4 +1,4 @@
-// Generated from packages/fabrial/README.md:250 by ../snippets.ts. Do not edit.
+// Generated from packages/fabrial/README.md:252 by ../snippets.ts. Do not edit.
 /* oxlint-disable */
 import { f, lookupOrder } from "../prelude.ts";
 const researcher = f.defineAgent({

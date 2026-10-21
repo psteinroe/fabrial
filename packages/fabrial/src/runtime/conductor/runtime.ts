@@ -14,6 +14,7 @@ import {
 	type ExecutionResult,
 } from "../../modules.ts";
 import { ExecutionError } from "../../runtime.ts";
+import { nativeMethods } from "../../context.ts";
 import {
 	Conductor,
 	Orchestrator,
@@ -37,7 +38,7 @@ const emptyMetadata = (requestId: string): InvocationMetadata => ({
 
 /** Set by the attempt middleware on the native context; the handler reuses its execution. */
 const ATTEMPT = Symbol("fabrial.attempt");
-type Attempt = { execution: DurableExecution; value: unknown };
+type Attempt = { execution: DurableExecution };
 function metadataOf(ctx: TaskContext): InvocationMetadata {
 	return (ctx.metadata as InvocationMetadata | undefined) ?? emptyMetadata(ctx.executionId);
 }
@@ -101,7 +102,15 @@ class ConductorRuntime implements DurableRuntime {
 		return this.config.clock?.now().getTime() ?? Date.now();
 	}
 
-	register({ workflows, events }: { workflows: RuntimeWorkflow[]; events: RuntimeEvent[] }): void {
+	register({
+		workflows,
+		events,
+		middleware,
+	}: {
+		workflows: RuntimeWorkflow[];
+		events: RuntimeEvent[];
+		middleware?: Middleware<TaskContext>[];
+	}): void {
 		if (this.registered) throw new Error("Conductor runtime is already registered");
 		for (const workflow of workflows) {
 			if (this.definitions.has(workflow.name) || workflow.name.startsWith("pgconductor.")) {
@@ -121,9 +130,16 @@ class ConductorRuntime implements DurableRuntime {
 			if (!definition?.attempt) return next({});
 			const durable = this.execution(definition.name, ctx, metadataOf(ctx));
 			let result: Awaited<ReturnType<typeof next>> | undefined;
-			await definition.attempt(durable, async (value) => {
-				result = await next({ [ATTEMPT]: { execution: durable, value } satisfies Attempt });
-			});
+			await definition.attempt(
+				durable,
+				async (additions) => {
+					result = await next({
+						...additions,
+						[ATTEMPT]: { execution: durable } satisfies Attempt,
+					});
+				},
+				ctx,
+			);
 			return result ?? next({});
 		};
 		const client = Conductor.create({
@@ -132,7 +148,7 @@ class ConductorRuntime implements DurableRuntime {
 			tasks: TaskSchemas.fromUnion<TaskDefinition<string, JsonObject, JsonObject, string>>(),
 			events: this.eventDefinitions,
 			context: {},
-			middleware: [attempt] as never,
+			middleware: [attempt, ...(middleware ?? [])] as never,
 			logger: this.config.logger,
 			clock: this.config.clock,
 			telemetry: false,
@@ -187,7 +203,7 @@ class ConductorRuntime implements DurableRuntime {
 								? event.payload!.input!
 								: (event.payload ?? { name: event.name });
 						// The native result: getExecution and result waits read `output`.
-						return { output: (await definition.handler(input, execution, attempt?.value)) ?? null };
+						return { output: (await definition.handler(input, execution, ctx)) ?? null };
 					},
 				),
 			);
@@ -311,9 +327,11 @@ class ConductorRuntime implements DurableRuntime {
 		metadata: InvocationMetadata,
 	): DurableExecution {
 		const executionId = raw.executionId;
+		// Conductor's own methods: Fabrial's wrappers merged onto the context apply to workflow code only.
+		const methods = nativeMethods(raw);
 		const start: DurableExecution["start"] = (id, name, input, options) => {
 			this.definition(name);
-			return raw.invoke(
+			return methods.invoke(
 				operationId(id),
 				{ name, queue: this.queue },
 				{ input },
@@ -329,7 +347,7 @@ class ConductorRuntime implements DurableRuntime {
 			workflow,
 			metadata,
 			signal: raw.signal,
-			step: (id, fn) => raw.step(operationId(id), fn),
+			step: (id, fn) => methods.step(operationId(id), fn),
 			finalAttempt: async () => {
 				const info = await this.client!.getExecution(executionId);
 				// Conductor's default is 3 attempts; `attempts` counts this one.
@@ -339,11 +357,11 @@ class ConductorRuntime implements DurableRuntime {
 				operationId(id);
 				duration(ms);
 				await raw.checkpoint();
-				await raw.sleep(id, ms);
+				await methods.sleep(id, ms);
 			},
 			subscribe: async (id, options) => {
 				const native = await (
-					raw.subscribe as (
+					methods.subscribe as (
 						key: string,
 						options: { event: EventDefinition<string, JsonObject, string>; filter?: object },
 					) => Promise<EventSubscription<unknown>>
@@ -360,7 +378,7 @@ class ConductorRuntime implements DurableRuntime {
 						"kind" in branch ? (branch as NativeSubscription).native : branch,
 					]),
 				);
-				const winner = (await raw.waitForAny(
+				const winner = (await methods.waitForAny(
 					id,
 					native as never,
 					options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : undefined,
@@ -393,7 +411,7 @@ class ConductorRuntime implements DurableRuntime {
 				return { key: "timeout", kind: "timeout" };
 			},
 			waitForResult: async (id, executionId) => {
-				const outcome = await raw.waitForResult<{ output: Json }>(operationId(id), executionId);
+				const outcome = await methods.waitForResult<{ output: Json }>(operationId(id), executionId);
 				if (outcome.status === "timeout") throw new Error("Unexpected result wait timeout");
 				return outcome.status === "completed"
 					? { status: "completed", output: outcome.result.output }
@@ -405,7 +423,7 @@ class ConductorRuntime implements DurableRuntime {
 				if (options?.timeoutMs !== undefined) duration(options.timeoutMs);
 				this.definition(name);
 				// Not invokeAndWait: a failed child must reach the caller's catch as an ExecutionError.
-				const child = await raw.invoke(
+				const child = await methods.invoke(
 					`__fabrial:invoke:${id}`,
 					{ name, queue: this.queue },
 					{ input },
@@ -414,7 +432,7 @@ class ConductorRuntime implements DurableRuntime {
 						cancelWithParent: !options?.detached,
 					},
 				);
-				const outcome = await raw.waitForResult<{ output: Json }>(
+				const outcome = await methods.waitForResult<{ output: Json }>(
 					id,
 					child,
 					options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : undefined,
@@ -431,18 +449,18 @@ class ConductorRuntime implements DurableRuntime {
 				raw.onSignal(name, (payload, info) => handler(payload as Json, { id: info.id })),
 			signalWithStart: (id, options) => {
 				this.definition(options.workflow);
-				return raw.signalWithStart(operationId(id), {
+				return methods.signalWithStart(operationId(id), {
 					task: options.workflow,
 					queue: this.queue,
 					key: options.key,
 					signal: options.signal,
 					input: { input: options.input ?? null },
 					metadata: mergeMetadata(metadata, options.metadata),
-				} as unknown as Parameters<TaskContext["signalWithStart"]>[1]);
+				} as never);
 			},
 			emit: async (event, payload, options) => {
 				this.event(event);
-				await raw.emit(event as never, payload as never, {
+				await methods.emit(event as never, payload as never, {
 					metadata: mergeMetadata(metadata, options?.metadata),
 					...(options?.id !== undefined ? { dedupe_key: options.id } : {}),
 				});

@@ -1,4 +1,4 @@
-// Generated from packages/fabrial/README.md:328 by ../snippets.ts. Do not edit.
+// Generated from packages/fabrial/README.md:330 by ../snippets.ts. Do not edit.
 /* oxlint-disable */
 import { slack, z } from "../prelude.ts";
 import { defineEvent, definePlugin, trigger } from "fabrial/plugin";

@@ -74,11 +74,12 @@ it("inputless workflows are invoked and started without an argument", () => {
 		run: async ({ name }) => name,
 	});
 	const check = async (ctx: WorkflowContext, tool: ToolContext) => {
-		expectTypeOf(ctx.invoke("hello", hello)).resolves.toEqualTypeOf<string>();
+		expectTypeOf(ctx.invokeAndWait("hello", hello)).resolves.toEqualTypeOf<string>();
 		expectTypeOf(
-			ctx.invoke("hello", hello, null, { detached: true }),
+			ctx.invoke("hello", hello, null, { cancelWithParent: true }),
 		).resolves.toEqualTypeOf<string>();
-		expectTypeOf(ctx.start("hello", hello)).resolves.toEqualTypeOf<string>();
+		// @ts-expect-error a workflow without input takes none
+		await ctx.invokeAndWait("hello", hello, { name: "x" });
 		expectTypeOf(tool.invoke("hello", hello)).resolves.toEqualTypeOf<string>();
 		expectTypeOf(tool.start("hello", hello)).resolves.toEqualTypeOf<string>();
 		// @ts-expect-error a workflow without input takes none

@@ -28,7 +28,7 @@ import {
 	threadOf,
 	threadSession,
 } from "./send.ts";
-import type { AnyWorkflow, ExecutionInfo, WorkflowContext } from "./workflow.ts";
+import type { AnyWorkflow, WorkflowContext } from "./workflow.ts";
 import type { Json, JsonObject } from "./json.ts";
 import { parseSchema } from "./schema.ts";
 import {
@@ -38,7 +38,8 @@ import {
 	type RuntimeWorkflow,
 } from "./runtime.ts";
 import type { ChatMessage, ThreadRef } from "./thread.ts";
-import { createContext } from "./context.ts";
+import { createContext, metadataOf } from "./context.ts";
+import type { Middleware, TaskContext } from "pgconductor-js";
 import { CLEANUP_ATTEMPTS, CLEANUP_WORKFLOW, cleanup } from "./cleanup.ts";
 import type { TriggerSpec } from "./trigger.ts";
 import { notifyFollowers } from "./follows.ts";
@@ -450,19 +451,42 @@ export function buildApp(config: CoreConfig): HostedApp {
 		},
 	};
 	agents = connectAgents(host, config.agents);
-	const middleware = config.plugins.flatMap((p) => p.hooks?.workflow ?? []);
-	/** Plugin middleware around one attempt; the innermost `next` hands its context to the handler. */
-	const wrap = (
-		info: ExecutionInfo,
-		context: WorkflowContext,
-		next: (context: WorkflowContext) => Promise<void>,
-	): Promise<void> => {
-		const run = (index: number, ctx: WorkflowContext): Promise<void> =>
-			index < middleware.length
-				? middleware[index]!(info, ctx, (inner) => run(index + 1, inner))
-				: next(ctx);
-		return run(0, context);
-	};
+	/**
+	 * Plugin workflow middleware, as Conductor middleware: it runs per attempt around executions with a
+	 * Fabrial context (not routing), after the attempt hook merged Fabrial's fields onto it.
+	 */
+	const middleware: Middleware<TaskContext>[] = config.plugins
+		.flatMap((p) => p.hooks?.workflow ?? [])
+		.map((hook) => async ({ execution, ctx }, next) => {
+			if (!("fabrial" in ctx)) return next({});
+			const metadata = metadataOf(ctx);
+			let result: Awaited<ReturnType<typeof next>> | undefined;
+			await hook(
+				{
+					executionId: execution.id,
+					workflow: execution.task_key,
+					actor: metadata.requestedBy,
+					origin: metadata.origin,
+				},
+				ctx as unknown as WorkflowContext,
+				async () => {
+					result = await next({});
+				},
+			);
+			return result ?? next({});
+		});
+	/** Merges Fabrial's fields onto Conductor's context of every attempt. */
+	const attempt: RuntimeWorkflow["attempt"] = async (execution, next, raw) =>
+		next(
+			await createContext({
+				host,
+				execution,
+				raw: raw as TaskContext,
+				metadata: execution.metadata,
+				agents,
+				now,
+			}),
+		);
 	const workflows: RuntimeWorkflow[] = config.workflows.map((workflow) => ({
 		name: workflow.name,
 		// The routing workflow starts app workflows; they have no runtime triggers.
@@ -474,22 +498,9 @@ export function buildApp(config: CoreConfig): HostedApp {
 		})),
 		concurrency: workflow.definition.concurrency,
 		retries: workflow.definition.retries,
-		async attempt(execution, next) {
-			const metadata = execution.metadata;
-			const context = await createContext({ host, execution, metadata, agents, now });
-			await wrap(
-				{
-					executionId: execution.executionId,
-					workflow: workflow.name,
-					actor: metadata.requestedBy,
-					origin: metadata.origin,
-				},
-				context,
-				next,
-			);
-		},
-		handler: async (input, _execution, context) => {
-			const output = (await workflow.definition.run(input, context as WorkflowContext)) ?? null;
+		attempt,
+		handler: async (input, _execution, ctx) => {
+			const output = (await workflow.definition.run(input, ctx as WorkflowContext)) ?? null;
 			// The output schema validates (and transforms) the result before the run records it.
 			return workflow.definition.output
 				? ((await parseSchema(
@@ -515,29 +526,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			retries: { maxAttempts: CLEANUP_ATTEMPTS },
 			handler: (input, execution) => cleanup(input, execution, host),
 		});
-		for (const workflow of extraWorkflows.values())
-			workflows.push({
-				...workflow,
-				attempt: async (execution, next) => {
-					const context = await createContext({
-						host,
-						execution,
-						metadata: execution.metadata,
-						agents,
-						now,
-					});
-					await wrap(
-						{
-							executionId: execution.executionId,
-							workflow: workflow.name,
-							actor: execution.metadata.requestedBy,
-							origin: execution.metadata.origin,
-						},
-						context,
-						next,
-					);
-				},
-			});
+		for (const workflow of extraWorkflows.values()) workflows.push({ ...workflow, attempt });
 		// Routing is plumbing: no workflow context or plugin middleware.
 		workflows.push({
 			name: ROUTE_WORKFLOW,
@@ -547,6 +536,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 		});
 		runtime.register({
 			workflows,
+			middleware,
 			events: [
 				...config.plugins.flatMap((p) =>
 					Object.entries(p.events ?? {}).map(([key, event]) => ({
