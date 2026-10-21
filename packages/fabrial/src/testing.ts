@@ -521,6 +521,8 @@ export function createTestApp<const P extends readonly import("./plugin.ts").Any
 			from pgconductor._private_executions
 			where queue = ${queue} and completed_at is null and failed_at is null
 				and task_key != 'pgconductor.maintenance'
+				-- a cron's next occurrence waits for its schedule, not on the app
+				and not (cron_expression is not null and attempts = 0 and locked_at is null)
 			limit ${limit}`;
 	const drained = async (description: string, queue: string, timeoutMs = 30_000) => {
 		const deadline = Date.now() + timeoutMs;

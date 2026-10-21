@@ -163,7 +163,9 @@ const STATE_EVENT = "fabrial.state.response";
 const STATE_REQUESTS = 5;
 
 /** A run of one conversation in the hosted Session: the requests it answers, until Pi has finished them. */
-export const callSession = (executionId: string, id: string) => `run:${executionId}:${id}`;
+export const callSession = (executionId: string, id: string) =>
+	`${CALL_SESSION}${executionId}:${id}`;
+const CALL_SESSION = "run:";
 
 /** The Session of a workflow's `ctx.state`: its thread's, else its own. */
 export function sessionKey(metadata: InvocationMetadata): string {
@@ -251,7 +253,18 @@ export interface PiOptions {
 	settings?: Omit<HarnessSettings, "extensions">;
 	/** How long a workflow's `ctx.state` waits for its Session to answer before it resends the request. */
 	stateTimeoutMs?: number;
+	/**
+	 * Days a finished `ctx.agent` call's Pi Session is kept after its Session execution settled (completed, failed or
+	 * cancelled), before `fabrial.sessions.reclaim` deletes it. Default 7.
+	 */
+	retainCallSessionsDays?: number;
+	/** Cron schedule (UTC) of `fabrial.sessions.reclaim`, or `false` to not schedule it. Default `30 3 * * *`. */
+	reclaimSchedule?: string | false;
+	/** Call Sessions `fabrial.sessions.reclaim` examines per step. Default 100. */
+	reclaimBatchSize?: number;
 }
+
+const RECLAIM_WORKFLOW = "fabrial.sessions.reclaim";
 
 export function pi(options: PiOptions): AgentIntegration {
 	return { kind: "fabrial.agents", connect: (host) => connect(options, host) };
@@ -496,7 +509,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	 *
 	 * A `ctx.agent` call's Session execution is a child of its caller and returns the call's outcome. Cancelled while
 	 * running, it aborts the call's Pi run before closing Pi; cancelled while suspended, nothing runs: its workflow tools
-	 * are cancelled with it, and the call's Pi Session is left as it is (never reopened, its storage retained).
+	 * are cancelled with it, and the call's Pi Session is left as it is (never reopened; reclaim deletes it later).
 	 */
 	async function hostSession(input: Json, execution: DurableExecution): Promise<Json> {
 		if (!started) throw new Error("Start the Pi integration before running agents");
@@ -610,7 +623,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	): Promise<SessionHost> {
 		// A crashed owner's lease lasts until it expires: SessionBusy
 		// fails the attempt, and Conductor retries it with backoff (the Session workflow's attempts cover a lease).
-		const storage = await PostgresStorage.open(options.sql, key);
+		const storage = await PostgresStorage.open(options.sql, key, {
+			executionId: execution.executionId,
+		});
 		const signal = AbortSignal.any([execution.signal, storage.lost.signal]);
 		/** The agents' conversations this opening configured, by agent name. */
 		const conversations = new Map<string, Hosted>();
@@ -1438,7 +1453,66 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		triggers: [],
 		// Retries back off 15s, 30s, 1m, …: the first attempts outlast a crashed owner's 30s lease.
 		retries: { maxAttempts: 10 },
+		// No retentionDays, so kept forever: callers wait on a call's result and replay from it, and reclaim reads when
+		// it settled. A finite retention must outlast both, and retainCallSessionsDays.
 		handler: hostSession,
+	};
+	const retainDays = options.retainCallSessionsDays ?? 7;
+	if (!(retainDays >= 0)) throw new RangeError("retainCallSessionsDays must not be negative");
+	const batchSize = options.reclaimBatchSize ?? 100;
+	if (!(batchSize >= 1)) throw new RangeError("reclaimBatchSize must be at least 1");
+	/**
+	 * Deletes the Pi storage of `ctx.agent` calls (`run:` Sessions, never a thread's) whose Session execution settled at
+	 * least `retainCallSessionsDays` ago: nothing reopens them once the caller stored the outcome, and a call cancelled
+	 * while suspended runs no cleanup of its own. Settlement is read with `getExecution` from the execution that last
+	 * hosted the Session; a Session leased, never hosted, or whose execution is unknown is kept. One step per batch, in
+	 * key order.
+	 */
+	const reclaim: RuntimeWorkflow = {
+		name: RECLAIM_WORKFLOW,
+		triggers: [],
+		cron:
+			options.reclaimSchedule === false
+				? []
+				: [{ schedule: options.reclaimSchedule ?? "30 3 * * *", name: RECLAIM_WORKFLOW }],
+		concurrency: 1,
+		// Nothing waits on it.
+		retentionDays: 30,
+		handler: async (_input, execution) => {
+			const cutoff = await execution.step(
+				"cutoff",
+				async () => (host.runtime.now?.() ?? Date.now()) - retainDays * 86_400_000,
+			);
+			let after = CALL_SESSION;
+			let reclaimed = 0;
+			let batches = 0;
+			for (;;) {
+				const batch = (await execution.step(`batch:${batches++}`, async () => {
+					const candidates = await PostgresStorage.reclaimable(
+						options.sql,
+						CALL_SESSION,
+						after,
+						batchSize,
+					);
+					let count = 0;
+					for (const { key, executionId } of candidates) {
+						const settled = await host.runtime.getExecution(executionId);
+						if (settled?.workflow !== SESSION_WORKFLOW || !settled.result) continue;
+						if (settled.settledAt === undefined || settled.settledAt > cutoff) continue;
+						if (await PostgresStorage.reclaim(options.sql, key, executionId)) count++;
+					}
+					return {
+						reclaimed: count,
+						next: candidates.length < batchSize ? null : candidates.at(-1)!.key,
+					};
+				})) as { reclaimed: number; next: string | null };
+				reclaimed += batch.reclaimed;
+				if (batch.next === null) break;
+				after = batch.next;
+			}
+			if (reclaimed) host.logger.info("Reclaimed finished agent call Sessions", { reclaimed });
+			return { reclaimed, batches };
+		},
 	};
 	// Effects run in a stable child execution, never in the Session's replaceable execution.
 	const effect: RuntimeWorkflow = {
@@ -1699,7 +1773,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		agents: port,
 		state,
 		evaluator,
-		workflows: [session, effect],
+		workflows: [session, effect, reclaim],
 		events: [{ name: STATE_EVENT, filterable: ["operation"] }],
 		async start() {
 			await PostgresStorage.migrate(options.sql);

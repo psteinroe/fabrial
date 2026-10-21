@@ -32,7 +32,8 @@ const settled = (queue: string) =>
 		const [row] = await db.sql<{ open: number }[]>`
 			select count(*)::int as open from pgconductor._private_executions
 			where (task_key = 'pgconductor.event-dispatch' or queue = ${queue})
-				and task_key != 'pgconductor.maintenance' and completed_at is null and failed_at is null`;
+				and task_key != 'pgconductor.maintenance' and completed_at is null and failed_at is null
+				and not (cron_expression is not null and attempts = 0 and locked_at is null)`;
 		return row!.open === 0 ? true : undefined;
 	});
 

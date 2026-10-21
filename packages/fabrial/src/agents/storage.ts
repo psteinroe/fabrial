@@ -40,20 +40,24 @@ export class PostgresStorage extends MemoryStorage {
 			session_key text NOT NULL REFERENCES fabrial_pi.sessions(key),
 			seq bigint NOT NULL, writes text NOT NULL, PRIMARY KEY (session_key, seq)
 		)`;
+			// The Conductor execution that last hosted the Session: reclaim reads when it settled.
+			await sql`ALTER TABLE fabrial_pi.sessions ADD COLUMN IF NOT EXISTS execution_id uuid`;
 		});
 	}
 
 	static async open(
 		sql: Sql,
 		key: string,
-		options: { leaseMs?: number } = {},
+		/** `executionId`: the Conductor execution hosting the Session, recorded for reclaim. */
+		options: { leaseMs?: number; executionId?: string } = {},
 	): Promise<PostgresStorage> {
 		const leaseMs = options.leaseMs ?? 30_000;
 		if (leaseMs < 100) throw new RangeError("leaseMs must be at least 100ms");
 		const owner = randomUUID();
 		await sql`INSERT INTO fabrial_pi.sessions (key) VALUES (${key}) ON CONFLICT DO NOTHING`;
 		const rows = await sql`UPDATE fabrial_pi.sessions SET epoch = epoch + 1, owner = ${owner},
-			lease_until = clock_timestamp() + ${leaseMs} * interval '1 millisecond'
+			lease_until = clock_timestamp() + ${leaseMs} * interval '1 millisecond',
+			execution_id = coalesce(${options.executionId ?? null}::uuid, execution_id)
 			WHERE key = ${key} AND (owner IS NULL OR lease_until <= clock_timestamp()) RETURNING epoch`;
 		if (!rows[0]) throw new SessionBusy(`Pi Session ${key} already has an owner`);
 		const storage = new PostgresStorage(sql, key, Number(rows[0].epoch), leaseMs, owner);
@@ -124,5 +128,39 @@ export class PostgresStorage extends MemoryStorage {
 		await super.close(context);
 		await this.sql`UPDATE fabrial_pi.sessions SET owner = NULL, lease_until = NULL
 			WHERE key = ${this.key} AND owner = ${this.owner} AND epoch = ${this.epoch}`;
+	}
+
+	/**
+	 * Up to `limit` Sessions whose key starts with `prefix`, after `after` in key order, without a live lease and
+	 * hosted by a recorded execution: candidates for `reclaim`.
+	 */
+	static async reclaimable(
+		sql: Sql,
+		prefix: string,
+		after: string,
+		limit: number,
+	): Promise<{ key: string; executionId: string }[]> {
+		const rows = await sql<{ key: string; execution_id: string }[]>`
+			SELECT key, execution_id FROM fabrial_pi.sessions
+			WHERE key > ${after} AND starts_with(key, ${prefix}) AND execution_id IS NOT NULL
+			AND (owner IS NULL OR lease_until <= clock_timestamp())
+			ORDER BY key LIMIT ${limit}`;
+		return rows.map((row) => ({ key: row.key, executionId: row.execution_id }));
+	}
+
+	/**
+	 * Deletes a Session's storage, commits then Session, in one transaction; only while `executionId` still hosts it
+	 * and nobody holds its lease. False if it was kept (or is already gone).
+	 */
+	static async reclaim(sql: Sql, key: string, executionId: string): Promise<boolean> {
+		return sql.begin(async (sql) => {
+			const [row] = await sql`SELECT 1 FROM fabrial_pi.sessions
+				WHERE key = ${key} AND execution_id = ${executionId}::uuid
+				AND (owner IS NULL OR lease_until <= clock_timestamp()) FOR UPDATE`;
+			if (!row) return false;
+			await sql`DELETE FROM fabrial_pi.commits WHERE session_key = ${key}`;
+			await sql`DELETE FROM fabrial_pi.sessions WHERE key = ${key}`;
+			return true;
+		});
 	}
 }

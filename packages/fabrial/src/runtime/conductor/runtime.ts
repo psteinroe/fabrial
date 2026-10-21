@@ -248,7 +248,7 @@ class ConductorRuntime implements DurableRuntime {
 
 	async getExecution(
 		executionId: string,
-	): Promise<{ workflow: string; result: ExecutionResult | null } | null> {
+	): Promise<{ workflow: string; result: ExecutionResult | null; settledAt?: number } | null> {
 		this.assertReady();
 		// Ids come from clicks and other untrusted input: anything but a UUID is unknown.
 		if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(executionId))
@@ -263,7 +263,8 @@ class ConductorRuntime implements DurableRuntime {
 					: info.status === "cancelled"
 						? { status: "cancelled", reason: info.error ?? "Cancelled by user" }
 						: null;
-		return { workflow: info.taskKey, result };
+		const settledAt = result ? (info.completedAt ?? info.failedAt)?.getTime() : undefined;
+		return { workflow: info.taskKey, result, ...(settledAt !== undefined ? { settledAt } : {}) };
 	}
 
 	async signal(executionId: string, signal: RuntimeSignal): Promise<boolean> {

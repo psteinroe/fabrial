@@ -248,10 +248,13 @@ export interface DurableRuntime {
 	/** Start an execution from outside any execution (tests, scripts). Not deduped; apps route through events. */
 	invoke(workflow: string, input: Json, options: { metadata: InvocationMetadata }): Promise<string>;
 	cancel(executionId: string, reason?: string): Promise<boolean>;
-	/** An execution of this runtime: its workflow and, once settled, its result. Null if unknown or removed. */
+	/**
+	 * An execution of this runtime: its workflow and, once settled, its result and when it settled (epoch ms, on the
+	 * runtime's clock). Null if unknown or removed.
+	 */
 	getExecution(
 		executionId: string,
-	): Promise<{ workflow: string; result: ExecutionResult | null } | null>;
+	): Promise<{ workflow: string; result: ExecutionResult | null; settledAt?: number } | null>;
 	/** See `SignalWithStartOptions`. Returns the id of the execution that received the signal. */
 	signalWithStart(
 		options: SignalWithStartOptions & { metadata: InvocationMetadata },

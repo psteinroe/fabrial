@@ -66,6 +66,8 @@ export function useAgents() {
 				and task_key like ${tasks} and completed_at is null and failed_at is null
 				-- each queue's maintenance task runs for as long as its workers do
 				and task_key != 'pgconductor.maintenance'
+				-- a cron's next occurrence waits for its schedule, not on the app
+				and not (cron_expression is not null and attempts = 0 and locked_at is null)
 		`;
 		return rows.map((row) => row.task);
 	}
