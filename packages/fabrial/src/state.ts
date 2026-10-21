@@ -12,7 +12,10 @@ export type StateScope = "session" | "agent";
  * State that agents see and change and that outlives a single step. Backed by Pi documents in the
  * Pi Session (implemented in `src/agents`).
  */
-export interface StateDefinition<T extends JsonObject = JsonObject, S extends StateScope = StateScope> {
+export interface StateDefinition<
+	T extends JsonObject = JsonObject,
+	S extends StateScope = StateScope,
+> {
 	readonly kind: "fabrial.state";
 	readonly name: string;
 	readonly scope: S;
