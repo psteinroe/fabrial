@@ -28,8 +28,8 @@ import {
 	type EventSubscription,
 } from "pgconductor-js";
 
-const emptyMetadata = (interactionId: string): InvocationMetadata => ({
-	interactionId,
+const emptyMetadata = (requestId: string): InvocationMetadata => ({
+	requestId,
 	origin: null,
 	replyTo: null,
 	requestedBy: null,

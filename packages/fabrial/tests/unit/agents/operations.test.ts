@@ -42,7 +42,7 @@ async function fixture(workflows: FabrialHost["workflows"] = []) {
 		BACKGROUND_CONTEXT,
 	);
 	const metadata: InvocationMetadata = {
-		interactionId: randomUUID(),
+		requestId: randomUUID(),
 		origin: { provider: "slack" },
 		replyTo: { kind: "thread", provider: "slack", threadId: "thread" },
 		requestedBy: { id: "alice", known: true, identities: [] },
@@ -85,7 +85,7 @@ async function fixture(workflows: FabrialHost["workflows"] = []) {
 			executionId: "a",
 			metadata: {
 				...metadata,
-				interactionId: "driver-interaction",
+				requestId: "driver-interaction",
 				requestedBy: { id: "driver", known: true, identities: [] },
 				replyTo: null,
 			},

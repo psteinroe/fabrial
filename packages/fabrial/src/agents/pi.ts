@@ -175,7 +175,7 @@ export function sessionKey(metadata: InvocationMetadata): string {
 		throw new Error(
 			"Post to the channel with ctx.thread.post before using Pi; a channel is not a Session key",
 		);
-	return metadata.interactionId;
+	return metadata.requestId;
 }
 
 const THINKING: Record<ThinkingLevel, "off" | "low" | "medium" | "high"> = {
@@ -1604,7 +1604,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				conversation.session,
 				`fabrial.stop:${id}:${conversation.agent}`,
 				{ kind: "stop", agent: conversation.agent, reason },
-				{ interactionId: id, origin: null, replyTo: null, requestedBy: null },
+				{ requestId: id, origin: null, replyTo: null, requestedBy: null },
 			);
 		},
 		async deliver(agent, request) {

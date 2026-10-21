@@ -17,7 +17,7 @@ const options = { botToken: "xoxb-test", signingSecret: "secret", workspace: "ac
 describe("Slack plugin", () => {
 	it("slack_post posts to a channel with the canonical client", async () => {
 		const plugin = slack(options);
-		const client = plugin.clients!({}).slack;
+		const client = plugin.clients!().slack;
 		const post = vi
 			.spyOn(client.chat, "postMessage")
 			.mockResolvedValue({ ok: true, channel: "C1", ts: "1700000000.000100" } as never);
@@ -39,7 +39,7 @@ describe("Slack plugin", () => {
 		expect(plugin.chat!.installationId).toBe(options.workspace);
 		expect(Object.keys(plugin.events!)).toEqual(["mentioned", "message", "dm"]);
 		expect(plugin.chat!.adapter()).toMatchObject({ name: "slack" });
-		expect(plugin.clients!({}).slack).toBeInstanceOf(WebClient);
+		expect(plugin.clients!().slack).toBeInstanceOf(WebClient);
 		expect(slack.mentioned).toBe(mentioned);
 	});
 
@@ -76,7 +76,7 @@ describe("Slack plugin", () => {
 
 	it("looks up display names using the configured client and rejects other installations", async () => {
 		const plugin = slack(options);
-		const clients = plugin.clients!({});
+		const clients = plugin.clients!();
 		const info = vi.spyOn(clients.slack.users, "info").mockResolvedValue({
 			ok: true,
 			user: { profile: { display_name: "Alice", real_name: "Alice Full" } },
@@ -92,7 +92,7 @@ describe("Slack plugin", () => {
 
 	it("falls back to real names for users without a display name", async () => {
 		const plugin = slack(options);
-		const clients = plugin.clients!({});
+		const clients = plugin.clients!();
 		vi.spyOn(clients.slack.users, "info").mockResolvedValue({
 			ok: true,
 			user: { real_name: "Alice Full" },
@@ -105,7 +105,7 @@ describe("Slack plugin", () => {
 
 describe("Slack user groups", () => {
 	it("resolves current members using the plugin client and configured workspace", async () => {
-		const clients = slack(options).clients!({});
+		const clients = slack(options).clients!();
 		const list = vi.spyOn(clients.slack.usergroups, "list").mockResolvedValue({
 			ok: true,
 			usergroups: [{ id: "S1", handle: "triage", team_id: "T_NATIVE" }],
@@ -131,7 +131,7 @@ describe("Slack user groups", () => {
 	});
 
 	it("does not silently grant access for missing groups or clients", async () => {
-		const clients = slack(options).clients!({});
+		const clients = slack(options).clients!();
 		vi.spyOn(clients.slack.usergroups, "list").mockResolvedValue({ ok: true, usergroups: [] });
 		const group = userGroup({ id: "triage", handle: "missing" });
 		await expect(group.resolve!({ clients, now: new Date(), principal: vi.fn() })).rejects.toThrow(

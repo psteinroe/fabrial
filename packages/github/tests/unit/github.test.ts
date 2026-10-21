@@ -24,7 +24,7 @@ describe("GitHub provider", () => {
 			"checkSuiteCompleted",
 			"checkRunCompleted",
 		]);
-		expect(plugin.clients!({}).github).toBe((plugin.chat!.adapter() as GitHubAdapter).octokit);
+		expect(plugin.clients!().github).toBe((plugin.chat!.adapter() as GitHubAdapter).octokit);
 		expect(github.mentioned).toBe(mentioned);
 	});
 	it("builds scoped triggers and observer specificity", () => {
@@ -96,7 +96,7 @@ describe("GitHub provider", () => {
 	});
 	it("looks up numeric IDs using the exposed client and ignores logins", async () => {
 		const plugin = github(options);
-		const clients = plugin.clients!({});
+		const clients = plugin.clients!();
 		const numeric = vi
 			.spyOn(clients.github, "request")
 			.mockResolvedValue({ data: { name: "Alice", login: "alice" } } as never);
@@ -113,7 +113,7 @@ describe("GitHub provider", () => {
 	});
 	it("returns undefined for missing users, but propagates outages", async () => {
 		const plugin = github(options);
-		const clients = plugin.clients!({});
+		const clients = plugin.clients!();
 		const lookup = vi
 			.spyOn(clients.github, "request")
 			.mockRejectedValueOnce(Object.assign(new Error("missing"), { status: 404 }))
@@ -277,7 +277,7 @@ it("rejects signed foreign repository owners for PATs on both ingress paths", as
 		(
 			await plugin.routes!["POST /github/webhook"]!(request(payload, "issues"), {
 				emit,
-				clients: plugin.clients!({}),
+				clients: plugin.clients!(),
 			})
 		).status,
 	).toBe(403);

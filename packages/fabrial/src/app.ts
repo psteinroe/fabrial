@@ -47,7 +47,7 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 			origin?: Origin;
 			replyTo?: Surface;
 			requestedBy?: ExternalIdentity;
-			interactionId?: string;
+			requestId?: string;
 		},
 	): Promise<"accepted">;
 

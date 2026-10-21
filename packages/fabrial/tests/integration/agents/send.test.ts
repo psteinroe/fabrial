@@ -319,7 +319,7 @@ it("maps notification priorities to write, followUp, and steer; written entries 
 	const notify = (input: { text: string; priority: "urgent" | "normal" | "low" }) =>
 		t.runtime.invoke(t.notify.name, input, {
 			metadata: {
-				interactionId: randomUUID(),
+				requestId: randomUUID(),
 				origin: { provider: "github" },
 				replyTo: null,
 				requestedBy: null,
@@ -416,7 +416,7 @@ it.each(["notification", "message"] as const)(
 						{ text: "late steer", priority: "urgent" },
 						{
 							metadata: {
-								interactionId: randomUUID(),
+								requestId: randomUUID(),
 								origin: { provider: "github" },
 								replyTo: null,
 								requestedBy: null,
@@ -440,7 +440,7 @@ it.each(["notification", "message"] as const)(
 				{ text: "first", priority: "normal" },
 				{
 					metadata: {
-						interactionId: randomUUID(),
+						requestId: randomUUID(),
 						origin: { provider: "github" },
 						replyTo: null,
 						requestedBy: null,
@@ -486,7 +486,7 @@ const queuedBehindFailedRun = async (kind: "notification" | "message") => {
 					{ text: "queued steer", priority: "urgent" },
 					{
 						metadata: {
-							interactionId: randomUUID(),
+							requestId: randomUUID(),
 							origin: { provider: "github" },
 							replyTo: null,
 							requestedBy: null,
@@ -514,7 +514,7 @@ const queuedBehindFailedRun = async (kind: "notification" | "message") => {
 			{ text: "first", priority: "normal" },
 			{
 				metadata: {
-					interactionId: randomUUID(),
+					requestId: randomUUID(),
 					origin: { provider: "github" },
 					replyTo: null,
 					requestedBy: null,
@@ -571,7 +571,7 @@ it("an urgent notification during a tool call steers the running run and is answ
 			{ text, priority },
 			{
 				metadata: {
-					interactionId: randomUUID(),
+					requestId: randomUUID(),
 					origin: { provider: "github" },
 					replyTo: { kind: "thread", provider: "chat", threadId: `chat:${t.channel}:t1` },
 					requestedBy: null,
@@ -1011,7 +1011,7 @@ it(
 			signal: { name: "input", id: `${request}:again`, payload: input },
 			input: { session: `chat:channel:${t.channel}` },
 			metadata: {
-				interactionId: request!,
+				requestId: request!,
 				origin: null,
 				replyTo: null,
 				requestedBy: null,
@@ -1124,7 +1124,7 @@ it("ctx.agent returns the answer and posts nothing, without offering no_reply", 
 		{ question: "What is the answer?" },
 		{
 			metadata: {
-				interactionId: randomUUID(),
+				requestId: randomUUID(),
 				origin: null,
 				replyTo: thread,
 				requestedBy: null,

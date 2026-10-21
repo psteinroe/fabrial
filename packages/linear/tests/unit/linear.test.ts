@@ -22,7 +22,7 @@ describe("Linear provider", () => {
 			"issueCreated",
 			"issueUpdated",
 		]);
-		expect(plugin.clients!({}).linear).toBe((plugin.chat!.adapter() as LinearAdapter).linearClient);
+		expect(plugin.clients!().linear).toBe((plugin.chat!.adapter() as LinearAdapter).linearClient);
 		expect(linear.mentioned).toBe(mentioned);
 	});
 	it("builds team/state filters with increasing specificity and observer support", () => {
@@ -49,7 +49,7 @@ describe("Linear provider", () => {
 	});
 	it("creates organization-scoped identities and looks up display names", async () => {
 		const plugin = linear(options);
-		const clients = plugin.clients!({});
+		const clients = plugin.clients!();
 		const lookup = vi
 			.spyOn(clients.linear, "user")
 			.mockResolvedValue({ displayName: "Alice", name: "Alice Full" } as never);
@@ -63,7 +63,7 @@ describe("Linear provider", () => {
 	});
 	it("falls back to full names and propagates lookup failures", async () => {
 		const plugin = linear(options);
-		const clients = plugin.clients!({});
+		const clients = plugin.clients!();
 		vi.spyOn(clients.linear, "user")
 			.mockResolvedValueOnce({ displayName: "", name: "Alice Full" } as never)
 			.mockRejectedValueOnce(new Error("outage"));
@@ -81,7 +81,7 @@ describe("Linear provider", () => {
 
 describe("Linear triage responsibility", () => {
 	it("resolves the live current user from the exposed client", async () => {
-		const clients = linear(options).clients!({});
+		const clients = linear(options).clients!();
 		const team = vi
 			.spyOn(clients.linear, "teams")
 			.mockResolvedValueOnce({
@@ -109,7 +109,7 @@ describe("Linear triage responsibility", () => {
 		expect(team).toHaveBeenCalledTimes(2);
 	});
 	it("fails closed for missing responsibility or client", async () => {
-		const clients = linear(options).clients!({});
+		const clients = linear(options).clients!();
 		vi.spyOn(clients.linear, "teams").mockResolvedValue({
 			nodes: [{ triageResponsibility: undefined }],
 		} as never);

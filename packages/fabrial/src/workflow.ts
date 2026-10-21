@@ -2,7 +2,8 @@ import type { ApprovalDecision, ApprovalHandle, ApprovalOptions } from "./approv
 import type { EvaluateQuestion, EvaluateRequest, EvaluateResult } from "./evaluate.ts";
 import type { GroupDefinition, Principal } from "./identity.ts";
 import type { Json } from "./json.ts";
-import type { AgentRef, AgentRunOptions, InvocationMetadata } from "./runtime.ts";
+import type { Origin } from "./events.ts";
+import type { AgentRef, AgentRunOptions } from "./runtime.ts";
 import type { Schema } from "./schema.ts";
 import type { SendOptions, SendReceipt } from "./send.ts";
 import type { ResourceRef } from "./plugin.ts";
@@ -13,14 +14,13 @@ import type { Awaitable, Thread } from "./thread.ts";
 import type { TriggerPayload, TriggerSpec } from "./trigger.ts";
 
 export interface WorkflowContext<TClients = Record<string, unknown>> {
+	/** For diagnostics: the durable execution running this workflow. */
 	readonly executionId: string;
-	readonly interactionId: string;
 	/** The thread this execution replies into. Absent for observers and executions without a surface. */
 	readonly thread: Thread | undefined;
 	readonly clients: TClients;
 	/** Who asked for this work. */
 	readonly actor: Principal | null;
-	readonly metadata: InvocationMetadata;
 	readonly signal: AbortSignal;
 
 	step<T extends Json | void>(id: string, fn: () => Promise<T> | T): Promise<T>;
@@ -80,7 +80,10 @@ export type RaceResult<R extends Record<string, Awaitable>> = {
 export interface ExecutionInfo {
 	readonly executionId: string;
 	readonly workflow: string;
-	readonly metadata: InvocationMetadata;
+	/** Who asked for this work. */
+	readonly actor: Principal | null;
+	/** The event that started the request, if any. */
+	readonly origin: Origin | null;
 }
 
 /**

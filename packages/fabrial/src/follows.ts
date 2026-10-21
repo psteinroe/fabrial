@@ -219,7 +219,7 @@ export async function notifyFollowers(
 			const state = await (await chat.thread(thread)).getState();
 			for (const follow of state?.resourceFollows ?? []) {
 				if (follow.events !== "all" && !kind.defaults.includes(notification.kind)) continue;
-				const requestId = `${metadata.interactionId}:${follow.session}:${follow.agent}`;
+				const requestId = `${metadata.requestId}:${follow.session}:${follow.agent}`;
 				if (delivered.has(requestId)) continue;
 				delivered.add(requestId);
 				if (!port?.deliver) throw new Error("Following resources needs the agent integration");
@@ -239,7 +239,7 @@ export async function notifyFollowers(
 					delivery: deliveryFor("notification", priority),
 					follow: null,
 					metadata: {
-						interactionId: requestId,
+						requestId,
 						origin: metadata.origin,
 						replyTo: follow.replyTo,
 						requestedBy: metadata.requestedBy,

@@ -35,7 +35,7 @@ function fixture(options: Partial<PiOptions> = {}) {
 	const models = createModels();
 	models.setProvider(faux.provider);
 	const metadata: InvocationMetadata = {
-		interactionId: randomUUID(),
+		requestId: randomUUID(),
 		origin: null,
 		replyTo: { kind: "thread", provider: "slack-test", threadId: randomUUID() },
 		requestedBy: { id: "alice", known: true, identities: [], name: "Alice" },

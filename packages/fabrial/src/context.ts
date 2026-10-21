@@ -31,6 +31,21 @@ export interface ContextOptions {
 	now: () => number;
 }
 
+const contextMetadata = new WeakMap<object, InvocationMetadata>();
+
+/** Binds a workflow or tool context to its invocation metadata, which contexts do not expose. */
+export function bindMetadata<T extends object>(ctx: T, metadata: InvocationMetadata): T {
+	contextMetadata.set(ctx, metadata);
+	return ctx;
+}
+
+/** The invocation metadata behind a context, for Fabrial's runtime modules and its own tests. */
+export function metadataOf(ctx: object): InvocationMetadata {
+	const metadata = contextMetadata.get(ctx);
+	if (!metadata) throw new Error("Expected a Fabrial context");
+	return metadata;
+}
+
 export async function createContext(options: ContextOptions): Promise<WorkflowContext> {
 	const { host, execution, metadata, agents, now } = options;
 	const ids = new Map<string, number>();
@@ -182,11 +197,9 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 	});
 	const ctx: WorkflowContext = {
 		executionId: execution.executionId,
-		interactionId: metadata.interactionId,
 		thread,
 		clients: host.clients(),
 		actor: metadata.requestedBy,
-		metadata,
 		signal: execution.signal,
 		step: (id, fn) => execution.step(op(id), fn),
 		sleep: (id, value) => execution.sleep(op(id), duration(value)),
@@ -264,5 +277,5 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 		},
 		isMember: (principal, group) => host.directory.isMember(principal, group),
 	};
-	return ctx;
+	return bindMetadata(ctx, metadata);
 }

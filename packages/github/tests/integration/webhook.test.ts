@@ -1,3 +1,4 @@
+import { metadataOf } from "../../../fabrial/src/context.ts";
 import { createHmac } from "node:crypto";
 import { GitHubAdapter } from "@chat-adapter/github";
 import { createFabrial, type WorkflowContext } from "fabrial";
@@ -34,7 +35,7 @@ const recorder = definePlugin({
 	hooks: {
 		workflow: [
 			async (execution, ctx, next) => {
-				executions.push(execution);
+				executions.push({ workflow: execution.workflow, metadata: metadataOf(ctx) });
 				return next(ctx);
 			},
 		],
@@ -107,7 +108,7 @@ describe("GitHub lifecycle webhooks", () => {
 	it("rejects bad signatures, JSON, missing delivery IDs and incomplete payloads", async () => {
 		const plugin = github(options);
 		const emit = vi.fn();
-		const ctx = { emit, clients: plugin.clients!({}) };
+		const ctx = { emit, clients: plugin.clients!() };
 		const route = plugin.routes!["POST /github/webhook"]!;
 		expect((await route(request(payload("issues"), "issues", "bad"), ctx)).status).toBe(401);
 		expect((await route(request({}, "issues"), ctx)).status).toBe(400);
@@ -131,7 +132,7 @@ describe("GitHub lifecycle webhooks", () => {
 			(
 				await plugin.routes!["POST /github/webhook"]!(malformed, {
 					emit,
-					clients: plugin.clients!({}),
+					clients: plugin.clients!(),
 				})
 			).status,
 		).toBe(400);
@@ -152,7 +153,7 @@ describe("GitHub lifecycle webhooks", () => {
 			(
 				await plugin.routes!["POST /github/webhook"]!(request(wrong, "issues"), {
 					emit,
-					clients: plugin.clients!({}),
+					clients: plugin.clients!(),
 				})
 			).status,
 		).toBe(403);
@@ -164,7 +165,7 @@ describe("GitHub lifecycle webhooks", () => {
 	it("ignores unsupported events/actions and PR-shaped issue events", async () => {
 		const plugin = github(options);
 		const emit = vi.fn();
-		const ctx = { emit, clients: plugin.clients!({}) };
+		const ctx = { emit, clients: plugin.clients!() };
 		const route = plugin.routes!["POST /github/webhook"]!;
 		expect((await route(request({}, "push"), ctx)).status).toBe(200);
 		expect((await route(request(payload("issues", "closed"), "issues"), ctx)).status).toBe(200);
@@ -182,7 +183,7 @@ describe("GitHub lifecycle webhooks", () => {
 		const verify = vi.fn().mockResolvedValueOnce(true).mockRejectedValueOnce(new Error("rejected"));
 		const plugin = github({ ...options, webhookVerifier: verify });
 		const emit = vi.fn();
-		const ctx = { emit, clients: plugin.clients!({}) };
+		const ctx = { emit, clients: plugin.clients!() };
 		const route = plugin.routes!["POST /github/webhook"]!;
 		expect((await route(request(payload("issues"), "issues", "bad"), ctx)).status).toBe(200);
 		expect((await route(request(payload("issues"), "issues"), ctx)).status).toBe(401);

@@ -1,3 +1,4 @@
+import { metadataOf } from "../../../src/context.ts";
 import { beforeEach } from "vitest";
 import { z } from "zod";
 import {
@@ -39,7 +40,7 @@ export const surface = {
 } as const;
 export const event = "chat.message";
 export const metadata: InvocationMetadata = {
-	interactionId: "test",
+	requestId: "test",
 	origin: null,
 	replyTo: null,
 	requestedBy: null,
@@ -111,13 +112,13 @@ export function useCoreApp() {
 	function setup(workflows: AnyWorkflow[], extra: Partial<CoreConfig> = {}) {
 		const runtime = db.runtime();
 		const chat = new FakeChat(() => runtime.now!());
-		const attempts: ExecutionInfo[] = [];
+		const attempts: (ExecutionInfo & { metadata: InvocationMetadata })[] = [];
 		const recorder = definePlugin({
 			id: "recorder",
 			hooks: {
 				workflow: [
 					async (execution, ctx, next) => {
-						attempts.push(execution);
+						attempts.push({ ...execution, metadata: metadataOf(ctx) });
 						return next(ctx);
 					},
 				],

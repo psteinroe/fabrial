@@ -1,3 +1,4 @@
+import { metadataOf } from "../../../fabrial/src/context.ts";
 import { createHmac } from "node:crypto";
 import { createFabrial, type WorkflowContext } from "fabrial";
 import { definePlugin } from "fabrial/plugin";
@@ -37,7 +38,7 @@ const recorder = definePlugin({
 	hooks: {
 		workflow: [
 			async (execution, ctx, next) => {
-				executions.push(execution);
+				executions.push({ workflow: execution.workflow, metadata: metadataOf(ctx) });
 				return next(ctx);
 			},
 		],
@@ -108,7 +109,7 @@ describe("Linear lifecycle webhooks", () => {
 	it("verifies signatures, timestamps, organization and required delivery IDs", async () => {
 		const plugin = linear(options);
 		const emit = vi.fn();
-		const ctx = { emit, clients: plugin.clients!({}) };
+		const ctx = { emit, clients: plugin.clients!() };
 		const route = plugin.routes!["POST /linear/webhook"]!;
 		expect((await route(request(payload(), "bad"), ctx)).status).toBe(401);
 		expect(
@@ -135,7 +136,7 @@ describe("Linear lifecycle webhooks", () => {
 			(
 				await plugin.routes!["POST /linear/webhook"]!(malformed, {
 					emit,
-					clients: plugin.clients!({}),
+					clients: plugin.clients!(),
 				})
 			).status,
 		).toBe(400);
@@ -144,7 +145,7 @@ describe("Linear lifecycle webhooks", () => {
 	it("ignores other types/actions", async () => {
 		const plugin = linear(options);
 		const emit = vi.fn();
-		const ctx = { emit, clients: plugin.clients!({}) };
+		const ctx = { emit, clients: plugin.clients!() };
 		const route = plugin.routes!["POST /linear/webhook"]!;
 		expect((await route(request({ ...payload(), type: "Project" }), ctx)).status).toBe(200);
 		expect((await route(request(payload("remove")), ctx)).status).toBe(200);
@@ -152,7 +153,7 @@ describe("Linear lifecycle webhooks", () => {
 	});
 	it("resolves team and state IDs when webhooks lack expanded objects", async () => {
 		const plugin = linear(options);
-		const clients = plugin.clients!({});
+		const clients = plugin.clients!();
 		const emit = vi.fn();
 		vi.spyOn(clients.linear, "team").mockResolvedValue({ key: "ENG" } as never);
 		vi.spyOn(clients.linear, "workflowState").mockResolvedValue({ type: "started" } as never);
@@ -182,7 +183,7 @@ describe("Linear lifecycle webhooks", () => {
 			.mockRejectedValueOnce(new Error("rejected"));
 		const plugin = linear({ ...options, webhookVerifier: verify });
 		const emit = vi.fn();
-		const ctx = { emit, clients: plugin.clients!({}) };
+		const ctx = { emit, clients: plugin.clients!() };
 		const route = plugin.routes!["POST /linear/webhook"]!;
 		expect((await route(request({}, "bad"), ctx)).status).toBe(200);
 		expect((await route(request(payload()), ctx)).status).toBe(401);
@@ -192,7 +193,7 @@ describe("Linear lifecycle webhooks", () => {
 
 it("uses an expanded issue creator without a webhook actor and rejects unattributed creation", async () => {
 	const plugin = linear(options);
-	const clients = plugin.clients!({});
+	const clients = plugin.clients!();
 	const emit = vi.fn();
 	const route = plugin.routes!["POST /linear/webhook"]!;
 	const source = { ...payload().data, creatorId: undefined, creator: { id: "author" } };

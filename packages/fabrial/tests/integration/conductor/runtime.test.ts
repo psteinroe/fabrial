@@ -1,3 +1,4 @@
+import { metadataOf } from "../../../src/context.ts";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import postgres from "postgres";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
@@ -27,7 +28,7 @@ let sql: postgres.Sql;
 let connectionString: string;
 let runtimes: DurableRuntime[];
 const metadata: InvocationMetadata = {
-	interactionId: "interaction",
+	requestId: "interaction",
 	origin: { provider: "test" },
 	replyTo: null,
 	requestedBy: {
@@ -260,23 +261,18 @@ test("invoke/start/emit inherit metadata; overrides affect only the child; start
 		workflow("parent", async (_input, ctx) => {
 			invokes++;
 			const output = await ctx.invoke("call", "child", "output", {
-				metadata: { interactionId: "override" },
+				metadata: { requestId: "override" },
 			});
 			expect(output).toBe("output");
 			childId = await ctx.start("start", "child", { data: true });
-			await ctx.start(
-				"override-start",
-				"child",
-				{},
-				{ metadata: { interactionId: "start-override" } },
-			);
+			await ctx.start("override-start", "child", {}, { metadata: { requestId: "start-override" } });
 			await ctx.emit("test.other", { key: "metadata" }, { id: `${ctx.executionId}:emit` });
 			await ctx.emit(
 				"test.other",
 				{ key: "override" },
-				{ id: `${ctx.executionId}:override-emit`, metadata: { interactionId: "emit-override" } },
+				{ id: `${ctx.executionId}:override-emit`, metadata: { requestId: "emit-override" } },
 			);
-			await ctx.invoke("resume", "resumed", {}, { metadata: { interactionId: "resumed" } });
+			await ctx.invoke("resume", "resumed", {}, { metadata: { requestId: "resumed" } });
 			await ctx.sleep("replay", 30);
 			return null;
 		}),
@@ -293,19 +289,19 @@ test("invoke/start/emit inherit metadata; overrides affect only the child; start
 	await expect.poll(() => completed(ids[0]!), poll).toBe(true);
 	await expect.poll(() => starts, poll).toBe(3);
 	expect(invokes).toBeGreaterThan(1);
-	expect(seen).toContainEqual({ ...metadata, interactionId: "override" });
+	expect(seen).toContainEqual({ ...metadata, requestId: "override" });
 	expect(seen).toContainEqual(metadata);
-	expect(seen).toContainEqual({ ...metadata, interactionId: "start-override" });
+	expect(seen).toContainEqual({ ...metadata, requestId: "start-override" });
 	await expect.poll(() => emitted.length, poll).toBe(2);
 	expect(emitted).toContainEqual({ ...metadata });
 	expect(emitted).toContainEqual({
 		...metadata,
-		interactionId: "emit-override",
+		requestId: "emit-override",
 	});
 	expect(await completed(childId!)).toBe(true);
 	// Native metadata is replayed on every attempt, including the resume after a sleep.
 	expect(resumed.length).toBeGreaterThanOrEqual(2);
-	for (const attempt of resumed) expect(attempt).toEqual({ ...metadata, interactionId: "resumed" });
+	for (const attempt of resumed) expect(attempt).toEqual({ ...metadata, requestId: "resumed" });
 	const [row] = await sql<
 		{ payload: Record<string, unknown> }[]
 	>`select payload from pgconductor._private_executions where task_key = 'resumed'`;
@@ -730,7 +726,7 @@ test("emit dedupe is event-scoped and retains the first payload across restart",
 	await second.emit(
 		"test.event",
 		{ key: "different" },
-		{ metadata: { ...metadata, interactionId: "different" }, id: "same" },
+		{ metadata: { ...metadata, requestId: "different" }, id: "same" },
 	);
 	const rows = await sql<{ payload: { payload: { key: string } }; metadata: InvocationMetadata }[]>`
 		select payload, metadata from pgconductor._private_executions where task_key = 'pgconductor.event-dispatch' order by created_at
@@ -802,7 +798,7 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 			workflow: [
 				async (info, ctx, next) => {
 					attempts.set(info.workflow, (attempts.get(info.workflow) ?? 0) + 1);
-					expect(info.metadata.interactionId).toBe("test.begin:delivery");
+					expect(metadataOf(ctx).requestId).toBe("test.begin:delivery");
 					return next(ctx);
 				},
 			],

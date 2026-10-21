@@ -199,7 +199,11 @@ export function useConductor(): ConductorFixture {
 		}
 		// Emits share Conductor's internal dispatch queue, which keeps receipts to dedupe ingress: forget
 		// this test's events, or the next test's `message("initial")` is a duplicate.
-		if (sql)
+		// A test that never started Conductor (e.g. run alone) has no schema to clean.
+		const [schema] = sql
+			? await sql`select to_regclass('pgconductor._private_executions') is not null as installed`
+			: [];
+		if (sql && schema?.installed)
 			await sql`delete from pgconductor._private_executions where queue = 'pgconductor.internal'`;
 		await clock?.reset();
 	});

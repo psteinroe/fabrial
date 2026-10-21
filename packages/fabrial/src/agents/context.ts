@@ -32,6 +32,7 @@ import {
 	type WorkflowInput,
 	type WorkflowOutput,
 } from "../modules.ts";
+import { bindMetadata } from "../context.ts";
 import {
 	applyState,
 	Binding,
@@ -167,103 +168,104 @@ export async function fields(
 			context,
 		);
 	};
-	return {
-		actor: metadata.requestedBy,
-		requestedBy: metadata.requestedBy,
-		clients: bridge.host.clients(),
-		interaction: metadata,
-		thread:
-			metadata.replyTo && bridge.host.chat()
-				? {
-						post: (id, message) =>
-							operation(id, "post", [cloneJson(message) as Json]) as unknown as ReturnType<
-								ThreadIO["post"]
-							>,
-						update: async (id, message, content) => {
-							await operation(id, "update", [
-								cloneJson(message) as unknown as Json,
-								cloneJson(content) as Json,
-							]);
-						},
-						history: (id, options) =>
-							operation(id, "history", [options ?? {}]) as ReturnType<ThreadIO["history"]>,
+	return bindMetadata(
+		{
+			actor: metadata.requestedBy,
+			clients: bridge.host.clients(),
+			thread:
+				metadata.replyTo && bridge.host.chat()
+					? {
+							post: (id, message) =>
+								operation(id, "post", [cloneJson(message) as Json]) as unknown as ReturnType<
+									ThreadIO["post"]
+								>,
+							update: async (id, message, content) => {
+								await operation(id, "update", [
+									cloneJson(message) as unknown as Json,
+									cloneJson(content) as Json,
+								]);
+							},
+							history: (id, options) =>
+								operation(id, "history", [options ?? {}]) as ReturnType<ThreadIO["history"]>,
+						}
+					: undefined,
+			start,
+			invoke: async (id, workflow, input) => {
+				if (!api) throw new Error("Prompt sections cannot invoke workflows");
+				const child = await start(id, workflow, input);
+				return (await childResult(child)) as WorkflowOutput<typeof workflow>;
+			},
+			// Sent from a managed child execution, through the same path as workflow `ctx.send`.
+			send: async (id, agent, options) => {
+				if (!api) throw new Error("Prompt sections cannot send");
+				const home = options.home && "post" in options.home ? options.home.ref : options.home;
+				return (await operation(id, "send", [
+					agent.name,
+					cloneJson({ ...options, home }) as unknown as Json,
+				])) as SendReceipt;
+			},
+			follow: async (id, resource, options) => {
+				if (!api) throw new Error("Prompt sections cannot follow");
+				return (await operation(id, "follow", [
+					cloneJson(resource) as unknown as Json,
+					storedFollowOptions(options),
+				])) as FollowReceipt;
+			},
+			unfollow: async (id, resource, options) => {
+				if (!api) throw new Error("Prompt sections cannot unfollow");
+				return (await operation(id, "unfollow", [
+					cloneJson(resource) as unknown as Json,
+					storedFollowOptions(options),
+				])) as UnfollowReceipt;
+			},
+			evaluate: async (id, request) => {
+				if (!api) throw new Error("Prompt sections cannot evaluate models");
+				const key = `fabrial:pi:evaluate:${operationId(id)}`;
+				const saved = await api.memo(key, context);
+				if (saved) return saved as unknown as EvaluateResult<typeof request.questions>;
+				const result = await bridge.evaluator.evaluate(
+					request,
+					context.abortSignal ?? bridge.execution.signal,
+				);
+				return (await api.memo(
+					key,
+					cloneJson(result) as unknown as Json,
+					context,
+				)) as unknown as EvaluateResult<typeof request.questions>;
+			},
+			state: <T extends JsonObject>(definition: StateDefinition<T>): ToolStateHandle<T> => {
+				const key = `${definition.scope}:${definition.name}`;
+				const load = async () => {
+					let entry = staged.get(key);
+					if (!entry) {
+						const value = await bridge.harness.commit(
+							async (tx) => cloneJson(await stateDraft(tx, definition, conversationId)),
+							context,
+						);
+						entry = {
+							definition: definition as unknown as StateDefinition,
+							value,
+							changes: [],
+						};
+						staged.set(key, entry);
 					}
-				: undefined,
-		start,
-		invoke: async (id, workflow, input) => {
-			if (!api) throw new Error("Prompt sections cannot invoke workflows");
-			const child = await start(id, workflow, input);
-			return (await childResult(child)) as WorkflowOutput<typeof workflow>;
+					return entry;
+				};
+				return {
+					get: async () => cloneJson((await load()).value) as T,
+					update: async (change) => {
+						if (!api) throw new Error("Prompt sections cannot mutate state");
+						const entry = await load();
+						const draft = cloneJson(entry.value) as T;
+						entry.value = await parseSchema(definition.schema, change(draft) ?? draft);
+						entry.changes.push(change as (draft: JsonObject) => void | JsonObject);
+						return cloneJson(entry.value) as T;
+					},
+				};
+			},
 		},
-		// Sent from a managed child execution, through the same path as workflow `ctx.send`.
-		send: async (id, agent, options) => {
-			if (!api) throw new Error("Prompt sections cannot send");
-			const home = options.home && "post" in options.home ? options.home.ref : options.home;
-			return (await operation(id, "send", [
-				agent.name,
-				cloneJson({ ...options, home }) as unknown as Json,
-			])) as SendReceipt;
-		},
-		follow: async (id, resource, options) => {
-			if (!api) throw new Error("Prompt sections cannot follow");
-			return (await operation(id, "follow", [
-				cloneJson(resource) as unknown as Json,
-				storedFollowOptions(options),
-			])) as FollowReceipt;
-		},
-		unfollow: async (id, resource, options) => {
-			if (!api) throw new Error("Prompt sections cannot unfollow");
-			return (await operation(id, "unfollow", [
-				cloneJson(resource) as unknown as Json,
-				storedFollowOptions(options),
-			])) as UnfollowReceipt;
-		},
-		evaluate: async (id, request) => {
-			if (!api) throw new Error("Prompt sections cannot evaluate models");
-			const key = `fabrial:pi:evaluate:${operationId(id)}`;
-			const saved = await api.memo(key, context);
-			if (saved) return saved as unknown as EvaluateResult<typeof request.questions>;
-			const result = await bridge.evaluator.evaluate(
-				request,
-				context.abortSignal ?? bridge.execution.signal,
-			);
-			return (await api.memo(
-				key,
-				cloneJson(result) as unknown as Json,
-				context,
-			)) as unknown as EvaluateResult<typeof request.questions>;
-		},
-		state: <T extends JsonObject>(definition: StateDefinition<T>): ToolStateHandle<T> => {
-			const key = `${definition.scope}:${definition.name}`;
-			const load = async () => {
-				let entry = staged.get(key);
-				if (!entry) {
-					const value = await bridge.harness.commit(
-						async (tx) => cloneJson(await stateDraft(tx, definition, conversationId)),
-						context,
-					);
-					entry = {
-						definition: definition as unknown as StateDefinition,
-						value,
-						changes: [],
-					};
-					staged.set(key, entry);
-				}
-				return entry;
-			};
-			return {
-				get: async () => cloneJson((await load()).value) as T,
-				update: async (change) => {
-					if (!api) throw new Error("Prompt sections cannot mutate state");
-					const entry = await load();
-					const draft = cloneJson(entry.value) as T;
-					entry.value = await parseSchema(definition.schema, change(draft) ?? draft);
-					entry.changes.push(change as (draft: JsonObject) => void | JsonObject);
-					return cloneJson(entry.value) as T;
-				},
-			};
-		},
-	};
+		metadata,
+	);
 }
 
 /**

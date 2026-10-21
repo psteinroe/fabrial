@@ -62,7 +62,7 @@ describe("instances", () => {
 		const production = fixture();
 		const test = fixture();
 		vi.spyOn(test.app.host, "clients").mockReturnValue({ database: { query: () => "fake" } });
-		expect(f.plugins[0]!.clients!({}).database.query()).toBe("production");
+		expect(f.plugins[0]!.clients!().database.query()).toBe("production");
 		expect(Object.isFrozen(f.plugins)).toBe(true);
 		for (const [fixture, value] of [
 			[production, "production"],
@@ -72,7 +72,7 @@ describe("instances", () => {
 			try {
 				const id = await fixture.runtime.invoke(workflow.name, null, {
 					metadata: {
-						interactionId: "query",
+						requestId: "query",
 						origin: null,
 						replyTo: null,
 						requestedBy: null,

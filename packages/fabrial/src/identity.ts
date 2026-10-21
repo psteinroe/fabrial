@@ -99,11 +99,3 @@ export interface IdentityDirectory {
 	members(group: GroupDefinition): Promise<Principal[]>;
 	isMember(principal: Principal, group: GroupDefinition): Promise<boolean>;
 }
-
-/** Identity facts of one invocation. */
-export interface InvocationIdentity {
-	/** Human or service that initiated the work. */
-	requestedBy: Principal | null;
-	/** Agent/service performing the current operation, e.g. `agent:bug-investigator`. */
-	executedBy?: string;
-}

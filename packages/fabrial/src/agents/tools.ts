@@ -97,9 +97,7 @@ export function instructionsSection(
 						? entry
 						: entry({
 								actor: ctx!.actor,
-								requestedBy: ctx!.requestedBy,
 								clients: ctx!.clients,
-								interaction: ctx!.interaction,
 								state: (definition: Parameters<NonNullable<typeof ctx>["state"]>[0]) => ({
 									get: () => ctx!.state(definition).get(),
 								}),

@@ -4,7 +4,7 @@ import { until, useConductor } from "../../conductor/helper.ts";
 
 const db = useConductor();
 const metadata: InvocationMetadata = {
-	interactionId: "interaction",
+	requestId: "interaction",
 	origin: null,
 	replyTo: null,
 	requestedBy: null,

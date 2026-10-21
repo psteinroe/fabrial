@@ -1,3 +1,4 @@
+import { metadataOf } from "../../../src/context.ts";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Context as TranscriptContext } from "@earendil-works/pi-ai";
@@ -44,7 +45,7 @@ function fixture() {
 	const models = createModels();
 	models.setProvider(faux.provider);
 	const metadata: InvocationMetadata = {
-		interactionId: randomUUID(),
+		requestId: randomUUID(),
 		origin: null,
 		replyTo: { kind: "thread", provider: "slack-test", threadId: randomUUID() },
 		requestedBy: { id: "alice", known: true, identities: [], name: "Alice" },
@@ -482,7 +483,7 @@ it("a child's workflow tool acts for the lead's request; the Session is released
 	expect(await settled()).toEqual({ status: "completed", output: "all done" });
 	expect(seen).toHaveLength(1);
 	expect(seen[0]).toMatchObject({
-		interactionId: f.metadata.interactionId,
+		requestId: f.metadata.requestId,
 		replyTo: f.metadata.replyTo,
 		requestedBy: f.metadata.requestedBy,
 	});
@@ -987,7 +988,7 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 	{
 		const id = await runtime.invoke(entry.name, null, {
 			metadata: {
-				interactionId: randomUUID(),
+				requestId: randomUUID(),
 				origin: null,
 				replyTo: null,
 				requestedBy: { id: alice.id, known: true, identities: [], name: "Alice" },
@@ -1174,7 +1175,7 @@ it("a background child waiting for approval suspends the Session: a new message 
 			{ text },
 			{
 				metadata: {
-					interactionId: randomUUID(),
+					requestId: randomUUID(),
 					origin: null,
 					replyTo: null,
 					requestedBy: { id: alice.id, known: true, identities: [], name: "Alice" },
@@ -1308,7 +1309,7 @@ it("continuing a background child from another actor and thread runs its tools f
 		description: "Reports who asked",
 		input: z.object({}),
 		run: async (_input, ctx) => {
-			const replyTo = ctx.interaction.replyTo;
+			const replyTo = metadataOf(ctx).replyTo;
 			seen.push(`${ctx.actor?.id}@${replyTo?.kind === "thread" ? replyTo.threadId : ""}`);
 			return "noted";
 		},
@@ -1355,7 +1356,7 @@ it("continuing a background child from another actor and thread runs its tools f
 			{ text },
 			{
 				metadata: {
-					interactionId: randomUUID(),
+					requestId: randomUUID(),
 					origin: null,
 					replyTo: { kind: "thread", provider: "slack-test", threadId: threads[index]! },
 					requestedBy: { id: users[index]!.id, known: true, identities: [] },

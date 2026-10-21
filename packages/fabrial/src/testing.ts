@@ -324,7 +324,7 @@ export function fakeAgents(
 	const values = new Map<string, JsonObject>();
 	const sent: (import("./send.ts").SendRequest & { agent: string })[] = [];
 	const key = (execution: DurableExecution, state: { name: string; scope: string }) =>
-		`${state.scope}:${state.scope === "thread" ? (execution.metadata.replyTo?.kind === "thread" ? execution.metadata.replyTo.threadId : execution.metadata.interactionId) : state.scope === "agent" ? execution.executionId : execution.metadata.interactionId}:${state.name}`;
+		`${state.scope}:${state.scope === "thread" ? (execution.metadata.replyTo?.kind === "thread" ? execution.metadata.replyTo.threadId : execution.metadata.requestId) : state.scope === "agent" ? execution.executionId : execution.metadata.requestId}:${state.name}`;
 	const state: StatePort = {
 		get: (execution, id, definition) =>
 			execution.step(id, async () => {

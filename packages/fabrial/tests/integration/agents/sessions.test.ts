@@ -160,7 +160,7 @@ async function launch(name: string, workflows: Parameters<typeof testApp>[1]["wo
 }
 
 const metadataOf = (): InvocationMetadata => ({
-	interactionId: randomUUID(),
+	requestId: randomUUID(),
 	origin: null,
 	replyTo: null,
 	requestedBy: { id: alice.id, known: true, identities: [], name: "Alice" },
@@ -486,7 +486,7 @@ it("a run resumes on a fresh instance after its host stops mid-run; each model r
 	const caller = await a.runtime.invoke(ask.name, "Go", { metadata });
 	await slow.entered;
 	await a.stop();
-	expect(await lease(metadata.interactionId)).toBeNull();
+	expect(await lease(metadata.requestId)).toBeNull();
 	await launch("b", [ask]);
 	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
 	expect(await output(caller)).toBe("all done");
@@ -497,7 +497,7 @@ it("a run resumes on a fresh instance after its host stops mid-run; each model r
 	]);
 	expect(lookups).toBe(1);
 	expect(slows).toBe(2);
-	await released(metadata.interactionId);
+	await released(metadata.requestId);
 });
 
 it("input redelivered with the same request id, also through another instance, is processed once", async () => {

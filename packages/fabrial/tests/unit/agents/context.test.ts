@@ -4,9 +4,7 @@ import type { ToolContext } from "../../internals.ts";
 it("exposes Fabrial's tool context, not Pi's tool API", () => {
 	expectTypeOf<keyof ToolContext>().toEqualTypeOf<
 		| "actor"
-		| "requestedBy"
 		| "clients"
-		| "interaction"
 		| "thread"
 		| "state"
 		| "invoke"

@@ -1,3 +1,4 @@
+import { metadataOf } from "../../../src/context.ts";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineEvent, definePlugin, trigger } from "../../internals.ts";
@@ -668,7 +669,7 @@ describe("provider route response context", () => {
 			name: "child",
 			run: async (_i, ctx) => ({
 				thread: ctx.thread?.ref.threadId ?? null,
-				owner: ctx.metadata.ownerWorkflow ?? null,
+				owner: metadataOf(ctx).ownerWorkflow ?? null,
 			}),
 		});
 		const test = setup([workflow(async () => null), child]);
@@ -697,7 +698,7 @@ describe("provider route response context", () => {
 			],
 			run: async (_i, ctx) => {
 				const ref = await ctx.thread!.post("first", "first");
-				if (ctx.metadata.replyTo?.threadId !== ref.threadId) throw new Error("Unbound metadata");
+				if (metadataOf(ctx).replyTo?.threadId !== ref.threadId) throw new Error("Unbound metadata");
 				await ctx.state(counter).update("update", (draft) => {
 					draft.count++;
 				});

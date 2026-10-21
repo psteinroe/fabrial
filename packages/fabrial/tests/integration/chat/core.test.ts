@@ -1,3 +1,4 @@
+import { metadataOf } from "../../../src/context.ts";
 // oxlint-disable typescript/unbound-method -- Referenced adapter methods are Vitest mocks.
 import { createTestMessage } from "@chat-adapter/tests";
 import { createMemoryState } from "@chat-adapter/state-memory";
@@ -90,7 +91,7 @@ it("rebinds a lazy channel from the durable first-post receipt on replay and chi
 		name: "child",
 		input: z.null(),
 		run: async (_input, ctx) => {
-			expect(ctx.metadata.replyTo).toEqual({
+			expect(metadataOf(ctx).replyTo).toEqual({
 				kind: "thread",
 				provider: "slack",
 				threadId: "slack:C1:root-1",

@@ -32,7 +32,7 @@ function setup(config: Partial<typeof options> = options) {
 	const lifecycle = (payload: unknown, event = "issue_comment") =>
 		plugin.routes!["POST /github/webhook"]!(request(payload, event), {
 			emit,
-			clients: plugin.clients!({}),
+			clients: plugin.clients!(),
 		});
 	const sdk = (payload: unknown, event = "issue_comment") =>
 		env.connection.routes["POST /github/events"]!(request(payload, event));

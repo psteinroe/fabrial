@@ -6,7 +6,7 @@ import { useConductor } from "../../conductor/helper.ts";
 const db = useConductor();
 beforeEach(() => db.clock.set(new Date()));
 const metadata: InvocationMetadata = {
-	interactionId: "test",
+	requestId: "test",
 	origin: null,
 	replyTo: null,
 	requestedBy: null,

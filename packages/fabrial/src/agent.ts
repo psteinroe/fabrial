@@ -1,7 +1,7 @@
 import type { EvaluateQuestion, EvaluateRequest, EvaluateResult } from "./evaluate.ts";
 import type { Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
-import type { AgentRef, InvocationMetadata } from "./runtime.ts";
+import type { AgentRef } from "./runtime.ts";
 import type { Schema } from "./schema.ts";
 import type { AgentSession, SendOptions, SendReceipt } from "./send.ts";
 import type { ResourceRef } from "./plugin.ts";
@@ -17,9 +17,7 @@ export type ThinkingLevel = "off" | "low" | "medium" | "high";
 export interface InstructionContext<TClients = Record<string, unknown>> {
 	/** Who sent the message this run answers. */
 	readonly actor: Principal | null;
-	readonly requestedBy: Principal | null;
 	readonly clients: TClients;
-	readonly interaction: InvocationMetadata;
 	state<T extends JsonObject>(definition: StateDefinition<T>): { get(): Promise<T> };
 }
 

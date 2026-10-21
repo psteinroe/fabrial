@@ -58,10 +58,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 	let agents: ReturnType<NonNullable<CoreConfig["agents"]>["connect"]> | undefined;
 	let liveClients: Record<string, unknown> | undefined;
 	const clients = (): Record<string, unknown> =>
-		(liveClients ??= Object.assign(
-			{},
-			...config.plugins.map((p) => p.clients?.({ chat: chat?.port }) ?? {}),
-		));
+		(liveClients ??= Object.assign({}, ...config.plugins.map((p) => p.clients?.() ?? {})));
 	const directory = createDirectory(
 		config.identity ?? [],
 		config.plugins,
@@ -148,7 +145,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 		const request = await prepareInput(host, metadata, {
 			agent: agent.name,
 			session: conversation.session,
-			requestId: `${metadata.interactionId}:${agent.name}`,
+			requestId: `${metadata.requestId}:${agent.name}`,
 			input,
 			kind: isChatMessage(input) ? "message" : "notification",
 			replyTo: metadata.replyTo,
@@ -157,10 +154,10 @@ export function buildApp(config: CoreConfig): HostedApp {
 		return request;
 	};
 	/** Store the request: one `fabrial.ingress` event, deduped by its provider id. `fabrial.route` routes it. */
-	const accept = async (ingress: IngressEvent, interactionId: string) => {
+	const accept = async (ingress: IngressEvent, requestId: string) => {
 		await runtime.emit(INGRESS_EVENT, ingress, {
 			id: ingressKey(ingress),
-			metadata: { interactionId, origin: ingress.origin, replyTo: null, requestedBy: null },
+			metadata: { requestId, origin: ingress.origin, replyTo: null, requestedBy: null },
 		});
 		return "accepted" as const;
 	};
@@ -170,7 +167,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 	 * delivery that completed without its receipt is deduped by its request id.
 	 */
 	const route = async (ingress: IngressEvent, execution: DurableExecution): Promise<Json> => {
-		const { interactionId } = execution.metadata;
+		const { requestId } = execution.metadata;
 		const actor = (
 			ingress.actor
 				? await execution.step(
@@ -217,7 +214,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 				{
 					id: ingress.id,
 					metadata: {
-						interactionId: approvalId!,
+						requestId: approvalId!,
 						origin: { provider: ingress.actor!.provider },
 						replyTo: null,
 						requestedBy: actor,
@@ -250,7 +247,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 					agent.definition.session,
 					ingress.payload,
 					replyTo,
-					message ? threadSession(message.provider, message.threadId) : interactionId,
+					message ? threadSession(message.provider, message.threadId) : requestId,
 				),
 				agent: agent.name,
 			});
@@ -299,7 +296,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 				await io.subscribe();
 			});
 		const metadata: InvocationMetadata = {
-			interactionId,
+			requestId,
 			origin: (message
 				? { provider: message.provider, messageId: message.messageId }
 				: (ingress.origin ?? {
@@ -366,7 +363,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 					replyTo: (options.replyTo ?? null) as IngressEvent["replyTo"],
 					actor: (options.requestedBy ?? null) as IngressEvent["actor"],
 				},
-				options.interactionId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID()),
+				options.requestId ?? (options.id ? `${event}:${options.id}` : crypto.randomUUID()),
 			);
 		},
 		async receiveMessage(message, options) {
@@ -484,7 +481,12 @@ export function buildApp(config: CoreConfig): HostedApp {
 			const metadata = execution.metadata;
 			const context = await createContext({ host, execution, metadata, agents, now });
 			await wrap(
-				{ executionId: execution.executionId, workflow: workflow.name, metadata },
+				{
+					executionId: execution.executionId,
+					workflow: workflow.name,
+					actor: metadata.requestedBy,
+					origin: metadata.origin,
+				},
 				context,
 				next,
 			);
@@ -518,7 +520,8 @@ export function buildApp(config: CoreConfig): HostedApp {
 					{
 						executionId: execution.executionId,
 						workflow: workflow.name,
-						metadata: execution.metadata,
+						actor: execution.metadata.requestedBy,
+						origin: execution.metadata.origin,
 					},
 					context,
 					next,

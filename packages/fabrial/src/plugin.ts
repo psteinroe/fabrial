@@ -55,7 +55,7 @@ export interface PluginDefinition<
 	/** Chat SDK adapter: routes, typed message events, `ctx.thread`, cards, status rendering, history. */
 	chat?: ChatCapability;
 	/** Canonical live clients, exposed as `ctx.clients.*` and rebuilt on every run/resume. */
-	clients?: (deps: { chat?: unknown }) => TClients;
+	clients?: () => TClients;
 	/** Tools and instructions for agents that list this plugin's id in `toolkits`. */
 	toolkit?: PluginToolkitFactory<TClients>;
 	/** Model context for a trigger's origin, loaded durably when an agent starts from it. */
@@ -93,7 +93,7 @@ export type ToolkitPlugin<
 	TClients extends Record<string, unknown> = Record<string, unknown>,
 > = PluginDefinition<TId, TEvents, TClients> & { toolkit: PluginToolkitFactory<TClients> };
 
-export type PluginClients<P> = P extends { clients?: (deps: never) => infer C }
+export type PluginClients<P> = P extends { clients?: () => infer C }
 	? C extends object
 		? C
 		: never

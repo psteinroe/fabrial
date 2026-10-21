@@ -16,7 +16,7 @@ import type { ChatMessage, MessageRef, OutboundMessage, Surface, ThreadRef } fro
 /** Serializable invocation context carried by every execution (Conductor execution metadata, item 2). */
 export interface InvocationMetadata extends JsonObject {
 	/** Correlates one request: derived from the source event (or the run), it keys request ids. */
-	interactionId: string;
+	requestId: string;
 	origin: (Origin & JsonObject) | null;
 	/** Where `ctx.thread` points. `null` for executions without a surface (observers, cron without replyTo). */
 	replyTo: (Surface & JsonObject) | null;

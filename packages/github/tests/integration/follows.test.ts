@@ -183,7 +183,7 @@ describe("follows in an app", () => {
 		const start = async (workflow: string, input: JsonObject | null = null) =>
 			t.settled(
 				await t.runtime.invoke(workflow, input, {
-					metadata: { interactionId: workflow, origin: null, replyTo: null, requestedBy: null },
+					metadata: { requestId: workflow, origin: null, replyTo: null, requestedBy: null },
 				}),
 			);
 		// Ingress dedupes deliveries across the database: scope this test's delivery ids to it.
@@ -286,7 +286,7 @@ describe("follows in an app", () => {
 describe("GitHub write tools", () => {
 	function tools() {
 		const instance = github(options);
-		const client = instance.clients!({}).github;
+		const client = instance.clients!().github;
 		const byName = Object.fromEntries(
 			instance.toolkit({ github: client }).tools.map((tool) => [tool.name, tool]),
 		);
