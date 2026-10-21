@@ -355,7 +355,7 @@ Chat providers pass a Chat SDK adapter in `chat: chatCapability({ adapter, insta
 
 Tests run on real Conductor and need Postgres; there is no in-memory engine. Start one per run in Vitest's `globalSetup` (e.g. `new PostgreSqlContainer("postgres:17").start()`, passed on with `project.provide`), and give each test file its own database: ingress is database-wide, so apps of other files running at once would route its events.
 
-`createTestApp(f, { database, workflows, agents?, routedAgents?, chat? })` runs workflows on Conductor with a `FakeChat` and fake agents, without models:
+`createTestApp(f, { database, workflows, routedAgents?, chat? })` runs workflows on Conductor with a `FakeChat` and fake agents, without models:
 
 ```ts check
 import { createTestApp } from "fabrial/testing";
@@ -392,7 +392,7 @@ const app = createIntegrationApp(f, { workflows: [], agents: [support], models }
 await app.start();
 ```
 
-Each model request consumes the next step; `model.calls` counts requests. Spy on `app.host.clients()` (or its client methods) to fake plugin clients. [examples/acme](../../examples/acme) drives signed Slack, GitHub, and Linear webhooks through `app.fetch` this way.
+Each model request consumes the next step; `model.calls` counts requests. Spy on `app.clients()` (or its client methods) to fake plugin clients; `app.routing(thread)` reads who follows a thread. `modelRetries: { maxRetries?, baseDelayMs?, maxDelayMs? }` turns durable model retries on with overrides of production's policy (e.g. tiny delays). Both functions return a `TestingApp`. [examples/acme](../../examples/acme) drives signed Slack, GitHub, and Linear webhooks through `app.fetch` this way.
 
 ## Guarantees and limits
 
@@ -416,7 +416,7 @@ Ingress only verifies, normalizes and emits one `fabrial.ingress` event, deduped
 
 #### Boundary
 
-Fabrial uses only public APIs of the libraries below: no private access, no polling loops, no Fabrial-owned engine tables. [PGCONDUCTOR.md](../../PGCONDUCTOR.md) lists the Conductor changes this needed; all have landed.
+In production, Fabrial uses only public APIs of the libraries below: no private access, no polling loops, no Fabrial-owned engine tables. The exception is `fabrial/testing`: `idle()` polls Conductor's internal executions table, since Conductor has no public API to list unsettled executions. [PGCONDUCTOR.md](../../PGCONDUCTOR.md) lists the Conductor changes this needed; all have landed.
 
 **From Conductor:** tasks and durable steps; `ctx.sleep`; `ctx.subscribe` and `ctx.waitForAny` with event, execution, and signal branches; `ctx.invoke` (with `cancelWithParent` unless detached) and `ctx.waitForResult`, whose failure or cancellation is a value; signals and `signalWithStart` with metadata; `emit` with `dedupe_key`; middleware on every attempt; execution metadata and `ctx.executionId`; cancellation that cascades to linked children; retries; the test clock.
 

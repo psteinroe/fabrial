@@ -40,7 +40,7 @@ export const announce = f.defineWorkflow({
 });
 ```
 
-Helpers: `slack.mentioned({ channel?, thread?, observe? })`, `slack.message({ channel, … })`, `slack.newThread({ channel, … })`, `slack.dm()`, `slack.channel(id)` (a surface for `replyTo`, `home`, and approval `destination`), `slack.identity({ workspace, userId })`, and `slack.userGroup({ id, handle })`. `userGroup` resolves live membership through `ctx.clients.slack` and never caches it. `ctx.clients.slack` is a `WebClient`; tests spy on `app.host.clients().slack`. The factory is side-effect free; credentials are checked at `app.start()`.
+Helpers: `slack.mentioned({ channel?, thread?, observe? })`, `slack.message({ channel, … })`, `slack.newThread({ channel, … })`, `slack.dm()`, `slack.channel(id)` (a surface for `replyTo`, `home`, and approval `destination`), `slack.identity({ workspace, userId })`, and `slack.userGroup({ id, handle })`. `userGroup` resolves live membership through `ctx.clients.slack` and never caches it. `ctx.clients.slack` is a `WebClient`; tests spy on `app.clients().slack`. The factory is side-effect free; credentials are checked at `app.start()`.
 
 One Slack workspace per app in this preview. Approval cards link their source thread with `chat.getPermalink`, and Reject opens a modal for an optional reason.
 
