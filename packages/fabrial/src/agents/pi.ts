@@ -253,6 +253,8 @@ export interface PiOptions {
 	settings?: Omit<HarnessSettings, "extensions">;
 	/** How long a workflow's `ctx.state` waits for its Session to answer before it resends the request. */
 	stateTimeoutMs?: number;
+	/** How often a workflow's state update may conflict (the state changed between its read and write) before it fails. Default 20. */
+	stateConflicts?: number;
 	/**
 	 * Days a finished `ctx.agent` call's Pi Session is kept after its Session execution settled (completed, failed or
 	 * cancelled), before `fabrial.sessions.reclaim` deletes it. Default 7.
@@ -1744,12 +1746,13 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		},
 		/**
 		 * Optimistic: reads the value and its revision, applies `change` here (closures stay in the workflow), and
-		 * replaces the value if nothing changed it since; otherwise it reads again.
+		 * replaces the value if nothing changed it since; otherwise it reads again, up to `stateConflicts` times.
 		 */
 		update: async (execution, id, definition, change) => {
 			const key = sessionKey(execution.metadata);
 			stateOf(definition.name);
-			for (let n = 0; ; n++) {
+			const conflicts = options.stateConflicts ?? 20;
+			for (let n = 0; n < conflicts; n++) {
 				const at = n ? `${id}:retry:${n}` : id;
 				const read = await stateRequest(execution, `${at}:read`, key, { state: definition.name });
 				if (!("value" in read)) throw new Error(`State ${definition.name}: a read cannot conflict`);
@@ -1767,6 +1770,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				});
 				if ("value" in written) return written.value as ReturnType<typeof definition.initial>;
 			}
+			throw new Error(
+				`State ${definition.name}: update ${id} conflicted ${conflicts} times; the state kept changing between its read and its write`,
+			);
 		},
 	};
 	return {

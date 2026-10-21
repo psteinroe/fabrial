@@ -17,7 +17,7 @@ import {
 import { FakeChat } from "../../../src/testing.ts";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
-import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
+import { callSession, pi, PostgresStorage, sessionKey } from "../../../src/agents/index.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { until } from "../../conductor/helper.ts";
 import { useAgents } from "./setup.ts";
@@ -36,6 +36,7 @@ function fixture(
 	plugins: FabrialHost["plugins"] = [],
 	definitionScope: object = definitions,
 	stateTimeoutMs?: number,
+	stateConflicts?: number,
 ) {
 	const runtime = db.runtime();
 	const chat = new FakeChat();
@@ -71,6 +72,7 @@ function fixture(
 		sql: sql(),
 		settings: { retry: { enabled: false } },
 		...(stateTimeoutMs ? { stateTimeoutMs } : {}),
+		...(stateConflicts ? { stateConflicts } : {}),
 	}).connect(host);
 	return { runtime, chat, faux, integration, metadata, host };
 }
@@ -961,6 +963,173 @@ it("a workflow restarted after sending its update waits for the same answer; not
 		output: { updated: { count: 1 }, read: { count: 1 } },
 	});
 	expect(change).toHaveBeenCalledTimes(1);
+	await f.integration.stop();
+});
+
+/** `execution` with `before` run ahead of each state write request it sends; `before` gets the write's number. */
+function beforeWrites<T extends object>(execution: T, before: (n: number) => Promise<void>): T {
+	let writes = 0;
+	return new Proxy(execution, {
+		get: (target, property) => {
+			const value = Reflect.get(target, property) as unknown;
+			if (property === "signalWithStart")
+				return async (id: string, options: never) => {
+					if (id.endsWith(":write:request")) await before(writes++);
+					return (target as { signalWithStart: (...args: unknown[]) => unknown }).signalWithStart(
+						id,
+						options,
+					);
+				};
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
+it("a tool that changes the state between a workflow's read and write makes the workflow read again", async () => {
+	const f = fixture();
+	const state = counter();
+	const bumped = Promise.withResolvers<void>();
+	const bump = defineTool({
+		name: "bump",
+		description: "Bumps the counter",
+		input: z.object({}),
+		run: async (_input, ctx) => {
+			await ctx.state(state).update((draft) => {
+				draft.count += 10;
+			});
+			bumped.resolve();
+			return "bumped";
+		},
+	});
+	const agent = defineAgent({
+		name: randomUUID(),
+		description: "Bumps the counter.",
+		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
+		tools: [bump],
+	});
+	f.faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("bump", {}), { stopReason: "toolUse" }),
+		fauxAssistantMessage("Bumped."),
+	]);
+	const seen: number[] = [];
+	const { result } = await execute(f, {
+		name: randomUUID(),
+		triggers: [],
+		handler: async (_input, execution) => {
+			// The first write waits until the agent's tool changed the state it read.
+			const forced = beforeWrites(execution, async (n) => {
+				if (n) return;
+				await f.integration.agents.deliver!(agent, {
+					session: sessionKey(f.metadata),
+					requestId: randomUUID(),
+					content: "Bump it",
+					delivery: "steer",
+					metadata: f.metadata,
+					follow: null,
+				});
+				await bumped.promise;
+			});
+			const updated = await f.integration.state.update(forced, "increment", state, (draft) => {
+				seen.push(draft.count);
+				draft.count++;
+			});
+			return { updated, read: await f.integration.state.get(execution, "read", state) };
+		},
+	});
+	expect(result).toEqual({
+		status: "completed",
+		output: { updated: { count: 11 }, read: { count: 11 } },
+	});
+	expect(seen).toEqual([0, 10]);
+	await f.integration.stop();
+});
+
+it("an update that keeps conflicting fails clearly after its conflicts run out", async () => {
+	const f = fixture([], definitions, undefined, 3);
+	const state = counter();
+	const change = vi.fn((draft: { count: number }) => {
+		draft.count++;
+	});
+	const { result } = await execute(f, {
+		name: randomUUID(),
+		triggers: [],
+		retries: { maxAttempts: 1 },
+		handler: async (_input, execution) => {
+			// Another update lands between every read and write.
+			const contended = beforeWrites(execution, async (n) => {
+				await f.integration.state.update(execution, `other:${n}`, state, (draft) => {
+					draft.count++;
+				});
+			});
+			return f.integration.state.update(contended, "increment", state, change);
+		},
+	});
+	expect(result).toMatchObject({
+		status: "failed",
+		error: expect.stringContaining("conflicted 3 times"),
+	});
+	expect(change).toHaveBeenCalledTimes(3);
+	await f.integration.stop();
+});
+
+it("a duplicated state write gets the same answer again and applies once", async () => {
+	const f = fixture();
+	const state = counter();
+	// The Session's responses to writes, as it emits them.
+	const answers: unknown[] = [];
+	const session = f.integration.workflows.find((workflow) => workflow.name === "fabrial.session")!;
+	const handler = session.handler;
+	session.handler = (input, execution, attempt) =>
+		handler(
+			input,
+			new Proxy(execution, {
+				get: (target, property) => {
+					const value = Reflect.get(target, property) as unknown;
+					if (property === "emit")
+						return async (event: string, payload: { operation?: string }, options: never) => {
+							if (payload.operation?.includes(":write")) answers.push(payload);
+							return execution.emit(event, payload as never, options);
+						};
+					return typeof value === "function" ? value.bind(target) : value;
+				},
+			}),
+			attempt,
+		);
+	const { result } = await execute(f, {
+		name: randomUUID(),
+		triggers: [],
+		handler: async (_input, execution) => {
+			// Every write request is delivered twice, under two signal ids: the second arrives once the first applied.
+			const duplicating = new Proxy(execution, {
+				get: (target, property) => {
+					const value = Reflect.get(target, property) as unknown;
+					if (property === "signalWithStart")
+						return async (id: string, options: Parameters<typeof execution.signalWithStart>[1]) => {
+							const sent = await execution.signalWithStart(id, options);
+							if (id.endsWith(":write:request"))
+								await execution.signalWithStart(`${id}:again`, {
+									...options,
+									signal: { ...options.signal, id: `${options.signal.id}:again` },
+								});
+							return sent;
+						};
+					return typeof value === "function" ? value.bind(target) : value;
+				},
+			});
+			const updated = await f.integration.state.update(duplicating, "increment", state, (draft) => {
+				draft.count++;
+			});
+			await until("both answers", async () => (answers.length === 2 ? true : undefined));
+			return { updated, read: await f.integration.state.get(execution, "read", state) };
+		},
+	});
+	expect(result).toEqual({
+		status: "completed",
+		output: { updated: { count: 1 }, read: { count: 1 } },
+	});
+	expect(answers).toHaveLength(2);
+	expect(answers[1]).toEqual(answers[0]);
+	expect(answers[0]).toMatchObject({ value: { count: 1 }, revision: 1 });
 	await f.integration.stop();
 });
 
