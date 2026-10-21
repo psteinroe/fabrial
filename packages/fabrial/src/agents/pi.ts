@@ -66,7 +66,6 @@ import {
 	toolName,
 	type Agent,
 	type AgentObservers,
-	type ThinkingLevel,
 	type Toolkit,
 } from "../agent.ts";
 import type { AnyWorkflow } from "../workflow.ts";
@@ -88,11 +87,8 @@ import {
 	BridgeKey,
 	cancelChildren,
 	cloneJson,
-	currentRequest,
 	childOutcome,
 	fields,
-	registerChild,
-	startWaited,
 	noReplyTool,
 	startChild,
 	type BridgeFrame,
@@ -100,7 +96,6 @@ import {
 import {
 	follow,
 	prepareSend,
-	threadSession,
 	conversationReference,
 	type ConversationKey,
 	type Delivery,
@@ -108,24 +103,15 @@ import {
 	type SendReceipt,
 	type SendRequest,
 } from "../send.ts";
-import {
-	followResource,
-	unfollowResource,
-	type ConversationRef,
-	type StoredFollowOptions,
-} from "../follows.ts";
+import { followResource, unfollowResource, type StoredFollowOptions } from "../follows.ts";
 import type { ResourceRefJson } from "../plugin.ts";
 import {
-	applyState,
 	Binding,
 	ChildResults,
 	Conversations,
 	Invocation,
 	Obligations,
-	stateDraft,
-	stateRevision,
 	Suspensions,
-	WorkflowReceipts,
 	EFFECT_WORKFLOW,
 	REPORT_WORKFLOW,
 	CHILD_SIGNAL,
@@ -134,11 +120,8 @@ import {
 	type Obligation,
 } from "./documents.ts";
 import { newErrorId, sentErrorReply, WAITING_STATUS } from "./errors.ts";
-import { createEvaluator } from "./evaluate.ts";
 import { LeaseLost, PostgresStorage } from "./storage.ts";
-import { definedStates, type StateDefinition } from "../state.ts";
 import { duration } from "../internal.ts";
-import type { Logger } from "../app.ts";
 import type { Follow } from "../routing.ts";
 
 const SESSION_WORKFLOW = "fabrial.session";
@@ -166,27 +149,7 @@ type SessionInput =
 			content: string;
 			metadata: InvocationMetadata;
 	  }
-	| { kind: "stop"; agent: string; reason: string }
-	| StateRequest;
-
-/**
- * A workflow's `ctx.state` operation, handled by the Session's host: a read, or a replacement of the value read at
- * `revision`. `operation` is stable across resends and dedupes it; the response event carries it back.
- */
-type StateRequest = {
-	kind: "state";
-	operation: string;
-	state: string;
-	write?: { value: JsonObject; revision: number };
-};
-/** The response to a `StateRequest`: the value at its revision, a conflict (the revision moved on), or an error. */
-type StateResponse =
-	| { value: JsonObject; revision: number }
-	| { conflict: true; revision: number }
-	| { error: string };
-const STATE_EVENT = "fabrial.state.response";
-/** A workflow resends an unanswered state request (same operation) this often before failing. */
-const STATE_REQUESTS = 5;
+	| { kind: "stop"; agent: string; reason: string };
 
 /** How a call with an `output` schema asks for its answer: one JSON value matching the schema's JSON Schema. */
 function outputInstruction(agent: string, schema: Schema): string {
@@ -198,30 +161,6 @@ function outputInstruction(agent: string, schema: Schema): string {
 export const callSession = (executionId: string, id: string) =>
 	`${CALL_SESSION}${executionId}:${id}`;
 const CALL_SESSION = "run:";
-
-/**
- * The Session of a workflow's `ctx.state`: the calling conversation's when an agent's tool started it (directly or
- * through other workflows), so it shares state with that agent whatever its session kind; else its thread's, else
- * its own.
- */
-export function sessionKey(metadata: InvocationMetadata): string {
-	const conversation = metadata.conversation as ConversationRef | undefined;
-	if (conversation?.session) return conversation.session;
-	const surface = metadata.replyTo;
-	if (surface?.kind === "thread") return threadSession(surface.provider, surface.threadId);
-	if (surface?.kind === "channel")
-		throw new Error(
-			"Post to the channel with ctx.thread.post before using Pi; a channel is not a Session key",
-		);
-	return metadata.requestId;
-}
-
-const THINKING: Record<ThinkingLevel, "off" | "low" | "medium" | "high"> = {
-	off: "off",
-	low: "low",
-	medium: "medium",
-	high: "high",
-};
 
 /** Fabrial observers as Pi hooks on the built-in generation and tool tasks. */
 function observerHooks(observers: AgentObservers[], host: FabrialHost) {
@@ -289,10 +228,6 @@ export interface PiOptions {
 	models: Models;
 	sql: Sql;
 	settings?: Omit<HarnessSettings, "extensions">;
-	/** How long a workflow's `ctx.state` waits for its Session to answer before it resends the request. */
-	stateTimeoutMs?: number;
-	/** How often a workflow's state update may conflict (the state changed between its read and write) before it fails. Default 20. */
-	stateConflicts?: number;
 	/**
 	 * Days a finished `ctx.agent` call's Pi Session is kept after its Session execution settled (completed, failed or
 	 * cancelled), before `fabrial.sessions.reclaim` deletes it. Default 7.
@@ -311,31 +246,17 @@ export type Agents = ReturnType<typeof connectAgents>;
 
 /**
  * Connect Pi to the host. Nothing touches Pi's storage, and no Pi workflow is registered, unless the instance
- * defines an agent or a state: an app without them runs no Pi work.
+ * defines an agent: an app without one runs no Pi work.
  */
 export function connectAgents(host: FabrialHost, options: PiOptions) {
 	const scope = host.definitionScope ?? host;
-	/** Whether the instance defines agents or state: decided when the app starts, after which neither can be defined. */
-	const used = () => !!definedAgents.get(scope)?.size || !!definedStates.get(scope)?.size;
+	/** Whether the instance defines agents: decided when the app starts, after which none can be defined. */
+	const used = () => !!definedAgents.get(scope)?.size;
 	const registry = createRegistry();
-	const evaluator = createEvaluator(options.models);
 	const agents = new Map<string, Agent>();
 	const configs = new Map<string, AgentChange>();
 	const active = new Map<BridgeFrame, Promise<void>>();
 	let started = false;
-	/** Workflow state resolves by name against this instance's definitions, on both sides of the Session's signal. */
-	const stateOf = (name: string): StateDefinition => {
-		const definition = definedStates.get(scope)?.get(name);
-		if (!definition)
-			throw new Error(
-				`State ${name} is not defined on this Fabrial instance; define it with defineState`,
-			);
-		if (definition.scope !== "session")
-			throw new Error(
-				`Agent state ${name} requires a Pi conversation; use it inside an agent tool`,
-			);
-		return definition;
-	};
 	const observers = host.plugins.flatMap((plugin) =>
 		plugin.hooks?.agent ? [plugin.hooks.agent] : [],
 	);
@@ -356,35 +277,31 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 	registry.install(internal);
 	const pluginToolkits = new Map<string, Extension>();
 	const appToolkits = new Map<string, { toolkit: Toolkit; extension: Extension }>();
-	const workflowTools = new WeakMap<ToolRegistration, AnyWorkflow>();
 	/** Each agent's extensions without, and its subagent tools as, an extension. */
 	const extensionsOf = new Map<string, { base: Extension[]; subagents?: Extension }>();
-	/** Workflow tools drop out until their workflow is registered. */
-	const registered = (tool: ToolRegistration) => {
-		const supplied = workflowTools.get(tool);
-		return !supplied || host.workflows.some((candidate) => candidate.name === supplied.name);
-	};
-
 	/** A child's agent: its own definition, subagent tools only with levels left, and never `no_reply`. */
 	function childAgent(agent: Agent, depth: number): AgentChange {
 		const { model, thinking } = agent.definition;
 		const parts = extensionsOf.get(agent.name)!;
-		const extensions = [...parts.base, ...(depth > 0 && parts.subagents ? [parts.subagents] : [])];
-		const tools = new Map<string, ToolRegistration>();
-		for (const extension of extensions)
-			for (const tool of extension.tools ?? []) tools.set(tool.name, tool);
 		return {
 			// Unset fields keep the copy of the lead's agent the child starts with.
 			...(model ? { model: parseModel(model) } : {}),
-			...(thinking ? { thinkingLevel: THINKING[thinking] } : {}),
+			...(thinking ? { thinkingLevel: thinking } : {}),
 			instructions: null,
-			extensions,
-			tools: [...tools.values()].filter((tool) => tool !== noReply && registered(tool)),
+			extensions: [...parts.base, ...(depth > 0 && parts.subagents ? [parts.subagents] : [])],
+			tools: { remove: [noReply] },
 		};
 	}
 
+	/** Workflow tools whose workflow the app does not register drop out. */
 	function tools(owner: string, list: Toolkit["tools"] = []): ToolRegistration[] {
-		return list.map((tool) => (isWorkflow(tool) ? workflowTool(tool, owner) : piToolOf(tool)));
+		return list.flatMap((tool) =>
+			!isWorkflow(tool)
+				? [piToolOf(tool)]
+				: host.workflows.some((candidate) => candidate.name === tool.name)
+					? [workflowTool(tool, owner)]
+					: [],
+		);
 	}
 
 	function toolkit(entry: string | Toolkit, agent: string): Extension {
@@ -463,7 +380,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		extensionsOf.set(name, { base: [internal, ...selected, own], subagents: delegates });
 		configs.set(name, {
 			model: model ? parseModel(model) : null,
-			thinkingLevel: thinking ? THINKING[thinking] : null,
+			thinkingLevel: thinking ?? null,
 			instructions: null,
 			extensions: [internal, ...selected, own, ...(delegates ? [delegates] : [])],
 			tools: null,
@@ -480,42 +397,14 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				? toJsonSchema(input, `Workflow ${workflow.name} (a tool of ${owner})`)
 				: { type: "object", properties: {}, additionalProperties: true }) as unknown as TSchema,
 			replay: "safe",
+			// Started behind a reporter like any waited child. A failed or cancelled workflow throws its outcome: Pi gives
+			// the model the error.
 			execute: async (input, api, context) => {
-				const frame = context.value(BridgeKey);
-				if (!frame) throw new Error("Workflow tools require a Fabrial bridge");
 				const ctx = await fields(context, api.conversationId, api);
-				const child = await startWaited(ctx, "workflow", workflow, input as Json);
-				const result = (await frame.harness.snapshot(ChildResults, context))?.results[child];
-				if (result)
-					return {
-						content: [
-							{
-								type: "text",
-								text: JSON.stringify(result.status === "completed" ? result.output : result),
-							},
-						],
-						isError: result.status !== "completed",
-					};
-				await registerChild(
-					frame,
-					await currentRequest(frame, api.conversationId, context),
-					api.taskId,
-					{ executionId: child, detached: false },
-					context,
-				);
-				const settled = await frame.waitChild(api.taskId, child, context);
-				return {
-					content: [
-						{
-							type: "text",
-							text: JSON.stringify(settled.status === "completed" ? settled.output : settled),
-						},
-					],
-					isError: settled.status !== "completed",
-				};
+				const output = await ctx.invoke("workflow", workflow, input as never);
+				return { content: [{ type: "text", text: JSON.stringify(output) }] };
 			},
 		});
-		workflowTools.set(native, workflow);
 		return native;
 	}
 
@@ -652,7 +541,6 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 	/** An agent's conversation in an opened Session: the tools it offers, and whether `no_reply` is among them. */
 	interface Hosted {
 		conversation: Conversation;
-		offered: readonly ToolRegistration[];
 		replying?: boolean;
 	}
 	type View = Awaited<ReturnType<typeof progressOf>>;
@@ -672,7 +560,6 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		ctx: TaskContext,
 		reportOf: (executionId: string) => PromiseWithResolvers<JsonObject>,
 	): Promise<SessionHost> {
-		const native = nativeMethods(ctx);
 		// A crashed owner's lease lasts until it expires: SessionBusy
 		// fails the attempt, and Conductor retries it with backoff (the Session workflow's attempts cover a lease).
 		const storage = await PostgresStorage.open(options.sql, key, {
@@ -688,7 +575,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		const frame: BridgeFrame = {
 			host,
 			ctx,
-			evaluator,
+			models: options.models,
 			harness: undefined as unknown as Harness,
 			session: key,
 			children: new Map(),
@@ -787,16 +674,17 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 			let conversation = id ? await harness.conversation(id, context) : undefined;
 			if (!conversation) {
 				conversation = await harness.createConversation(
-					{ ownership: { kind: "ownerless" } },
+					{
+						ownership: { kind: "ownerless" },
+						init: async (tx, created) => {
+							(await tx.doc(Conversations)).ids[agentName] = created;
+						},
+					},
 					context,
 				);
-				const created = conversation.id;
-				await harness.commit(async (tx) => {
-					(await tx.doc(Conversations)).ids[agentName] = created;
-				}, context);
 			}
 			await conversation.configure(configs.get(agentName)!, context);
-			const entry: Hosted = { conversation, offered: (await conversation.agent(context)).tools };
+			const entry: Hosted = { conversation };
 			conversations.set(agentName, entry);
 			await offer(entry, await threaded(conversation.id));
 			return entry;
@@ -811,16 +699,12 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		}
 
 		// Tools are not filtered by who is talking: a conversation can have many participants, and a tool that needs
-		// permission asks its own approvers. Only unregistered workflows drop out, and `no_reply` is offered only while
-		// the conversation answers input with a reply thread.
+		// permission asks its own approvers. `no_reply` is offered only while the conversation answers input with a reply
+		// thread.
 		async function offer(hosted: Hosted, withNoReply: boolean) {
 			if (hosted.replying === withNoReply) return;
 			await hosted.conversation.configure(
-				{
-					tools: hosted.offered.filter((tool) =>
-						tool === noReply ? withNoReply : registered(tool),
-					),
-				},
+				{ tools: withNoReply ? null : { remove: [noReply] } },
 				context,
 			);
 			hosted.replying = withNoReply;
@@ -950,49 +834,8 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 			await closeView(conversation.id);
 		}
 
-		/**
-		 * A workflow's state operation, between Pi's passes: commits its response with its receipt (a write only if the
-		 * state is still at the revision it read), then emits it. A resent operation gets its receipt again.
-		 */
-		async function stateOperation(input: StateRequest) {
-			let response: StateResponse;
-			try {
-				const definition = stateOf(input.state);
-				const replacement = input.write
-					? await parseSchema(definition.schema, input.write.value, `state ${definition.name}`)
-					: undefined;
-				response = await harness.commit(async (tx) => {
-					const receipt = await tx.doc(WorkflowReceipts, input.operation, "");
-					if (receipt.value !== null) return cloneJson(receipt.value) as StateResponse;
-					const revision = await stateRevision(tx, definition);
-					const result: StateResponse = !input.write
-						? { value: cloneJson(await stateDraft(tx, definition)), revision }
-						: input.write.revision !== revision
-							? { conflict: true, revision }
-							: {
-									value: await applyState(tx, definition, undefined, [() => replacement!]),
-									revision: revision + 1,
-								};
-					receipt.value = cloneJson(result) as JsonObject;
-					return result;
-				}, context);
-			} catch (error) {
-				if (signal.aborted) throw error;
-				response = { error: error instanceof Error ? error.message : String(error) };
-			}
-			await native.emit(
-				STATE_EVENT as never,
-				{ operation: input.operation, ...response } as never,
-				{ metadata: childMetadata(ctx, sessionMetadata(key)) } as never,
-			);
-		}
-
 		const apply = (input: SessionInput) =>
-			input.kind === "stop"
-				? stop(input.agent, input.reason)
-				: input.kind === "state"
-					? stateOperation(input)
-					: admit(input);
+			input.kind === "stop" ? stop(input.agent, input.reason) : admit(input);
 
 		const obligations = async () => (await harness.snapshot(Obligations, context))?.requests ?? {};
 		/** Pi's record of a request submitted to a conversation. */
@@ -1390,8 +1233,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 			idle,
 			outcomes,
 			async handle(input) {
-				// A state operation gives Pi no work.
-				if (settled && input.kind !== "state") missed = true;
+				if (settled) missed = true;
 				inflight++;
 				try {
 					await serial(() => apply(input));
@@ -1821,111 +1663,13 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 			);
 		},
 	};
-	/**
-	 * Sends a state request to the Session's host through its input signal, subscribed to the response first; the
-	 * host's signal handling wakes a suspended Session and starts a closed one. Unanswered, the same operation is sent
-	 * again, and the host answers it from its receipt.
-	 */
-	async function stateRequest(
-		ctx: TaskContext,
-		id: string,
-		key: string,
-		request: Omit<StateRequest, "kind" | "operation">,
-	): Promise<Exclude<StateResponse, { error: string }>> {
-		const native = nativeMethods(ctx);
-		const operation = `${ctx.executionId}:${id}`;
-		const payload: StateRequest = { kind: "state", operation, ...request };
-		for (let n = 0; n < STATE_REQUESTS; n++) {
-			const at = n ? `${id}:${n}` : id;
-			const response = await native.subscribe(`${at}:response`, {
-				event: { name: STATE_EVENT },
-				filter: { operation: [operation] },
-			} as never);
-			await native.signalWithStart(`${at}:request`, {
-				task: SESSION_WORKFLOW,
-				queue: ctx.queue,
-				key,
-				signal: {
-					name: "input",
-					id: `fabrial.state:${operation}${n ? `:${n}` : ""}`,
-					payload: payload as unknown as Json,
-				},
-				input: { session: key },
-				metadata: childMetadata(ctx, sessionMetadata(key)),
-			} as never);
-			const won = await native.waitForAny(
-				`${at}:wait`,
-				{ response },
-				{ timeout: options.stateTimeoutMs ?? 60_000 },
-			);
-			if (!("event" in won)) continue;
-			const answer = (won.event as { payload: unknown }).payload as StateResponse;
-			if ("error" in answer) throw new Error(answer.error);
-			return answer;
-		}
-		throw new Error(
-			`State ${request.state}: Session ${key} did not answer operation ${id} after ${STATE_REQUESTS} requests`,
-		);
-	}
-	/** `ctx.state(S)` in workflow code. Each call is one durable operation. */
-	const state = {
-		get: async <T extends JsonObject>(
-			ctx: TaskContext,
-			id: string,
-			definition: StateDefinition<T>,
-		): Promise<T> => {
-			const key = sessionKey(metadataOf(ctx));
-			stateOf(definition.name);
-			const answer = await stateRequest(ctx, id, key, { state: definition.name });
-			if ("conflict" in answer) throw new Error(`State ${definition.name}: a read cannot conflict`);
-			return answer.value as T;
-		},
-		/**
-		 * Optimistic: reads the value and its revision, applies `change` here (closures stay in the workflow), and
-		 * replaces the value if nothing changed it since; otherwise it reads again, up to `stateConflicts` times.
-		 */
-		update: async <T extends JsonObject>(
-			ctx: TaskContext,
-			id: string,
-			definition: StateDefinition<T>,
-			change: (draft: T) => void | T,
-		): Promise<T> => {
-			const key = sessionKey(metadataOf(ctx));
-			stateOf(definition.name);
-			const conflicts = options.stateConflicts ?? 20;
-			for (let n = 0; n < conflicts; n++) {
-				const at = n ? `${id}:retry:${n}` : id;
-				const read = await stateRequest(ctx, `${at}:read`, key, { state: definition.name });
-				if (!("value" in read)) throw new Error(`State ${definition.name}: a read cannot conflict`);
-				const value = await nativeMethods(ctx).step(`${at}:apply`, async () => {
-					const draft = cloneJson(read.value) as T;
-					return parseSchema(
-						definition.schema,
-						change(draft) ?? draft,
-						`state ${definition.name}`,
-					) as unknown as Json;
-				});
-				const written = await stateRequest(ctx, `${at}:write`, key, {
-					state: definition.name,
-					write: { value: value as JsonObject, revision: read.revision },
-				});
-				if ("value" in written) return written.value as T;
-			}
-			throw new Error(
-				`State ${definition.name}: update ${id} conflicted ${conflicts} times; the state kept changing between its read and its write`,
-			);
-		},
-	};
 	return {
 		...port,
-		state,
-		evaluator,
-		/** Pi's workflows, if the instance defines agents or state (core registers them when the app starts). */
+		/** The instance's Pi AI models: `ctx.evaluate` classifies with them too. */
+		models: options.models,
+		/** Pi's workflows, if the instance defines agents (core registers them when the app starts). */
 		get workflows(): WorkflowTask[] {
 			return used() ? [session, effect, report, reclaim] : [];
-		},
-		get events() {
-			return used() ? [{ name: STATE_EVENT, filterable: ["operation"] }] : [];
 		},
 		async start() {
 			if (!used()) return;
@@ -1943,14 +1687,6 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 					registry.install(extension);
 				}
 			for (const agent of definedAgents.get(scope) ?? []) install(agent);
-			await abortOrphans(
-				options.sql,
-				registry
-					.snapshot()
-					.tasks()
-					.map((task) => task.definition.name),
-				host.logger,
-			);
 			started = true;
 		},
 		async stop() {
@@ -1961,68 +1697,4 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 			await Promise.all(active.values());
 		},
 	};
-}
-
-/**
- * Aborts live Pi tasks whose kind is no longer installed (e.g. a removed toolkit), using Pi's abort cascade: a startup
- * policy of the deployment. The commit log only finds candidate Sessions (the latest record of such a task is not
- * terminal), without taking leases; each is then opened and Pi's own inspection decides what is live. A Session held
- * by another owner is skipped with a warning.
- */
-export async function abortOrphans(
-	sql: Sql,
-	installedKinds: readonly string[],
-	logger: Logger,
-): Promise<number> {
-	// Writes are JSON text (JSON.stringify), which may escape lone surrogates or NUL: Postgres JSON rejects the former
-	// and jsonb the latter. Surrogate escapes become U+FFFD and only the task fields read here are unescaped.
-	let candidates: { session_key: string }[];
-	try {
-		candidates = await sql<{ session_key: string }[]>`
-			SELECT DISTINCT session_key FROM (
-				SELECT DISTINCT ON (c.session_key, w.value->'value'->>'id') c.session_key,
-					w.value->'value'->>'kind' AS kind, w.value->'value'->'state'->>'status' AS status
-				FROM fabrial_pi.commits c, json_array_elements(
-					regexp_replace(c.writes, '\\\\u[dD][89a-fA-F][0-9a-fA-F]{2}', '\\\\ufffd', 'g')::json
-				) WITH ORDINALITY AS w(value, n)
-				WHERE c.writes LIKE '%"type":"task"%' AND w.value->>'type' = 'task'
-				ORDER BY c.session_key, w.value->'value'->>'id', c.seq DESC, w.n DESC
-			) latest
-			WHERE status <> 'terminal' AND NOT (kind = ANY(${[...installedKinds]}))
-			ORDER BY session_key`;
-	} catch (error) {
-		logger.warn("Could not look for orphaned agent work", { error });
-		return 0;
-	}
-	let aborted = 0;
-	for (const { session_key: key } of candidates) {
-		const counts = new Map<string, number>();
-		try {
-			const storage = await PostgresStorage.open(sql, key);
-			const { createModels } = await import("@earendil-works/pi-ai/models");
-			const harness = await Harness.open(
-				storage,
-				{ models: createModels(), registry: createRegistry() },
-				BACKGROUND_CONTEXT,
-			);
-			try {
-				const orphans = (await harness.inspect(BACKGROUND_CONTEXT)).tasks
-					.map((task) => task.record)
-					.filter((task) => !installedKinds.includes(task.kind));
-				for (const task of orphans) {
-					await harness.abortTask(task.id, BACKGROUND_CONTEXT);
-					await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
-					counts.set(task.kind, (counts.get(task.kind) ?? 0) + 1);
-					aborted++;
-				}
-			} finally {
-				await harness.close(BACKGROUND_CONTEXT);
-			}
-		} catch (error) {
-			logger.warn("Could not abort orphaned agent work", { session: key, error });
-		}
-		for (const [kind, count] of counts)
-			logger.warn("Aborted orphaned agent work", { session: key, kind, count });
-	}
-	return aborted;
 }

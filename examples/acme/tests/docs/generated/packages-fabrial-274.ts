@@ -19,10 +19,4 @@ const note = f.defineTool({
 		return "noted";
 	},
 });
-const seed = f.defineWorkflow({
-	name: "seed",
-	async run(_input, ctx) {
-		await ctx.state(Notes).update("seed", (s) => ({ notes: [...s.notes, "Seeded."] }));
-	},
-});
 export {};

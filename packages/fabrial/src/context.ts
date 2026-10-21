@@ -25,8 +25,7 @@ import type { AgentRef, AgentRunOptions } from "./agent.ts";
 import type { SendOptions } from "./send.ts";
 import type { ResourceRef } from "./plugin.ts";
 import type { FollowOptions } from "./follows.ts";
-import type { EvaluateRequest } from "./evaluate.ts";
-import type { StateDefinition } from "./state.ts";
+import { evaluate, type EvaluateRequest } from "./models.ts";
 import type { ApprovalOptions } from "./approval.ts";
 import type { GroupDefinition, Principal } from "./identity.ts";
 
@@ -275,15 +274,11 @@ export async function createContext(options: ContextOptions) {
 			native.step(op(id), () =>
 				unfollowResource(host, metadata, surfaces(), resource, storedFollowOptions(opts)),
 			),
-		evaluate: async (id: string, request: EvaluateRequest<any>) =>
+		evaluate: async (id: string, request: EvaluateRequest) =>
 			native.step(
 				op(id),
-				async () => (await agents.evaluator.evaluate(request, raw.signal)) as unknown as Json,
+				async () => (await evaluate(agents.models, request, raw.signal)) as unknown as Json,
 			),
-		state: (state: StateDefinition<any, "session">) => ({
-			get: (id: string) => agents.state.get(raw, op(id), state),
-			update: (id: string, fn: never) => agents.state.update(raw, op(id), state, fn),
-		}),
 		requestApproval: async (id: string, opts: ApprovalOptions) =>
 			createApproval(op(id), opts, { ...options, native, op }),
 		waitForApproval: async (id: string, opts: ApprovalOptions) => {

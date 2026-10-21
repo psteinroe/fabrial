@@ -26,19 +26,14 @@ export type {
 	ToolResult,
 	ToolThread,
 } from "./agent.ts";
-export type { ModelCredentials } from "./agents/models.ts";
+export type { ModelCredentials } from "./models.ts";
 export type {
 	ApprovalDecision,
 	ApprovalHandle,
 	ApprovalOptions,
 	DecisionStatus,
 } from "./approval.ts";
-export type {
-	EvaluateAnswer,
-	EvaluateQuestion,
-	EvaluateRequest,
-	EvaluateResult,
-} from "./evaluate.ts";
+export type { EvaluateRequest } from "./models.ts";
 export type { EmitOptions, EventFilter, FilterAlternative, Origin } from "./events.ts";
 export type { ConversationRef, FollowOptions, FollowReceipt, UnfollowReceipt } from "./follows.ts";
 export {
@@ -64,7 +59,7 @@ export type {
 	SendReceipt,
 	SessionOption,
 } from "./send.ts";
-export type { StateDefinition, StateScope, ToolStateHandle, WorkflowStateHandle } from "./state.ts";
+export type { StateDefinition, StateScope, ToolStateHandle } from "./state.ts";
 export type {
 	Card,
 	CardAction,

@@ -12,15 +12,16 @@ export const generalAssistant = f.defineWorkflow({
 			state: { message: message.text, channel: message.channelId },
 			questions: {
 				bug: {
-					type: "boolean",
+					type: "bool",
 					instructions: "Is this a bug report rather than a support operation?",
+					criteria: { true: "A bug report", false: "A support operation" },
 				},
 			},
 		});
 		if (
 			message.channelId === channels.bugs ||
 			(route.stopReason === "stop" &&
-				route.answers.bug?.value &&
+				route.answers.bug?.type === "bool" &&
 				route.answers.bug.probability >= 0.9)
 		) {
 			// The investigation is the support agent's answer here; nothing waits for replies in this thread.

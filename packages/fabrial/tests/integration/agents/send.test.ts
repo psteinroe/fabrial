@@ -26,7 +26,7 @@ import {
 	type Json,
 	type JsonObject,
 } from "../../internals.ts";
-import { PostgresStorage } from "../../../src/agents/index.ts";
+import { PostgresStorage } from "../../../src/agents/storage.ts";
 import { Conversations, Invocation, Obligations } from "../../../src/agents/documents.ts";
 import { WAITING_STATUS } from "../../../src/agents/errors.ts";
 import type { Logger } from "../../../src/app.ts";

@@ -90,26 +90,6 @@ export const Suspensions = defineDoc({
 	version: 1,
 	initial: (): { count: number } => ({ count: 0 }),
 });
-/** A workflow's state operation's response, by operation id: a retried request gets the same answer. */
-export const WorkflowReceipts = defineDocFamily({
-	family: true,
-	kind: "fabrial.workflow-state-receipt",
-	scope: "session",
-	version: 1,
-	initial: (_seed: string): { value: JsonObject | null } => ({ value: null }),
-});
-/** Thread state revisions, by state name: every change advances its state's, so a workflow's update can compare. */
-const StateRevisions = defineDoc({
-	kind: "fabrial.state-revisions",
-	scope: "session",
-	version: 1,
-	initial: (): { revisions: Record<string, number> } => ({ revisions: {} }),
-});
-
-export async function stateRevision(tx: Tx, definition: StateDefinition): Promise<number> {
-	return (await tx.doc(StateRevisions)).revisions[definition.name] ?? 0;
-}
-
 export interface ChildIntent extends JsonObject {
 	workflow: string;
 	input: Json;
@@ -233,9 +213,5 @@ export async function applyState<T extends JsonObject>(
 	value = await parseSchema(definition.schema, value, `state ${definition.name}`);
 	for (const key of Object.keys(draft)) if (!(key in value)) delete draft[key];
 	Object.assign(draft, value);
-	if (definition.scope === "session") {
-		const { revisions } = await tx.doc(StateRevisions);
-		revisions[definition.name] = (revisions[definition.name] ?? 0) + 1;
-	}
 	return value;
 }

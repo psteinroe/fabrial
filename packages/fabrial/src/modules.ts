@@ -29,10 +29,9 @@ export type {
 	ToolResult,
 	ToolThread,
 } from "./agent.ts";
-export type { ModelCredentials } from "./agents/models.ts";
+export type { ModelCredentials } from "./models.ts";
 export type { App, FabrialHost, Logger } from "./app.ts";
 export type * from "./approval.ts";
-export * from "./evaluate.ts";
 export * from "./events.ts";
 export * from "./identity.ts";
 export type * from "./json.ts";

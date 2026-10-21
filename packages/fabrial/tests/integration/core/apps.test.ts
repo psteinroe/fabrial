@@ -17,7 +17,7 @@ import {
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { createModels } from "@earendil-works/pi-ai/models";
 import postgres, { type Sql } from "postgres";
-import { PostgresStorage } from "../../../src/agents/index.ts";
+import { PostgresStorage } from "../../../src/agents/storage.ts";
 import { FakeChat, sessionSignals, testApp } from "../../../src/testing-internal.ts";
 import { useConductor } from "../../conductor/helper.ts";
 

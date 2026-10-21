@@ -5,7 +5,7 @@ import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import postgres, { type Sql } from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { LeaseLost, PostgresStorage, SessionBusy } from "../../../src/agents/index.ts";
+import { LeaseLost, PostgresStorage, SessionBusy } from "../../../src/agents/storage.ts";
 
 let sql: Sql;
 let container: Awaited<ReturnType<PostgreSqlContainer["start"]>>;

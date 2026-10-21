@@ -290,17 +290,11 @@ const note = f.defineTool({
 		return "noted";
 	},
 });
-const seed = f.defineWorkflow({
-	name: "seed",
-	async run(_input, ctx) {
-		await ctx.state(Notes).update("seed", (s) => ({ notes: [...s.notes, "Seeded."] }));
-	},
-});
 ```
 
-- `scope: "session"`: one value per Session, shared by every conversation in it and the workflows its agents call as tools (and the workflows those start). Other workflows use their thread's Session, so they don't see a channel or custom Session's value; once their thread exists (posted). A `ctx.agent` call's tools see their call Session's value, not the thread's: pass what the agent needs in `input`.
+- `scope: "session"`: one value per Session, shared by the tools of every conversation in it. A `ctx.agent` call's tools see their call Session's value, not the thread's: pass what the agent needs in `input`.
 - `scope: "agent"`: one value per conversation, for tools only (a type error in workflows).
-- Agents listing a state in `state` see its `render` output in their prompt. Tool updates commit with the tool result; workflow updates are optimistic and retry on conflict. Updaters must be pure. Bump `version` and add `migrate` when the shape changes.
+- Agents listing a state in `state` see its `render` output in their prompt. Tool updates commit with the tool result. Only tools use state: workflows pass what an agent needs with `ctx.send` or `ctx.agent`'s `input`. Updaters must be pure. Bump `version` and add `migrate` when the shape changes.
 
 ### `ctx.evaluate`
 
@@ -312,15 +306,21 @@ const route = f.defineWorkflow({
 		const result = await ctx.evaluate("route", {
 			model: "typesafe/jev-latest",
 			state: { message: message.text },
-			questions: { bug: { type: "boolean", instructions: "Is this a bug report?" } },
+			questions: {
+				bug: {
+					type: "bool",
+					instructions: "Is this a bug report?",
+					criteria: { true: "Yes", false: "No" },
+				},
+			},
 		});
-		const bug = result.stopReason === "stop" && result.answers.bug?.value;
+		const bug = result.answers.bug?.type === "bool" && result.answers.bug.probability >= 0.5;
 		await ctx.send("deliver", support, { input: message, priority: bug ? "urgent" : "normal" });
 	},
 });
 ```
 
-Questions are `choice`, `score`, or `boolean`, on Pi AI's `models.classify()`; distributions, confidence, and usage are kept. Unknown classifiers and provider errors return `stopReason: "error"`, so workflows fall back explicitly. The result is a memoized step in workflows and a memo in tools.
+The request is Pi AI's `ClassifierContext` (`choice`, `score` and `bool` questions) plus the classifier's `"provider/model"`, and the result is Pi AI's `ClassifierResult`, unchanged. Unknown classifiers and provider errors return `stopReason: "error"`, so workflows fall back explicitly. The result is a memoized step in workflows and a memo in tools.
 
 ### Plugins
 
@@ -462,7 +462,7 @@ Cancellation aborts the recorded request and task tree, not a newer run in the c
 
 **Tools and state.** Fabrial tools become Pi tools; toolkits and instructions become Pi extensions and prompt sections; observers are Pi hooks. Managed thread posts, updates, and history use stable child executions keyed by Session, Pi task, and operation id. Their step receipts survive Session reopenings; an external I/O crash before the receipt remains at-least-once. `ctx.evaluate` in tools uses Pi memos. `ctx.start` is independent; `ctx.invoke` is reconnectable workflow work. Plugin clients are not automatically durable: use managed operations or workflow tools for side effects.
 
-State uses Pi documents: a thread family per Session and rewindable, forkable conversation documents. **State has two scopes.** `"session"` state belongs to a Session: its conversations share it, and so do the workflows its agents' tools started (their metadata carries the calling conversation, whose Session they use), so a channel-session agent and its workflow tools see the same value from every thread of its channel. Independent workflows (triggered, or started by other workflows) use their thread's Session, else their own request's. A `ctx.agent` call runs in its own Session, so its tools read and write that call Session's state, not the thread's; pass what the agent needs in `input` and write results back from the workflow. Workflow reads and updates go through the Session: the workflow signals its execution with a state request and waits for the response event, so it never opens Pi and never waits behind a running agent. Updates are optimistic: the updater runs in the workflow, and the Session applies the new value only if the state's revision is unchanged since the read; otherwise the workflow reads again, up to `stateConflicts` times (default 20), then fails. An operation receipt stores each response in the same Pi commit as the mutation, so a resent or duplicated request gets the same answer and applies once; an unanswered request is resent after `stateTimeoutMs`. Workflow state needs a posted thread: an unposted channel locator is rejected (post with `ctx.thread.post` first). `"agent"` state is per conversation, for tools only: `ctx.state` in a workflow accepts only session-scoped definitions (a type error otherwise, and a runtime error for untyped callers) because the state port carries no conversation selector. Tool changes are staged, schema-validated, and committed on the Session's serialized commit line together with a tool result receipt; Pi appends its transcript result in its next settlement commit. On replay the receipt returns the saved result without reapplying state. This works around Pi 1.0 having no tool-result transaction callback; it is not an atomic transcript append. Updates must be pure because they may run again against newer state.
+State uses Pi documents: a thread family per Session and rewindable, forkable conversation documents. **State has two scopes.** `"session"` state belongs to a Session: its conversations' tools share it, so a channel-session agent sees the same value from every thread of its channel. A `ctx.agent` call runs in its own Session, so its tools read and write that call Session's state, not the thread's; pass what the agent needs in `input`. Only tools read and change state; workflows pass data to agents with `ctx.send` or `ctx.agent`'s `input`. Tool changes are staged, schema-validated, and committed on the Session's serialized commit line together with a tool result receipt; Pi appends its transcript result in its next settlement commit. On replay the receipt returns the saved result without reapplying state. This works around Pi 1.0 having no tool-result transaction callback; it is not an atomic transcript append. Updates must be pure because they may run again against newer state.
 
 **Registry and orphans.** Plugin observers are installed globally; agents select their toolkits explicitly. Installation covers plugin toolkits and the tools, toolkits, and state of agents defined through `f` before start. Discovery is instance-scoped, not exact workflow reachability: apps from the same `f` share definitions, unrelated instances do not install each other's agents, and unused agents of the same instance may still be installed. At start, Fabrial finds Sessions whose latest record of a task with an uninstalled kind is not terminal (e.g. a toolkit removed from every agent) from the commit log, without taking leases; it acquires only those Sessions, aborts the live tasks Pi's `inspect()` reports with such a kind through Pi's abort cascade, and logs a warning per Session and task kind with the count. A Session held by another owner is skipped with a warning; startup does not fail.
 

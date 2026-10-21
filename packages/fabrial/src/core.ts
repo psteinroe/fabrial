@@ -567,7 +567,6 @@ export function buildApp(config: CoreConfig): HostedApp {
 				),
 				{ name: INGRESS_EVENT, filterable: [] },
 				{ name: APPROVAL_DECIDED_EVENT, filterable: ["approvalId"] },
-				...agents.events,
 			],
 		});
 	};

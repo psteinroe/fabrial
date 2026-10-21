@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import { z } from "zod";
-import { toJsonSchema, toolContent } from "../../../src/agents/index.ts";
+import { toJsonSchema, toolContent } from "../../../src/agents/tools.ts";
 
 it("converts a Standard Schema input to JSON Schema for the model", () => {
 	const schema = toJsonSchema(

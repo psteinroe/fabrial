@@ -25,7 +25,8 @@ import {
 	type WorkflowTask,
 } from "../../internals.ts";
 import { toolName } from "../../../src/agent.ts";
-import { callSession, connectAgents, PostgresStorage } from "../../../src/agents/index.ts";
+import { callSession, connectAgents } from "../../../src/agents/pi.ts";
+import { PostgresStorage } from "../../../src/agents/storage.ts";
 import { SubagentWork } from "../../../src/agents/documents.ts";
 import type { ExternalIdentity } from "../../../src/identity.ts";
 import { FakeChat } from "../../../src/testing.ts";
@@ -1511,7 +1512,7 @@ it("continuing a background child from another actor and thread runs its tools f
 	await idle(client.queue);
 });
 
-it("channel-session agents share session state across threads with their workflow tools; a ctx.agent call's tools see their own", async () => {
+it("channel-session agents share session state across threads; a ctx.agent call's tools see their own", async () => {
 	const g = createFabrial({ plugins: [slackTest] });
 	const faux = fauxProvider();
 	const models = createModels();
@@ -1536,29 +1537,11 @@ it("channel-session agents share session state across threads with their workflo
 			return { result: `count=${count}` };
 		},
 	});
-	// A workflow the agent calls as a tool uses the calling conversation's (channel) Session, not its thread's.
-	const flow = g.defineWorkflow({
-		name: `flow-${short()}`,
-		description: "Bumps the counter from a workflow",
-		input: z.object({}),
-		run: async (_input, ctx) => {
-			const { count } = await ctx.state(Counter).update("bump", (draft) => {
-				draft.count++;
-			});
-			seen.push(count);
-			return { result: `count=${count}` };
-		},
-	});
-	// An independent workflow on the thread uses the thread's Session.
-	const read = g.defineWorkflow({
-		name: `read-${short()}`,
-		run: (_input, ctx) => ctx.state(Counter).get("read"),
-	});
 	const desk = g.defineAgent({
 		name: `desk-${short()}`,
 		description: "Bumps.",
 		model,
-		tools: [bump, flow],
+		tools: [bump],
 	});
 	const deliver = g.defineWorkflow({
 		name: `deliver-${short()}`,
@@ -1577,13 +1560,12 @@ it("channel-session agents share session state across threads with their workflo
 			const text = lastText(context);
 			if (text.includes("count="))
 				return say(`Done ${(JSON.parse(text) as { result: string }).result}.`);
-			if (text.includes("Flow")) return use(toolName(flow.name), {});
 			if (text.includes("Bump")) return use("bump", {});
 			return say("ok");
 		}),
 	);
 	const { client } = await launch(g, {
-		workflows: [deliver, call, flow, read],
+		workflows: [deliver, call],
 		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
 	// The fake chat derives a thread's channel from its id (`slack-test:<channel>:<thread>`): both threads share one.
@@ -1612,14 +1594,7 @@ it("channel-session agents share session state across threads with their workflo
 	expect(seen).toEqual([1, 2, 1]);
 	await client.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("a") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2, 1, 3]);
-	await client.invoke(deliver.name, { text: "Flow" }, { metadata: metadata("b") });
+	await client.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("b") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2, 1, 3, 4]);
-	await client.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("a") });
-	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2, 1, 3, 4, 5]);
-	const own = await client.invoke(read.name, null, { metadata: metadata("a") });
-	expect(await db.execution(own).settled()).toEqual({
-		status: "completed",
-		output: { count: 0 },
-	});
 	await idle(client.queue);
 });

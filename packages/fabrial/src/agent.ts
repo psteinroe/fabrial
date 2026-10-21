@@ -1,4 +1,5 @@
-import type { EvaluateQuestion, EvaluateRequest, EvaluateResult } from "./evaluate.ts";
+import type { ClassifierResult } from "@earendil-works/pi-ai";
+import type { EvaluateRequest } from "./models.ts";
 import type { Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { InferOutput, Schema } from "./schema.ts";
@@ -47,10 +48,8 @@ export interface ToolContext<
 		...args: WorkflowArgs<W>
 	): Promise<WorkflowOutput<W>>;
 	start<W extends AnyWorkflow>(id: string, workflow: W, ...args: WorkflowArgs<W>): Promise<string>;
-	evaluate<Q extends Record<string, EvaluateQuestion>>(
-		id: string,
-		request: EvaluateRequest<Q>,
-	): Promise<EvaluateResult<Q>>;
+	/** A classifier judgment with Pi AI's question and result types; durable under `id`. */
+	evaluate(id: string, request: EvaluateRequest): Promise<ClassifierResult>;
 	/** Send input to a conversation and return, as in workflows; `replyTo` defaults to this request's. */
 	send(id: string, agent: AgentRef, options: SendOptions): Promise<SendReceipt>;
 	/**

@@ -1,7 +1,7 @@
 import { createModels, createProvider } from "@earendil-works/pi-ai/models";
-import type { ClassifierContext, ClassifierModel } from "@earendil-works/pi-ai";
+import type { ClassifierContext, ClassifierModel, ClassifierQuestion } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { createEvaluator } from "../../../src/agents/index.ts";
+import { evaluate } from "../../../src/models.ts";
 
 const ref = "test/classifier";
 function fixture() {
@@ -48,47 +48,33 @@ function fixture() {
 			},
 		}),
 	);
-	return { evaluator: createEvaluator(models), received: () => received };
+	return { models, received: () => received };
 }
 
-describe("Pi classifier adapter", () => {
-	it("maps boolean, choice and ordered score rubric without inventing score probabilities", async () => {
-		const { evaluator, received } = fixture();
-		const result = await evaluator.evaluate(
-			{
-				model: ref,
-				state: "hello",
-				questions: {
-					ok: { type: "boolean", instructions: "Good?" },
-					route: { type: "choice", instructions: "Route", criteria: { a: "A", b: "B" } },
-					score: { type: "score", instructions: "Score", rubric: { low: "Low", high: "High" } },
-				},
-			},
-			new AbortController().signal,
-		);
-		expect(received()?.questions.ok?.type).toBe("bool");
-		expect(received()?.state).toEqual({ value: "hello" });
-		expect(result.answers.ok).toEqual({ type: "boolean", value: true, probability: 0.8 });
-		expect(result.answers.route).toMatchObject({
-			choice: "a",
-			probability: 0.7,
-			confidence: 0.4,
-			probabilities: { a: 0.7, b: 0.3 },
-		});
-		expect(result.answers.score).toEqual({
-			type: "score",
-			score: "high",
-			probabilities: {},
-			confidence: 0.6,
+describe("ctx.evaluate", () => {
+	it("passes Pi AI's questions and returns its result as is", async () => {
+		const { models, received } = fixture();
+		const questions = {
+			ok: { type: "bool" as const, instructions: "Good?", criteria: { true: "Yes", false: "No" } },
+			route: { type: "choice", instructions: "Route", criteria: { a: "A", b: "B" } },
+			score: { type: "score", instructions: "Score", criteria: ["Low", "High"] },
+		} satisfies Record<string, ClassifierQuestion>;
+		const result = await evaluate(models, { model: ref, state: { text: "hello" }, questions });
+		expect(received()).toEqual({ state: { text: "hello" }, questions });
+		expect(result.answers).toEqual({
+			ok: { type: "bool", probability: 0.8 },
+			route: { type: "choice", choice: "a", probabilities: { a: 0.7, b: 0.3 }, confidence: 0.4 },
+			score: { type: "score", score: 1, confidence: 0.6 },
 		});
 	});
-	it("returns errors rather than rejecting for unavailable classifiers", async () => {
-		const result = await createEvaluator(createModels()).evaluate(
-			{ model: ref, state: {}, questions: {} },
-			new AbortController().signal,
-		);
-		expect(result.stopReason).toBe("error");
-		expect(result.error).toBe("Unknown classifier test/classifier");
-		expect(result.model).toBe("test/classifier");
+	it("returns an error result rather than rejecting for unknown classifiers", async () => {
+		const result = await evaluate(createModels(), { model: ref, state: {}, questions: {} });
+		expect(result).toMatchObject({
+			stopReason: "error",
+			errorMessage: "Unknown classifier test/classifier",
+			provider: "test",
+			model: "classifier",
+			answers: {},
+		});
 	});
 });

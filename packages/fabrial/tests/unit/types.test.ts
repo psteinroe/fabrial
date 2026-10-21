@@ -46,7 +46,7 @@ it("ctx.agent rejects mismatched usage", () => {
 	expectTypeOf(check).toBeFunction();
 });
 
-it("workflows accept session state and reject agent state", () => {
+it("tools use state of both scopes; workflows have none", () => {
 	const schema = z.object({ count: z.number() });
 	const session = defineState({
 		name: "s",
@@ -56,9 +56,8 @@ it("workflows accept session state and reject agent state", () => {
 	});
 	const agent = defineState({ name: "a", scope: "agent", schema, initial: () => ({ count: 0 }) });
 	const check = async (ctx: WorkflowContext, tool: ToolContext) => {
-		expectTypeOf(await ctx.state(session).get("get")).toEqualTypeOf<{ count: number }>();
-		// @ts-expect-error Agent-scoped state belongs to a conversation, which a workflow does not select.
-		ctx.state(agent);
+		// @ts-expect-error State belongs to tools; workflows pass data to agents with `ctx.send`.
+		ctx.state(session);
 		expectTypeOf(await tool.state(session).get()).toEqualTypeOf<{ count: number }>();
 		expectTypeOf(await tool.state(agent).get()).toEqualTypeOf<{ count: number }>();
 	};

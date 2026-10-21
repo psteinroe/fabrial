@@ -3,7 +3,7 @@ import type { MutableModels } from "@earendil-works/pi-ai";
 import type { ConversationRetryPolicy } from "@earendil-works/pi-durable";
 import postgres, { type Sql } from "postgres";
 import type { PiOptions } from "./agents/pi.ts";
-import { createModels, type ModelCredentials } from "./agents/models.ts";
+import { createModels, type ModelCredentials } from "./models.ts";
 import type { CoreConfig } from "./app.ts";
 import type { ConductorConfig } from "./conductor.ts";
 

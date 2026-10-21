@@ -1,5 +1,6 @@
 import { defineTool as piTool, LiveDoc } from "@earendil-works/pi-durable";
-import type { TSchema } from "@earendil-works/pi-ai";
+import type { ClassifierResult, Models, TSchema } from "@earendil-works/pi-ai";
+import { evaluate } from "../models.ts";
 import type { Context } from "@earendil-works/chord";
 import { createContextKey } from "@earendil-works/chord/context";
 import type {
@@ -19,8 +20,6 @@ import {
 import {
 	parseSchema,
 	type AnyWorkflow,
-	type EvaluateResult,
-	type Evaluator,
 	type FabrialHost,
 	type InvocationMetadata,
 	type Json,
@@ -50,7 +49,8 @@ export interface BridgeFrame {
 	host: FabrialHost;
 	/** Conductor's context of the Session's execution. */
 	ctx: TaskContext;
-	evaluator: Evaluator;
+	/** The instance's Pi AI models, for `ctx.evaluate`. */
+	models: Models;
 	harness: Harness;
 	/** The Pi Session key this execution hosts. */
 	session: string;
@@ -119,7 +119,10 @@ export async function fields(
 		ids.set(id, count + 1);
 		return count ? `${id}#${count}` : id;
 	};
-	/** `child` is a reporter (`waited` start): its result is the committed outcome of the workflow it ran. */
+	/**
+	 * `child` is a reporter (`waited` start): its result is the committed outcome of the workflow it ran. An outcome
+	 * other than completed throws as JSON, so a workflow tool's model sees its status (failed or cancelled).
+	 */
 	const childResult = async (child: string): Promise<Json> => {
 		let result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
 		if (!result) {
@@ -132,8 +135,7 @@ export async function fields(
 			);
 			result = await bridge.waitChild(api!.taskId, child, context);
 		}
-		if (result.status !== "completed")
-			throw new Error(JSON.stringify(result.error ?? result.reason ?? result.status));
+		if (result.status !== "completed") throw new Error(JSON.stringify(result));
 		return result.output ?? null;
 	};
 	const operation = async (id: string, method: string, args: Json[]): Promise<Json> => {
@@ -172,7 +174,7 @@ export async function fields(
 	};
 	const start = (id: string, workflow: AnyWorkflow, input: Json = null) =>
 		launch(id, workflow, input, false);
-	const ctx = bindMetadata<FabrialFields>(
+	return bindMetadata<FabrialFields>(
 		{
 			actor: metadata.requestedBy,
 			clients: bridge.host.clients(),
@@ -225,8 +227,9 @@ export async function fields(
 				if (!api) throw new Error("Prompt sections cannot evaluate models");
 				const key = `fabrial:pi:evaluate:${operationId(id)}`;
 				const saved = await api.memo(key, context);
-				if (saved) return saved as unknown as EvaluateResult<typeof request.questions>;
-				const result = await bridge.evaluator.evaluate(
+				if (saved) return saved as unknown as ClassifierResult;
+				const result = await evaluate(
+					bridge.models,
 					request,
 					context.abortSignal ?? bridge.ctx.signal,
 				);
@@ -234,7 +237,7 @@ export async function fields(
 					key,
 					cloneJson(result) as unknown as Json,
 					context,
-				)) as unknown as EvaluateResult<typeof request.questions>;
+				)) as unknown as ClassifierResult;
 			},
 			state: <T extends JsonObject>(definition: StateDefinition<T>): ToolStateHandle<T> => {
 				const key = `${definition.scope}:${definition.name}`;
@@ -269,22 +272,6 @@ export async function fields(
 		},
 		metadata,
 	);
-	waitedStarts.set(ctx, (id, workflow, input) => launch(id, workflow, input as never, true));
-	return ctx;
-}
-
-const waitedStarts = new WeakMap<
-	object,
-	(id: string, workflow: AnyWorkflow, input: Json) => Promise<string>
->();
-/** Starts a workflow a tool waits on, behind its reporter (see `startChild`); returns the reporter's execution id. */
-export function startWaited(
-	ctx: FabrialFields,
-	id: string,
-	workflow: AnyWorkflow,
-	input: Json,
-): Promise<string> {
-	return waitedStarts.get(ctx)!(id, workflow, input);
 }
 
 /** A reporter's result is `{ child, result }`, the committed outcome of the child it ran; else it never reported. */

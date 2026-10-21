@@ -1,5 +1,12 @@
-import type { CredentialStore, MutableModels } from "@earendil-works/pi-ai";
+import type {
+	ClassifierContext,
+	ClassifierResult,
+	CredentialStore,
+	Models,
+	MutableModels,
+} from "@earendil-works/pi-ai";
 import { builtinModels, builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import { parseModel } from "./agent.ts";
 
 /** Credentials per model provider, e.g. `{ anthropic: { apiKey } }`. */
 export type ModelCredentials = Record<string, { apiKey: string | undefined }>;
@@ -28,5 +35,33 @@ export function createModels(credentials: ModelCredentials): {
 				if (!value.apiKey) throw new Error(`Model provider "${provider}" requires an apiKey`);
 			}
 		},
+	};
+}
+
+/** `ctx.evaluate`'s request: Pi AI's classifier context and the classifier, `"provider/model"`. */
+export interface EvaluateRequest extends ClassifierContext {
+	model: string;
+}
+
+/**
+ * Classifies with Pi AI's `models.classify()`. An unknown classifier is a result with `stopReason: "error"`, as are
+ * provider failures, so callers fall back explicitly. Callers make it durable: a step in workflows, a memo in tools.
+ */
+export async function evaluate(
+	models: Models,
+	{ model: name, ...context }: EvaluateRequest,
+	signal?: AbortSignal,
+): Promise<ClassifierResult> {
+	const ref = parseModel(name);
+	const model = models.getModelOfType("classifier", ref.provider, ref.modelId);
+	if (model) return models.classify(model, context, signal ? { signal } : {});
+	return {
+		api: "unknown",
+		provider: ref.provider,
+		model: ref.modelId,
+		answers: {},
+		stopReason: "error",
+		errorMessage: `Unknown classifier ${name}`,
+		timestamp: Date.now(),
 	};
 }

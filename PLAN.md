@@ -149,7 +149,6 @@ Workflow context:
 | `ctx.agent(id, agent, opts)`                    | Calls an agent and returns its answer; nothing is posted.                                                       |
 | `ctx.send(id, agent, { input, home? })`         | Hands an event to an agent's conversation and returns (see [Conversations](#conversations)).                    |
 | `ctx.follow(id, ref)` / `ctx.unfollow(id, ref)` | A conversation starts or stops following a thread or resource.                                                  |
-| `ctx.state(S).get(id)` / `.update(id, fn)`      | Shared state (`defineState`), durable.                                                                          |
 | `ctx.evaluate(id, { model, state, questions })` | Structured judgment (Jev), durably recorded.                                                                    |
 | `ctx.waitForApproval(id, opts)`                 | Complete approval protocol over Conductor `waitForEvent`. Sugar for `requestApproval` + awaiting the decision.  |
 | `ctx.requestApproval(id, opts)`                 | Posts the approval request and returns a handle: `branch` (for `ctx.waitForAny`), `wait(id)`, `cancel(reason)`. |
@@ -245,22 +244,16 @@ export const Findings = f.defineState({
 	render: (s) => (s.notes.length ? `Known so far:\n- ${s.notes.join("\n- ")}` : undefined), // optional: show to agents
 });
 
-// workflow: durable ops with IDs
-await ctx.state(Findings).update("seed", (s) => {
-	s.customerId ??= report.organisationId;
-});
-const findings = await ctx.state(Findings).get("check");
-
-// tool: no ID, committed atomically with the tool result
+// tools only: no ID, committed atomically with the tool result
 await ctx.state(Findings).update((s) => {
 	s.notes.push(text);
 });
 ```
 
-| Scope    | Lives for                         | Shared by                                  | Pi document underneath |
-| -------- | --------------------------------- | ------------------------------------------ | ---------------------- |
-| `thread` | the whole thread, across requests | every workflow and agent in the thread     | session doc            |
-| `agent`  | one agent's conversation          | that agent only; forks and rewinds with it | conversation doc       |
+| Scope     | Lives for                          | Shared by                                  | Pi document underneath |
+| --------- | ---------------------------------- | ------------------------------------------ | ---------------------- |
+| `session` | the whole Session, across requests | the tools of every agent in the Session    | session doc            |
+| `agent`   | one agent's conversation           | that agent only; forks and rewinds with it | conversation doc       |
 
 - A workflow's own local state is just its variables, made durable through steps.
 - Workflow `get`/`update` go through the thread's Session: the workflow signals the Session's execution (starting it if closed) with a state request and waits for its response event, so it never opens Pi itself and never waits behind a running agent. The host answers between Pi's passes, also while the Session is suspended on an approval.
@@ -285,7 +278,7 @@ Approvals are always workflow-backed. A tool that needs approval is a workflow i
 
 ### `ctx.evaluate` (Jev)
 
-The shape follows Vercel AI SDK's experimental `evaluate`. It is implemented on Pi AI's native `models.classify()` and needs neither AI SDK nor AI Gateway.
+A thin durable helper over Pi AI's `models.classify()`: the request is Pi AI's `ClassifierContext` plus `model`, the result Pi AI's `ClassifierResult`.
 
 ```ts
 const result = await ctx.evaluate("route", {
@@ -853,7 +846,7 @@ Recorded as open questions are resolved.
   ```
 - **Following other things is `ctx.follow` / `ctx.unfollow`, with records in the resource thread's state** (replaces `ctx.subscribe`, the `fabrial.subscriptions` table, `f.defineSubscriptionPolicy`, presets, `until`, and the delivery observer workflow). Plugin ingress delivers notifications directly: it reads the follow records of the event's threads and signals each follower; request ids are `${event id}:${session}:${agent}`. Overrides are declarative (`priority` per kind, `events: "all"`); there are no app filter or priority functions. Resource follows are a list of their own in thread state (`resourceFollows`), so chat messages on a PR thread don't reach them and a comment arriving on both GitHub endpoints is delivered once. The app's own bot is trusted, but its comments and reviews are `low`, so an agent's own GitHub reply doesn't wake it.
 - **Runtimes are hidden behind Fabrial's API** (replaces thin adapters returning native Pi objects). App authors install one `fabrial` package and configure a database and model credentials; Conductor, Pi, and Chat SDK are internal modules. Tools use a Standard Schema `input` (converted to JSON Schema for the model) and return a string or JSON; toolkits replace Pi extensions and sections; hooks are Fabrial observers. There is no escape hatch (`ctx.raw`, `configure`) while Fabrial is in preview: what apps need becomes API. Plugin authors writing a chat provider still hand over a Chat SDK adapter, the one runtime type they see. Internally, per-request context still comes from a `fabrial.invocation` document that `ctx.agent` commits right before `submit()`, keyed by request ID.
-- **State is `defineState`, and app authors don't write Pi tasks.** `defineState({ name, scope, schema, initial, render })` with scopes `session` and `agent`, backed by Pi documents. Session state belongs to the Session (workflows on that thread's Session and conversations following it); agent state is tools-only and rejected in workflows at the type level; a `ctx.agent` call's tools see the call Session's state. `ctx.state(S).get/update` works in workflows (durable ops with IDs) and in tools (committed with the tool result). Agents see the states listed in `defineAgent.state` through `render`. Durable or long-running tool work is a workflow in `tools`. Pi tasks and raw documents stay internal / advanced, with no `defineTask` adapter. This replaces exposing raw Pi (`ctx.pi`) and `ctx.agent` document options, both of which made the DX convoluted.
+- **State is `defineState`, and app authors don't write Pi tasks.** `defineState({ name, scope, schema, initial, render })` with scopes `session` and `agent`, backed by Pi documents. Session state belongs to the Session's conversations, agent state to one conversation; a `ctx.agent` call's tools see the call Session's state. `ctx.state(S).get/update` is for tools only (committed with the tool result); workflows pass data to agents with `ctx.send` (the workflow-side state protocol was cut). Agents see the states listed in `defineAgent.state` through `render`. Durable or long-running tool work is a workflow in `tools`. Pi tasks and raw documents stay internal / advanced, with no `defineTask` adapter. This replaces exposing raw Pi (`ctx.pi`) and `ctx.agent` document options, both of which made the DX convoluted.
 - **The agent registry is derived, and nothing is selected by default.** There is no app-level toolkit list. Installed = Fabrial's internal toolkit + every plugin's `toolkit` + every toolkit referenced by an agent reachable from the registered workflows. Each agent gets exactly what its `toolkits` and `tools` list. On startup, Fabrial aborts pending agent work whose toolkit is no longer installed and logs it.
 - **Approval is explicit code only.** A tool that needs approval is a workflow that calls `ctx.waitForApproval`, listed in an agent's `tools`. The approval sits next to the logic, so previews, conditions, and multiple approvals are plain code. Not for now: a declarative `approval` option on `defineWorkflow`, or a `requireApproval` option on `f.defineTool`. Add them later if needed.
 - **Orphaned agent work is aborted at startup.** When a deploy removes a toolkit that pending agent work still needs, `app.start()` aborts that work and logs it instead of failing the deploy.

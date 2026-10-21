@@ -1,5 +1,6 @@
 import type { ApprovalDecision, ApprovalHandle, ApprovalOptions } from "./approval.ts";
-import type { EvaluateQuestion, EvaluateRequest, EvaluateResult } from "./evaluate.ts";
+import type { ClassifierResult } from "@earendil-works/pi-ai";
+import type { EvaluateRequest } from "./models.ts";
 import type { GroupDefinition, Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { Origin } from "./events.ts";
@@ -10,8 +11,6 @@ import type { Schema } from "./schema.ts";
 import type { SendOptions, SendReceipt } from "./send.ts";
 import type { ResourceRef } from "./plugin.ts";
 import type { FollowOptions, FollowReceipt, UnfollowReceipt } from "./follows.ts";
-import type { JsonObject as StateValue } from "./json.ts";
-import type { StateDefinition, WorkflowStateHandle } from "./state.ts";
 import type { Thread } from "./thread.ts";
 import type { TriggerPayload, TriggerSpec } from "./trigger.ts";
 
@@ -142,12 +141,8 @@ export interface WorkflowContext<TClients = Record<string, unknown>> extends Omi
 		resource: ResourceRef<any>,
 		options?: Pick<FollowOptions, "to">,
 	): Promise<UnfollowReceipt>;
-	evaluate<Q extends Record<string, EvaluateQuestion>>(
-		id: string,
-		request: EvaluateRequest<Q>,
-	): Promise<EvaluateResult<Q>>;
-	/** Session-scoped state only: agent-scoped state belongs to a conversation, which a workflow does not select. */
-	state<T extends StateValue>(state: StateDefinition<T, "session">): WorkflowStateHandle<T>;
+	/** A classifier judgment with Pi AI's question and result types; durable under `id`. */
+	evaluate(id: string, request: EvaluateRequest): Promise<ClassifierResult>;
 
 	waitForApproval(id: string, options: ApprovalOptions): Promise<ApprovalDecision>;
 	requestApproval(id: string, options: ApprovalOptions): Promise<ApprovalHandle>;

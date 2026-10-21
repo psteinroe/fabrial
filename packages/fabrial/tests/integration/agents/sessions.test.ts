@@ -21,7 +21,8 @@ import {
 	type ThreadRef,
 } from "../../internals.ts";
 import { toolName } from "../../../src/agent.ts";
-import { callSession, PostgresStorage } from "../../../src/agents/index.ts";
+import { callSession } from "../../../src/agents/pi.ts";
+import { PostgresStorage } from "../../../src/agents/storage.ts";
 import { testClient } from "../../conductor/helper.ts";
 import { FakeChat, testApp } from "../../../src/testing-internal.ts";
 
@@ -938,94 +939,4 @@ it("a workflow tool's result sent while its Session restarts on another instance
 		1,
 	);
 	await released(await only());
-});
-
-it("workflows on another instance read and update a Session's state during a generation and while it waits on an approval; with its tool, nothing is lost", async () => {
-	const Counter = f.defineState({
-		name: `counter-${short()}`,
-		scope: "session",
-		schema: z.object({ count: z.number() }),
-		initial: () => ({ count: 0 }),
-	});
-	const bump = f.defineTool({
-		name: "bump",
-		description: "Bumps the counter",
-		input: z.object({}),
-		run: async (_input, ctx) => {
-			await ctx.state(Counter).update((draft) => {
-				draft.count++;
-			});
-			return "bumped";
-		},
-	});
-	const { runSql } = approvalTool();
-	const lead = f.defineAgent({
-		name: `lead-${short()}`,
-		description: "Bumps and runs SQL.",
-		model,
-		tools: [bump, runSql],
-	});
-	const deliver = f.defineWorkflow({
-		name: `deliver-${short()}`,
-		input: z.object({ text: z.string() }),
-		run: async ({ text: input }, ctx) => {
-			await ctx.send("send", lead, { session: "thread", input });
-		},
-	});
-	const increment = f.defineWorkflow({
-		name: `increment-${short()}`,
-		input: z.object({ times: z.number() }),
-		run: async ({ times }, ctx) => {
-			for (let n = 0; n < times; n++)
-				await ctx.state(Counter).update(`increment:${n}`, (draft) => {
-					draft.count++;
-				});
-			return { count: (await ctx.state(Counter).get("read")).count };
-		},
-	});
-	const busy = gate();
-	script = async ({ context, signal }) => {
-		const text = lastText(context);
-		if (requests.length === 1) {
-			await busy.pass(signal);
-			return use("bump", {});
-		}
-		if (text.includes("bumped")) return use(toolName(runSql.name), { sql: "update x" });
-		if (text.includes("ran")) return say("Done.");
-		return say(`unexpected: ${text}`);
-	};
-	const workflows = [deliver, increment, runSql];
-	const a = await launch("a", workflows);
-	const b = await launch("b", workflows);
-	const cards = [await approvals(a), await approvals(b)];
-	// Workflows of the Session's thread: their `ctx.state` is the Session's.
-	const metadata: InvocationMetadata = {
-		...metadataOf(),
-		replyTo: thread() as InvocationMetadata["replyTo"],
-	};
-	const run = async (times: number) => {
-		const id = await b.client.invoke(increment.name, { times }, { metadata });
-		await expect.poll(() => execution(id), poll).toMatchObject({ done: true });
-		return (await result(id))?.count;
-	};
-	await a.client.invoke(deliver.name, { text: "Go" }, { metadata });
-	await busy.entered;
-	const session = await only();
-	// During the generation: the host answers between Pi's passes; two workflows race on the revision.
-	const raced = await Promise.all([run(3), run(3)]);
-	expect(Math.max(...(raced as number[]))).toBe(6);
-	expect(requests).toHaveLength(1);
-	busy.open();
-	await expect.poll(() => cards.some((card) => !!card.action), poll).toBe(true);
-	// Waiting on the approval, the Session is suspended: the request wakes it, and it suspends again.
-	await suspended(session);
-	expect(await run(1)).toBe(8);
-	await suspended(session);
-	const card = cards.find((each) => !!each.action)!;
-	const clicker = card === cards[0] ? a : b;
-	await clicker.chat.click(card.ref!, card.action!, alice.identities[0]!);
-	await released(session);
-	expect(requests).toHaveLength(3);
-	expect(await run(0)).toBe(8);
-	await released(session);
 });

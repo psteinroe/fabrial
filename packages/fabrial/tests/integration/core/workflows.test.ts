@@ -332,12 +332,6 @@ describe("durability and context", () => {
 		});
 		const test = setup(
 			(f) => {
-				const counter = f.defineState({
-					name: "count",
-					scope: "session",
-					schema: z.object({ count: z.number() }),
-					initial: () => ({ count: 0 }),
-				});
 				const echo = f.defineAgent({
 					name: "echo",
 					description: "Echoes its input.",
@@ -345,17 +339,20 @@ describe("durability and context", () => {
 				});
 				return [
 					workflow(async (_i, ctx) => {
-						await ctx.state(counter).update("count", (draft) => {
-							draft.count++;
-						});
-						await ctx.evaluate("evaluate", {
+						const judged = await ctx.evaluate("evaluate", {
 							model: "judge/classifier",
 							state: {},
-							questions: { relevant: { type: "boolean", instructions: "Relevant?" } },
+							questions: {
+								relevant: {
+									type: "bool",
+									instructions: "Relevant?",
+									criteria: { true: "Yes", false: "No" },
+								},
+							},
 						});
 						const answer = await ctx.agent("agent", echo, { input: "echo" });
 						await ctx.sleep("sleep", "1h");
-						return { answer, count: (await ctx.state(counter).get("read")).count };
+						return { answer, relevant: (judged.answers.relevant ?? null) as JsonObject | null };
 					}),
 				];
 			},
@@ -364,7 +361,10 @@ describe("durability and context", () => {
 		const owner = await enter(test);
 		await owner.suspended("sleep");
 		await db.clock.advance("1h");
-		expect(await owner.output()).toEqual({ answer: "echo", count: 1 });
+		expect(await owner.output()).toEqual({
+			answer: "echo",
+			relevant: { type: "bool", probability: 1 },
+		});
 		expect(evaluations).toBe(1);
 		expect(model.calls).toBe(1);
 	});
@@ -400,27 +400,6 @@ describe("durability and context", () => {
 		});
 		expect(await execution.settled()).toEqual({ status: "completed", output: 1 });
 		expect(effects).toBe(1);
-	});
-	it("initializes state once and validates initial values", async () => {
-		let initializations = 0;
-		const test = setup(
-			(f) => {
-				const state = f.defineState({
-					name: "state",
-					scope: "session",
-					schema: z.object({ count: z.number() }),
-					initial: () => ({ count: ++initializations }),
-				});
-				return [
-					workflow(async (_i, ctx) => [
-						(await ctx.state(state).get("one")).count,
-						(await ctx.state(state).get("two")).count,
-					]),
-				];
-			},
-			{ models: scriptedModels() },
-		);
-		expect(await (await enter(test)).output()).toEqual([1, 1]);
 	});
 });
 
@@ -812,19 +791,13 @@ describe("provider route response context", () => {
 		});
 		expect(await db.execution(id).output()).toEqual({ thread: surface.threadId, owner: null });
 	});
-	it("uses receipt-derived metadata for state and agents after lazy channel posts", async () => {
+	it("uses receipt-derived metadata for children after lazy channel posts", async () => {
 		const test = setup(
-			(f) => {
-				const counter = f.defineState({
-					name: "counter",
-					scope: "session",
-					schema: z.object({ count: z.number() }),
-					initial: () => ({ count: 0 }),
-				});
+			() => {
 				const child = defineWorkflow({
 					name: "child",
 					input: z.object({}),
-					run: async (_i, ctx) => ({ count: (await ctx.state(counter).get("get")).count }),
+					run: async (_i, ctx) => ({ thread: metadataOf(ctx).replyTo?.threadId ?? null }),
 				});
 				const owner = defineWorkflow({
 					name: "owner",
@@ -835,10 +808,8 @@ describe("provider route response context", () => {
 						const ref = await ctx.thread!.post("first", "first");
 						if (metadataOf(ctx).replyTo?.threadId !== ref.threadId)
 							throw new Error("Unbound metadata");
-						await ctx.state(counter).update("update", (draft) => {
-							draft.count++;
-						});
-						return ctx.invokeAndWait("child", child, {});
+						const { thread } = await ctx.invokeAndWait("child", child, {});
+						return { bound: thread === ref.threadId };
 					},
 				});
 				return [owner, child];
@@ -847,7 +818,7 @@ describe("provider route response context", () => {
 		);
 		await test.app.start();
 		await test.app.emit(event, {});
-		expect(await (await test.execution()).output()).toEqual({ count: 1 });
+		expect(await (await test.execution()).output()).toEqual({ bound: true });
 	});
 });
 

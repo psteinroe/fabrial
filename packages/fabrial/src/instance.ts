@@ -10,7 +10,7 @@ import {
 	type ToolkitDefinition,
 } from "./agent.ts";
 import type { App, CoreConfig, HostedApp, Logger } from "./app.ts";
-import type { ModelCredentials } from "./agents/models.ts";
+import type { ModelCredentials } from "./models.ts";
 import { buildApp } from "./core.ts";
 import { defineGroup, type GroupDefinition, type UserDefinition } from "./identity.ts";
 import type { JsonObject } from "./json.ts";

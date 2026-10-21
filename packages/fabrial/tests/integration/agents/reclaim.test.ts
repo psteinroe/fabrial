@@ -15,12 +15,8 @@ import {
 	type WorkflowTask,
 } from "../../internals.ts";
 import { FakeChat } from "../../../src/testing.ts";
-import {
-	callSession,
-	connectAgents,
-	PostgresStorage,
-	type PiOptions,
-} from "../../../src/agents/index.ts";
+import { callSession, connectAgents, type PiOptions } from "../../../src/agents/pi.ts";
+import { PostgresStorage } from "../../../src/agents/storage.ts";
 import { until } from "../../conductor/helper.ts";
 import { useAgents } from "./setup.ts";
 
@@ -92,10 +88,7 @@ function fixture(options: Partial<PiOptions> = {}) {
 	async function start(workflows: WorkflowTask[], events: string[] = []) {
 		tasks.register({
 			workflows: [...workflows, ...integration.workflows],
-			events: [
-				...[GO, ...events].map((name) => ({ name, filterable: [] })),
-				...(integration.events ?? []),
-			],
+			events: [GO, ...events].map((name) => ({ name, filterable: [] })),
 		});
 		await integration.start();
 		await tasks.start();
