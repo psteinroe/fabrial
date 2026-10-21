@@ -39,14 +39,18 @@ function fixture(
 	stateConflicts?: number,
 ) {
 	const runtime = db.runtime();
-	const chat = new FakeChat();
+	const chat = new FakeChat({ installationId: "w" });
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
 	const metadata: InvocationMetadata = {
 		requestId: randomUUID(),
 		origin: null,
-		replyTo: { kind: "thread", provider: "slack-test", threadId: randomUUID() },
+		replyTo: {
+			kind: "thread",
+			provider: "slack-test",
+			threadId: `slack-test:general:${randomUUID()}`,
+		},
 		requestedBy: { id: "alice", known: true, identities: [], name: "Alice" },
 		ownerWorkflow: null,
 		triggerEvent: null,
@@ -57,7 +61,7 @@ function fixture(
 		workflows: [],
 		runtime,
 		clients: () => ({ example: "client" }),
-		chat: () => chat,
+		chat: () => chat.connection().port,
 		logger: { warn() {}, error() {}, debug() {}, info() {} },
 		directory: { isMember: async () => true },
 		resolvePrincipal: async (identity: { subjectId: string }) => ({
@@ -67,6 +71,8 @@ function fixture(
 			name: identity.subjectId,
 		}),
 	} as unknown as FabrialHost;
+	// The fake platform behind `slack-test`, the provider of the tests' threads.
+	chat.connect({ ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
 	const integration = pi({
 		models,
 		sql: sql(),
@@ -220,8 +226,9 @@ it("binds adapter identity, clients, sections and durable posts; commits tool st
 		output: { answer: "finished", state: { notes: ["seed"] } },
 	});
 	expect(actor).toBe("alice");
-	const io = await f.chat.resolve(f.metadata.replyTo!);
-	const recorded = await f.chat.thread(io.ref);
+	const recorded = await f.chat.thread(
+		f.metadata.replyTo as import("../../internals.ts").ThreadRef,
+	);
 	expect(recorded.posts).toHaveLength(1);
 	expect(recorded.statuses).toContain("Thinking…");
 	expect(recorded.statuses.at(-1)).toBeNull();
@@ -1245,7 +1252,9 @@ it("stop joins driver routing cleanup after the harness has closed", async () =>
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	f.faux.setResponses([fauxAssistantMessage("done")]);
-	const io = await f.chat.thread(f.metadata.replyTo as Parameters<typeof f.chat.thread>[0]);
+	const io = await f.chat
+		.connection()
+		.port.thread(f.metadata.replyTo as Parameters<typeof f.chat.thread>[0]);
 	let reached!: () => void;
 	const cleaning = new Promise<void>((resolve) => {
 		reached = resolve;

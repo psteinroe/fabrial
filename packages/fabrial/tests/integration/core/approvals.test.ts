@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defineGroup, defineUser } from "../../internals.ts";
+import { defineGroup, definePlugin, defineUser } from "../../internals.ts";
 import type { DurableExecution, Json, RuntimeWorkflow, WorkflowContext } from "../../internals.ts";
 import { until } from "../../conductor/helper.ts";
 import {
@@ -10,6 +10,8 @@ import {
 	identity,
 	message,
 	outsider,
+	plugin,
+	source,
 	surface,
 	team,
 	useCoreApp,
@@ -421,7 +423,10 @@ describe("approval edge cases", () => {
 							.then(() => "requested"),
 					),
 				],
-				{ identity: [alice, user] },
+				{
+					identity: [alice, user],
+					plugins: [plugin, source, definePlugin({ id: "slack" }), definePlugin({ id: "github" })],
+				},
 			);
 			const attempts: string[] = [];
 			const open = test.chat.openDM.bind(test.chat);
@@ -433,7 +438,7 @@ describe("approval edge cases", () => {
 			await test.app.start();
 			await test.app.emit(event, message("initial"), {
 				origin: { provider: "github" },
-				replyTo: { ...surface, provider: "slack" },
+				replyTo: { ...surface, provider: "slack", threadId: "slack:general:thread" },
 			});
 			const owner = await test.execution();
 			// Cards are posted by their cleanups: an unreachable approver fails only its card.
@@ -892,7 +897,8 @@ describe("approval cards", () => {
 		await test.execution();
 		const c = await card(test);
 		expect(field(c.post.content, "Source")).toBe(
-			"https://chat.test/github/github:acme/app:5 (github repo acme/app number 5)",
+			// The app has no GitHub chat provider to link it.
+			"github thread github:acme/app:5 (github repo acme/app number 5)",
 		);
 		expect(field(c.post.content, "Reply thread")).toBe(
 			`https://chat.test/chat/${surface.threadId}`,

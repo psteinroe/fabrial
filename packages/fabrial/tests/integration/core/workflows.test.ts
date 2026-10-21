@@ -9,6 +9,7 @@ import {
 	defineState,
 	defineWorkflow,
 	event,
+	mention,
 	message,
 	once,
 	metadata,
@@ -104,7 +105,7 @@ describe("routing and lifecycle", () => {
 		expect(await test.routes()).toHaveLength(1);
 		// A handled thread is subscribed; routing stores nothing in it.
 		const thread = await test.chat.thread(surface);
-		expect(thread.subscribed).toBe(true);
+		expect(await thread.isSubscribed()).toBe(true);
 		expect(await thread.getState()).toBeNull();
 	});
 	it("ignores a message nothing handles: no state, no subscription", async () => {
@@ -119,7 +120,7 @@ describe("routing and lifecycle", () => {
 		expect(await test.chat.receive(message("unhandled"))).toBe("accepted");
 		expect(await test.route()).toMatchObject({ route: "ignored", owner: null });
 		const thread = await test.chat.thread(surface);
-		expect(thread.subscribed).toBe(false);
+		expect(await thread.isSubscribed()).toBe(false);
 		expect(await thread.getState()).toBeNull();
 		expect(test.ids("owner")).toEqual([]);
 	});
@@ -500,7 +501,7 @@ describe("multi-category chat ingress", () => {
 		});
 		const test = setup([broad, specific, observer]);
 		await test.app.start();
-		await test.chat.receive(message("multi"), { events: [event, "chat.mentioned"] });
+		await test.chat.receive(mention("multi"));
 		await (await test.execution("specific")).suspended("pause");
 		await (await test.execution("observer")).output();
 		expect(seen).toEqual(
@@ -522,9 +523,7 @@ describe("multi-category chat ingress", () => {
 		});
 		const test = setup([a, b]);
 		await test.app.start();
-		expect(await test.chat.receive(message("tie"), { events: [event, "chat.mentioned"] })).toBe(
-			"accepted",
-		);
+		expect(await test.chat.receive(mention("tie"))).toBe("accepted");
 		const route = await until("the route", async () => (await test.routes())[0]);
 		await until("the tie", async () => {
 			const [row] = await db.sql<{ last_error: string | null }[]>`
@@ -544,10 +543,10 @@ describe("multi-category chat ingress", () => {
 		});
 		const test = setup([workflow(async () => {}), observer]);
 		await test.app.start();
-		await test.chat.receive(message("multi"), { events: [event, "chat.mentioned"] });
+		await test.chat.receive(mention("multi"));
 		await (await test.execution()).output();
 		await (await test.execution("observer")).output();
-		await test.chat.receive(message("multi"), { events: [event, "chat.mentioned"] });
+		await test.chat.receive(mention("multi"));
 		expect(test.ids("owner")).toHaveLength(1);
 		expect(test.ids("observer")).toHaveLength(1);
 	});
@@ -636,15 +635,12 @@ describe("ingress dedupe", () => {
 		});
 		const test = setup([workflow(async () => {}), observer]);
 		await test.app.start();
-		for (let i = 0; i < 2; i++)
-			expect(await test.chat.receive(message("multi"), { events: [event, "chat.mentioned"] })).toBe(
-				"accepted",
-			);
+		for (let i = 0; i < 2; i++) expect(await test.chat.receive(mention("multi"))).toBe("accepted");
 		expect(await test.route()).toMatchObject({ route: "new", owner: { workflow: "owner" } });
 		await (await test.execution()).output();
 		await (await test.execution("observer")).output();
 		// Redelivered after routing finished: still the one ingress event.
-		await test.chat.receive(message("multi"), { events: [event, "chat.mentioned"] });
+		await test.chat.receive(mention("multi"));
 		expect(await emitted("fabrial.ingress")).toBe(1);
 		expect(await test.routes()).toHaveLength(1);
 		expect(test.ids("owner")).toHaveLength(1);
@@ -683,7 +679,7 @@ describe("provider route response context", () => {
 			triggers: [trigger({ event: "provider.opened" })],
 			run: async (_i, ctx) => ({ actor: ctx.actor?.id ?? null, thread: ctx.thread!.ref.threadId }),
 		});
-		const test = setup([owner], { plugins: [provider] });
+		const test = setup([owner], { plugins: [plugin, provider] });
 		await test.app.start();
 		await test.app.fetch(new Request("https://test/opened", { method: "POST" }));
 		expect(await (await test.execution()).output()).toEqual({

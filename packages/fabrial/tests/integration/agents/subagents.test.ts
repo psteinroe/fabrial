@@ -15,6 +15,7 @@ import { expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
 	createFabrial,
+	definePlugin,
 	defineUser,
 	type Agent,
 	type FabrialHost,
@@ -25,11 +26,14 @@ import {
 import { toolName } from "../../../src/agent.ts";
 import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { SubagentWork } from "../../../src/agents/documents.ts";
+import type { ExternalIdentity } from "../../../src/identity.ts";
 import { FakeChat } from "../../../src/testing.ts";
 import { until } from "../../conductor/helper.ts";
 import { useAgents } from "./setup.ts";
 
 const definitions = createFabrial({ plugins: [] });
+// The provider of the tests' threads and DMs: apps reach the fake platform through a plugin of that id.
+const slackTest = definePlugin({ id: "slack-test" });
 const { defineAgent, defineTool, defineWorkflow } = definitions;
 
 /**
@@ -40,14 +44,18 @@ const { db, sql, launch, idle, open, all } = useAgents();
 
 function fixture() {
 	const runtime = db.runtime();
-	const chat = new FakeChat();
+	const chat = new FakeChat({ installationId: "w" });
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
 	const metadata: InvocationMetadata = {
 		requestId: randomUUID(),
 		origin: null,
-		replyTo: { kind: "thread", provider: "slack-test", threadId: randomUUID() },
+		replyTo: {
+			kind: "thread",
+			provider: "slack-test",
+			threadId: `slack-test:general:${randomUUID()}`,
+		},
 		requestedBy: { id: "alice", known: true, identities: [], name: "Alice" },
 		ownerWorkflow: null,
 		triggerEvent: null,
@@ -64,11 +72,13 @@ function fixture() {
 		workflows: [],
 		runtime,
 		clients: () => ({}),
-		chat: () => chat,
+		chat: () => chat.connection().port,
 		logger,
 		directory: { isMember: async () => true },
 		resolvePrincipal: async () => null,
 	} as unknown as FabrialHost;
+	// The fake platform behind `slack-test`, the provider of the tests' threads.
+	chat.connect({ ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
 	const integration = pi({ models, sql: sql(), settings: { retry: { enabled: false } } }).connect(
 		host,
 	);
@@ -172,6 +182,28 @@ const userTexts = (context: TranscriptContext) =>
 			: [],
 	);
 
+/**
+ * A reply that takes a while: the chat thread shows a different status at most once a second, so a child's
+ * status shows only if its turn outlasts that window.
+ */
+const slowly = <T>(reply: T) =>
+	new Promise<T>((resolve) => setTimeout(() => resolve(reply), 1_200));
+
+/** The approval cards in `identity`'s DM, each with a click on its approve action. */
+async function approvalCards(chat: FakeChat, identity: ExternalIdentity) {
+	return (await chat.openDM(identity)).posts.flatMap((post) => {
+		const action =
+			typeof post.content === "object" && "card" in post.content
+				? post.content.card.actions?.find((each) => each.id.startsWith("fabrial.approval.approve:"))
+				: undefined;
+		return action ? [{ post, approve: () => chat.click(post.ref, action.id, identity) }] : [];
+	});
+}
+
+/** Resolves with the first approval card posted to `identity`'s DM. */
+const approvalCard = (chat: FakeChat, identity: ExternalIdentity) =>
+	until("the approval card", async () => (await approvalCards(chat, identity))[0]);
+
 function researcherOf(f: Fixture, tools: Parameters<typeof defineAgent>[0]["tools"] = []) {
 	return defineAgent({
 		name: `researcher-${short()}`,
@@ -196,7 +228,7 @@ it("a fresh foreground child answers its task and the lead uses the escaped resu
 		fauxAssistantMessage(fauxToolCall(tool, { task: "Find the root cause" }), {
 			stopReason: "toolUse",
 		}),
-		fauxAssistantMessage("It is <b>DNS</b> & </subagent>"),
+		() => slowly(fauxAssistantMessage("It is <b>DNS</b> & </subagent>")),
 		fauxAssistantMessage("The researcher says it is DNS."),
 	]);
 	const { settled } = await f.call(lead, "Why is the site down?");
@@ -604,9 +636,8 @@ it("a background child returns its name at once; a call settles after the lead a
 		new RegExp(`- ${tool}-1 \\(${researcher.name}, background\\): (working|idle)`),
 	);
 	expect(await requests(f, "fabrial.subagent-report:")).toHaveLength(1);
-	const statuses = (await f.chat.thread(f.metadata.replyTo as Parameters<typeof f.chat.thread>[0]))
-		.statuses;
-	expect(statuses).toContain(`${researcher.name}: Thinking…`);
+	// No status assertion: the lead's own status follows the child's within the chat thread's throttle window,
+	// so the child's never shows. Foreground children show theirs (above).
 	await f.integration.stop();
 });
 
@@ -920,7 +951,7 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 		name: "Alice",
 		identities: [{ provider: "slack-test", installationId: "w", subjectId: `A${short()}` }],
 	});
-	const g = createFabrial({ plugins: [], identity: [alice] });
+	const g = createFabrial({ plugins: [slackTest], identity: [alice] });
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
@@ -964,22 +995,7 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 			return say(`unexpected: ${text}`);
 		}),
 	);
-	const chat = new FakeChat();
-	const dm = await chat.openDM(alice.identities[0]!);
-	const post = dm.post.bind(dm);
-	let cards = 0;
-	dm.post = async (content) => {
-		const ref = await post(content);
-		const action =
-			typeof content === "object" && "card" in content
-				? content.card.actions?.find((each) => each.id.startsWith("fabrial.approval.approve:"))
-				: undefined;
-		if (action) {
-			cards++;
-			await chat.click(ref, action.id, alice.identities[0]!);
-		}
-		return ref;
-	};
+	const chat = new FakeChat({ installationId: "w" });
 	const { runtime } = await launch(g, {
 		workflows: [runSql, entry],
 		chat,
@@ -996,11 +1012,13 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 				triggerEvent: null,
 			},
 		});
+		await (await approvalCard(chat, alice.identities[0]!)).approve();
 		expect(await db.execution(id).settled()).toMatchObject({
 			status: "completed",
 			output: `Lead: <subagent name="${toolName(researcher.name)}-1" status="done">Fixed after approval.</subagent>`,
 		});
-		expect(cards).toBe(1);
+		// One card, decided in place.
+		expect((await chat.openDM(alice.identities[0]!)).posts).toHaveLength(1);
 	}
 });
 
@@ -1099,7 +1117,7 @@ it("a stop after the lead answered cancels a background child's approval workflo
 		name: "Alice",
 		identities: [{ provider: "slack-test", installationId: "w", subjectId: `A${short()}` }],
 	});
-	const g = createFabrial({ plugins: [], identity: [alice] });
+	const g = createFabrial({ plugins: [slackTest], identity: [alice] });
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
@@ -1131,7 +1149,11 @@ it("a stop after the lead answered cancels a background child's approval workflo
 	});
 	const tool = toolName(researcher.name);
 	const session = `ticket-${short()}`;
-	const thread = { kind: "thread", provider: "slack-test", threadId: randomUUID() } as const;
+	const thread = {
+		kind: "thread",
+		provider: "slack-test",
+		threadId: `slack-test:general:${randomUUID()}`,
+	} as const;
 	const ask = g.defineWorkflow({
 		name: `ask-${short()}`,
 		input: z.object({ text: z.string() }),
@@ -1151,19 +1173,7 @@ it("a stop after the lead answered cancels a background child's approval workflo
 			return say(`unexpected: ${text}`);
 		}),
 	);
-	const chat = new FakeChat();
-	const dm = await chat.openDM(alice.identities[0]!);
-	const post = dm.post.bind(dm);
-	let approve: (() => Promise<void>) | undefined;
-	dm.post = async (content) => {
-		const ref = await post(content);
-		const action =
-			typeof content === "object" && "card" in content
-				? content.card.actions?.find((each) => each.id.startsWith("fabrial.approval.approve:"))
-				: undefined;
-		if (action) approve = () => chat.click(ref, action.id, alice.identities[0]!);
-		return ref;
-	};
+	const chat = new FakeChat({ installationId: "w" });
 	const { runtime } = await launch(g, {
 		workflows: [runSql, ask],
 		chat,
@@ -1192,7 +1202,7 @@ it("a stop after the lead answered cancels a background child's approval workflo
 	};
 	await send("Fix the row");
 	await expect.poll(posts, { timeout: 30_000 }).toEqual(["On it."]);
-	await until("the approval card", async () => (approve ? true : undefined));
+	const { approve } = await approvalCard(chat, alice.identities[0]!);
 	const db = sql();
 	const approvalWorkflow = async () => {
 		const rows = await db<{ cancelled: boolean; done: boolean }[]>`
@@ -1205,7 +1215,7 @@ it("a stop after the lead answered cancels a background child's approval workflo
 	await expect
 		.poll(approvalWorkflow, { timeout: 30_000 })
 		.toMatchObject({ cancelled: true, done: false });
-	await approve!();
+	await approve();
 	await idle(runtime.queue);
 	expect(await approvalWorkflow()).toMatchObject({ cancelled: true, done: false });
 	expect(await posts()).toEqual(["On it."]);
@@ -1217,7 +1227,7 @@ it("a background child waiting for approval suspends the Session: a new message 
 		name: "Alice",
 		identities: [{ provider: "slack-test", installationId: "w", subjectId: `A${short()}` }],
 	});
-	const g = createFabrial({ plugins: [], identity: [alice] });
+	const g = createFabrial({ plugins: [slackTest], identity: [alice] });
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
@@ -1249,7 +1259,11 @@ it("a background child waiting for approval suspends the Session: a new message 
 	});
 	const tool = toolName(researcher.name);
 	const session = `ticket-${short()}`;
-	const thread = { kind: "thread", provider: "slack-test", threadId: randomUUID() } as const;
+	const thread = {
+		kind: "thread",
+		provider: "slack-test",
+		threadId: `slack-test:general:${randomUUID()}`,
+	} as const;
 	const ask = g.defineWorkflow({
 		name: `ask-${short()}`,
 		input: z.object({ text: z.string() }),
@@ -1269,19 +1283,7 @@ it("a background child waiting for approval suspends the Session: a new message 
 			return say(`unexpected: ${text}`);
 		}),
 	);
-	const chat = new FakeChat();
-	const dm = await chat.openDM(alice.identities[0]!);
-	const post = dm.post.bind(dm);
-	let approve: (() => Promise<void>) | undefined;
-	dm.post = async (content) => {
-		const ref = await post(content);
-		const action =
-			typeof content === "object" && "card" in content
-				? content.card.actions?.find((each) => each.id.startsWith("fabrial.approval.approve:"))
-				: undefined;
-		if (action) approve = () => chat.click(ref, action.id, alice.identities[0]!);
-		return ref;
-	};
+	const chat = new FakeChat({ installationId: "w" });
 	const { runtime } = await launch(g, {
 		workflows: [runSql, ask],
 		chat,
@@ -1311,7 +1313,7 @@ it("a background child waiting for approval suspends the Session: a new message 
 	{
 		await send("Fix the row");
 		await expect.poll(posts, { timeout: 30_000 }).toEqual(["On it."]);
-		await until("the approval card", async () => (approve ? true : undefined));
+		const { approve } = await approvalCard(chat, alice.identities[0]!);
 		// Every live task waits on the approval: the Session's execution suspended on it and its lease is free.
 		await expect
 			.poll(
@@ -1328,7 +1330,7 @@ it("a background child waiting for approval suspends the Session: a new message 
 		await expect
 			.poll(posts, { timeout: 30_000 })
 			.toEqual(["On it.", "Still waiting for approval."]);
-		await approve!();
+		await approve();
 		// The report reaches the lead after its Session reopened; the run stays hosted until it is answered, so the
 		// answer posts.
 		await expect
@@ -1349,10 +1351,10 @@ it("a child's answer frees its concurrency slot as it settles, and its status li
 	const tool = toolName(researcher.name);
 	route(f, (text) => {
 		if (text.includes("Go")) return use(tool, { task: "First" });
-		if (text === "First") return say("one");
+		if (text === "First") return slowly(say("one"));
 		if (text.startsWith(`<subagent name="${tool}-1"`))
 			return use(tool, { task: "Second", background: true });
-		if (text === "Second") return say("two");
+		if (text === "Second") return slowly(say("two"));
 		if (text.startsWith("Started")) return say("Waiting.");
 		if (text.startsWith(`<subagent name="${tool}-2"`)) return say("Final");
 		return say(`unexpected: ${text}`);
@@ -1416,7 +1418,7 @@ it("continuing a background child from another actor and thread runs its tools f
 			identities: [{ provider: "slack-test", installationId: "w", subjectId: `${id}${short()}` }],
 		}),
 	);
-	const g = createFabrial({ plugins: [], identity: users });
+	const g = createFabrial({ plugins: [slackTest], identity: users });
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
@@ -1467,7 +1469,7 @@ it("continuing a background child from another actor and thread runs its tools f
 		workflows: [ask],
 		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
 	});
-	const threads = [randomUUID(), randomUUID()];
+	const threads = [`slack-test:general:${randomUUID()}`, `slack-test:general:${randomUUID()}`];
 	const send = (text: string, index: number) =>
 		runtime.invoke(
 			ask.name,
@@ -1492,7 +1494,7 @@ it("continuing a background child from another actor and thread runs its tools f
 });
 
 it("channel-session agents share session state across threads with their workflow tools; a ctx.agent call's tools see their own", async () => {
-	const g = createFabrial({ plugins: [] });
+	const g = createFabrial({ plugins: [slackTest] });
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
@@ -1565,12 +1567,16 @@ it("channel-session agents share session state across threads with their workflo
 		workflows: [deliver, call, flow, read],
 		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
 	});
-	// The fake chat derives a thread's channel from its id (`<kind>:<channel>:<thread>`): both threads share one.
+	// The fake chat derives a thread's channel from its id (`slack-test:<channel>:<thread>`): both threads share one.
 	const channel = `C-${short()}`;
 	const metadata = (thread: string): InvocationMetadata => ({
 		requestId: randomUUID(),
 		origin: null,
-		replyTo: { kind: "thread", provider: "slack-test", threadId: `thread:${channel}:${thread}` },
+		replyTo: {
+			kind: "thread",
+			provider: "slack-test",
+			threadId: `slack-test:${channel}:${thread}`,
+		},
 		requestedBy: { id: "alice", known: true, identities: [] },
 		ownerWorkflow: null,
 		triggerEvent: null,

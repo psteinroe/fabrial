@@ -71,11 +71,16 @@ export function renderMessage(message: OutboundMessage): AdapterPostableMessage 
 export type SDKState = { fabrial?: ThreadRoutingState | null } & Record<string, unknown>;
 type Bot = Chat<Record<string, Adapter>, SDKState>;
 
+/** Threads holding a throttled status, so stopping the port can drop their timers. */
+type StatusTimers = { closed: boolean; threads: Set<LiveThread> };
+
 class LiveThread implements ThreadIO {
 	private lastStatusAt = 0;
 	private statusText: string | null = null;
 	private statusMessageId: string | null = null;
 	private fallbackStatus = false;
+	private pendingStatus: { text: string; timer: ReturnType<typeof setTimeout> } | undefined;
+	private statusChain = Promise.resolve();
 
 	constructor(
 		private readonly sdk: SDKThread<SDKState>,
@@ -83,6 +88,7 @@ class LiveThread implements ThreadIO {
 		private readonly capability: ChatPluginCapability,
 		private readonly host: FabrialHost,
 		private readonly stateAdapter: StateAdapter,
+		private readonly statusTimers: StatusTimers,
 	) {
 		this.fallbackStatus = capability.status === "message";
 	}
@@ -112,12 +118,50 @@ class LiveThread implements ThreadIO {
 		await this.sdk.adapter.editMessage(this.sdk.id, message.messageId, renderMessage(content));
 	}
 
+	/**
+	 * At most one status change per second, and a repeat of the shown status at most every 5 s.
+	 * A change inside the window shows when it ends (the latest one wins); clearing is immediate.
+	 */
 	async setStatus(text: string | null): Promise<void> {
-		const now = Date.now();
-		if (text !== null && now - this.lastStatusAt < (text === this.statusText ? 5000 : 1000)) return;
+		const elapsed = Date.now() - this.lastStatusAt;
+		if (text !== null && elapsed < (text === this.statusText ? 5000 : 1000)) {
+			if (text === this.statusText) this.dropStatus();
+			else if (this.pendingStatus) this.pendingStatus.text = text;
+			else if (!this.statusTimers.closed) {
+				const timer = setTimeout(() => {
+					const pending = this.pendingStatus;
+					this.dropStatus();
+					if (pending) void this.showStatus(pending.text);
+				}, 1000 - elapsed);
+				timer.unref?.();
+				this.pendingStatus = { text, timer };
+				this.statusTimers.threads.add(this);
+			}
+			return;
+		}
+		this.dropStatus();
+		await this.showStatus(text);
+	}
+
+	/** Forgets a status waiting for the throttle window to end. */
+	dropStatus() {
+		if (!this.pendingStatus) return;
+		clearTimeout(this.pendingStatus.timer);
+		this.pendingStatus = undefined;
+		this.statusTimers.threads.delete(this);
+	}
+
+	private showStatus(text: string | null): Promise<void> {
 		// Clearing doesn't throttle the next status: a new run's "Thinking…" right after a clear shows.
-		this.lastStatusAt = text === null ? 0 : now;
+		this.lastStatusAt = text === null ? 0 : Date.now();
 		this.statusText = text;
+		// In order, so a trailing status and a clear right after it don't race on the fallback post.
+		const shown = this.statusChain.then(() => this.writeStatus(text));
+		this.statusChain = shown;
+		return shown;
+	}
+
+	private async writeStatus(text: string | null): Promise<void> {
 		try {
 			if (!this.fallbackStatus) {
 				try {
@@ -294,6 +338,7 @@ export function createChatPort(
 	const pending = new Set<Promise<unknown>>();
 	let closing = false;
 	const threads = new Map<string, ThreadIO>();
+	const statusTimers: StatusTimers = { closed: false, threads: new Set() };
 	const capability = (provider: string) => {
 		const value = capabilities.get(provider);
 		if (!value) throw new Error(`No chat provider "${provider}"`);
@@ -308,6 +353,8 @@ export function createChatPort(
 	const port: ChatPort & { stop(): Promise<void> } = {
 		async stop() {
 			closing = true;
+			statusTimers.closed = true;
+			for (const thread of statusTimers.threads) thread.dropStatus();
 			// Native workers can finish in-flight state operations after their abort
 			// race settles. Keep the adapter connected through releaseLock.
 			await Promise.allSettled(pending);
@@ -319,7 +366,14 @@ export function createChatPort(
 			await bot.initialize();
 			let io = threads.get(ref.threadId);
 			if (!io) {
-				io = new LiveThread(bot.thread(ref.threadId), ref.provider, config, host, bot.getState());
+				io = new LiveThread(
+					bot.thread(ref.threadId),
+					ref.provider,
+					config,
+					host,
+					bot.getState(),
+					statusTimers,
+				);
 				const update = io.updateState.bind(io);
 				io.updateState = (change) => {
 					if (closing) return Promise.reject(new Error("Chat integration is stopped"));

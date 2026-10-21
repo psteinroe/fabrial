@@ -47,7 +47,11 @@ const interrupter = definePlugin({
 		],
 	},
 });
-const f = createFabrial({ plugins: [interrupter], identity: [alice] });
+// `slack-test` is the provider of the tests' threads and DMs: apps reach the fake platform through it.
+const f = createFabrial({
+	plugins: [interrupter, definePlugin({ id: "slack-test" })],
+	identity: [alice],
+});
 const probe = fauxProvider();
 const model = `${probe.provider.id}/${probe.getModel().id}`;
 const debug = process.env.SESSIONS_DEBUG ? (...args: unknown[]) => console.log(...args) : () => {};
@@ -154,7 +158,7 @@ async function launch(name: string, workflows: Parameters<typeof testApp>[1]["wo
 			},
 		),
 	);
-	const chat = new FakeChat();
+	const chat = new FakeChat({ installationId: "w" });
 	const app = testApp(f, {
 		workflows,
 		runtime,
@@ -186,7 +190,7 @@ const short = () => randomUUID().slice(0, 8);
 const thread = (): ThreadRef => ({
 	kind: "thread",
 	provider: "slack-test",
-	threadId: randomUUID(),
+	threadId: `slack-test:general:${randomUUID()}`,
 });
 
 /** Session executions: how many exist, how many run (are locked by a worker) now, and which ended (returned or failed). */

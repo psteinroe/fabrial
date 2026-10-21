@@ -37,7 +37,7 @@ function setup(
 	extra: Partial<import("../../src/app.ts").CoreConfig> = {},
 	runtime: StubRuntime = new StubRuntime(),
 ) {
-	const chat = new FakeChat(() => runtime.now());
+	const chat = new FakeChat();
 	const config = {
 		runtime,
 		chat,
@@ -138,22 +138,5 @@ describe("identity", () => {
 			id: "dynamic",
 		});
 		expect(await test.app.host.directory.identitiesFor("dynamic")).toEqual(user.identities);
-	});
-});
-
-describe("fake ports", () => {
-	it("fake ChatPort atomically updates state without exposing mutable stored objects", async () => {
-		const chat = new FakeChat();
-		const thread = await chat.thread(surface);
-		await thread.updateState(() => ({ count: 0 }));
-		await Promise.all(
-			Array.from({ length: 100 }, () =>
-				thread.updateState((state) => state && { ...state, count: Number(state.count) + 1 }),
-			),
-		);
-		const state = await thread.getState();
-		expect(state?.count).toBe(100);
-		state!.count = 0;
-		expect((await thread.getState())?.count).toBe(100);
 	});
 });

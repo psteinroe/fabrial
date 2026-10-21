@@ -41,6 +41,7 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
+		"@chat-adapter/state-memory": "catalog:",
 		"@chat-adapter/state-pg": "catalog:",
 		"@earendil-works/chord": "catalog:",
 		"@earendil-works/pi-ai": "catalog:",
@@ -53,7 +54,6 @@
 	},
 	"devDependencies": {
 		"@chat-adapter/slack": "catalog:",
-		"@chat-adapter/state-memory": "catalog:",
 		"@chat-adapter/tests": "catalog:",
 		"@testcontainers/postgresql": "catalog:",
 		"zod": "catalog:"

@@ -36,7 +36,7 @@ export const team = defineGroup({ id: "team", members: [alice, bob] });
 export const surface = {
 	kind: "thread",
 	provider: "chat",
-	threadId: "channel:general:thread",
+	threadId: "chat:general:thread",
 } as const;
 export const event = "chat.message";
 export const metadata: InvocationMetadata = {
@@ -45,6 +45,7 @@ export const metadata: InvocationMetadata = {
 	replyTo: null,
 	requestedBy: null,
 };
+/** A message in `surface`; FakeChat's SDK ingests it as `chat.message`. */
 export const message = (id: string, author = alice, text = id): ChatMessage => ({
 	provider: "chat",
 	threadId: surface.threadId,
@@ -56,9 +57,14 @@ export const message = (id: string, author = alice, text = id): ChatMessage => (
 		name: author.name ?? null,
 		isBot: false,
 	},
-	isMention: true,
+	isMention: false,
 	isDM: false,
 	sentAt: "2026-01-05T00:00:00Z",
+});
+/** A message mentioning the bot: `chat.message` and `chat.mentioned`. */
+export const mention = (id: string, author = alice, text = id): ChatMessage => ({
+	...message(id, author, text),
+	isMention: true,
 });
 const payload = z.record(z.string(), z.json());
 export const plugin = definePlugin({
@@ -111,7 +117,7 @@ export function useCoreApp() {
 
 	function setup(workflows: AnyWorkflow[], extra: Partial<CoreConfig> = {}) {
 		const runtime = db.runtime();
-		const chat = new FakeChat(() => runtime.now!());
+		const chat = new FakeChat();
 		const attempts: (ExecutionInfo & { metadata: InvocationMetadata })[] = [];
 		const recorder = definePlugin({
 			id: "recorder",

@@ -51,7 +51,7 @@ export function useAgents() {
 					retries[workflow.name] ? { ...workflow, retries: retries[workflow.name] } : workflow,
 				),
 			});
-		const chat = rest.chat ?? new FakeChat();
+		const chat = rest.chat ?? new FakeChat({ installationId: "w" });
 		const app = testApp(instance, { ...rest, runtime, chat });
 		await app.start();
 		apps.push(app as HostedApp<never>);
@@ -118,14 +118,15 @@ export function useAgents() {
 	}
 
 	/**
-	 * How the router routed the ingress `id` on `queue` (a message's dedupe id defaults to its message id),
-	 * once it finished: `follow`, `new` or `ignored`.
+	 * How the router routed the ingress of message `messageId` on `queue`, once it finished: `follow`,
+	 * `new` or `ignored`.
 	 */
-	async function routed(queue: string, id: string) {
-		return until(`ingress ${id} to be routed`, async () => {
+	async function routed(queue: string, messageId: string) {
+		return until(`ingress of message ${messageId} to be routed`, async () => {
 			const [row] = await sql()<{ route: string | null }[]>`
 				select result->'output'->>'route' as route from pgconductor._private_executions
-				where queue = ${queue} and task_key = 'fabrial.route' and payload->'payload'->>'id' = ${id}
+				where queue = ${queue} and task_key = 'fabrial.route'
+					and payload->'payload'->'origin'->>'messageId' = ${messageId}
 					and completed_at is not null
 			`;
 			return row?.route ?? undefined;

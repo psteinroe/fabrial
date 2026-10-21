@@ -306,6 +306,57 @@ describe("ChatPort", () => {
 		expect(env.adapter.startTyping).toHaveBeenCalledTimes(3);
 	});
 
+	it("shows the latest status throttled inside the window once it ends", async () => {
+		vi.useFakeTimers();
+		const env = setup();
+		const thread = await env.connection.port.thread(ref);
+		await thread.setStatus("Thinking");
+		await thread.setStatus("Waiting");
+		await thread.setStatus("Looking up");
+		await vi.advanceTimersByTimeAsync(999);
+		expect(env.adapter.startTyping).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(vi.mocked(env.adapter.startTyping).mock.calls.map((call) => call[1])).toEqual([
+			"Thinking",
+			"Looking up",
+		]);
+		// A change back to the shown status inside the window leaves nothing pending.
+		await thread.setStatus("Thinking");
+		await thread.setStatus("Looking up");
+		await vi.advanceTimersByTimeAsync(5000);
+		expect(env.adapter.startTyping).toHaveBeenCalledTimes(2);
+	});
+
+	it("clears a status immediately, dropping one still throttled", async () => {
+		vi.useFakeTimers();
+		const env = setup();
+		const thread = await env.connection.port.thread(ref);
+		await thread.setStatus("Thinking");
+		await thread.setStatus("Looking up");
+		await thread.setStatus(null);
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(vi.mocked(env.adapter.startTyping).mock.calls.map((call) => call[1])).toEqual([
+			"Thinking",
+			"",
+		]);
+		// And the next status after a clear shows at once.
+		await thread.setStatus("Thinking");
+		expect(env.adapter.startTyping).toHaveBeenCalledTimes(3);
+	});
+
+	it("posts no throttled status after the chat stops", async () => {
+		vi.useFakeTimers();
+		const env = setup();
+		const thread = await env.connection.port.thread(ref);
+		await thread.setStatus("Thinking");
+		await thread.setStatus("Looking up");
+		await env.connection.stop!();
+		await thread.setStatus("Searching");
+		expect(vi.getTimerCount()).toBe(0);
+		await vi.advanceTimersByTimeAsync(2000);
+		expect(env.adapter.startTyping).toHaveBeenCalledOnce();
+	});
+
 	it("falls back to a single edited status post, reattaches, clears, and is best effort", async () => {
 		vi.useFakeTimers();
 		const env = setup();

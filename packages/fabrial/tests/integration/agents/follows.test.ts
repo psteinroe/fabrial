@@ -113,7 +113,7 @@ const reviewer = f.defineAgent({
 });
 
 /** Chat SDK state outlives app restarts (Postgres in production); one fake chat stands in for it. */
-const chat = new FakeChat();
+const chat = new FakeChat({ installationId: "w" });
 
 /** Start the app, or restart it on the queue of a stopped one. */
 async function launch(routedAgents = [developer], queue?: string) {

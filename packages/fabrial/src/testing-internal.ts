@@ -299,7 +299,7 @@ export function createTestApp<const P extends readonly AnyPlugin[]>(
 			worker: { concurrency: 8, pollIntervalMs: 20, flushIntervalMs: 20, fetchBatchSize: 10 },
 		},
 	);
-	const chat = fake ?? new FakeChat(() => runtime.now!());
+	const chat = fake ?? new FakeChat();
 	const app = testApp(instance, {
 		...appConfig,
 		runtime,

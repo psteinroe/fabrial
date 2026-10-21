@@ -702,12 +702,20 @@ it("a non-retryable model error posts one error reply with an error id; the conv
 });
 
 it("a transient model error retried durably shows the waiting status and posts no error reply", async () => {
+	// The chat thread shows a different status at most once a second: the error and the retry come later.
 	const t = await setup(undefined, {
-		retry: { enabled: true, maxRetries: 2, baseDelayMs: 300, maxAgentDelayMs: 300 },
+		retry: { enabled: true, maxRetries: 2, baseDelayMs: 1_200, maxAgentDelayMs: 1_200 },
 	});
 	t.respond([
-		fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 overloaded" }),
-		fauxAssistantMessage("Answer one"),
+		async () => {
+			await new Promise((resolve) => setTimeout(resolve, 1_200));
+			return fauxAssistantMessage("", { stopReason: "error", errorMessage: "503 overloaded" });
+		},
+		// Slow too: a "Thinking…" inside the window shows when it ends, unless the reply's clear comes first.
+		async () => {
+			await new Promise((resolve) => setTimeout(resolve, 1_200));
+			return fauxAssistantMessage("Answer one");
+		},
 	]);
 	await t.chat.receive(t.message("m1", "t1"));
 	await t.settle();

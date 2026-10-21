@@ -783,7 +783,7 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 	);
 	runtimes.push(runtime);
 	const chat = new FakeChat();
-	const surface = { kind: "thread", provider: "test", threadId: "channel:general:thread" } as const;
+	const surface = { kind: "thread", provider: "test", threadId: "test:general:thread" } as const;
 	const attempts = new Map<string, number>();
 	let effects = 0;
 	let childEffects = 0;

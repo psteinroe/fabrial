@@ -37,23 +37,29 @@ function fixture(options: Partial<PiOptions> = {}) {
 	const metadata: InvocationMetadata = {
 		requestId: randomUUID(),
 		origin: null,
-		replyTo: { kind: "thread", provider: "slack-test", threadId: randomUUID() },
+		replyTo: {
+			kind: "thread",
+			provider: "slack-test",
+			threadId: `slack-test:general:${randomUUID()}`,
+		},
 		requestedBy: { id: "alice", known: true, identities: [], name: "Alice" },
 		ownerWorkflow: null,
 		triggerEvent: null,
 	};
-	const chat = new FakeChat();
+	const chat = new FakeChat({ installationId: "w" });
 	const host = {
 		definitionScope: definitions,
 		plugins: [],
 		workflows: [],
 		runtime,
 		clients: () => ({}),
-		chat: () => chat,
+		chat: () => chat.connection().port,
 		logger: { warn() {}, error() {}, debug() {}, info() {} },
 		directory: { isMember: async () => true },
 		resolvePrincipal: async () => null,
 	} as unknown as FabrialHost;
+	// The fake platform behind `slack-test`, the provider of the tests' threads.
+	chat.connect({ ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
 	const integration = pi({
 		models,
 		sql: sql(),

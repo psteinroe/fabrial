@@ -105,7 +105,7 @@ describe("follow records", () => {
 	const ref = { kind: "thread", provider: "chat", threadId: "chat:general:t1" } as const;
 	const start = (agents: ReturnType<typeof fakeAgents>, workflows: AnyWorkflow[] = []) => {
 		const runtime = db.runtime();
-		const chat = new FakeChat(() => runtime.now!());
+		const chat = new FakeChat({ installationId: "w" });
 		const app = testApp(f, { workflows, routedAgents: [agent], agents, runtime, chat });
 		return { app, chat };
 	};
@@ -120,8 +120,9 @@ describe("follow records", () => {
 		const thread = await chat.thread(ref);
 		await until("the follow record", async () => (await thread.getState())?.follows);
 		expect((await thread.getState())?.follows).toEqual([{ session, agent: "support" }]);
-		// The follow record, not the trigger, routes the next message: it needs no mention or channel match.
-		await chat.receive({ ...message("m2", ref.threadId), channelId: "other" });
+		// The follow record, not the trigger, routes the next message. (A thread's channel is its id's: a
+		// message in it always matches the trigger's channel.)
+		await chat.receive(message("m2", ref.threadId));
 		await until("the second delivery", async () => agents.sent[1]);
 		expect(agents.sent.map((each) => [each.session, each.agent])).toEqual([
 			[session, "support"],
@@ -156,7 +157,8 @@ describe("follow records", () => {
 		expect(stops).toEqual([
 			[
 				{ session: "chat:chat:general:t1", agent: "support" },
-				"stop-1",
+				// The production dedupe id of Slack's stop, whose streamed message ids FakeChat sends as ["stop-1"].
+				JSON.stringify(["chat", "agent-session-stopped", ref.threadId, "B", ["stop-1"]]),
 				expect.stringContaining("Stopped by"),
 			],
 		]);
@@ -180,7 +182,7 @@ describe("follow records", () => {
 		};
 		const { app, chat } = start(agents);
 		await app.start();
-		const thread = await chat.thread(ref);
+		const thread = await app.host.chat()!.thread(ref);
 		await thread.updateState(() => ({
 			follows: [
 				{ session: "app:one", agent: "support" },
@@ -222,7 +224,7 @@ describe("follow records", () => {
 			"the follow record",
 			async () => (await (await chat.thread(ref)).getState())?.follows,
 		);
-		await chat.receive({ ...message("m2", ref.threadId), channelId: "other" });
+		await chat.receive(message("m2", ref.threadId));
 		await until("the observer in the followed thread", async () => seen[1]);
 		await until("the second delivery", async () => agents.sent[1]);
 		// Observers run without the thread, once per message.

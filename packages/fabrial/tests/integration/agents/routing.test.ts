@@ -66,8 +66,7 @@ async function setup(
 		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
 	});
 	const settle = () => idle(runtime.queue);
-	const threadId = (thread: string, provider = "chat") =>
-		provider === "chat" ? `chat:${channel}:${thread}` : `${provider}:${thread}`;
+	const threadId = (thread: string, provider = "chat") => `${provider}:${channel}:${thread}`;
 	const message = (
 		id: string,
 		thread: string,
@@ -95,15 +94,11 @@ async function setup(
 		};
 	};
 	/**
-	 * Receive a message as the chat integration does (a mention is both a message and a mention), and wait
+	 * Receive a message through the Chat SDK (a mention is both a message and a mention), and wait
 	 * for the router's decision.
 	 */
 	const receive = async (m: ChatMessage) =>
-		(await fake.receive(m, {
-			events: [`${m.provider}.message`, ...(m.isMention ? [`${m.provider}.mentioned`] : [])],
-		})) === "ignored"
-			? "ignored"
-			: routed(runtime.queue, m.messageId);
+		(await fake.receive(m)) === "ignored" ? "ignored" : routed(runtime.queue, m.messageId);
 	const posts = async (thread: string, provider = "chat") =>
 		(
 			await fake.thread({ kind: "thread", provider, threadId: threadId(thread, provider) })
@@ -290,7 +285,7 @@ it("use case 6: an event without a thread starts a conversation in its home; the
 	expect(seen[0]).toContain("<notification");
 	expect(seen[0]).toContain("TypeError in checkout");
 	const created = [...t.chat.threads.values()].find((thread) =>
-		thread.ref.threadId.startsWith(`channel:${t.channel}:root-`),
+		thread.ref.threadId.startsWith(`chat:${t.channel}:message-`),
 	)!;
 	expect(created.posts.map((post) => post.content)).toEqual(["Answer 1"]);
 	expect((await created.getState())?.follows).toEqual([
@@ -466,7 +461,7 @@ it("equal specificity between an agent's and a workflow's trigger fails at start
 		launch(f, {
 			workflows: [workflow],
 			routedAgents: [agent],
-			chat: new FakeChat(),
+			chat: new FakeChat({ installationId: "w" }),
 			agents: pi({ models: createModels(), sql: sql() }),
 		}),
 	).rejects.toThrow(
