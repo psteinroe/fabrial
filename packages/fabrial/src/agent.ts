@@ -1,8 +1,7 @@
 import type { EvaluateQuestion, EvaluateRequest, EvaluateResult } from "./evaluate.ts";
 import type { Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
-import type { AgentRef } from "./runtime.ts";
-import type { Schema } from "./schema.ts";
+import type { InferOutput, Schema } from "./schema.ts";
 import type { AgentSession, SendOptions, SendReceipt } from "./send.ts";
 import type { ResourceRef } from "./plugin.ts";
 import type { FollowOptions, FollowReceipt, UnfollowReceipt } from "./follows.ts";
@@ -317,4 +316,25 @@ export function parseModel(model: string): { provider: string; modelId: string }
 
 export function isWorkflow(tool: AgentTool): tool is AnyWorkflow {
 	return "kind" in tool && tool.kind === "fabrial.workflow";
+}
+
+export type DurationInput = string | number;
+
+export interface AgentRunOptions<O extends Schema | undefined = Schema | undefined> {
+	input: Json;
+	/** Let the agent execution survive cancellation of its caller (and a timeout). */
+	detached?: boolean;
+	/** Stop waiting after this long; an attached call is cancelled, a detached one keeps running. */
+	timeout?: DurationInput;
+	/** Standard Schema for a typed structured result. Without it, the result is the answer text. */
+	output?: O;
+}
+
+/** What `ctx.agent` returns: the schema's output with `output`, otherwise the answer text. */
+export type AgentResult<O extends Schema | undefined> = O extends Schema ? InferOutput<O> : string;
+
+/** Minimal shape core needs from `f.defineAgent`. */
+export interface AgentRef {
+	readonly kind: "fabrial.agent";
+	readonly name: string;
 }

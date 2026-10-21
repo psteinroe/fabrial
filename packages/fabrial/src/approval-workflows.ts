@@ -5,7 +5,9 @@ import { CLEANUP_WORKFLOW, type CardDestination, type CleanupInput } from "./cle
 import { samePrincipal } from "./directory.ts";
 import { definedGroup, type Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
-import type { DurableExecution, RuntimeWorkflow } from "./runtime.ts";
+import type { TaskContext } from "pgconductor-js";
+import { childMetadata, executionResult, nativeMethods } from "./execution.ts";
+import type { RuntimeWorkflow } from "./runtime.ts";
 import type { CardAction, Surface } from "./thread.ts";
 
 /** One execution per approval request; its result is the request the routing workflow authorizes clicks against. */
@@ -104,10 +106,11 @@ export function approvalDeliveryWorkflow(): RuntimeWorkflow {
 		name: APPROVAL_DELIVERY_WORKFLOW,
 		triggers: [],
 		retentionDays: REQUEST_RETENTION_DAYS,
-		handler: async (input, execution) => {
+		handler: async (input, _execution, ctx) => {
 			const { cleanups } = input as { cleanups: string[] };
+			const native = nativeMethods(ctx);
 			for (const [index, id] of cleanups.entries())
-				if ((await execution.waitForResult(`card:${index}`, id)).status === "completed")
+				if ((await native.waitForResult(`card:${index}`, id)).status === "completed")
 					return { reached: true };
 			return { reached: false };
 		},
@@ -124,18 +127,18 @@ export function approvalDecisionWorkflow(now: () => number): RuntimeWorkflow {
 		name: APPROVAL_DECISION_WORKFLOW,
 		triggers: [],
 		// No retention: a caller may first wait on its decision any time later.
-		handler: async (input, execution) => {
+		handler: async (input, _execution, ctx) => {
 			const data = input as unknown as DecisionInput;
 			// Registered before any wait. The handler returns only once the reason is kept, so a crash in
 			// between redelivers it.
 			const cancel = Promise.withResolvers<string>();
 			const kept = Promise.withResolvers<void>();
-			execution.onSignal(APPROVAL_CANCEL_SIGNAL, async (payload) => {
+			ctx.onSignal(APPROVAL_CANCEL_SIGNAL, async (payload) => {
 				cancel.resolve((payload as { reason: string }).reason);
 				await kept.promise;
 			});
 			try {
-				return await decide(data, execution, now, cancel.promise);
+				return await decide(data, ctx, now, cancel.promise);
 			} finally {
 				kept.resolve();
 			}
@@ -145,37 +148,39 @@ export function approvalDecisionWorkflow(now: () => number): RuntimeWorkflow {
 
 async function decide(
 	data: DecisionInput,
-	execution: DurableExecution,
+	ctx: TaskContext,
 	now: () => number,
 	cancelled: Promise<string>,
 ): Promise<JsonObject> {
-	const decided = await execution.subscribe("decided", {
-		event: APPROVAL_DECIDED_EVENT,
+	const native = nativeMethods(ctx);
+	const internal = { replyTo: null, ownerWorkflow: null, triggerEvent: null };
+	const decided = await native.subscribe("decided", {
+		event: { name: APPROVAL_DECIDED_EVENT },
 		filter: { approvalId: [data.approvalId] },
-	});
+	} as never);
 	const cleanups = await Promise.all(
 		data.cards.map((card, index) =>
-			execution.start(
+			native.invoke(
 				`card:${index}`,
-				CLEANUP_WORKFLOW,
+				{ name: CLEANUP_WORKFLOW, queue: ctx.queue },
 				{
 					requestExecutionId: data.approvalId,
-					decisionId: execution.executionId,
+					decisionId: ctx.executionId,
 					proposal: data.proposal,
 					...card,
-				} satisfies CleanupInput as unknown as Json,
-				{ metadata: { replyTo: null, ownerWorkflow: null, triggerEvent: null } },
+				} satisfies CleanupInput as never,
+				{ metadata: childMetadata(ctx, internal) } as never,
 			),
 		),
 	);
 	// The requester's status card is not an approver card.
-	const delivery = await execution.start(
+	const delivery = await native.invoke(
 		"delivery",
-		APPROVAL_DELIVERY_WORKFLOW,
-		{ cleanups: cleanups.filter((_id, index) => data.cards[index]!.approver) },
-		{ metadata: { replyTo: null, ownerWorkflow: null, triggerEvent: null } },
+		{ name: APPROVAL_DELIVERY_WORKFLOW, queue: ctx.queue },
+		{ cleanups: cleanups.filter((_id, index) => data.cards[index]!.approver) } as never,
+		{ metadata: childMetadata(ctx, internal) } as never,
 	);
-	const winner = await execution.waitForAny(
+	const winner = await native.waitForAny(
 		"decision",
 		{
 			decided,
@@ -184,13 +189,13 @@ async function decide(
 			delivery: { execution: delivery },
 		},
 		// At least 1ms: a deadline passed before the wait registered (a resume after a crash) still expires it.
-		{ timeoutMs: Math.max(1, data.deadline - now()) },
+		{ timeout: Math.max(1, data.deadline - now()) },
 	);
-	if (winner.kind === "execution" && winner.key === "delivery") {
+	if ("outcome" in winner && winner.key === "delivery") {
 		const error =
-			winner.result.status === "completed"
+			winner.outcome.status === "completed"
 				? UNREACHABLE
-				: `Approval delivery ${winner.result.status}`;
+				: `Approval delivery ${winner.outcome.status}`;
 		return {
 			error,
 			label: error,
@@ -199,8 +204,8 @@ async function decide(
 	}
 	const decidedAt = new Date(now()).toISOString();
 	let result: DecisionResult;
-	if (winner.kind === "signal") {
-		const reason = await execution.step("cancelled", () => cancelled);
+	if ("signal" in winner) {
+		const reason = await native.step("cancelled", () => cancelled);
 		result = {
 			decision: {
 				status: "cancelled",
@@ -211,8 +216,8 @@ async function decide(
 			},
 			label: reason === "superseded" ? "Superseded" : "Cancelled",
 		};
-	} else if (winner.kind === "event") {
-		const event = winner.event.payload;
+	} else if ("event" in winner) {
+		const event = winner.event.payload as JsonObject;
 		const status = event.status as ApprovalDecision["status"];
 		const actor = event.actor as unknown as Principal | null;
 		const name = actor?.name ?? actor?.id;
@@ -234,12 +239,12 @@ async function decide(
 	} else
 		result = {
 			decision: {
-				status: winner.kind === "timeout" ? "expired" : "cancelled",
+				status: winner.key === "timeout" ? "expired" : "cancelled",
 				approved: false,
 				decidedBy: null,
 				decidedAt,
 			},
-			label: winner.kind === "timeout" ? "Expired" : "Cancelled",
+			label: winner.key === "timeout" ? "Expired" : "Cancelled",
 		};
 	return result as unknown as JsonObject;
 }
@@ -247,16 +252,17 @@ async function decide(
 /** The request of an approval id from a click: null for unknown ids and executions of other workflows. */
 export async function loadRequest(
 	host: FabrialHost,
-	execution: DurableExecution,
+	ctx: TaskContext,
 	approvalId: string,
 ): Promise<ApprovalRequest | null> {
-	const found = await execution.step("approval", async () => {
+	const native = nativeMethods(ctx);
+	const found = await native.step("approval", async () => {
 		const info = await host.runtime.getExecution(approvalId);
 		return info?.workflow === APPROVAL_REQUEST_WORKFLOW;
 	});
 	if (!found) return null;
 	// Started before any card was posted, so it settles right after a fast click at the latest.
-	const result = await execution.waitForResult("approval:result", approvalId);
+	const result = executionResult(await native.waitForResult("approval:result", approvalId));
 	return result.status === "completed" ? (result.output as unknown as ApprovalRequest) : null;
 }
 

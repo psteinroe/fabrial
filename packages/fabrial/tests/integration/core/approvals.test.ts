@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineGroup, definePlugin, defineUser } from "../../internals.ts";
-import type { DurableExecution, Json, RuntimeWorkflow, WorkflowContext } from "../../internals.ts";
+import type { Json, RuntimeWorkflow, WorkflowContext } from "../../internals.ts";
 import { until } from "../../conductor/helper.ts";
 import {
 	alice,
@@ -43,16 +43,21 @@ function paused(at: "start" | "cards") {
 							await pause();
 							return definition.handler(input, execution, ctx);
 						}
-						// After the cards started, before the decision's wait computes its timeout.
-						const start: DurableExecution["start"] = async (id, ...rest) => {
-							if (id === "delivery") await pause();
-							return execution.start(id, ...rest);
+						// After the cards started, before the decision's wait computes its timeout. Fabrial starts
+						// children with Conductor's own `invoke`, from the context's prototype.
+						const proto = Object.getPrototypeOf(ctx) as { invoke: (...args: unknown[]) => unknown };
+						const invoke = async (key: string, ...rest: unknown[]) => {
+							if (key === "delivery") await pause();
+							return proto.invoke.call(ctx, key, ...rest);
 						};
-						return definition.handler(
-							input,
-							Object.assign(Object.create(execution) as DurableExecution, { start }),
-							ctx,
-						);
+						const held = new Proxy(ctx, {
+							getPrototypeOf: () => Object.assign(Object.create(proto) as object, { invoke }),
+							get: (target, property) => {
+								const value = Reflect.get(target, property) as unknown;
+								return typeof value === "function" ? value.bind(target) : value;
+							},
+						});
+						return definition.handler(input, execution, held);
 					},
 				};
 	const register = runtime.register.bind(runtime);

@@ -19,7 +19,6 @@ import {
 import {
 	parseSchema,
 	type AnyWorkflow,
-	type DurableExecution,
 	type EvaluateResult,
 	type Evaluator,
 	type FabrialHost,
@@ -30,7 +29,8 @@ import {
 	type Thread,
 	type ToolStateHandle,
 } from "../modules.ts";
-import { bindMetadata } from "../context.ts";
+import type { TaskContext } from "pgconductor-js";
+import { bindMetadata, childMetadata, nativeMethods } from "../execution.ts";
 import {
 	applyState,
 	Binding,
@@ -48,7 +48,8 @@ import {
 
 export interface BridgeFrame {
 	host: FabrialHost;
-	execution: DurableExecution;
+	/** Conductor's context of the Session's execution. */
+	ctx: TaskContext;
 	evaluator: Evaluator;
 	harness: Harness;
 	/** The Pi Session key this execution hosts. */
@@ -227,7 +228,7 @@ export async function fields(
 				if (saved) return saved as unknown as EvaluateResult<typeof request.questions>;
 				const result = await bridge.evaluator.evaluate(
 					request,
-					context.abortSignal ?? bridge.execution.signal,
+					context.abortSignal ?? bridge.ctx.signal,
 				);
 				return (await api.memo(
 					key,
@@ -364,7 +365,7 @@ export async function startChild(
 		const saved = await tx.doc(ChildIntents, key, {
 			workflow: waited ? REPORT_WORKFLOW : workflow,
 			input: waited
-				? { workflow, input: cloneJson(input ?? null), session: bridge.execution.executionId }
+				? { workflow, input: cloneJson(input ?? null), session: bridge.ctx.executionId }
 				: cloneJson(input ?? null),
 			metadata: { ...cloneJson(metadata), triggerEvent: null, ownerWorkflow: null },
 			dedupeKey,
@@ -385,16 +386,21 @@ export async function startChild(
  * are the intent's. Saves its execution id.
  */
 async function launch(
-	bridge: Pick<BridgeFrame, "harness" | "execution">,
+	bridge: Pick<BridgeFrame, "harness" | "ctx">,
 	key: string,
 	intent: ChildIntent,
 	context: Context,
 ): Promise<string> {
-	const executionId = await bridge.execution.start(key, intent.workflow, intent.input, {
-		metadata: intent.metadata,
-		dedupeKey: intent.dedupeKey,
-		cancelWithParent: !intent.detached,
-	});
+	const executionId = await nativeMethods(bridge.ctx).invoke(
+		key,
+		{ name: intent.workflow, queue: bridge.ctx.queue },
+		intent.input as never,
+		{
+			metadata: childMetadata(bridge.ctx, intent.metadata),
+			dedupe_key: intent.dedupeKey,
+			...(intent.detached ? {} : { cancelWithParent: true }),
+		} as never,
+	);
 	await bridge.harness.commit(async (tx) => {
 		(await tx.doc(ChildIntents, key, intent)).executionId = executionId;
 	}, context);
@@ -424,7 +430,7 @@ export async function registerChild(
  * cancelled, and no later start joins them.
  */
 export async function cancelChildren(
-	bridge: Pick<BridgeFrame, "harness" | "execution">,
+	bridge: Pick<BridgeFrame, "harness" | "ctx">,
 	cancel: (executionId: string, reason: string) => Promise<unknown>,
 	requests: Iterable<string>,
 	reason: string,

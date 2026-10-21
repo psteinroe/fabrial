@@ -3,7 +3,8 @@ import type { EvaluateQuestion, EvaluateRequest, EvaluateResult } from "./evalua
 import type { GroupDefinition, Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { Origin } from "./events.ts";
-import type { AgentRef, AgentResult, AgentRunOptions, InvocationMetadata } from "./runtime.ts";
+import type { AgentRef, AgentResult, AgentRunOptions } from "./agent.ts";
+import type { InvocationMetadata } from "./execution.ts";
 import type { TaskContext } from "pgconductor-js";
 import type { Schema } from "./schema.ts";
 import type { SendOptions, SendReceipt } from "./send.ts";

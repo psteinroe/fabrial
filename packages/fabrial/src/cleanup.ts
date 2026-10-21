@@ -4,7 +4,8 @@ import type { ApprovalCard, DecisionResult } from "./approval-workflows.ts";
 import type { Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 import { editMessage, postMessage, postTo, type ChatConnection } from "./chat/threads.ts";
-import type { DurableExecution } from "./runtime.ts";
+import type { TaskContext } from "pgconductor-js";
+import { executionResult, nativeMethods } from "./execution.ts";
 import type { MessageRef, Surface } from "./thread.ts";
 
 export const CLEANUP_WORKFLOW = "fabrial.cleanup";
@@ -28,11 +29,8 @@ export const CLEANUP_ATTEMPTS = 3;
  * One independent execution per approval card: posts it, waits for the decision, and relabels it
  * without actions. It survives cancellation of the caller and restarts.
  */
-export async function cleanup(
-	input: Json,
-	execution: DurableExecution,
-	host: FabrialHost,
-): Promise<void> {
+export async function cleanup(input: Json, ctx: TaskContext, host: FabrialHost): Promise<void> {
+	const native = nativeMethods(ctx);
 	const data = input as unknown as CleanupInput;
 	const chat = host.chat();
 	if (!chat) throw new Error("Approvals require a chat integration");
@@ -41,7 +39,7 @@ export async function cleanup(
 			approvalId: data.requestExecutionId,
 			error: error instanceof Error ? error.message : String(error),
 		});
-	const ref = (await execution
+	const ref = (await native
 		.step("post", async () => {
 			const card = { card: pendingCard(data.proposal, data.status, data.actions) };
 			const { destination } = data;
@@ -54,8 +52,8 @@ export async function cleanup(
 			throw error;
 		})) as unknown as MessageRef;
 	// Only the decision: a card posted after both it and the caller settled must show the decision.
-	const result = await execution.waitForResult("closed", data.decisionId);
-	await execution
+	const result = executionResult(await native.waitForResult("closed", data.decisionId));
+	await native
 		.step("update", async () => {
 			const outcome: Outcome =
 				result.status === "completed"

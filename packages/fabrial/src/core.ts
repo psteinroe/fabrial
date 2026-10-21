@@ -31,12 +31,9 @@ import {
 import { workflowObject, type AnyWorkflow, type WorkflowContext } from "./workflow.ts";
 import type { Json, JsonObject } from "./json.ts";
 import { parseSchema } from "./schema.ts";
-import {
-	type AgentRef,
-	type DurableExecution,
-	type InvocationMetadata,
-	type RuntimeWorkflow,
-} from "./runtime.ts";
+import type { AgentRef } from "./agent.ts";
+import type { RuntimeWorkflow } from "./runtime.ts";
+import { childMetadata, nativeMethods, type InvocationMetadata } from "./execution.ts";
 import type { ChatMessage, ThreadRef } from "./thread.ts";
 import { createContext, metadataOf } from "./context.ts";
 import type { Middleware, TaskContext } from "pgconductor-js";
@@ -176,11 +173,12 @@ export function buildApp(config: CoreConfig): HostedApp {
 	 * operation: a retry after a partial delivery resumes after the deliveries that completed, and a
 	 * delivery that completed without its receipt is deduped by its request id.
 	 */
-	const route = async (ingress: IngressEvent, execution: DurableExecution): Promise<Json> => {
-		const { requestId } = execution.metadata;
+	const route = async (ingress: IngressEvent, ctx: TaskContext): Promise<Json> => {
+		const native = nativeMethods(ctx);
+		const { requestId } = metadataOf(ctx);
 		const actor = (
 			ingress.actor
-				? await execution.step(
+				? await native.step(
 						"actor",
 						async () => (await directory.resolveIdentity(ingress.actor!)) as unknown as Json,
 					)
@@ -196,13 +194,13 @@ export function buildApp(config: CoreConfig): HostedApp {
 			const [, verb, approvalId] = /^fabrial\.approval\.(approve|reject|cancel):(.+)$/.exec(
 				action.actionId,
 			)!;
-			const request = await loadRequest(host, execution, approvalId!);
-			const allowed = await execution.step(
+			const request = await loadRequest(host, ctx, approvalId!);
+			const allowed = await native.step(
 				"authorize",
 				async () => !!request && (await authorized(host, request, verb as ApprovalAction, actor)),
 			);
 			if (!allowed) {
-				await execution.step("denied", async () => {
+				await native.step("denied", async () => {
 					if (ingress.actor && ingress.replyTo)
 						await chat?.postEphemeral(
 							ingress.replyTo as ThreadRef,
@@ -214,7 +212,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			}
 			// The persisted deadline holds here too: the decision may not have registered its timeout yet,
 			// and a retry reuses the authorization above.
-			const decided = await execution.step("decide", async () => {
+			const decided = await native.step("decide", async () => {
 				if (now() >= request!.deadline) return false;
 				await runtime.emit(
 					APPROVAL_DECIDED_EVENT,
@@ -241,7 +239,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 				return true;
 			});
 			if (!decided) {
-				await execution.step("expired", async () => {
+				await native.step("expired", async () => {
 					if (ingress.actor && ingress.replyTo)
 						await chat?.postEphemeral(
 							ingress.replyTo as ThreadRef,
@@ -255,13 +253,13 @@ export function buildApp(config: CoreConfig): HostedApp {
 		}
 		if (ingress.kind === "stop") {
 			const sdk = await chat?.thread(ingress.replyTo as ThreadRef);
-			const follows = (await execution.step(
+			const follows = (await native.step(
 				"follows",
 				async () => ((sdk && (await routingState(sdk)))?.follows ?? []) as Json,
 			)) as Follow[];
 			// A stop cancels the current run of each conversation following the thread; anyone there may stop.
 			for (const [index, conversation] of follows.entries())
-				await execution.step(`stop:${index}`, async () => {
+				await native.step(`stop:${index}`, async () => {
 					await agents.stopConversation(conversation, ingress.id, `Stopped by ${actor!.id}`);
 				});
 			return null;
@@ -270,7 +268,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			ingress.kind === "message" ? (ingress.payload as unknown as ChatMessage) : undefined;
 		const thread = message && threadOf(message);
 		const sdk = thread && (await chat?.thread(thread));
-		const decision = await execution.step("route", async (): Promise<RouteDecision> => {
+		const decision = await native.step("route", async (): Promise<RouteDecision> => {
 			const { selected, tied, observers } = select(ingress.events, ingress.payload);
 			const conversation = (agent: Agent, replyTo: InvocationMetadata["replyTo"]): Follow => ({
 				session: conversationSession(
@@ -320,7 +318,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 		});
 		// A handled thread stays subscribed; every conversation receiving its messages follows it.
 		if (chat && sdk && decision.route !== "ignored")
-			await execution.step("follow", async () => {
+			await native.step("follow", async () => {
 				if (decision.conversations.length)
 					await updateRoutingState(chat!, sdk, (state) =>
 						decision.conversations.reduce(addFollow, state),
@@ -341,7 +339,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 		};
 		const named = knownAgents();
 		for (const [index, conversation] of decision.conversations.entries())
-			await execution.step(`deliver:${index}`, async () => {
+			await native.step(`deliver:${index}`, async () => {
 				const request = await deliver(
 					named.get(conversation.agent) ?? { kind: "fabrial.agent", name: conversation.agent },
 					conversation,
@@ -351,20 +349,37 @@ export function buildApp(config: CoreConfig): HostedApp {
 				// An event's conversation follows the thread its replies go to.
 				if (!message) await follow(host, request.follow, conversation);
 			});
-		if (decision.owner)
-			await execution.start("owner", decision.owner.workflow, ingress.payload, { metadata });
+		const start = (key: string, workflow: string, metadata: Partial<InvocationMetadata>) =>
+			native.invoke(
+				key,
+				{ name: workflow, queue: ctx.queue },
+				ingress.payload as never,
+				{
+					metadata: childMetadata(ctx, metadata),
+				} as never,
+			);
+		if (decision.owner) await start("owner", decision.owner.workflow, metadata);
 		// Observers run without the thread.
 		for (const observer of decision.observers)
-			await execution.start(`observer:${observer.workflow}`, observer.workflow, ingress.payload, {
-				metadata: { ...metadata, replyTo: null, triggerEvent: observer.event },
+			await start(`observer:${observer.workflow}`, observer.workflow, {
+				...metadata,
+				replyTo: null,
+				triggerEvent: observer.event,
 			});
 		// Each category is also emitted once for `ctx.waitForEvent`; no workflow triggers on it.
 		if (ingress.kind === "event" || decision.route === "new")
 			for (const event of ingress.events)
-				await execution.emit(event, ingress.payload, { id: ingress.id, metadata });
+				await native.emit(
+					event as never,
+					ingress.payload as never,
+					{
+						dedupe_key: ingress.id,
+						metadata: childMetadata(ctx, metadata),
+					} as never,
+				);
 		// Conversations following the event's resource threads get a notification; triggers still run.
 		if (ingress.kind === "event")
-			await execution.step("notify", async () => {
+			await native.step("notify", async () => {
 				await notifyFollowers(host, agents, ingress.events[0]!, ingress.payload, {
 					...metadata,
 					replyTo: null,
@@ -479,17 +494,8 @@ export function buildApp(config: CoreConfig): HostedApp {
 			return ran ? result! : next({});
 		});
 	/** Merges Fabrial's fields onto Conductor's context of every attempt. */
-	const attempt: RuntimeWorkflow["attempt"] = async (execution, next, raw) =>
-		next(
-			await createContext({
-				host,
-				execution,
-				raw: raw as TaskContext,
-				metadata: execution.metadata,
-				agents,
-				now,
-			}),
-		);
+	const attempt: RuntimeWorkflow["attempt"] = async (_execution, next, raw) =>
+		next(await createContext({ host, raw, metadata: metadataOf(raw), agents, now }));
 	const workflows: RuntimeWorkflow[] = config.workflows.map((workflow) => ({
 		name: workflow.name,
 		// The routing workflow starts app workflows; they have no runtime triggers.
@@ -503,7 +509,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 		retries: workflow.definition.retries,
 		attempt,
 		handler: async (input, _execution, ctx) => {
-			const output = await workflow.definition.run(input, ctx as WorkflowContext);
+			const output = await workflow.definition.run(input, ctx as unknown as WorkflowContext);
 			// The output schema validates (and transforms) the result before the run records it.
 			const label = `workflow ${workflow.name} output`;
 			if (workflow.definition.output)
@@ -524,7 +530,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			name: CLEANUP_WORKFLOW,
 			triggers: [],
 			retries: { maxAttempts: CLEANUP_ATTEMPTS },
-			handler: (input, execution) => cleanup(input, execution, host),
+			handler: (input, _execution, ctx) => cleanup(input, ctx, host),
 		});
 		for (const workflow of extraWorkflows.values()) workflows.push({ ...workflow, attempt });
 		// Routing is plumbing: no workflow context or plugin middleware.
@@ -532,7 +538,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			name: ROUTE_WORKFLOW,
 			triggers: [{ event: INGRESS_EVENT }],
 			retries: { maxAttempts: 5 },
-			handler: (input, execution) => route(input as IngressEvent, execution),
+			handler: (input, _execution, ctx) => route(input as IngressEvent, ctx),
 		});
 		runtime.register({
 			workflows,

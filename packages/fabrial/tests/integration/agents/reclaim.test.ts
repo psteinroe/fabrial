@@ -112,8 +112,8 @@ it("reclaims a completed call's Session once its execution settled 7 days ago, n
 	const caller: RuntimeWorkflow = {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (_input, execution) => {
-			const answer = await f.integration.run(execution, "answer", f.agent, {
+		handler: async (_input, execution, ctx) => {
+			const answer = await f.integration.run(ctx, "answer", f.agent, {
 				input: "Question",
 			});
 			const go = await execution.subscribe("go", { event: GO });
@@ -170,7 +170,7 @@ it("reclaims a call cancelled while suspended on a workflow tool, but not while 
 	const caller: RuntimeWorkflow = {
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution) => f.integration.run(execution, "agent", agent, { input: "Wait" }),
+		handler: (_input, execution, ctx) => f.integration.run(ctx, "agent", agent, { input: "Wait" }),
 	};
 	await f.start(
 		[
@@ -222,8 +222,8 @@ it("examines at most reclaimBatchSize Sessions per step", async () => {
 	const caller: RuntimeWorkflow = {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (_input, execution) => {
-			for (const call of calls) await f.integration.run(execution, call, f.agent, { input: call });
+		handler: async (_input, execution, ctx) => {
+			for (const call of calls) await f.integration.run(ctx, call, f.agent, { input: call });
 			return null;
 		},
 	};

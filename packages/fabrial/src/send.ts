@@ -2,7 +2,8 @@ import type { FabrialHost } from "./app.ts";
 import { updateRoutingState } from "./chat/threads.ts";
 import type { Json, JsonObject } from "./json.ts";
 import { addFollow } from "./routing.ts";
-import type { AgentRef, InvocationMetadata } from "./runtime.ts";
+import type { AgentRef } from "./agent.ts";
+import type { InvocationMetadata } from "./execution.ts";
 import type { ChatMessage, Surface, Thread, ThreadRef } from "./thread.ts";
 
 /** Which Session (and with the agent name, which conversation) an input goes to. */

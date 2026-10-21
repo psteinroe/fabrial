@@ -7,12 +7,8 @@ import {
 	MemoryStorage,
 	type ToolExecutionApi,
 } from "@earendil-works/pi-durable";
-import {
-	createFabrial,
-	type DurableExecution,
-	type FabrialHost,
-	type InvocationMetadata,
-} from "../../internals.ts";
+import { createFabrial, type FabrialHost, type InvocationMetadata } from "../../internals.ts";
+import { TaskContext } from "pgconductor-js";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
@@ -81,20 +77,31 @@ async function fixture(workflows: FabrialHost["workflows"] = []) {
 			chat: () => ({}),
 		} as unknown as FabrialHost,
 		session: "app:operations",
-		execution: {
+		// Conductor's context of the Session's execution: Fabrial starts children with its prototype's `invoke`.
+		ctx: Object.assign(Object.create(conductorMethods(start)) as object, {
 			executionId: "a",
+			queue: "default",
 			metadata: {
 				...metadata,
 				requestId: "driver-interaction",
 				requestedBy: { id: "driver", known: true, identities: [] },
 				replyTo: null,
 			},
-			start,
-		} as unknown as DurableExecution,
+			onSignal() {},
+		}),
 	} as unknown as BridgeFrame;
 	const context = withContextValue(BridgeKey, bridge, BACKGROUND_CONTEXT);
 	const api = { taskId: 42, conversationId: conversation.id } as ToolExecutionApi;
 	return { harness, bridge, context, api, start, metadata, conversation };
+}
+
+/** Conductor's context methods (not its getters, which the fixture's plain fields replace), with `invoke` stubbed. */
+function conductorMethods(invoke: unknown): object {
+	const proto = TaskContext.prototype as unknown as Record<string, unknown>;
+	const methods = Object.getOwnPropertyNames(proto).filter(
+		(name) => typeof Object.getOwnPropertyDescriptor(proto, name)!.value === "function",
+	);
+	return { ...Object.fromEntries(methods.map((name) => [name, proto[name]])), invoke };
 }
 
 it("ordinary tool children carry request identity, not the driver's trigger ownership", async () => {
@@ -158,7 +165,13 @@ it("managed effects reconnect across drivers without executing another post", as
 	try {
 		const first = await fields(f.context, f.conversation.id, f.api);
 		expect(await first.thread!.post("post", "hello")).toEqual({ messageId: "posted" });
-		f.bridge.execution = { ...f.bridge.execution, executionId: "b" };
+		f.bridge.ctx = Object.assign(
+			Object.create(Object.getPrototypeOf(f.bridge.ctx) as object),
+			f.bridge.ctx,
+			{
+				executionId: "b",
+			},
+		);
 		const replay = await fields(f.context, f.conversation.id, f.api);
 		expect(await replay.thread!.post("post", "hello")).toEqual({ messageId: "posted" });
 		expect(f.start).toHaveBeenCalledTimes(1);
@@ -187,7 +200,13 @@ it("reconciles a lost child-start receipt from its persisted intent and stable g
 			(await f.harness.snapshot(Obligations, BACKGROUND_CONTEXT))?.requests.request?.intents,
 		).toContain(key);
 		expect(intent?.executionId).toBeNull();
-		f.bridge.execution = { ...f.bridge.execution, executionId: "b" };
+		f.bridge.ctx = Object.assign(
+			Object.create(Object.getPrototypeOf(f.bridge.ctx) as object),
+			f.bridge.ctx,
+			{
+				executionId: "b",
+			},
+		);
 		await (
 			await fields(f.context, f.conversation.id, f.api)
 		).start("start", workflow, undefined as never);

@@ -13,7 +13,7 @@ import {
 import { createApproval } from "./protocol.ts";
 import { duration } from "./internal.ts";
 import type { Json, JsonObject } from "./json.ts";
-import type { DurableExecution, InvocationMetadata } from "./runtime.ts";
+import { bindMetadata, nativeMethods, type InvocationMetadata } from "./execution.ts";
 import { parseSchema } from "./schema.ts";
 import { follow, prepareSend } from "./send.ts";
 import { followResource, storedFollowOptions, unfollowResource } from "./follows.ts";
@@ -21,7 +21,7 @@ import type { MessageRef, OutboundMessage, Thread, Surface } from "./thread.ts";
 import { workflowObject, type AnyWorkflow } from "./workflow.ts";
 import type { TaskContext } from "pgconductor-js";
 import { CHILD_SIGNAL } from "./agents/documents.ts";
-import type { AgentRef, AgentRunOptions } from "./runtime.ts";
+import type { AgentRef, AgentRunOptions } from "./agent.ts";
 import type { SendOptions } from "./send.ts";
 import type { ResourceRef } from "./plugin.ts";
 import type { FollowOptions } from "./follows.ts";
@@ -32,7 +32,6 @@ import type { GroupDefinition, Principal } from "./identity.ts";
 
 export interface ContextOptions {
 	host: FabrialHost;
-	execution: DurableExecution;
 	/** Conductor's context of the attempt: Fabrial's fields are merged onto it. */
 	raw: TaskContext;
 	metadata: InvocationMetadata;
@@ -40,20 +39,7 @@ export interface ContextOptions {
 	now: () => number;
 }
 
-const contextMetadata = new WeakMap<object, InvocationMetadata>();
-
-/** Binds a workflow or tool context to its invocation metadata, which contexts do not expose. */
-export function bindMetadata<T extends object>(ctx: T, metadata: InvocationMetadata): T {
-	contextMetadata.set(ctx, metadata);
-	return ctx;
-}
-
-/** The invocation metadata behind a context, for Fabrial's runtime modules and its own tests. */
-export function metadataOf(ctx: object): InvocationMetadata {
-	const metadata = contextMetadata.get(ctx);
-	if (!metadata) throw new Error("Expected a Fabrial context");
-	return metadata;
-}
+export { bindMetadata, metadataOf, nativeMethods } from "./execution.ts";
 
 /** Operation keys beginning with `fabrial:` are Fabrial's; Conductor derives its own keys from a key and a suffix. */
 export function userKey(key: string): string {
@@ -62,45 +48,6 @@ export function userKey(key: string): string {
 	if (key.startsWith("fabrial:"))
 		throw new Error("Operation keys beginning with fabrial: are reserved");
 	return key;
-}
-
-type Native = Pick<
-	TaskContext,
-	| "step"
-	| "sleep"
-	| "subscribe"
-	| "waitForEvent"
-	| "waitForAny"
-	| "waitForResult"
-	| "invoke"
-	| "invokeAndWait"
-	| "schedule"
-	| "unschedule"
-	| "sendSignal"
-	| "signalWithStart"
-	| "emit"
->;
-
-const NATIVE = [
-	"step",
-	"sleep",
-	"subscribe",
-	"waitForEvent",
-	"waitForAny",
-	"waitForResult",
-	"invoke",
-	"invokeAndWait",
-	"schedule",
-	"unschedule",
-	"sendSignal",
-	"signalWithStart",
-	"emit",
-] as const;
-
-/** Conductor's own methods of a context, from its prototype: unaffected by wrappers merged onto it. */
-export function nativeMethods(ctx: TaskContext): Native {
-	const proto = Object.getPrototypeOf(ctx) as Record<string, (...args: unknown[]) => unknown>;
-	return Object.fromEntries(NATIVE.map((name) => [name, proto[name]!.bind(ctx)])) as Native;
 }
 
 /** Signals Fabrial's internal executions listen for: user code cannot send them. */
@@ -112,7 +59,7 @@ const INTERNAL_SIGNALS = new Set(["input", CHILD_SIGNAL]);
  * reserved destinations); `fabrial.native` keeps the originals for Fabrial's own helpers.
  */
 export async function createContext(options: ContextOptions) {
-	const { host, execution, raw, metadata, agents } = options;
+	const { host, raw, metadata, agents } = options;
 	const native = nativeMethods(raw);
 	const op = userKey;
 	const chat = host.chat();
@@ -123,7 +70,7 @@ export async function createContext(options: ContextOptions) {
 	let firstPost: Promise<unknown> | undefined;
 	const post = async (id: string, message: OutboundMessage): Promise<MessageRef> => {
 		while (firstPost) await firstPost.catch(() => {});
-		const posting = execution.step(id, async () => {
+		const posting = native.step(id, async () => {
 			if (!metadata.replyTo || !chat) throw new Error("This execution has no chat surface");
 			return (await (bound
 				? postMessage(bound, message)
@@ -138,7 +85,6 @@ export async function createContext(options: ContextOptions) {
 				threadId: ref.threadId,
 			});
 			metadata.replyTo = threadRef(bound) as InvocationMetadata["replyTo"];
-			execution.metadata.replyTo = metadata.replyTo;
 			return ref;
 		} finally {
 			if (firstPost === posting) firstPost = undefined;
@@ -172,9 +118,9 @@ export async function createContext(options: ContextOptions) {
 					},
 					post: (id, message) => post(op(id), message),
 					update: async (id, message, content) =>
-						execution.step(op(id), () => editMessage(chat, message, content)),
+						native.step(op(id), () => editMessage(chat, message, content)),
 					history: (id, opts = {}) =>
-						execution.step(op(id), async () => (bound ? fetchHistory(chat, bound, opts) : [])),
+						native.step(op(id), async () => (bound ? fetchHistory(chat, bound, opts) : [])),
 				}
 			: undefined;
 	/** An app workflow: internal tasks (routing, approvals, sessions, …) are not destinations for user code. */
@@ -303,7 +249,7 @@ export async function createContext(options: ContextOptions) {
 				} as never,
 			),
 		agent: async (id: string, agent: AgentRef, opts: AgentRunOptions) =>
-			agents.run(execution, op(id), agent, opts),
+			agents.run(raw, op(id), agent, opts),
 		send: async (id: string, agent: AgentRef, opts: SendOptions) => {
 			const key = op(id);
 			const request = await native.step(`fabrial:${key}:send`, async () => {
@@ -319,7 +265,7 @@ export async function createContext(options: ContextOptions) {
 				await follow(host, prepared.follow, { session: prepared.session, agent: agent.name });
 				return prepared;
 			});
-			return agents.send(execution, key, agent, request);
+			return agents.send(raw, key, agent, request);
 		},
 		follow: (id: string, resource: ResourceRef<any>, opts?: FollowOptions) =>
 			native.step(op(id), () =>
@@ -335,8 +281,8 @@ export async function createContext(options: ContextOptions) {
 				async () => (await agents.evaluator.evaluate(request, raw.signal)) as unknown as Json,
 			),
 		state: (state: StateDefinition<any, "session">) => ({
-			get: (id: string) => agents.state.get(execution, op(id), state),
-			update: (id: string, fn: never) => agents.state.update(execution, op(id), state, fn),
+			get: (id: string) => agents.state.get(raw, op(id), state),
+			update: (id: string, fn: never) => agents.state.update(raw, op(id), state, fn),
 		}),
 		requestApproval: async (id: string, opts: ApprovalOptions) =>
 			createApproval(op(id), opts, { ...options, native, op }),

@@ -29,11 +29,7 @@ import {
 	parseSchema,
 	type AgentRef,
 	type AgentRunOptions,
-	type DurableExecution,
 	type ExecutionResult,
-	ExecutionError,
-	isCancelled,
-	type WaitBranch,
 	type FabrialHost,
 	type InvocationMetadata,
 	type Json,
@@ -43,6 +39,16 @@ import {
 	type RuntimeWorkflow,
 	type Schema,
 } from "../modules.ts";
+import type { TaskContext } from "pgconductor-js";
+import {
+	childMetadata,
+	executionResult,
+	ExecutionError,
+	isCancelled,
+	metadataOf,
+	nativeMethods,
+	startAndWait,
+} from "../execution.ts";
 import {
 	channelOfSurface,
 	editMessage,
@@ -513,11 +519,11 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 	}
 
 	/** The channel of an execution's reply surface, without the provider. */
-	async function channelOfExecution(execution: DurableExecution, what: string): Promise<string> {
+	async function channelOfExecution(ctx: TaskContext, what: string): Promise<string> {
 		const chat = host.chat();
-		if (!execution.metadata.replyTo || !chat)
-			throw new Error(`Managed Pi ${what} has no chat surface`);
-		return channelOfSurface(chat, execution.metadata.replyTo);
+		const { replyTo } = metadataOf(ctx);
+		if (!replyTo || !chat) throw new Error(`Managed Pi ${what} has no chat surface`);
+		return channelOfSurface(chat, replyTo);
 	}
 
 	/** Metadata of a Session execution: it serves many requests, so it carries none of theirs. */
@@ -554,7 +560,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 	 * running, it aborts the call's Pi run before closing Pi; cancelled while suspended, nothing runs: its workflow tools
 	 * are cancelled with it, and the call's Pi Session is left as it is (never reopened; reclaim deletes it later).
 	 */
-	async function hostSession(input: Json, execution: DurableExecution): Promise<Json> {
+	async function hostSession(input: Json, ctx: TaskContext): Promise<Json> {
 		if (!started) throw new Error("Start the Pi integration before running agents");
 		const { session: key, call } = input as { session: string; call?: SessionInput };
 		let phase: "opening" | "open" | "closing" | "returned" = "opening";
@@ -563,10 +569,10 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		// A `ctx.agent` call arrives as the input of its own Session's execution, a child of the caller.
 		if (call?.kind === "call") late.push({ payload: call, id: call.requestId, done: () => {} });
 		// Registered before any wait: a signal still being handled when the wait registers wins it.
-		execution.onSignal("input", async (payload, { id }) => {
+		ctx.onSignal("input", async (payload, { id }) => {
 			const input = payload as unknown as SessionInput;
 			if (phase === "returned") {
-				await signalSession(key, `${id}:requeued`, input, execution.metadata);
+				await signalSession(key, `${id}:requeued`, input, metadataOf(ctx));
 				return;
 			}
 			if (phase === "open" && hosted) return hosted.handle(input);
@@ -584,14 +590,14 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		};
 		// Returns at once: a signal arriving while the Session closes does not win its wait, but the reporter's execution
 		// branch does once it settled. While suspended, the signal wins the wait.
-		execution.onSignal(CHILD_SIGNAL, (payload) => {
+		ctx.onSignal(CHILD_SIGNAL, (payload) => {
 			const { executionId, result } = payload as unknown as ChildSignal;
 			reportOf(executionId).resolve(result);
 		});
 		try {
 			for (;;) {
 				phase = "opening";
-				const session = await openSession(key, execution, reportOf);
+				const session = await openSession(key, ctx, reportOf);
 				hosted = session;
 				phase = "open";
 				for (const each of late.splice(0))
@@ -608,7 +614,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				// Input handled after Pi went idle has not run yet.
 				if (missed) continue;
 				if (idle.kind === "parked") {
-					const branches: Record<string, WaitBranch> = {
+					const branches: Record<string, { signal: string } | { execution: string }> = {
 						input: { signal: "input" },
 						child: { signal: CHILD_SIGNAL },
 					};
@@ -616,7 +622,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 						branches[`task:${taskId}`] = { execution: executionId };
 					for (const executionId of idle.deliveries)
 						branches[`delivery:${executionId}`] = { execution: executionId };
-					await execution.waitForAny(`idle:${idle.n}`, branches);
+					await nativeMethods(ctx).waitForAny(`idle:${idle.n}`, branches as never);
 					continue;
 				}
 				if (late.length) continue;
@@ -661,15 +667,16 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 
 	async function openSession(
 		key: string,
-		execution: DurableExecution,
+		ctx: TaskContext,
 		reportOf: (executionId: string) => PromiseWithResolvers<JsonObject>,
 	): Promise<SessionHost> {
+		const native = nativeMethods(ctx);
 		// A crashed owner's lease lasts until it expires: SessionBusy
 		// fails the attempt, and Conductor retries it with backoff (the Session workflow's attempts cover a lease).
 		const storage = await PostgresStorage.open(options.sql, key, {
-			executionId: execution.executionId,
+			executionId: ctx.executionId,
 		});
-		const signal = AbortSignal.any([execution.signal, storage.lost.signal]);
+		const signal = AbortSignal.any([ctx.signal, storage.lost.signal]);
 		/** The agents' conversations this opening configured, by agent name. */
 		const conversations = new Map<string, Hosted>();
 		/** Progress of the conversations with outstanding obligations, by conversation id; the newest shows child status. */
@@ -678,7 +685,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		const outcomes = new Map<string, CallOutcome>();
 		const frame: BridgeFrame = {
 			host,
-			execution,
+			ctx,
 			evaluator,
 			harness: undefined as unknown as Harness,
 			session: key,
@@ -735,9 +742,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		};
 		const onLost = () =>
 			rejectIdle(
-				execution.signal.aborted
-					? execution.signal.reason
-					: new LeaseLost("Pi Session ownership lost"),
+				ctx.signal.aborted ? ctx.signal.reason : new LeaseLost("Pi Session ownership lost"),
 			);
 		signal.addEventListener("abort", onLost, { once: true });
 		let joined!: () => void;
@@ -972,9 +977,11 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				if (signal.aborted) throw error;
 				response = { error: error instanceof Error ? error.message : String(error) };
 			}
-			await execution.emit(STATE_EVENT, { operation: input.operation, ...response } as JsonObject, {
-				metadata: sessionMetadata(key),
-			});
+			await native.emit(
+				STATE_EVENT as never,
+				{ operation: input.operation, ...response } as never,
+				{ metadata: childMetadata(ctx, sessionMetadata(key)) } as never,
+			);
 		}
 
 		const apply = (input: SessionInput) =>
@@ -1272,7 +1279,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 						await finishCall(conversationId, requestId, {
 							status: "failed",
 							error: `Pi run unanswered: ${record.reason}`,
-							executionId: execution.executionId,
+							executionId: ctx.executionId,
 						});
 					continue;
 				}
@@ -1397,7 +1404,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 					// model calls happen. The Session is the call's own, so the abort reaches its background children too.
 					// Best effort: a call cancelled while suspended runs nothing, and its Session is never reopened (its
 					// workflow tools are cancelled with the Session's execution).
-					if (isCancelled(execution.signal))
+					if (isCancelled(ctx.signal))
 						for (const obligation of Object.values(
 							(await harness.snapshot(Obligations, BACKGROUND_CONTEXT))?.requests ?? {},
 						))
@@ -1519,7 +1526,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		retries: { maxAttempts: 10 },
 		// No retentionDays, so kept forever: callers wait on a call's result and replay from it, and reclaim reads when
 		// it settled. A finite retention must outlast both, and retainCallSessionsDays.
-		handler: hostSession,
+		handler: (input, _execution, ctx) => hostSession(input, ctx),
 	};
 	const retainDays = options.retainCallSessionsDays ?? 7;
 	if (!(retainDays >= 0)) throw new RangeError("retainCallSessionsDays must not be negative");
@@ -1542,8 +1549,9 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		concurrency: 1,
 		// Nothing waits on it.
 		retentionDays: 30,
-		handler: async (_input, execution) => {
-			const cutoff = await execution.step(
+		handler: async (_input, _execution, ctx) => {
+			const native = nativeMethods(ctx);
+			const cutoff = await native.step(
 				"cutoff",
 				async () => (host.runtime.now?.() ?? Date.now()) - retainDays * 86_400_000,
 			);
@@ -1551,7 +1559,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 			let reclaimed = 0;
 			let batches = 0;
 			for (;;) {
-				const batch = (await execution.step(`batch:${batches++}`, async () => {
+				const batch = (await native.step(`batch:${batches++}`, async () => {
 					const candidates = await PostgresStorage.reclaimable(
 						options.sql,
 						CALL_SESSION,
@@ -1586,7 +1594,8 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 	const report: RuntimeWorkflow = {
 		name: REPORT_WORKFLOW,
 		triggers: [],
-		handler: async (input, execution) => {
+		handler: async (input, _execution, ctx) => {
+			const native = nativeMethods(ctx);
 			const {
 				workflow,
 				input: data,
@@ -1596,13 +1605,18 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				input: Json;
 				session: string;
 			};
-			const child = await execution.start("child", workflow, data, { cancelWithParent: true });
-			const result = (await execution.waitForResult("result", child)) as JsonObject;
-			await execution.step("report", async () => {
-				await host.runtime.signal(session, {
+			const child = await native.invoke(
+				"child",
+				{ name: workflow, queue: ctx.queue },
+				data as never,
+				{ metadata: childMetadata(ctx), cancelWithParent: true } as never,
+			);
+			const result = executionResult(await native.waitForResult("result", child)) as JsonObject;
+			await native.step("report", async () => {
+				await native.sendSignal(session, {
 					name: CHILD_SIGNAL,
 					id: `child:${child}`,
-					payload: { executionId: execution.executionId, result } satisfies ChildSignal,
+					payload: { executionId: ctx.executionId, result } satisfies ChildSignal,
 				});
 			});
 			return { child, result };
@@ -1612,49 +1626,51 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 	const effect: RuntimeWorkflow = {
 		name: EFFECT_WORKFLOW,
 		triggers: [],
-		handler: async (input, execution) => {
+		handler: async (input, _execution, ctx) => {
+			const native = nativeMethods(ctx);
+			const metadata = metadataOf(ctx);
 			const { method, args } = input as { method: string; args: Json[] };
 			if (method === "follow" || method === "unfollow") {
 				const [resource, options] = args as [ResourceRefJson, StoredFollowOptions];
 				const surface = {
-					current: execution.metadata.replyTo,
-					channelId: () => channelOfExecution(execution, method),
+					current: metadata.replyTo,
+					channelId: () => channelOfExecution(ctx, method),
 				};
 				const apply = method === "follow" ? followResource : unfollowResource;
-				return execution.step(`fabrial:pi:${method}`, () =>
-					apply(host, execution.metadata, surface, resource as never, options),
+				return native.step(`fabrial:pi:${method}`, () =>
+					apply(host, metadata, surface, resource as never, options),
 				);
 			}
 			if (method === "send") {
 				const [agent, options] = args as [string, SendOptions];
 				const ref = agents.get(agent) ?? { kind: "fabrial.agent" as const, name: agent };
-				const request = await execution.step("fabrial:pi:send", async () => {
+				const request = await native.step("fabrial:pi:send", async () => {
 					const prepared = await prepareSend(
 						host,
-						execution.metadata,
+						metadata,
 						{
-							current: execution.metadata.replyTo,
-							channelId: () => channelOfExecution(execution, "send"),
+							current: metadata.replyTo,
+							channelId: () => channelOfExecution(ctx, "send"),
 						},
-						`${execution.executionId}:send`,
+						`${ctx.executionId}:send`,
 						ref,
 						options,
 					);
 					await follow(host, prepared.follow, { session: prepared.session, agent });
 					return prepared;
 				});
-				return port.send(execution, "send", ref, request);
+				return port.send(ctx, "send", ref, request);
 			}
-			return execution.step("fabrial:pi:effect", async () => {
+			return native.step("fabrial:pi:effect", async () => {
 				const chat = host.chat();
-				const replyTo = execution.metadata.replyTo;
+				const replyTo = metadata.replyTo;
 				if (!replyTo || !chat) throw new Error("Managed Pi thread operation has no thread");
 				if (method === "post") {
 					// To a channel home, each post starts a thread of its own.
 					const posted = await postTo(chat, replyTo, args[0] as OutboundMessage);
 					// A reply to a channel home created the conversation's thread: follow it.
-					const conversation = execution.metadata.follow as ConversationKey | undefined;
-					if (conversation && execution.metadata.replyTo?.kind === "channel")
+					const conversation = metadata.follow as ConversationKey | undefined;
+					if (conversation && metadata.replyTo?.kind === "channel")
 						await follow(
 							host,
 							{ kind: "thread", provider: posted.provider, threadId: posted.threadId },
@@ -1722,38 +1738,40 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		},
 		/** Deliver a rendered input to the conversation `[request.session, agent]` without waiting. */
 		async send(
-			execution: DurableExecution,
+			ctx: TaskContext,
 			id: string,
 			agent: AgentRef,
 			request: SendRequest,
 		): Promise<SendReceipt> {
 			const input = sessionInput(agent, request);
-			await execution.signalWithStart(`fabrial:pi:deliver:${id}`, {
-				workflow: SESSION_WORKFLOW,
+			await nativeMethods(ctx).signalWithStart(`fabrial:pi:deliver:${id}`, {
+				task: SESSION_WORKFLOW,
+				queue: ctx.queue,
 				key: request.session,
 				signal: { name: "input", id: request.requestId, payload: input as unknown as Json },
 				input: { session: request.session },
-				metadata: sessionMetadata(request.session),
-			});
+				metadata: childMetadata(ctx, sessionMetadata(request.session)),
+			} as never);
 			return {
 				requestId: request.requestId,
 				conversation: conversationReference(agent.name, request.session),
 			};
 		},
 		async run(
-			execution: DurableExecution,
+			ctx: TaskContext,
 			id: string,
 			agent: AgentRef,
 			request: AgentRunOptions,
 		): Promise<Json> {
+			const native = nativeMethods(ctx);
 			// A call has its own Session, keyed by the workflow run: it never shares a transcript with a thread's
 			// conversation and never follows a thread. Its Session execution is a child of the caller, so cancelling or
 			// failing the caller cancels it (and the workflows its tools started), unless detached.
-			const metadata = execution.metadata;
-			const key = callSession(execution.executionId, id);
-			const requestId = `${execution.executionId}:${id}`;
+			const metadata = metadataOf(ctx);
+			const key = callSession(ctx.executionId, id);
+			const requestId = `${ctx.executionId}:${id}`;
 			const instruction = request.output ? outputInstruction(agent.name, request.output) : "";
-			const content = await execution.step(`fabrial:pi:origin:${id}`, async () => {
+			const content = await native.step(`fabrial:pi:origin:${id}`, async () => {
 				const sections = metadata.origin
 					? await Promise.all(
 							host.plugins.map(async (plugin) =>
@@ -1776,10 +1794,11 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				content,
 				metadata: cloneJson({ ...metadata, piSession: key }),
 			};
-			const outcome = (await execution.invoke(
+			const outcome = (await startAndWait(
+				ctx,
 				`fabrial:pi:call:${id}`,
 				SESSION_WORKFLOW,
-				{ session: key, call } as unknown as Json,
+				{ session: key, call } as unknown as JsonObject,
 				{
 					metadata: sessionMetadata(key),
 					detached: !!request.detached,
@@ -1790,7 +1809,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				throw new ExecutionError(outcome.executionId, { status: "failed", error: outcome.error });
 			const answer = outcome.output ?? null;
 			if (!request.output) return answer;
-			return execution.step(`fabrial:pi:output:${id}`, async () =>
+			return native.step(`fabrial:pi:output:${id}`, async () =>
 				parseSchema(
 					request.output as Schema<Json>,
 					JSON.parse(typeof answer === "string" ? answer : JSON.stringify(answer)),
@@ -1805,21 +1824,23 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 	 * again, and the host answers it from its receipt.
 	 */
 	async function stateRequest(
-		execution: DurableExecution,
+		ctx: TaskContext,
 		id: string,
 		key: string,
 		request: Omit<StateRequest, "kind" | "operation">,
 	): Promise<Exclude<StateResponse, { error: string }>> {
-		const operation = `${execution.executionId}:${id}`;
+		const native = nativeMethods(ctx);
+		const operation = `${ctx.executionId}:${id}`;
 		const payload: StateRequest = { kind: "state", operation, ...request };
 		for (let n = 0; n < STATE_REQUESTS; n++) {
 			const at = n ? `${id}:${n}` : id;
-			const response = await execution.subscribe(`${at}:response`, {
-				event: STATE_EVENT,
+			const response = await native.subscribe(`${at}:response`, {
+				event: { name: STATE_EVENT },
 				filter: { operation: [operation] },
-			});
-			await execution.signalWithStart(`${at}:request`, {
-				workflow: SESSION_WORKFLOW,
+			} as never);
+			await native.signalWithStart(`${at}:request`, {
+				task: SESSION_WORKFLOW,
+				queue: ctx.queue,
 				key,
 				signal: {
 					name: "input",
@@ -1827,15 +1848,15 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 					payload: payload as unknown as Json,
 				},
 				input: { session: key },
-				metadata: sessionMetadata(key),
-			});
-			const won = await execution.waitForAny(
+				metadata: childMetadata(ctx, sessionMetadata(key)),
+			} as never);
+			const won = await native.waitForAny(
 				`${at}:wait`,
 				{ response },
-				{ timeoutMs: options.stateTimeoutMs ?? 60_000 },
+				{ timeout: options.stateTimeoutMs ?? 60_000 },
 			);
-			if (won.kind !== "event") continue;
-			const answer = won.event.payload as unknown as StateResponse;
+			if (!("event" in won)) continue;
+			const answer = (won.event as { payload: unknown }).payload as StateResponse;
 			if ("error" in answer) throw new Error(answer.error);
 			return answer;
 		}
@@ -1846,13 +1867,13 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 	/** `ctx.state(S)` in workflow code. Each call is one durable operation. */
 	const state = {
 		get: async <T extends JsonObject>(
-			execution: DurableExecution,
+			ctx: TaskContext,
 			id: string,
 			definition: StateDefinition<T>,
 		): Promise<T> => {
-			const key = sessionKey(execution.metadata);
+			const key = sessionKey(metadataOf(ctx));
 			stateOf(definition.name);
-			const answer = await stateRequest(execution, id, key, { state: definition.name });
+			const answer = await stateRequest(ctx, id, key, { state: definition.name });
 			if ("conflict" in answer) throw new Error(`State ${definition.name}: a read cannot conflict`);
 			return answer.value as T;
 		},
@@ -1861,19 +1882,19 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		 * replaces the value if nothing changed it since; otherwise it reads again, up to `stateConflicts` times.
 		 */
 		update: async <T extends JsonObject>(
-			execution: DurableExecution,
+			ctx: TaskContext,
 			id: string,
 			definition: StateDefinition<T>,
 			change: (draft: T) => void | T,
 		): Promise<T> => {
-			const key = sessionKey(execution.metadata);
+			const key = sessionKey(metadataOf(ctx));
 			stateOf(definition.name);
 			const conflicts = options.stateConflicts ?? 20;
 			for (let n = 0; n < conflicts; n++) {
 				const at = n ? `${id}:retry:${n}` : id;
-				const read = await stateRequest(execution, `${at}:read`, key, { state: definition.name });
+				const read = await stateRequest(ctx, `${at}:read`, key, { state: definition.name });
 				if (!("value" in read)) throw new Error(`State ${definition.name}: a read cannot conflict`);
-				const value = await execution.step(`${at}:apply`, async () => {
+				const value = await nativeMethods(ctx).step(`${at}:apply`, async () => {
 					const draft = cloneJson(read.value) as T;
 					return parseSchema(
 						definition.schema,
@@ -1881,7 +1902,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 						`state ${definition.name}`,
 					) as unknown as Json;
 				});
-				const written = await stateRequest(execution, `${at}:write`, key, {
+				const written = await stateRequest(ctx, `${at}:write`, key, {
 					state: definition.name,
 					write: { value: value as JsonObject, revision: read.revision },
 				});

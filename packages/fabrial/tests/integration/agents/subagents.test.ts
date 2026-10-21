@@ -111,7 +111,7 @@ function fixture() {
 		const workflow: RuntimeWorkflow = {
 			name: randomUUID(),
 			triggers: [],
-			handler: (_input, execution) => integration.run(execution, "agent", agent, { input }),
+			handler: (_input, execution, ctx) => integration.run(ctx, "agent", agent, { input }),
 		};
 		runtime.register({
 			workflows: [workflow, ...integration.workflows, ...others],

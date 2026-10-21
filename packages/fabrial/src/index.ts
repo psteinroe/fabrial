@@ -53,13 +53,8 @@ export {
 } from "./identity.ts";
 export type { Json, JsonObject } from "./json.ts";
 export type { ResourceRef } from "./plugin.ts";
-export {
-	ExecutionError,
-	type AgentRef,
-	type AgentResult,
-	type AgentRunOptions,
-	type ExecutionResult,
-} from "./runtime.ts";
+export type { AgentRef, AgentResult, AgentRunOptions } from "./agent.ts";
+export { ExecutionError, type ExecutionResult } from "./execution.ts";
 export { SchemaValidationError, type InferOutput, type Schema } from "./schema.ts";
 export type {
 	ConversationReference,

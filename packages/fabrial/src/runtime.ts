@@ -5,25 +5,20 @@
  *
  * Every durable operation maps onto the Conductor call of the same name (README, "Boundary").
  */
-import type { EventFilter, Origin } from "./events.ts";
-import type { Principal } from "./identity.ts";
+import type { TaskContext } from "pgconductor-js";
+import type { AgentRef, AgentResult, AgentRunOptions, DurationInput } from "./agent.ts";
+import type { EventFilter } from "./events.ts";
+import type { ExecutionResult, InvocationMetadata } from "./execution.ts";
 import type { Json, JsonObject } from "./json.ts";
-import type { InferOutput, Schema } from "./schema.ts";
 import type { Surface } from "./thread.ts";
 
-/** Serializable invocation context carried by every execution (Conductor execution metadata, item 2). */
-export interface InvocationMetadata extends JsonObject {
-	/** Correlates one request: derived from the source event (or the run), it keys request ids. */
-	requestId: string;
-	origin: (Origin & JsonObject) | null;
-	/** Where `ctx.thread` points. `null` for executions without a surface (observers, cron without replyTo). */
-	replyTo: (Surface & JsonObject) | null;
-	requestedBy: (Principal & JsonObject) | null;
-	// Requests delivered by `ctx.send` also carry `send: SentRequest` (kind and priority). Tools and the
-	// workflows they start carry `conversation: ConversationRef`, the agent conversation they belong to.
-}
-
-export type DurationInput = string | number;
+export {
+	ExecutionError,
+	isCancelled,
+	type ExecutionResult,
+	type InvocationMetadata,
+} from "./execution.ts";
+export type { AgentRef, AgentResult, AgentRunOptions, DurationInput };
 
 /**
  * A one-shot event subscription (Conductor `ctx.subscribe`): it holds the first matching event emitted
@@ -45,32 +40,6 @@ export type WaitForAnyResult =
 	| { key: string; kind: "execution"; result: ExecutionResult }
 	| { key: string; kind: "signal"; signal: { id: string; name: string } }
 	| { key: "timeout"; kind: "timeout" };
-
-export type ExecutionResult =
-	| { status: "completed"; output: Json }
-	| { status: "failed"; error: string }
-	| { status: "cancelled"; reason: string };
-
-/** The abort reason of a cancelled execution's `signal` (Conductor's). */
-const CANCELLED = "cancelled";
-
-/** True when an execution's `signal` aborted because the execution was cancelled, not because its attempt ended. */
-export function isCancelled(signal: AbortSignal): boolean {
-	return (
-		signal.aborted && (signal.reason as { reason?: unknown } | undefined)?.reason === CANCELLED
-	);
-}
-
-/** A child terminal failure, distinguishable from ordinary handler failures. */
-export class ExecutionError extends Error {
-	constructor(
-		readonly executionId: string,
-		readonly result: Exclude<ExecutionResult, { status: "completed" }>,
-	) {
-		super(result.status === "cancelled" ? result.reason : result.error);
-		this.name = "ExecutionError";
-	}
-}
 
 /**
  * Data sent to one execution (Conductor item 12). `id` dedupes: sending an id to an execution again stores
@@ -204,10 +173,10 @@ export interface RuntimeWorkflow {
 	attempt?: (
 		execution: DurableExecution,
 		next: (additions: object) => Promise<void>,
-		ctx: unknown,
+		ctx: TaskContext,
 	) => Promise<void>;
 	/** Its return value is the execution's native result (`getExecution`, result waits). */
-	handler: (input: Json, execution: DurableExecution, ctx: unknown) => Promise<Json | void>;
+	handler: (input: Json, execution: DurableExecution, ctx: TaskContext) => Promise<Json | void>;
 }
 
 export interface RuntimeEvent {
@@ -252,23 +221,4 @@ export interface DurableRuntime {
 	signal(executionId: string, signal: RuntimeSignal): Promise<boolean>;
 	start(): Promise<void>;
 	stop(): Promise<void>;
-}
-
-export interface AgentRunOptions<O extends Schema | undefined = Schema | undefined> {
-	input: Json;
-	/** Let the agent execution survive cancellation of its caller (and a timeout). */
-	detached?: boolean;
-	/** Stop waiting after this long; an attached call is cancelled, a detached one keeps running. */
-	timeout?: DurationInput;
-	/** Standard Schema for a typed structured result. Without it, the result is the answer text. */
-	output?: O;
-}
-
-/** What `ctx.agent` returns: the schema's output with `output`, otherwise the answer text. */
-export type AgentResult<O extends Schema | undefined> = O extends Schema ? InferOutput<O> : string;
-
-/** Minimal shape core needs from `f.defineAgent`. */
-export interface AgentRef {
-	readonly kind: "fabrial.agent";
-	readonly name: string;
 }

@@ -9,7 +9,8 @@ import type { JsonObject } from "./json.ts";
 import type { AnyPlugin, ResourceKind, ResourceRef } from "./plugin.ts";
 import type { ResourceFollow, ThreadRoutingState } from "./routing.ts";
 import type { Agents } from "./agents/pi.ts";
-import type { AgentRef, InvocationMetadata } from "./runtime.ts";
+import type { AgentRef } from "./agent.ts";
+import type { InvocationMetadata } from "./execution.ts";
 import {
 	deliveryFor,
 	renderInput,

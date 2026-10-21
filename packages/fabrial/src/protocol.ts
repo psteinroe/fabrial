@@ -1,5 +1,6 @@
 import type { ApprovalHandle, ApprovalOptions } from "./approval.ts";
-import type { ContextOptions, nativeMethods } from "./context.ts";
+import type { ContextOptions } from "./context.ts";
+import type { nativeMethods } from "./execution.ts";
 import {
 	APPROVAL_CANCEL_SIGNAL,
 	APPROVAL_DECISION_WORKFLOW,
@@ -72,14 +73,14 @@ export async function createApproval(
 	options: ApprovalOptions,
 	ctx: ApprovalContext,
 ): Promise<ApprovalHandle> {
-	const { host, execution, metadata, now } = ctx;
+	const { host, raw, native, metadata, now } = ctx;
 	if (!host.chat()) throw new Error("Approvals require a chat integration");
 	const originatingProvider = metadata.origin?.provider ?? metadata.replyTo?.provider;
 	const targets = Array.isArray(options.approvers) ? options.approvers : [options.approvers];
 	for (const field of options.card?.fields ?? [])
 		if (RESERVED_LABELS.some((label) => label.toLowerCase() === field.label.trim().toLowerCase()))
 			throw new Error(`Approval ${id}: card field label "${field.label}" is reserved`);
-	const request = (await execution.step(`fabrial:${id}:request`, async () => {
+	const request = (await native.step(`fabrial:${id}:request`, async () => {
 		const resolved: Principal[] = [];
 		const users: Principal[] = [];
 		for (const target of targets) {
@@ -103,7 +104,7 @@ export async function createApproval(
 		const approvers = [...new Map(resolved.map((p) => [p.id, p])).values()];
 		if (!approvers.length) throw new Error("Approval requires at least one approver");
 		return {
-			callerId: execution.executionId,
+			callerId: raw.executionId,
 			operationId: id,
 			assigned: {
 				users,
@@ -126,11 +127,11 @@ export async function createApproval(
 		);
 	// The request's own execution: its result is what the routing workflow authorizes clicks against.
 	const internal = { replyTo: null, ownerWorkflow: null, triggerEvent: null };
-	const approvalId = await execution.start(
+	const approvalId = await native.invoke(
 		`fabrial:${id}:record`,
-		APPROVAL_REQUEST_WORKFLOW,
-		request as unknown as Json,
-		{ metadata: { ...metadata, ...internal } },
+		{ name: APPROVAL_REQUEST_WORKFLOW, queue: raw.queue },
+		request as never,
+		{ metadata: { ...metadata, ...internal } } as never,
 	);
 	const approvers = request.approvers;
 	const decide = [
@@ -164,12 +165,12 @@ export async function createApproval(
 					: [{ id: `fabrial.approval.cancel:${approvalId}`, label: "Cancel request" }],
 		});
 	// Subscribes to decisions before its cleanups post the cards; independent of this execution.
-	const decisionId = await execution.start(
+	const decisionId = await native.invoke(
 		`fabrial:${id}:decision`,
-		APPROVAL_DECISION_WORKFLOW,
+		{ name: APPROVAL_DECISION_WORKFLOW, queue: raw.queue },
 		{
 			approvalId,
-			callerId: execution.executionId,
+			callerId: raw.executionId,
 			deadline: request.deadline,
 			proposal: {
 				title: request.title,
@@ -181,8 +182,8 @@ export async function createApproval(
 				content: request.content,
 			},
 			cards,
-		} satisfies DecisionInput as unknown as Json,
-		{ metadata: { ...metadata, ...internal } },
+		} satisfies DecisionInput as never,
+		{ metadata: { ...metadata, ...internal } } as never,
 	);
 
 	// A wait that loses `waitForAny` leaves the decision running: the approval can be awaited again.
@@ -212,8 +213,8 @@ export async function createApproval(
 		// decision execution even when that has not subscribed yet.
 		cancel: async (cancelId, reason) => {
 			const op = ctx.op(cancelId);
-			await execution.step(op, async () => {
-				await host.runtime.signal(decisionId, {
+			await native.step(op, async () => {
+				await native.sendSignal(decisionId, {
 					name: APPROVAL_CANCEL_SIGNAL,
 					id: op,
 					payload: { reason },
