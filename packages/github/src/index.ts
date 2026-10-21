@@ -425,6 +425,8 @@ const followTool: Tool<{ pr: string; events?: "default" | "all" }> = {
 	name: "github_follow_pull_request",
 	description:
 		"Follow a GitHub pull request in this conversation until you unfollow it: new commits, reviews, comments from collaborators, merge, and close arrive as notifications (`events: all` also adds labels and CI results).",
+	// Only a Fabrial durable operation: a call interrupted by a restart resumes it.
+	idempotent: true,
 	input: z.object({ pr: prInput, events: z.enum(["default", "all"]).optional() }),
 	async run({ pr, events }, ctx) {
 		const receipt = await ctx.follow("follow", pullRequest(pr), { events });
@@ -435,6 +437,8 @@ const unfollowTool: Tool<{ pr: string }> = {
 	name: "github_unfollow_pull_request",
 	description:
 		"Stop following a GitHub pull request in this conversation, e.g. after it is merged.",
+	// Only a Fabrial durable operation: a call interrupted by a restart resumes it.
+	idempotent: true,
 	input: z.object({ pr: prInput }),
 	async run({ pr }, ctx) {
 		const receipt = await ctx.unfollow("unfollow", pullRequest(pr));

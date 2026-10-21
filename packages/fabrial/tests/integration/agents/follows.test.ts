@@ -248,6 +248,8 @@ it("orchestrator: a channel lead starts a background worker per message; reports
 	// The third worker follows only after the fourth message joined the lead's run.
 	const fourthPlaced = gate();
 	const reported = new Set<string>();
+	// What each worker's follow returned: a follow is a durable operation, never "interrupted" by a resumed Session.
+	const followed: string[] = [];
 	const follow = (pr: string) =>
 		fauxAssistantMessage(fauxToolCall("github_follow_pull_request", { pr }), {
 			stopReason: "toolUse",
@@ -258,7 +260,10 @@ it("orchestrator: a channel lead starts a background worker per message; reports
 		const task = textOf(messages[0]);
 		if (task.startsWith("Handle the")) {
 			const request = which(task);
-			if (messages.length > 1) return fauxAssistantMessage(`Worker done with ${request}.`);
+			if (messages.length > 1) {
+				followed.push(text);
+				return fauxAssistantMessage(`Worker done with ${request}.`);
+			}
 			if (request === "second") return follow("acme/app#5");
 			if (request === "third") {
 				await fourthPlaced.opened;
@@ -373,5 +378,8 @@ it("orchestrator: a channel lead starts a background worker per message; reports
 	await t.webhook(webhooks.review("changes_requested"), "orchestrated-review-2");
 	expect((await posts("t4")).at(-1)).toBe("Lead handles the review.");
 	expect(await posts("t3")).not.toContain("Lead handles the review.");
+	expect(followed).toHaveLength(3);
+	for (const result of followed)
+		expect(result).toMatch(/^\["Following github:acme\/app#[56]\."\]$/);
 	await t.app.stop();
 });
