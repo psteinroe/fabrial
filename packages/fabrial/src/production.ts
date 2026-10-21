@@ -4,8 +4,7 @@ import type { ConversationRetryPolicy } from "@earendil-works/pi-durable";
 import postgres, { type Sql } from "postgres";
 import { pi, type PiOptions } from "./agents/pi.ts";
 import { createModels, type ModelCredentials } from "./agents/models.ts";
-import type { ChatIntegration, CoreConfig } from "./app.ts";
-import { chat } from "./chat/index.ts";
+import type { CoreConfig } from "./app.ts";
 import { conductor, type ConductorConfig } from "./runtime/conductor/index.ts";
 
 /** Settings only `fabrial/testing` may change. */
@@ -61,16 +60,10 @@ export function production(
 	const pool = lazyPool(config.database);
 	const credentials = createModels(config.models);
 	let state: ReturnType<typeof createPostgresState> | undefined;
-	const chatIntegration: ChatIntegration = {
-		kind: "fabrial.chat",
-		connect(host) {
-			state = createPostgresState({ url: pool.url! });
-			return chat({ state }).connect(host);
-		},
-	};
 	return {
 		runtime: conductor({ sql: pool.sql }, overrides.conductor),
-		chat: chatIntegration,
+		// Opened when the app starts.
+		chat: { state: () => (state = createPostgresState({ url: pool.url! })) },
 		agents: pi({
 			models: overrides.models ?? credentials.models,
 			sql: pool.sql,

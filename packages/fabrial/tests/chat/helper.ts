@@ -3,9 +3,9 @@ import { createMemoryState } from "@chat-adapter/state-memory";
 import type { ChatInstance, StateAdapter } from "chat";
 import type { FabrialHost, ThreadRoutingState } from "../internals.ts";
 import { vi } from "vitest";
-import { chat, chatCapability, chatEvents } from "../../src/chat/index.ts";
+import { chatCapability, chatEvents, connectChat } from "../../src/chat/index.ts";
 
-export const routingState: ThreadRoutingState = {
+export const routingFixture: ThreadRoutingState = {
 	ingestedDedupeIds: [{ kind: "message", id: "message-1", at: 1 }],
 	statusMessageId: null,
 	follows: [{ session: "slack:C1:root", agent: "support" }],
@@ -52,13 +52,13 @@ export function setup(state: StateAdapter = createMemoryState()) {
 		},
 		logger: createMockLogger(),
 		clients: () => ({}),
-		chat: () => connection.port,
+		chat: () => connection,
 		ingest: vi.fn(),
 		receiveMessage: vi.fn(async () => "accepted" as const),
 		receiveAction: vi.fn(),
 		receiveCancellation: vi.fn(),
 		resolvePrincipal: vi.fn(),
 	};
-	const connection = chat({ state }).connect(host);
+	const connection = connectChat({ state }, host);
 	return { host, adapter, connection, state, sdk: () => sdk };
 }

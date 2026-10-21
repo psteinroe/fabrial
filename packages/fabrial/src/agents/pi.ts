@@ -38,11 +38,19 @@ import {
 	type InvocationMetadata,
 	type Json,
 	type JsonObject,
+	type MessageRef,
+	type OutboundMessage,
 	type RuntimeWorkflow,
 	type Schema,
 	type StatePort,
-	type ThreadIO,
 } from "../modules.ts";
+import {
+	channelOfSurface,
+	editMessage,
+	fetchHistory,
+	postTo,
+	type SDKThread,
+} from "../chat/threads.ts";
 import {
 	definedAgents,
 	isWorkflow,
@@ -497,10 +505,12 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		return native;
 	}
 
-	async function thread(execution: DurableExecution): Promise<ThreadIO | undefined> {
-		return execution.metadata.replyTo && host.chat()
-			? host.chat()!.resolve(execution.metadata.replyTo)
-			: undefined;
+	/** The channel of an execution's reply surface, without the provider. */
+	async function channelOfExecution(execution: DurableExecution, what: string): Promise<string> {
+		const chat = host.chat();
+		if (!execution.metadata.replyTo || !chat)
+			throw new Error(`Managed Pi ${what} has no chat surface`);
+		return channelOfSurface(chat, execution.metadata.replyTo);
 	}
 
 	/** Metadata of a Session execution: it serves many requests, so it carries none of theirs. */
@@ -818,8 +828,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			let view = views.get(conversation.id);
 			if (!view) {
 				const io =
-					call?.replyTo?.kind === "thread"
-						? await thread({ metadata: call } as DurableExecution)
+					call?.replyTo?.kind === "thread" && host.chat()
+						? await host.chat()!.thread(call.replyTo)
 						: undefined;
 				view = await progressOf(conversation, io, harness, context);
 				views.set(conversation.id, view);
@@ -1221,7 +1231,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			outcomes.set(requestId, outcome);
 			const io = views.get(conversationId)?.io;
 			await closeView(conversationId);
-			await io?.setStatus(null).catch(() => {});
+			if (io)
+				await host
+					.chat()
+					?.setStatus(io, null)
+					.catch(() => {});
 		}
 
 		/**
@@ -1413,7 +1427,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	 */
 	async function progressOf(
 		conversation: Conversation,
-		io: ThreadIO | undefined,
+		io: SDKThread | undefined,
 		harness: Harness,
 		context: Context,
 	) {
@@ -1421,11 +1435,18 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		let progressRequest: string | undefined;
 		let waiting = false;
 		let childStatus: string | undefined;
-		const shown = new Set<ThreadIO>();
+		const shown = new Map<string, SDKThread>();
+		const setStatus = async (thread: SDKThread | undefined, text: string | null) => {
+			if (thread)
+				await host
+					.chat()
+					?.setStatus(thread, text)
+					.catch(() => {});
+		};
 		const showStatus = async (text: string) => {
 			if (!progress) return;
-			shown.add(progress);
-			await progress.setStatus(text).catch(() => {});
+			shown.set(progress.id, progress);
+			await setStatus(progress, text);
 		};
 		const thinking = () => showStatus(waiting ? WAITING_STATUS : "Thinking…");
 		const events = await watchEvents(harness, conversation.id, context);
@@ -1454,13 +1475,13 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			async follow(requestId: string) {
 				const replyTo = (await harness.snapshot(Invocation, requestId, context))?.replyTo;
 				if (replyTo?.kind !== "thread" || !host.chat()) return;
-				progress = await host.chat()!.resolve(replyTo);
+				progress = await host.chat()!.thread(replyTo);
 				progressRequest = requestId;
 				await thinking();
 			},
 			async unfollow(requestId: string) {
 				if (progressRequest !== requestId) return;
-				await progress?.setStatus(null).catch(() => {});
+				await setStatus(progress, null);
 				progress = undefined;
 			},
 			async status(text: string) {
@@ -1474,12 +1495,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				childStatus = undefined;
 				if (waiting) return;
 				if ((await harness.snapshot(LiveDoc, conversation.id, context))?.run) await thinking();
-				else await progress?.setStatus(null).catch(() => {});
+				else await setStatus(progress, null);
 			},
 			async stop() {
 				await events.stop();
-				for (const surface of shown)
-					if (surface !== io) await surface.setStatus(null).catch(() => {});
+				for (const [id, surface] of shown) if (id !== io?.id) await setStatus(surface, null);
 				shown.clear();
 			},
 		};
@@ -1591,11 +1611,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				const [resource, options] = args as [ResourceRefJson, StoredFollowOptions];
 				const surface = {
 					current: execution.metadata.replyTo,
-					channelId: async () => {
-						const io = await thread(execution);
-						if (!io) throw new Error(`Managed Pi ${method} has no chat surface`);
-						return io.channelId;
-					},
+					channelId: () => channelOfExecution(execution, method),
 				};
 				const apply = method === "follow" ? followResource : unfollowResource;
 				return execution.step(`fabrial:pi:${method}`, () =>
@@ -1611,11 +1627,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						execution.metadata,
 						{
 							current: execution.metadata.replyTo,
-							channelId: async () => {
-								const io = await thread(execution);
-								if (!io) throw new Error("Managed Pi send has no chat surface");
-								return io.channelId;
-							},
+							channelId: () => channelOfExecution(execution, "send"),
 						},
 						`${execution.executionId}:send`,
 						ref,
@@ -1627,10 +1639,12 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				return port.send(execution, "send", ref, request);
 			}
 			return execution.step("fabrial:pi:effect", async () => {
-				const io = await thread(execution);
-				if (!io) throw new Error("Managed Pi thread operation has no thread");
+				const chat = host.chat();
+				const replyTo = execution.metadata.replyTo;
+				if (!replyTo || !chat) throw new Error("Managed Pi thread operation has no thread");
 				if (method === "post") {
-					const posted = await io.post(args[0] as Parameters<ThreadIO["post"]>[0]);
+					// To a channel home, each post starts a thread of its own.
+					const posted = await postTo(chat, replyTo, args[0] as OutboundMessage);
 					// A reply to a channel home created the conversation's thread: follow it.
 					const conversation = execution.metadata.follow as ConversationKey | undefined;
 					if (conversation && execution.metadata.replyTo?.kind === "channel")
@@ -1642,14 +1656,24 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					return cloneJson(posted) as unknown as Json;
 				}
 				if (method === "update") {
-					await io.update(
-						args[0] as unknown as Parameters<ThreadIO["update"]>[0],
-						args[1] as Parameters<ThreadIO["update"]>[1],
+					await editMessage(
+						chat,
+						args[0] as unknown as MessageRef,
+						args[1] as OutboundMessage,
+						replyTo,
 					);
 					return null;
 				}
 				if (method === "history")
-					return cloneJson(await io.history(args[0] as Parameters<ThreadIO["history"]>[0]));
+					return replyTo.kind === "thread"
+						? cloneJson(
+								await fetchHistory(
+									chat,
+									await chat.thread(replyTo),
+									args[0] as { limit?: number; sinceLastBotReply?: boolean },
+								),
+							)
+						: [];
 				throw new Error(`Unknown Pi effect ${method}`);
 			});
 		},

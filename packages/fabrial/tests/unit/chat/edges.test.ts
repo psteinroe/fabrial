@@ -2,8 +2,14 @@
 import { createMockAdapter, createTestMessage } from "@chat-adapter/tests";
 import type { ChatInstance } from "chat";
 import { afterEach, expect, it, vi } from "vitest";
-import { chat, chatCapability, chatEvents } from "../../../src/chat/index.ts";
-import { routingState, setup } from "../../chat/helper.ts";
+import {
+	chatCapability,
+	chatEvents,
+	connectChat,
+	routingState,
+	updateRoutingState,
+} from "../../../src/chat/index.ts";
+import { routingFixture, setup } from "../../chat/helper.ts";
 
 const ref = { kind: "thread" as const, provider: "slack", threadId: "slack:C1:root" };
 const author = { userId: "U1", userName: "alice", fullName: "Alice", isMe: false, isBot: false };
@@ -17,19 +23,22 @@ it("initializes ONE SDK bot for all providers and exposes only chat webhook rout
 			githubBot = sdk;
 		}),
 	});
-	const connection = chat({ state: env.state }).connect({
-		...env.host,
-		plugins: [
-			...env.host.plugins,
-			{
-				id: "github",
-				events: chatEvents(),
-				chat: chatCapability({ adapter: () => github, installationId: "org" }),
-			},
-			{ id: "non-chat" },
-		],
-	});
-	await connection.port.thread(ref);
+	const connection = connectChat(
+		{ state: env.state },
+		{
+			...env.host,
+			plugins: [
+				...env.host.plugins,
+				{
+					id: "github",
+					events: chatEvents(),
+					chat: chatCapability({ adapter: () => github, installationId: "org" }),
+				},
+				{ id: "non-chat" },
+			],
+		},
+	);
+	await connection.thread(ref);
 	expect(githubBot).toBe(env.sdk());
 	expect(Object.keys(connection.routes)).toEqual(["POST /slack/events", "POST /github/events"]);
 	expect(github.initialize).toHaveBeenCalledOnce();
@@ -38,7 +47,7 @@ it("initializes ONE SDK bot for all providers and exposes only chat webhook rout
 
 it("does not coalesce concurrent arrivals", async () => {
 	const env = setup();
-	await env.connection.port.thread(ref);
+	await env.connection.thread(ref);
 	await Promise.all(
 		Array.from({ length: 20 }, (_, index) =>
 			env
@@ -82,16 +91,16 @@ it("allows failed webhook ingress to be retried with the same platform id", asyn
 it("expires routing bindings after 30 days", async () => {
 	vi.useFakeTimers();
 	const env = setup();
-	const thread = await env.connection.port.thread(ref);
-	await thread.updateState(() => routingState);
+	const thread = await env.connection.thread(ref);
+	await updateRoutingState(env.connection, thread, () => routingFixture);
 	vi.advanceTimersByTime(30 * 24 * 60 * 60 * 1000 + 1);
-	expect(await thread.getState()).toBeNull();
+	expect(await routingState(thread)).toBeNull();
 });
 
 it("maps the native platform stop control to actor-aware cancellation ingress", async () => {
 	const env = setup();
-	const thread = await env.connection.port.thread(ref);
-	await thread.updateState(() => routingState);
+	const thread = await env.connection.thread(ref);
+	await updateRoutingState(env.connection, thread, () => routingFixture);
 	const tasks: Promise<unknown>[] = [];
 	env.sdk().processAgentSessionStopped(
 		{
@@ -121,54 +130,58 @@ it("creates one fallback status message and edits it", async () => {
 	vi.useFakeTimers();
 	const env = setup();
 	vi.mocked(env.adapter.startTyping).mockRejectedValue(new Error("unsupported"));
-	const thread = await env.connection.port.thread(ref);
-	await thread.updateState(() => routingState);
-	await thread.setStatus("Thinking");
+	const thread = await env.connection.thread(ref);
+	await updateRoutingState(env.connection, thread, () => routingFixture);
+	await env.connection.setStatus(thread, "Thinking");
 	vi.advanceTimersByTime(1001);
-	await thread.setStatus("Searching");
+	await env.connection.setStatus(thread, "Searching");
 	expect(env.adapter.postMessage).toHaveBeenCalledOnce();
 	expect(env.adapter.editMessage).toHaveBeenCalledWith(ref.threadId, "msg-1", {
 		markdown: "Searching",
 	});
-	expect((await thread.getState())?.statusMessageId).toBe("msg-1");
+	expect((await routingState(thread))?.statusMessageId).toBe("msg-1");
 });
 
 it("serializes independent Chat instances and releases the state lock after updater/write failures", async () => {
 	const first = setup();
 	const second = setup(first.state);
-	const a = await first.connection.port.thread(ref);
-	const b = await second.connection.port.thread(ref);
-	await a.updateState(() => routingState);
+	const a = await first.connection.thread(ref);
+	const b = await second.connection.thread(ref);
+	await updateRoutingState(first.connection, a, () => routingFixture);
 	await expect(
-		a.updateState(() => {
+		updateRoutingState(first.connection, a, () => {
 			throw new Error("updater failed");
 		}),
 	).rejects.toThrow("updater failed");
 	const set = vi.spyOn(first.state, "set").mockRejectedValueOnce(new Error("write failed"));
-	await expect(a.updateState(() => routingState)).rejects.toThrow("write failed");
+	await expect(updateRoutingState(first.connection, a, () => routingFixture)).rejects.toThrow(
+		"write failed",
+	);
 	set.mockRestore();
 	await Promise.all(
 		Array.from({ length: 20 }, (_, i) =>
-			(i % 2 ? a : b).updateState((state) => ({
+			updateRoutingState(i % 2 ? first.connection : second.connection, i % 2 ? a : b, (state) => ({
 				...state!,
 				follows: [...(state?.follows ?? []), { session: `user-${i}`, agent: "a" }],
 			})),
 		),
 	);
-	const state = await a.getState();
+	const state = await routingState(a);
 	expect(state?.follows).toHaveLength(21);
 	expect(new Set(state?.follows?.map((f) => f.session)).size).toBe(21);
 	// Caller mutation must not change persisted state in memory adapters either.
 	state?.follows?.push({ session: "outside-mutation", agent: "a" });
-	expect((await a.getState())?.follows).toHaveLength(21);
+	expect((await routingState(a))?.follows).toHaveLength(21);
 });
 
 it("bounds lock contention retries without force-releasing another updater's lock", async () => {
 	vi.useFakeTimers();
 	const env = setup();
-	const thread = await env.connection.port.thread(ref);
+	const thread = await env.connection.thread(ref);
 	const lock = await env.state.acquireLock(`fabrial:routing:${ref.threadId}`, 60_000);
-	const result = expect(thread.updateState(() => routingState)).rejects.toThrow("Timed out");
+	const result = expect(
+		updateRoutingState(env.connection, thread, () => routingFixture),
+	).rejects.toThrow("Timed out");
 	await vi.advanceTimersByTimeAsync(10_001);
 	await result;
 	expect(await env.state.acquireLock(`fabrial:routing:${ref.threadId}`, 60_000)).toBeNull();
@@ -178,24 +191,24 @@ it("bounds lock contention retries without force-releasing another updater's loc
 it("retries a pure updater after losing its lease and preserves unrelated fields in fallback status writes", async () => {
 	const env = setup();
 	const replica = setup(env.state);
-	const thread = await env.connection.port.thread(ref);
-	const other = await replica.connection.port.thread(ref);
-	await thread.updateState(() => routingState);
+	const thread = await env.connection.thread(ref);
+	const other = await replica.connection.thread(ref);
+	await updateRoutingState(env.connection, thread, () => routingFixture);
 	const extend = vi.spyOn(env.state, "extendLock").mockResolvedValueOnce(false);
-	const updater = vi.fn((state: typeof routingState | null) => state);
-	await thread.updateState(updater);
+	const updater = vi.fn((state: typeof routingFixture | null) => state);
+	await updateRoutingState(env.connection, thread, updater);
 	expect(updater).toHaveBeenCalledTimes(2);
 	extend.mockRestore();
 	vi.mocked(env.adapter.startTyping).mockRejectedValue(new Error("unsupported"));
 	vi.mocked(env.adapter.postMessage).mockImplementationOnce(async () => {
-		await other.updateState((current) => ({
+		await updateRoutingState(replica.connection, other, (current) => ({
 			...current!,
 			follows: [{ session: "slack:C1:root", agent: "carol" }],
 		}));
 		return { id: "status-post", threadId: ref.threadId, raw: {} };
 	});
-	await thread.setStatus("Thinking");
-	expect(await thread.getState()).toMatchObject({
+	await env.connection.setStatus(thread, "Thinking");
+	expect(await routingState(thread)).toMatchObject({
 		follows: [{ session: "slack:C1:root", agent: "carol" }],
 		statusMessageId: "status-post",
 	});

@@ -13,12 +13,17 @@ import {
 	type StateAdapter,
 	type WebhookOptions,
 } from "chat";
-import type { ChatIntegration, FabrialHost } from "./app.ts";
-import { connectChat, ingressOptions, type ChatConnection } from "./chat/index.ts";
-import type { ChatPluginCapability } from "./chat/events.ts";
-import { literalCard } from "./chat/port.ts";
+import {
+	ingressOptions,
+	literalCard,
+	routingState,
+	type ChatConnection,
+	type ChatOptions,
+	type ChatPluginCapability,
+} from "./chat/index.ts";
 import type { ExternalIdentity } from "./identity.ts";
-import type { ThreadRoutingState } from "./runtime.ts";
+import type { AnyPlugin } from "./plugin.ts";
+import type { ThreadRoutingState } from "./routing.ts";
 import type { ChatMessage, MessageRef, OutboundMessage, ThreadRef } from "./thread.ts";
 
 const clone = <T>(value: T): T => structuredClone(value);
@@ -114,7 +119,7 @@ export class FakeThread {
 	}
 	/** Fabrial's routing state of the thread, read through the connected app. */
 	async getState(): Promise<ThreadRoutingState | null> {
-		return (await this.owner.connection().port.thread(this.ref)).getState();
+		return routingState(await this.owner.connection().thread(this.ref));
 	}
 	setStatus(text: string | null) {
 		if (this.statuses.at(-1) !== text) this.statuses.push(text);
@@ -233,18 +238,18 @@ class RecordingAdapter implements Adapter {
  * plugin is a provider; plugins without a chat capability belong to installation `installationId`.
  * Its state is in memory and outlives app restarts, as a database would.
  */
-export class FakeChat implements ChatIntegration {
-	readonly kind = "fabrial.chat" as const;
+export class FakeChat implements ChatOptions {
 	readonly threads = new Map<string, FakeThread>();
 	readonly ephemeral: { thread: ThreadRef; identity: ExternalIdentity; text: string }[] = [];
 	readonly modals: FakeModal[] = [];
-	/** Routes served besides the chat integration's own. */
+	/** Routes served besides the providers' webhooks. */
 	readonly routes: Record<string, (request: Request) => Promise<Response>> = {};
 	readonly installation: string;
 	nextMessageId = 1;
 	private readonly installations = new Map<string, string>();
-	private readonly state: StateAdapter;
-	private connected?: ChatConnection & { results: Map<string, "accepted" | "ignored"> };
+	readonly state: StateAdapter;
+	private connection_?: ChatConnection;
+	private readonly results = new Map<string, "accepted" | "ignored">();
 	constructor(options: { installationId?: string } = {}) {
 		this.installation = options.installationId ?? "workspace";
 		const memory = createMemoryState();
@@ -258,38 +263,28 @@ export class FakeChat implements ChatIntegration {
 						: target[key as keyof StateAdapter],
 		});
 	}
-	connect(host: FabrialHost): ReturnType<ChatIntegration["connect"]> {
-		const results = new Map<string, "accepted" | "ignored">();
-		const plugins = host.plugins.map((plugin) => {
-			const adapter = new RecordingAdapter(plugin.id, this);
-			const capability = plugin.chat as ChatPluginCapability | undefined;
-			const chat: ChatPluginCapability = {
-				installationId: this.installation,
-				permalink: async (thread) => `https://chat.test/${thread.provider}/${thread.threadId}`,
-				...capability,
-				adapter: () => adapter,
-			};
-			this.installations.set(plugin.id, chat.installationId);
-			return { ...plugin, chat };
-		});
-		const connection = connectChat(
-			{ state: this.state },
-			Object.assign(Object.create(host) as FabrialHost, {
-				plugins,
-				async receiveMessage(...args: Parameters<FabrialHost["receiveMessage"]>) {
-					const result = await host.receiveMessage(...args);
-					results.set(`${args[0].threadId} ${args[0].messageId}`, result);
-					return result;
-				},
-			}),
-		);
-		this.connected = { ...connection, results };
-		return { ...connection, routes: Object.assign(this.routes, connection.routes) };
+	/** Every plugin is a provider, on a recording adapter. */
+	capability(plugin: AnyPlugin): ChatPluginCapability {
+		const adapter = new RecordingAdapter(plugin.id, this);
+		const chat: ChatPluginCapability = {
+			installationId: this.installation,
+			permalink: async (thread) => `https://chat.test/${thread.provider}/${thread.threadId}`,
+			...(plugin.chat as ChatPluginCapability | undefined),
+			adapter: () => adapter,
+		};
+		this.installations.set(plugin.id, chat.installationId);
+		return chat;
+	}
+	received(message: ChatMessage, result: "accepted" | "ignored") {
+		this.results.set(`${message.threadId} ${message.messageId}`, result);
+	}
+	connected(connection: ChatConnection) {
+		this.connection_ = connection;
 	}
 	/** The connected app's chat. */
-	connection() {
-		if (!this.connected) throw new Error("FakeChat must be connected to an app");
-		return this.connected;
+	connection(): ChatConnection {
+		if (!this.connection_) throw new Error("FakeChat must be connected to an app");
+		return this.connection_;
 	}
 	/** What `threadId` shows. */
 	record(threadId: string): FakeThread {
@@ -343,7 +338,7 @@ export class FakeChat implements ChatIntegration {
 		const history = this.record(message.threadId).history;
 		if (!history.some((m) => m.id === message.messageId)) history.push(sdk);
 		await this.dispatch((options) => bot.processMessage(adapter, message.threadId, sdk, options));
-		return this.connected!.results.get(`${message.threadId} ${message.messageId}`) ?? "ignored";
+		return this.results.get(`${message.threadId} ${message.messageId}`) ?? "ignored";
 	}
 	/** A stop of the thread's agent session by `actor`; one `dedupeId` is one stop. */
 	async cancel(

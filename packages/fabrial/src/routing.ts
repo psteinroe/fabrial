@@ -1,8 +1,37 @@
 import type { Origin } from "./events.ts";
 import type { ExternalIdentity } from "./identity.ts";
 import type { JsonObject } from "./json.ts";
-import type { Follow, ThreadRoutingState } from "./runtime.ts";
+import type { InputPriority } from "./send.ts";
 import type { Surface } from "./thread.ts";
+
+/** A conversation following a thread: `[session, agent]`. */
+export interface Follow extends JsonObject {
+	session: string;
+	agent: string;
+}
+
+/**
+ * A conversation following a resource thread (`ctx.follow`): the plugin's events for the thread reach it as
+ * notifications, whose final replies go to `replyTo` (the conversation's home).
+ */
+export type ResourceFollow = Follow & {
+	/** Resource key, e.g. `github:acme/app#42`. */
+	resource: string;
+	replyTo: (Surface & JsonObject) | null;
+	/** Priority per notification kind, overriding the plugin's default. */
+	priority?: Record<string, InputPriority>;
+	/** Every notification kind, not only the plugin's defaults. */
+	events?: "all";
+};
+
+/** Fabrial's state of a thread: follows and the progress status message. */
+export type ThreadRoutingState = JsonObject & {
+	statusMessageId?: string | null;
+	/** Conversations following this thread, whatever their session kind: its messages reach them. */
+	follows?: Follow[];
+	/** Conversations following the resource of this thread (a pull request): its events notify them. */
+	resourceFollows?: ResourceFollow[];
+};
 
 /** The one event ingress emits; `fabrial.route` triggers on it. */
 export const INGRESS_EVENT = "fabrial.ingress";

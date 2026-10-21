@@ -27,7 +27,7 @@ import {
 	type Json,
 	type JsonObject,
 	type StateDefinition,
-	type ThreadIO,
+	type Thread,
 	type ToolStateHandle,
 } from "../modules.ts";
 import { bindMetadata } from "../context.ts";
@@ -180,7 +180,7 @@ export async function fields(
 					? {
 							post: (id, message) =>
 								operation(id, "post", [cloneJson(message) as Json]) as unknown as ReturnType<
-									ThreadIO["post"]
+									Thread["post"]
 								>,
 							update: async (id, message, content) => {
 								await operation(id, "update", [
@@ -189,7 +189,7 @@ export async function fields(
 								]);
 							},
 							history: (id, options) =>
-								operation(id, "history", [options ?? {}]) as ReturnType<ThreadIO["history"]>,
+								operation(id, "history", [options ?? {}]) as ReturnType<Thread["history"]>,
 						}
 					: undefined,
 			start: start as FabrialFields["start"],

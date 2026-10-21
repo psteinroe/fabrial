@@ -2,7 +2,7 @@
 import { createHmac } from "node:crypto";
 import { SlackAdapter } from "@chat-adapter/slack";
 import { pendingCard, finalCard } from "../../../fabrial/src/approval-card.ts";
-import { chat } from "../../../fabrial/src/chat/index.ts";
+import { connectChat, editMessage, postMessage } from "../../../fabrial/src/chat/index.ts";
 import type { WebClient } from "@slack/web-api";
 import { afterEach, expect, it, vi } from "vitest";
 import { setup } from "../../../fabrial/tests/chat/helper.ts";
@@ -55,10 +55,13 @@ function environment() {
 	});
 	const env = setup();
 	// Keep this exact adapter instance in the plugin capability.
-	const connection = chat({ state: env.state }).connect({
-		...env.host,
-		plugins: [{ ...plugin, chat: { ...plugin.chat!, adapter: () => adapter } }],
-	});
+	const connection = connectChat(
+		{ state: env.state },
+		{
+			...env.host,
+			plugins: [{ ...plugin, chat: { ...plugin.chat!, adapter: () => adapter } }],
+		},
+	);
 	return { ...env, adapter, connection, route: connection.routes["POST /slack/events"]! };
 }
 
@@ -181,12 +184,14 @@ it("posts and updates approval cards literally, with buttons that still route", 
 		{ id: "fabrial.approve", label: "Approve", style: "primary" as const, value: "req-1" },
 		{ id: "fabrial.reject", label: "Reject", style: "danger" as const, value: "req-1" },
 	];
-	const thread = await env.connection.port.thread({
+	const thread = await env.connection.thread({
 		kind: "thread",
 		provider: "slack",
 		threadId: "slack:C1:1700000000.000001",
 	});
-	const ref = await thread.post({ card: pendingCard(proposal, "Waiting for approval", actions) });
+	const ref = await postMessage(thread, {
+		card: pendingCard(proposal, "Waiting for approval", actions),
+	});
 	expect(ref.messageId).toBe("1700000002.000001");
 
 	const sent = post.mock.calls[0]![0] as unknown as {
@@ -255,7 +260,7 @@ it("posts and updates approval cards literally, with buttons that still route", 
 		}),
 	);
 
-	await thread.update(ref, {
+	await editMessage(env.connection, ref, {
 		card: finalCard(proposal, { label: "Expired", at: "2026-10-21T10:00:00.000Z" }),
 	});
 	const edited = update.mock.calls[0]![0] as unknown as {

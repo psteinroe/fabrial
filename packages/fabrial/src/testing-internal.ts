@@ -3,7 +3,8 @@
 import { createTestClock, type TestClock } from "pgconductor-js/testing";
 import { Conductor, TaskSchemas } from "pgconductor-js";
 import postgres from "postgres";
-import type { AgentIntegration, App, ChatIntegration, HostedApp } from "./app.ts";
+import type { AgentIntegration, App, HostedApp } from "./app.ts";
+import { routingState, type ChatOptions } from "./chat/index.ts";
 import type { Evaluator } from "./evaluate.ts";
 import { FakeChat } from "./fake-chat.ts";
 import {
@@ -168,7 +169,7 @@ export function testApp<const P extends readonly AnyPlugin[]>(
 	instance: Fabrial<P>,
 	config: Omit<AppConfig, "agents"> & {
 		runtime: DurableRuntime;
-		chat?: ChatIntegration;
+		chat?: ChatOptions;
 		agents?: AgentIntegration;
 		/** `f.app({ agents })`: agents whose triggers receive events. */
 		routedAgents?: AppConfig["agents"];
@@ -237,7 +238,7 @@ export function testingApp<C>(app: HostedApp<C>): TestingApp<C> {
 		async routing(thread: ThreadRef): Promise<ThreadFollowers> {
 			const chat = app.host.chat();
 			if (!chat) throw new Error("The app has no chat integration");
-			const state = await (await chat.thread(thread)).getState();
+			const state = await routingState(await chat.thread(thread));
 			return {
 				follows: (state?.follows ?? []).map(({ session, agent }) => ({ session, agent })),
 				resourceFollows: (state?.resourceFollows ?? []).map(

@@ -1,3 +1,4 @@
+import { createMemoryState } from "@chat-adapter/state-memory";
 import { expect, expectTypeOf, it, vi } from "vitest";
 import { createFabrial, definePlugin, defineUser } from "../internals.ts";
 import { testApp } from "../../src/testing-internal.ts";
@@ -69,14 +70,14 @@ it("isolates instance client types and supports client-less catalogs", () => {
 });
 
 it("does not connect chat adapters until startup", async () => {
-	const connect = vi.fn(() => ({ port: {} as never, routes: {} }));
+	const connect = vi.fn(() => undefined);
 	const instance = createFabrial({
 		plugins: [{ id: "chat", chat: { installationId: "", adapter: vi.fn() } }],
 	});
 	const app = testApp(instance, {
 		runtime: new StubRuntime(),
 		workflows: [],
-		chat: { kind: "fabrial.chat", connect },
+		chat: { state: createMemoryState(), capability: connect },
 	});
 	expect(connect).not.toHaveBeenCalled();
 	await app.start();

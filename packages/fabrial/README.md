@@ -473,7 +473,7 @@ State uses Pi documents: a thread family per Session and rewindable, forkable co
 
 ### Chat (Chat SDK)
 
-`src/chat` connects one Chat SDK bot to all chat-capable plugins, with Postgres state on the instance's database. It supports reconstructed threads, lazy channel roots, DMs, ephemeral messages, text/Markdown/cards, edited messages, best-effort throttled progress, attributed bounded history, and routing state under `thread.state.fabrial`. `ThreadIO.updateState(fn)` is an atomic read-modify-write under the state adapter's token-owned per-thread lock; all routing-state writers use it. Lock contention retries for at most 10 seconds; leases last 60 seconds and are checked and renewed before writing, with release in `finally`. Keep callbacks pure, since a lost lease can retry them. State writes refresh a 30-day TTL. Card action ids and values are forwarded unchanged to core.
+`src/chat` connects one Chat SDK bot to all chat-capable plugins, with Postgres state on the instance's database. It supports reconstructed threads, lazy channel roots, DMs, ephemeral messages, text/Markdown/cards, edited messages, best-effort throttled progress, attributed bounded history, and routing state under `thread.state.fabrial`. Consumers hold the SDK's own `Chat` and `Thread`; `src/chat/threads.ts` adds Fabrial's semantics on them. `updateRoutingState(chat, thread, fn)` is an atomic read-modify-write (the SDK's `setState` is read/merge/write) under the state adapter's token-owned per-thread lock; all routing-state writers use it. Lock contention retries for at most 10 seconds; leases last 60 seconds and are checked and renewed before writing, with release in `finally`. Keep callbacks pure, since a lost lease can retry them. State writes refresh a 30-day TTL. Card action ids and values are forwarded unchanged to core.
 
 Start and stop map to SDK initialize and shutdown. Local SDK concurrency slots serialize arrivals without coalescing. Webhook ingress disables the SDK's pre-dispatch dedupe so failed durable ingress can be retried; core receives a stable platform message or action dedupe id. Channel surfaces stay provisional until the first post and cannot store routing state until then.
 
@@ -488,4 +488,4 @@ Limitations:
 
 ### Current boundaries
 
-Live plugin clients are built once per app; they must not capture invocation identity. Core adds no reaction acknowledgement to replies because `ChatPort` has no reaction operation.
+Live plugin clients are built once per app; they must not capture invocation identity. Core adds no reaction acknowledgement to replies.

@@ -1,3 +1,4 @@
+import { connectChat } from "../../../src/chat/index.ts";
 import { randomUUID } from "node:crypto";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
@@ -53,13 +54,13 @@ function fixture(options: Partial<PiOptions> = {}) {
 		workflows: [],
 		runtime,
 		clients: () => ({}),
-		chat: () => chat.connection().port,
+		chat: () => chat.connection(),
 		logger: { warn() {}, error() {}, debug() {}, info() {} },
 		directory: { isMember: async () => true },
 		resolvePrincipal: async () => null,
 	} as unknown as FabrialHost;
 	// The fake platform behind `slack-test`, the provider of the tests' threads.
-	chat.connect({ ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
+	connectChat(chat, { ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
 	const integration = pi({
 		models,
 		sql: sql(),

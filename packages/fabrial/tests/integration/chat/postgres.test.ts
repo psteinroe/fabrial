@@ -3,7 +3,8 @@ import { once } from "node:events";
 import { createPostgresState } from "@chat-adapter/state-pg";
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { expect, it } from "vitest";
-import { routingState, setup } from "../../chat/helper.ts";
+import { routingFixture as fixture, setup } from "../../chat/helper.ts";
+import { routingState, updateRoutingState } from "../../../src/chat/index.ts";
 
 it("persists thread routing state and subscription through a Postgres-backed restart", async () => {
 	const container = await new PostgreSqlContainer("postgres:17-alpine").start();
@@ -12,9 +13,9 @@ it("persists thread routing state and subscription through a Postgres-backed res
 	try {
 		const ref = { kind: "thread" as const, provider: "slack", threadId: "slack:C1:root" };
 		const env = setup(first);
-		const thread = await env.connection.port.thread(ref);
+		const thread = await env.connection.thread(ref);
 		await first.set(`thread-state:${ref.threadId}`, { custom: "preserved" });
-		await thread.updateState(() => routingState);
+		await updateRoutingState(env.connection, thread, () => fixture);
 		// Two OS processes, separate Chat instances and pools, one durable lock namespace.
 		const children = ["a", "b"].map((id) =>
 			fork(new URL("./state-worker.ts", import.meta.url), {
@@ -40,25 +41,25 @@ it("persists thread routing state and subscription through a Postgres-backed res
 				[0, null],
 				[0, null],
 			]);
-			const updated = await thread.getState();
+			const updated = await routingState(thread);
 			expect(updated?.follows).toHaveLength(41);
 			expect(new Set(updated?.follows?.map((f) => f.session)).size).toBe(41);
 			expect(updated).toMatchObject({
 				ingestedDedupeIds: [{ kind: "message", id: "message-1", at: 1 }],
 			});
 			// Restore the codec fixture for the restart/TTL assertions below.
-			await thread.updateState(() => routingState);
+			await updateRoutingState(env.connection, thread, () => fixture);
 		} finally {
 			for (const child of children) if (child.exitCode === null) child.kill();
 		}
 		await first.disconnect();
 		const restored = setup(second);
-		const restoredThread = await restored.connection.port.thread(ref);
-		expect(await restoredThread.getState()).toEqual(routingState);
+		const restoredThread = await restored.connection.thread(ref);
+		expect(await routingState(restoredThread)).toEqual(fixture);
 		expect(await second.isSubscribed(ref.threadId)).toBe(true);
 		expect(await second.get(`thread-state:${ref.threadId}`)).toEqual({
 			custom: "preserved",
-			fabrial: routingState,
+			fabrial: fixture,
 		});
 		const { rows } = await second
 			.getClient()
@@ -68,8 +69,8 @@ it("persists thread routing state and subscription through a Postgres-backed res
 		expect(new Date(rows[0].expires_at).getTime() - Date.now()).toBeGreaterThan(
 			29 * 24 * 60 * 60 * 1000,
 		);
-		await restoredThread.updateState(() => null);
-		expect(await restoredThread.getState()).toBeNull();
+		await updateRoutingState(restored.connection, restoredThread, () => null);
+		expect(await routingState(restoredThread)).toBeNull();
 	} finally {
 		await first.disconnect();
 		await second.disconnect();

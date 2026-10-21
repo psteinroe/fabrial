@@ -1,3 +1,4 @@
+import { connectChat } from "../../../src/chat/index.ts";
 import { randomUUID } from "node:crypto";
 import type { Message, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -61,7 +62,7 @@ function fixture(
 		workflows: [],
 		runtime,
 		clients: () => ({ example: "client" }),
-		chat: () => chat.connection().port,
+		chat: () => chat.connection(),
 		logger: { warn() {}, error() {}, debug() {}, info() {} },
 		directory: { isMember: async () => true },
 		resolvePrincipal: async (identity: { subjectId: string }) => ({
@@ -72,7 +73,7 @@ function fixture(
 		}),
 	} as unknown as FabrialHost;
 	// The fake platform behind `slack-test`, the provider of the tests' threads.
-	chat.connect({ ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
+	connectChat(chat, { ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
 	const integration = pi({
 		models,
 		sql: sql(),
@@ -1252,9 +1253,7 @@ it("stop joins driver routing cleanup after the harness has closed", async () =>
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	f.faux.setResponses([fauxAssistantMessage("done")]);
-	const io = await f.chat
-		.connection()
-		.port.thread(f.metadata.replyTo as Parameters<typeof f.chat.thread>[0]);
+	const connection = f.chat.connection();
 	let reached!: () => void;
 	const cleaning = new Promise<void>((resolve) => {
 		reached = resolve;
@@ -1263,13 +1262,13 @@ it("stop joins driver routing cleanup after the harness has closed", async () =>
 	const cleanup = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const setStatus = io.setStatus.bind(io);
-	vi.spyOn(io, "setStatus").mockImplementation(async (status) => {
+	const setStatus = connection.setStatus.bind(connection);
+	vi.spyOn(connection, "setStatus").mockImplementation(async (thread, status) => {
 		if (status === null) {
 			reached();
 			await cleanup;
 		}
-		return setStatus(status);
+		return setStatus(thread, status);
 	});
 	const workflow: RuntimeWorkflow = {
 		name: randomUUID(),

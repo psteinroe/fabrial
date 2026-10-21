@@ -4,15 +4,11 @@
  * following conversation a notification. The records are the only routing index; Fabrial owns no tables.
  */
 import type { FabrialHost } from "./app.ts";
+import { routingState, updateRoutingState } from "./chat/threads.ts";
 import type { JsonObject } from "./json.ts";
 import type { AnyPlugin, ResourceKind, ResourceRef } from "./plugin.ts";
-import type {
-	AgentPort,
-	AgentRef,
-	InvocationMetadata,
-	ResourceFollow,
-	ThreadRoutingState,
-} from "./runtime.ts";
+import type { ResourceFollow, ThreadRoutingState } from "./routing.ts";
+import type { AgentPort, AgentRef, InvocationMetadata } from "./runtime.ts";
 import {
 	deliveryFor,
 	renderInput,
@@ -136,10 +132,15 @@ export function addResourceFollow(
 	};
 }
 
-function threadOf(host: FabrialHost, thread: ThreadRef) {
+/** Atomically update the routing state of a resource's thread. */
+async function updateThread(
+	host: FabrialHost,
+	ref: ThreadRef,
+	fn: (state: ThreadRoutingState | null) => ThreadRoutingState | null,
+) {
 	const chat = host.chat();
 	if (!chat) throw new Error("Following a resource needs the chat integration (its thread state)");
-	return chat.thread(thread);
+	await updateRoutingState(chat, await chat.thread(ref), fn);
 }
 
 /** Write a follow record on the resource's thread. Shared by workflow and tool `ctx.follow`. */
@@ -163,7 +164,7 @@ export async function followResource(
 		...(Object.keys(priority).length ? { priority } : {}),
 		...(options.events === "all" ? { events: "all" as const } : {}),
 	};
-	await (await threadOf(host, thread)).updateState((state) => addResourceFollow(state, record));
+	await updateThread(host, thread, (state) => addResourceFollow(state, record));
 	return { resource: key, ...conversation };
 }
 
@@ -177,9 +178,7 @@ export async function unfollowResource(
 	const { key, thread } = resolveResource(host.plugins, ref);
 	const conversation = await target(metadata, surface, options.to);
 	let removed = false;
-	await (
-		await threadOf(host, thread)
-	).updateState((state) => {
+	await updateThread(host, thread, (state) => {
 		removed = !!state?.resourceFollows?.some((each) => same(each, conversation));
 		return removed
 			? {
@@ -216,7 +215,7 @@ export async function notifyFollowers(
 		if (!notification) continue;
 		const threads = new Map(kind.threads({ name, payload }).map((t) => [t.threadId, t]));
 		for (const thread of threads.values()) {
-			const state = await (await chat.thread(thread)).getState();
+			const state = await routingState(await chat.thread(thread));
 			for (const follow of state?.resourceFollows ?? []) {
 				if (follow.events !== "all" && !kind.defaults.includes(notification.kind)) continue;
 				const requestId = `${metadata.requestId}:${follow.session}:${follow.agent}`;

@@ -1,14 +1,14 @@
 import { createHmac } from "node:crypto";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { createMockLogger } from "@chat-adapter/tests";
-import { chat } from "../../fabrial/src/chat/index.ts";
-import type { ChatIntegration, FabrialHost } from "../../fabrial/src/app.ts";
+import { connectChat, type ChatConnection } from "../../fabrial/src/chat/index.ts";
+import type { FabrialHost } from "../../fabrial/src/app.ts";
 import type { AnyPlugin } from "../../fabrial/src/plugin.ts";
 import { vi } from "vitest";
 
 export function connect(plugin: AnyPlugin): {
 	host: FabrialHost;
-	connection: ReturnType<ChatIntegration["connect"]>;
+	connection: ChatConnection;
 	state: ReturnType<typeof createMemoryState>;
 } {
 	const state = createMemoryState();
@@ -34,14 +34,14 @@ export function connect(plugin: AnyPlugin): {
 		},
 		logger: createMockLogger(),
 		clients: () => ({}),
-		chat: () => connection.port,
+		chat: () => connection,
 		ingest: vi.fn(),
 		receiveMessage: vi.fn(async () => "accepted" as const),
 		receiveAction: vi.fn(),
 		receiveCancellation: vi.fn(),
 		resolvePrincipal: vi.fn(),
 	};
-	const connection = chat({ state }).connect(host);
+	const connection = connectChat({ state }, host);
 	return { host, connection, state };
 }
 

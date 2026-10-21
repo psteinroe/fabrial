@@ -12,7 +12,7 @@ import {
 import { z } from "zod";
 import { testApp } from "../../../src/testing-internal.ts";
 import { expect, it, vi } from "vitest";
-import { chat, chatTrigger } from "../../../src/chat/index.ts";
+import { chatTrigger } from "../../../src/chat/index.ts";
 import { setup } from "../../chat/helper.ts";
 import { until, useConductor } from "../../conductor/helper.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
@@ -45,7 +45,7 @@ it("dispatches a mention to its owner and all matching observers without duplica
 	const observer = vi.fn(async () => {});
 	const app = testApp(createFabrial({ plugins: env.host.plugins }), {
 		runtime,
-		chat: chat({ state: createMemoryState() }),
+		chat: { state: createMemoryState() },
 		workflows: [
 			defineWorkflow({ name: "owner", triggers: [chatTrigger("slack", "mentioned")], run: owner }),
 			defineWorkflow({
@@ -102,7 +102,7 @@ it("rebinds a lazy channel from the durable first-post receipt on replay and chi
 	const refs: string[] = [];
 	const app = testApp(createFabrial({ plugins: [...env.host.plugins, demo] }), {
 		runtime,
-		chat: chat({ state: createMemoryState() }),
+		chat: { state: createMemoryState() },
 		workflows: [
 			child,
 			defineWorkflow({

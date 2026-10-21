@@ -1,8 +1,7 @@
 // Each child owns an independent Chat instance and Postgres pool (no shared JS mutex).
 import { createPostgresState } from "@chat-adapter/state-pg";
 import { Chat, type Adapter } from "chat";
-import type { FabrialHost } from "../../internals.ts";
-import { createChatPort, type SDKState } from "../../../src/chat/port.ts";
+import { ChatConnection, updateRoutingState, type SDKState } from "../../../src/chat/threads.ts";
 import { chatCapability } from "../../../src/chat/events.ts";
 
 const state = createPostgresState({ url: process.env.STATE_URL! });
@@ -16,13 +15,14 @@ const bot = new Chat<Record<string, Adapter>, SDKState>({
 	state,
 	userName: "test",
 });
-const port = createChatPort(
+const connection = new ChatConnection(
 	bot,
 	new Map([["slack", chatCapability({ adapter: () => adapter, installationId: "acme" })]]),
-	{ logger: console } as unknown as FabrialHost,
+	console,
+	{},
 );
 try {
-	const thread = await port.thread({
+	const thread = await connection.thread({
 		kind: "thread",
 		provider: "slack",
 		threadId: "slack:C1:root",
@@ -31,7 +31,7 @@ try {
 	await new Promise<void>((resolve) => process.once("message", () => resolve()));
 	await Promise.all(
 		Array.from({ length: 20 }, (_, i) =>
-			thread.updateState((current) => {
+			updateRoutingState(connection, thread, (current) => {
 				if (!current) throw new Error("Missing initial state");
 				return {
 					...current,

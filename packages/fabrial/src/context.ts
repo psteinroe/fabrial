@@ -1,11 +1,20 @@
 import type { AgentIntegration, FabrialHost } from "./app.ts";
+import {
+	channelOf,
+	channelOfSurface,
+	editMessage,
+	fetchHistory,
+	postMessage,
+	postTo,
+	threadRef,
+	type SDKThread,
+} from "./chat/threads.ts";
 import { createApproval } from "./protocol.ts";
 import { duration } from "./internal.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type {
 	DurableExecution,
 	InvocationMetadata,
-	ThreadIO,
 	WaitBranch,
 	WaitForAnyResult,
 } from "./runtime.ts";
@@ -62,31 +71,34 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 		used.add(key);
 		return key;
 	};
-	let io: ThreadIO | undefined;
-	let realThread = metadata.replyTo?.kind === "thread";
-	const getIO = async (): Promise<ThreadIO> => {
-		if (io) return io;
-		if (!metadata.replyTo || !host.chat()) throw new Error("This execution has no chat surface");
-		io =
-			metadata.replyTo.kind === "thread"
-				? await host.chat()!.thread(metadata.replyTo)
-				: await host.chat()!.resolve(metadata.replyTo);
-		return io;
-	};
-	if (metadata.replyTo?.kind === "thread" && host.chat()) await getIO();
-
+	const chat = host.chat();
+	// The thread replies go to. A channel destination stays lazy until its first post, whose receipt
+	// (also on replay) names the thread later posts and child executions use.
+	let bound: SDKThread | undefined =
+		metadata.replyTo?.kind === "thread" && chat ? await chat.thread(metadata.replyTo) : undefined;
+	let firstPost: Promise<unknown> | undefined;
 	const post = async (id: string, message: OutboundMessage): Promise<MessageRef> => {
-		const ref = (await execution.step(
-			id,
-			async () => (await (await getIO()).post(message)) as unknown as JsonObject,
-		)) as unknown as MessageRef;
-		io = await host
-			.chat()!
-			.thread({ kind: "thread", provider: ref.provider, threadId: ref.threadId });
-		realThread = true;
-		metadata.replyTo = io.ref as InvocationMetadata["replyTo"];
-		execution.metadata.replyTo = metadata.replyTo;
-		return ref;
+		while (firstPost) await firstPost.catch(() => {});
+		const posting = execution.step(id, async () => {
+			if (!metadata.replyTo || !chat) throw new Error("This execution has no chat surface");
+			return (await (bound
+				? postMessage(bound, message)
+				: postTo(chat, metadata.replyTo, message))) as unknown as JsonObject;
+		}) as unknown as Promise<MessageRef>;
+		if (!bound) firstPost = posting;
+		try {
+			const ref = await posting;
+			bound = await chat!.thread({
+				kind: "thread",
+				provider: ref.provider,
+				threadId: ref.threadId,
+			});
+			metadata.replyTo = threadRef(bound) as InvocationMetadata["replyTo"];
+			execution.metadata.replyTo = metadata.replyTo;
+			return ref;
+		} finally {
+			if (firstPost === posting) firstPost = undefined;
+		}
 	};
 
 	/**
@@ -143,37 +155,34 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 	};
 	const surface = metadata.replyTo as Surface | null;
 	const thread: Thread | undefined =
-		surface && host.chat()
+		surface && chat
 			? {
 					get ref() {
-						return (
-							io?.ref ??
-							(surface.kind === "thread"
+						return bound
+							? threadRef(bound)
+							: surface.kind === "thread"
 								? surface
-								: { kind: "thread", provider: surface.provider, threadId: surface.channelId })
-						);
+								: {
+										kind: "thread" as const,
+										provider: surface.provider,
+										threadId: surface.channelId,
+									};
 					},
 					get channelId() {
-						return (
-							io?.channelId ?? (surface.kind === "channel" ? surface.channelId : surface.threadId)
-						);
+						return bound
+							? channelOf(bound)
+							: surface.kind === "channel"
+								? surface.channelId
+								: surface.threadId;
 					},
 					get isDM() {
-						return io?.isDM ?? false;
+						return bound?.isDM ?? false;
 					},
 					post: (id, message) => post(op(id), message),
 					update: async (id, message, content) =>
-						execution.step(op(id), async () =>
-							(
-								await host.chat()!.thread({
-									kind: "thread",
-									provider: message.provider,
-									threadId: message.threadId,
-								})
-							).update(message, content),
-						),
+						execution.step(op(id), () => editMessage(chat, message, content)),
 					history: (id, opts = {}) =>
-						execution.step(op(id), async () => (await getIO()).history(opts)),
+						execution.step(op(id), async () => (bound ? fetchHistory(chat, bound, opts) : [])),
 				}
 			: undefined;
 	const checkInput = async (workflow: AnyWorkflow, input: Json): Promise<Json> => {
@@ -183,17 +192,18 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 			? parseSchema(registered.definition.input, input, `${workflow.name} input`)
 			: input;
 	};
+	// After a lazy post, `metadata.replyTo` is the thread it created.
 	const childMetadata = (): Partial<InvocationMetadata> => ({
 		...metadata,
 		ownerWorkflow: null,
 		triggerEvent: null,
-		replyTo: (realThread
-			? (io?.ref ?? metadata.replyTo)
-			: metadata.replyTo) as InvocationMetadata["replyTo"],
 	});
 	const surfaces = () => ({
-		current: (realThread && io ? io.ref : metadata.replyTo) as InvocationMetadata["replyTo"],
-		channelId: async () => (await getIO()).channelId,
+		current: metadata.replyTo,
+		channelId: async () => {
+			if (!metadata.replyTo || !chat) throw new Error("This execution has no chat surface");
+			return channelOfSurface(chat, metadata.replyTo);
+		},
 	});
 	const ctx: WorkflowContext = {
 		executionId: execution.executionId,

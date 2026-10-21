@@ -34,6 +34,7 @@ export * from "./identity.ts";
 export type * from "./json.ts";
 export * from "./plugin.ts";
 export * from "./runtime.ts";
+export type { Follow, ResourceFollow, ThreadRoutingState } from "./routing.ts";
 export * from "./schema.ts";
 export {
 	renderInput,

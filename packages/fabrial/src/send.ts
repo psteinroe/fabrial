@@ -1,4 +1,5 @@
 import type { FabrialHost } from "./app.ts";
+import { updateRoutingState } from "./chat/threads.ts";
 import type { Json, JsonObject } from "./json.ts";
 import { addFollow } from "./routing.ts";
 import type { AgentRef, InvocationMetadata } from "./runtime.ts";
@@ -333,5 +334,7 @@ export async function follow(
 ): Promise<void> {
 	const chat = host.chat();
 	if (!thread || !chat) return;
-	await (await chat.thread(thread)).updateState((state) => addFollow(state, conversation));
+	await updateRoutingState(chat, await chat.thread(thread), (state) =>
+		addFollow(state, conversation),
+	);
 }

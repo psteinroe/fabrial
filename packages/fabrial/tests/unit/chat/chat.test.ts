@@ -4,13 +4,19 @@ import { Chat, type Author } from "chat";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	actionDedupeId,
-	chat,
 	chatEvents,
+	connectChat,
+	editMessage,
+	fetchHistory,
+	postMessage,
+	postTo,
+	routingState,
+	updateRoutingState,
 	chatTrigger,
 	REJECT_MODAL,
 	renderMessage,
 } from "../../../src/chat/index.ts";
-import { routingState, setup } from "../../chat/helper.ts";
+import { routingFixture, setup } from "../../chat/helper.ts";
 
 const ref = { kind: "thread" as const, provider: "slack", threadId: "slack:C1:root-1" };
 const actor = { provider: "slack", installationId: "acme", subjectId: "U1" };
@@ -59,7 +65,7 @@ describe("inbound Chat SDK dispatch", () => {
 		"normalizes $name and leaves subscribing to routing",
 		async ({ thread, mention, isDM, events }) => {
 			const env = setup();
-			await env.connection.port.thread({ ...ref, threadId: thread });
+			await env.connection.thread({ ...ref, threadId: thread });
 			await env.sdk().processMessage(env.adapter, thread, message("root-1", "hello", mention));
 			expect(env.host.receiveMessage).toHaveBeenCalledExactlyOnceWith(
 				{
@@ -86,7 +92,7 @@ describe("inbound Chat SDK dispatch", () => {
 
 	it("routes subscribed replies and subscribed mentions once, retaining classification", async () => {
 		const env = setup();
-		await env.connection.port.thread(ref);
+		await env.connection.thread(ref);
 		await env.state.subscribe(ref.threadId);
 		vi.mocked(env.host.receiveMessage).mockResolvedValue("accepted");
 		await env.sdk().processMessage(env.adapter, ref.threadId, message("reply-1", "followup"));
@@ -99,7 +105,7 @@ describe("inbound Chat SDK dispatch", () => {
 
 	it("dedupes repeated messages and ignores the bot's own messages", async () => {
 		const env = setup();
-		await env.connection.port.thread(ref);
+		await env.connection.thread(ref);
 		await env.sdk().processMessage(env.adapter, ref.threadId, message("one", "hello"));
 		await env.sdk().processMessage(env.adapter, ref.threadId, message("one", "hello", true));
 		await env
@@ -114,7 +120,7 @@ describe("inbound Chat SDK dispatch", () => {
 
 	it("does not subscribe ignored messages", async () => {
 		const env = setup();
-		await env.connection.port.thread(ref);
+		await env.connection.thread(ref);
 		vi.mocked(env.host.receiveMessage).mockResolvedValue("ignored");
 		await env.sdk().processMessage(env.adapter, ref.threadId, message("one", "hello"));
 		expect(await env.state.isSubscribed(ref.threadId)).toBe(false);
@@ -122,7 +128,7 @@ describe("inbound Chat SDK dispatch", () => {
 
 	it("forwards actions with scoped actor and stable receipt dedupe", async () => {
 		const env = setup();
-		await env.connection.port.thread(ref);
+		await env.connection.thread(ref);
 		const action = {
 			adapter: env.adapter,
 			actionId: "approve",
@@ -148,7 +154,7 @@ describe("inbound Chat SDK dispatch", () => {
 
 	it("asks for a rejection reason in a modal and forwards its submit as the reject action", async () => {
 		const env = setup();
-		await env.connection.port.thread(ref);
+		await env.connection.thread(ref);
 		const openModal = vi.fn(async () => ({ viewId: "V1" }));
 		env.adapter.openModal = openModal;
 		const actionId = "fabrial.approval.reject:approval-1";
@@ -199,7 +205,7 @@ describe("inbound Chat SDK dispatch", () => {
 
 	it("rejects without a reason where the provider has no modals", async () => {
 		const env = setup();
-		await env.connection.port.thread(ref);
+		await env.connection.thread(ref);
 		env.adapter.openModal = undefined;
 		const action = {
 			adapter: env.adapter,
@@ -236,18 +242,18 @@ describe("inbound Chat SDK dispatch", () => {
 	});
 });
 
-describe("ChatPort", () => {
+describe("Chat SDK threads", () => {
 	it("posts text/markdown/cards, updates by receipt and rejects foreign receipts", async () => {
 		const env = setup();
-		const thread = await env.connection.port.thread(ref);
-		const receipt = await thread.post("hello");
+		const thread = await env.connection.thread(ref);
+		const receipt = await postMessage(thread, "hello");
 		expect(receipt).toEqual({ provider: "slack", threadId: ref.threadId, messageId: "msg-1" });
-		await thread.update(receipt, { markdown: "**edited**" });
+		await editMessage(env.connection, receipt, { markdown: "**edited**" });
 		expect(env.adapter.editMessage).toHaveBeenCalledWith(ref.threadId, "msg-1", {
 			markdown: "**edited**",
 		});
-		await thread.post({ markdown: "**hello**" });
-		await thread.post({
+		await postMessage(thread, { markdown: "**hello**" });
+		await postMessage(thread, {
 			card: {
 				title: "Approve?",
 				text: "Details",
@@ -266,26 +272,36 @@ describe("ChatPort", () => {
 				{ type: "actions", children: [{ id: "approve", value: "request-1", style: "primary" }] },
 			],
 		});
-		await expect(thread.update({ ...receipt, provider: "other" }, "bad")).rejects.toThrow(
-			"does not belong",
-		);
+		await expect(
+			editMessage(env.connection, { ...receipt, provider: "other" }, "bad"),
+		).rejects.toThrow('No chat provider "other"');
+		await expect(
+			editMessage(env.connection, receipt, "bad", { ...ref, threadId: "slack:C1:other" }),
+		).rejects.toThrow("does not belong");
+		await expect(
+			editMessage(env.connection, receipt, "bad", {
+				kind: "channel",
+				provider: "slack",
+				channelId: "C2",
+			}),
+		).rejects.toThrow("another channel");
 	});
 
 	it("round-trips routing state under fabrial, preserving other state with 30-day TTL", async () => {
 		const env = setup();
 		const set = vi.spyOn(env.state, "set");
-		const thread = await env.connection.port.thread(ref);
+		const thread = await env.connection.thread(ref);
 		await env.sdk().getState().set(`thread-state:${ref.threadId}`, { other: "kept" });
-		expect(await thread.getState()).toBeNull();
-		await thread.updateState(() => routingState);
-		expect(await thread.getState()).toEqual(routingState);
+		expect(await routingState(thread)).toBeNull();
+		await updateRoutingState(env.connection, thread, () => routingFixture);
+		expect(await routingState(thread)).toEqual(routingFixture);
 		expect(set).toHaveBeenLastCalledWith(
 			`thread-state:${ref.threadId}`,
-			{ other: "kept", fabrial: routingState },
+			{ other: "kept", fabrial: routingFixture },
 			30 * 24 * 60 * 60 * 1000,
 		);
-		await thread.updateState(() => null);
-		expect(await thread.getState()).toBeNull();
+		await updateRoutingState(env.connection, thread, () => null);
+		expect(await routingState(thread)).toBeNull();
 		expect(await env.state.get(`thread-state:${ref.threadId}`)).toEqual({
 			other: "kept",
 			fabrial: null,
@@ -295,13 +311,13 @@ describe("ChatPort", () => {
 	it("throttles typing/status and always clears it", async () => {
 		vi.useFakeTimers();
 		const env = setup();
-		const thread = await env.connection.port.thread(ref);
-		await thread.setStatus("Thinking");
-		await thread.setStatus("Looking up");
+		const thread = await env.connection.thread(ref);
+		await env.connection.setStatus(thread, "Thinking");
+		await env.connection.setStatus(thread, "Looking up");
 		expect(env.adapter.startTyping).toHaveBeenCalledTimes(1);
 		vi.advanceTimersByTime(1001);
-		await thread.setStatus("Looking up");
-		await thread.setStatus(null);
+		await env.connection.setStatus(thread, "Looking up");
+		await env.connection.setStatus(thread, null);
 		expect(env.adapter.startTyping).toHaveBeenLastCalledWith(ref.threadId, "");
 		expect(env.adapter.startTyping).toHaveBeenCalledTimes(3);
 	});
@@ -309,10 +325,10 @@ describe("ChatPort", () => {
 	it("shows the latest status throttled inside the window once it ends", async () => {
 		vi.useFakeTimers();
 		const env = setup();
-		const thread = await env.connection.port.thread(ref);
-		await thread.setStatus("Thinking");
-		await thread.setStatus("Waiting");
-		await thread.setStatus("Looking up");
+		const thread = await env.connection.thread(ref);
+		await env.connection.setStatus(thread, "Thinking");
+		await env.connection.setStatus(thread, "Waiting");
+		await env.connection.setStatus(thread, "Looking up");
 		await vi.advanceTimersByTimeAsync(999);
 		expect(env.adapter.startTyping).toHaveBeenCalledTimes(1);
 		await vi.advanceTimersByTimeAsync(1);
@@ -321,8 +337,8 @@ describe("ChatPort", () => {
 			"Looking up",
 		]);
 		// A change back to the shown status inside the window leaves nothing pending.
-		await thread.setStatus("Thinking");
-		await thread.setStatus("Looking up");
+		await env.connection.setStatus(thread, "Thinking");
+		await env.connection.setStatus(thread, "Looking up");
 		await vi.advanceTimersByTimeAsync(5000);
 		expect(env.adapter.startTyping).toHaveBeenCalledTimes(2);
 	});
@@ -330,28 +346,28 @@ describe("ChatPort", () => {
 	it("clears a status immediately, dropping one still throttled", async () => {
 		vi.useFakeTimers();
 		const env = setup();
-		const thread = await env.connection.port.thread(ref);
-		await thread.setStatus("Thinking");
-		await thread.setStatus("Looking up");
-		await thread.setStatus(null);
+		const thread = await env.connection.thread(ref);
+		await env.connection.setStatus(thread, "Thinking");
+		await env.connection.setStatus(thread, "Looking up");
+		await env.connection.setStatus(thread, null);
 		await vi.advanceTimersByTimeAsync(2000);
 		expect(vi.mocked(env.adapter.startTyping).mock.calls.map((call) => call[1])).toEqual([
 			"Thinking",
 			"",
 		]);
 		// And the next status after a clear shows at once.
-		await thread.setStatus("Thinking");
+		await env.connection.setStatus(thread, "Thinking");
 		expect(env.adapter.startTyping).toHaveBeenCalledTimes(3);
 	});
 
 	it("posts no throttled status after the chat stops", async () => {
 		vi.useFakeTimers();
 		const env = setup();
-		const thread = await env.connection.port.thread(ref);
-		await thread.setStatus("Thinking");
-		await thread.setStatus("Looking up");
-		await env.connection.stop!();
-		await thread.setStatus("Searching");
+		const thread = await env.connection.thread(ref);
+		await env.connection.setStatus(thread, "Thinking");
+		await env.connection.setStatus(thread, "Looking up");
+		await env.connection.stop();
+		await env.connection.setStatus(thread, "Searching");
 		expect(vi.getTimerCount()).toBe(0);
 		await vi.advanceTimersByTimeAsync(2000);
 		expect(env.adapter.startTyping).toHaveBeenCalledOnce();
@@ -361,21 +377,24 @@ describe("ChatPort", () => {
 		vi.useFakeTimers();
 		const env = setup();
 		vi.mocked(env.adapter.startTyping).mockRejectedValue(new Error("unsupported"));
-		const thread = await env.connection.port.thread(ref);
-		await thread.updateState(() => ({ ...routingState, statusMessageId: "old-status" }));
-		await thread.setStatus("Thinking");
+		const thread = await env.connection.thread(ref);
+		await updateRoutingState(env.connection, thread, () => ({
+			...routingFixture,
+			statusMessageId: "old-status",
+		}));
+		await env.connection.setStatus(thread, "Thinking");
 		expect(env.adapter.postMessage).not.toHaveBeenCalled();
 		expect(env.adapter.editMessage).toHaveBeenLastCalledWith(ref.threadId, "old-status", {
 			markdown: "Thinking",
 		});
 		vi.advanceTimersByTime(1001);
-		await thread.setStatus("Looking up");
-		await thread.setStatus(null);
+		await env.connection.setStatus(thread, "Looking up");
+		await env.connection.setStatus(thread, null);
 		expect(env.adapter.deleteMessage).toHaveBeenCalledWith(ref.threadId, "old-status");
-		expect((await thread.getState())?.statusMessageId).toBeNull();
+		expect((await routingState(thread))?.statusMessageId).toBeNull();
 		vi.mocked(env.adapter.postMessage).mockRejectedValue(new Error("offline"));
 		vi.advanceTimersByTime(1001);
-		await expect(thread.setStatus("Thinking")).resolves.toBeUndefined();
+		await expect(env.connection.setStatus(thread, "Thinking")).resolves.toBeUndefined();
 	});
 
 	it("loads bounded attributed history and applies the last own-bot-reply boundary", async () => {
@@ -387,51 +406,48 @@ describe("ChatPort", () => {
 				message("new", "new"),
 			],
 		});
-		const thread = await env.connection.port.thread(ref);
-		const history = await thread.history({ limit: 3, sinceLastBotReply: true });
+		const thread = await env.connection.thread(ref);
+		const history = await fetchHistory(env.connection, thread, {
+			limit: 3,
+			sinceLastBotReply: true,
+		});
 		expect(history.map((m) => [m.text, m.author.name, m.author.identity])).toEqual([
 			["new", "Alice", actor],
 		]);
-		expect((await thread.history({ limit: 1 })).map((m) => m.messageId)).toEqual(["new"]);
-		expect(await thread.history({ limit: 0 })).toEqual([]);
+		expect(
+			(await fetchHistory(env.connection, thread, { limit: 1 })).map((m) => m.messageId),
+		).toEqual(["new"]);
+		expect(await fetchHistory(env.connection, thread, { limit: 0 })).toEqual([]);
 	});
 
 	it("opens provider-scoped DMs and posts ephemeral messages", async () => {
 		const env = setup();
-		const dm = await env.connection.port.openDM(actor);
+		const dm = await env.connection.openDM(actor);
 		expect(dm.isDM).toBe(true);
-		expect(dm.ref.threadId).toBe("slack:DU1:");
-		await env.connection.port.postEphemeral(ref, actor, "not authorized");
+		expect(dm.id).toBe("slack:DU1:");
+		await env.connection.postEphemeral(ref, actor, "not authorized");
 		expect(env.adapter.postEphemeral).toHaveBeenCalledWith(ref.threadId, "U1", "not authorized", {
 			fallbackToDM: true,
 		});
-		await expect(env.connection.port.openDM({ ...actor, installationId: "other" })).rejects.toThrow(
+		await expect(env.connection.openDM({ ...actor, installationId: "other" })).rejects.toThrow(
 			"another installation",
 		);
 	});
 
-	it("creates a channel thread only on first post and then reuses it", async () => {
+	it("posts to a channel by starting a thread, whose receipt names it", async () => {
 		const env = setup();
-		const thread = await env.connection.port.resolve({
-			kind: "channel",
-			provider: "slack",
-			channelId: "C1",
-		});
-		expect(thread.ref.threadId).toBe("provisional:slack:C1");
-		await expect(env.connection.port.thread(thread.ref)).rejects.toThrow("another provider");
-		await expect(thread.updateState(() => routingState)).rejects.toThrow("provisional");
-		expect(await thread.getState()).toBeNull();
-		await thread.setStatus("Thinking");
-		expect(await thread.history({})).toEqual([]);
-		expect(env.adapter.postChannelMessage).not.toHaveBeenCalled();
-		const root = await thread.post("root");
-		expect(root.threadId).toBe(ref.threadId);
-		expect(thread.ref).toEqual(ref);
-		await thread.updateState(() => routingState);
-		expect(await thread.getState()).toEqual(routingState);
-		await thread.post("reply");
+		const channel = { kind: "channel" as const, provider: "slack", channelId: "C1" };
+		await expect(
+			env.connection.thread({ ...ref, threadId: "provisional:slack:C1" }),
+		).rejects.toThrow("another provider");
+		const root = await postTo(env.connection, channel, "root");
+		expect(root).toEqual({ provider: "slack", threadId: ref.threadId, messageId: "root-1" });
+		await postTo(env.connection, { ...ref, threadId: root.threadId }, "reply");
 		expect(env.adapter.postChannelMessage).toHaveBeenCalledOnce();
 		expect(env.adapter.postMessage).toHaveBeenCalledWith(ref.threadId, "reply");
+		await expect(postTo(env.connection, { ...channel, provider: "other" }, "x")).rejects.toThrow(
+			'No chat provider "other"',
+		);
 	});
 });
 
@@ -452,10 +468,13 @@ it("exports standard events and channel/thread specificity for other plugins", a
 it("rejects a chat plugin lacking configured installation identity", () => {
 	const env = setup();
 	expect(() =>
-		chat({ state: env.state }).connect({
-			...env.host,
-			plugins: [{ id: "broken", chat: { adapter: () => env.adapter, installationId: "" } }],
-		}),
+		connectChat(
+			{ state: env.state },
+			{
+				...env.host,
+				plugins: [{ id: "broken", chat: { adapter: () => env.adapter, installationId: "" } }],
+			},
+		),
 	).toThrow("installationId");
 });
 
@@ -463,7 +482,7 @@ it("maps application signal aborts with authenticated reasons, never impersonati
 	const registration = vi.spyOn(Chat.prototype, "onNewMessage");
 	try {
 		const env = setup();
-		await env.connection.start!();
+		await env.connection.start();
 		const receive = registration.mock.calls[0]![1];
 		for (const authenticated of [false, true]) {
 			const controller = new AbortController();
@@ -491,10 +510,10 @@ it("starts and shuts down the SDK through the connection lifecycle", async () =>
 	const disconnect = vi.spyOn(env.state, "disconnect");
 	const shutdown = vi.spyOn(env.adapter, "disconnect");
 	expect(env.adapter.initialize).not.toHaveBeenCalled();
-	await env.connection.start!();
-	await env.connection.start!();
+	await env.connection.start();
+	await env.connection.start();
 	expect(env.adapter.initialize).toHaveBeenCalledOnce();
-	await env.connection.stop!();
+	await env.connection.stop();
 	expect(disconnect).toHaveBeenCalledOnce();
 	expect(shutdown).toHaveBeenCalledOnce();
 });

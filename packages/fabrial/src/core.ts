@@ -1,4 +1,10 @@
 import type { CoreConfig, FabrialHost, HostedApp, Logger } from "./app.ts";
+import {
+	connectChat,
+	routingState,
+	updateRoutingState,
+	type ChatConnection,
+} from "./chat/index.ts";
 import { createDirectory } from "./directory.ts";
 import { filtersOverlap, matchesFilter } from "./internal.ts";
 import { definedAgents, type Agent } from "./agent.ts";
@@ -7,6 +13,7 @@ import {
 	INGRESS_EVENT,
 	ingressKey,
 	ROUTE_WORKFLOW,
+	type Follow,
 	type IngressEvent,
 	type RouteDecision,
 	type RoutedWorkflow,
@@ -25,7 +32,6 @@ import { parseSchema } from "./schema.ts";
 import {
 	type AgentRef,
 	type DurableExecution,
-	type Follow,
 	type InvocationMetadata,
 	type RuntimeWorkflow,
 } from "./runtime.ts";
@@ -56,7 +62,7 @@ const MAX_REASON = 3000;
 export function buildApp(config: CoreConfig): HostedApp {
 	const runtime = config.runtime;
 	const now = () => runtime.now?.() ?? Date.now();
-	let chat: ReturnType<NonNullable<CoreConfig["chat"]>["connect"]> | undefined;
+	let chat: ChatConnection | undefined;
 	let agents: ReturnType<NonNullable<CoreConfig["agents"]>["connect"]> | undefined;
 	let liveClients: Record<string, unknown> | undefined;
 	const clients = (): Record<string, unknown> =>
@@ -196,7 +202,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			if (!allowed) {
 				await execution.step("denied", async () => {
 					if (ingress.actor && ingress.replyTo)
-						await chat?.port.postEphemeral(
+						await chat?.postEphemeral(
 							ingress.replyTo as ThreadRef,
 							ingress.actor,
 							"You are not authorized to decide this approval.",
@@ -235,7 +241,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			if (!decided) {
 				await execution.step("expired", async () => {
 					if (ingress.actor && ingress.replyTo)
-						await chat?.port.postEphemeral(
+						await chat?.postEphemeral(
 							ingress.replyTo as ThreadRef,
 							ingress.actor,
 							"This approval has expired.",
@@ -246,10 +252,10 @@ export function buildApp(config: CoreConfig): HostedApp {
 			return { authorized: true };
 		}
 		if (ingress.kind === "stop") {
-			const io = await chat?.port.thread(ingress.replyTo as ThreadRef);
+			const sdk = await chat?.thread(ingress.replyTo as ThreadRef);
 			const follows = (await execution.step(
 				"follows",
-				async () => ((await io?.getState())?.follows ?? []) as Json,
+				async () => ((sdk && (await routingState(sdk)))?.follows ?? []) as Json,
 			)) as Follow[];
 			// A stop cancels the current run of each conversation following the thread; anyone there may stop.
 			for (const [index, conversation] of follows.entries())
@@ -261,7 +267,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 		const message =
 			ingress.kind === "message" ? (ingress.payload as unknown as ChatMessage) : undefined;
 		const thread = message && threadOf(message);
-		const io = thread && (await chat?.port.thread(thread));
+		const sdk = thread && (await chat?.thread(thread));
 		const decision = await execution.step("route", async (): Promise<RouteDecision> => {
 			const { selected, tied, observers } = select(ingress.events, ingress.payload);
 			const conversation = (agent: Agent, replyTo: InvocationMetadata["replyTo"]): Follow => ({
@@ -275,7 +281,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			});
 			// 1. Followers: everyone in a followed thread steers. Naming one agent addresses only that agent.
 			// Observers still run.
-			const followers = (await io?.getState())?.follows ?? [];
+			const followers = (sdk && (await routingState(sdk)))?.follows ?? [];
 			if (message && followers.length) {
 				const mentioned = mentionedAgent(message.text);
 				const own = mentioned ? followers.filter((f) => f.agent === mentioned.name) : followers;
@@ -311,11 +317,13 @@ export function buildApp(config: CoreConfig): HostedApp {
 			};
 		});
 		// A handled thread stays subscribed; every conversation receiving its messages follows it.
-		if (io && decision.route !== "ignored")
+		if (chat && sdk && decision.route !== "ignored")
 			await execution.step("follow", async () => {
 				if (decision.conversations.length)
-					await io.updateState((state) => decision.conversations.reduce(addFollow, state));
-				await io.subscribe();
+					await updateRoutingState(chat!, sdk, (state) =>
+						decision.conversations.reduce(addFollow, state),
+					);
+				await sdk.subscribe();
 			});
 		const metadata: InvocationMetadata = {
 			requestId,
@@ -370,7 +378,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 		directory,
 		logger: config.logger ?? silentLogger,
 		clients,
-		chat: () => chat?.port,
+		chat: () => chat,
 		resolvePrincipal: (identity) => directory.resolveIdentity(identity),
 		ingest: (event, payload, options) => {
 			// The routing workflow re-emits ingested events; only Fabrial emits its own.
@@ -592,15 +600,15 @@ export function buildApp(config: CoreConfig): HostedApp {
 				}
 			for (const plugin of config.plugins) await plugin.init?.();
 			await config.resources?.open();
-			chat = config.chat?.connect(host);
-			await chat?.start?.();
+			chat = config.chat && connectChat(config.chat, host);
+			await chat?.start();
 			await agents?.start();
 			await runtime.start();
 		},
 		async stop() {
 			await runtime.stop();
 			await agents?.stop();
-			await chat?.stop?.();
+			await chat?.stop();
 			for (const plugin of [...config.plugins].reverse()) await plugin.shutdown?.();
 			await config.resources?.close();
 			liveClients = undefined;

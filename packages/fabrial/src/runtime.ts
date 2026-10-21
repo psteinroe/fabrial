@@ -3,16 +3,16 @@
  * routing, and identity on top of these; adapters implement them:
  *
  * - `DurableRuntime` → `runtime/conductor` (PG Conductor; a thin mapping onto its public API)
- * - `ChatPort`       → `chat` (Chat SDK)
  * - `AgentPort`, `StatePort`, `Evaluator` → `agents` (Pi Durable, pi-ai)
  *
  * Every durable operation maps onto the Conductor call of the same name (README, "Boundary").
  */
 import type { EventFilter, Origin } from "./events.ts";
-import type { ExternalIdentity, Principal } from "./identity.ts";
+import type { Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { InferOutput, Schema } from "./schema.ts";
-import type { ChatMessage, MessageRef, OutboundMessage, Surface, ThreadRef } from "./thread.ts";
+import type { Follow } from "./routing.ts";
+import type { Surface } from "./thread.ts";
 
 /** Serializable invocation context carried by every execution (Conductor execution metadata, item 2). */
 export interface InvocationMetadata extends JsonObject {
@@ -249,70 +249,6 @@ export interface DurableRuntime {
 	signal(executionId: string, signal: RuntimeSignal): Promise<boolean>;
 	start(): Promise<void>;
 	stop(): Promise<void>;
-}
-
-/** Live I/O for one chat thread. Not durable by itself; core wraps intentional operations in steps. */
-export interface ThreadIO {
-	readonly ref: ThreadRef;
-	readonly channelId: string;
-	readonly isDM: boolean;
-	post(message: OutboundMessage): Promise<MessageRef>;
-	update(message: MessageRef, content: OutboundMessage): Promise<void>;
-	/** Replaceable progress status ("Thinking…"); `null` clears it. Best effort, never durable. */
-	setStatus(text: string | null): Promise<void>;
-	history(options: { limit?: number; sinceLastBotReply?: boolean }): Promise<ChatMessage[]>;
-	/** Subscribe the thread in Chat SDK, so its later messages arrive as subscribed messages. */
-	subscribe(): Promise<void>;
-	/** Fabrial's routing state in Chat SDK thread state (30-day TTL, refreshed on write). */
-	getState(): Promise<ThreadRoutingState | null>;
-	/**
-	 * Atomic read-modify-write of the routing state under a per-thread lock (Chat SDK state adapter lock),
-	 * across processes. `fn` may run more than once; keep it pure. Returning `null` clears the state.
-	 */
-	updateState(
-		fn: (state: ThreadRoutingState | null) => ThreadRoutingState | null,
-	): Promise<ThreadRoutingState | null>;
-}
-
-/** A conversation following a thread: `[session, agent]`. */
-export interface Follow extends JsonObject {
-	session: string;
-	agent: string;
-}
-
-/**
- * A conversation following a resource thread (`ctx.follow`): the plugin's events for the thread reach it as
- * notifications, whose final replies go to `replyTo` (the conversation's home).
- */
-export type ResourceFollow = Follow & {
-	/** Resource key, e.g. `github:acme/app#42`. */
-	resource: string;
-	replyTo: (Surface & JsonObject) | null;
-	/** Priority per notification kind, overriding the plugin's default. */
-	priority?: Record<string, import("./send.ts").InputPriority>;
-	/** Every notification kind, not only the plugin's defaults. */
-	events?: "all";
-};
-
-/** Fabrial's state of a thread: follows and the progress status message. */
-export type ThreadRoutingState = JsonObject & {
-	statusMessageId?: string | null;
-	/** Conversations following this thread, whatever their session kind: its messages reach them. */
-	follows?: Follow[];
-	/** Conversations following the resource of this thread (a pull request): its events notify them. */
-	resourceFollows?: ResourceFollow[];
-};
-
-/** Port implemented by the chat module. */
-export interface ChatPort {
-	thread(ref: ThreadRef): Promise<ThreadIO>;
-	/** Resolve a surface to a thread, creating a new thread in a channel lazily. */
-	resolve(surface: Surface): Promise<ThreadIO>;
-	openDM(identity: ExternalIdentity): Promise<ThreadIO>;
-	/** A link to the thread, when its provider has one. */
-	permalink?(thread: ThreadRef): Promise<string | null>;
-	/** Short-lived message visible only to one user (e.g. "you are not an approver"). */
-	postEphemeral(thread: ThreadRef, identity: ExternalIdentity, text: string): Promise<void>;
 }
 
 export interface AgentRunOptions<O extends Schema | undefined = Schema | undefined> {

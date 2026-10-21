@@ -3,7 +3,8 @@ import { finalCard, pendingCard, type Outcome, type Proposal } from "./approval-
 import type { ApprovalCard, DecisionResult } from "./approval-workflows.ts";
 import type { Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
-import type { DurableExecution, ThreadIO } from "./runtime.ts";
+import { editMessage, postMessage, postTo, type ChatConnection } from "./chat/threads.ts";
+import type { DurableExecution } from "./runtime.ts";
 import type { MessageRef, Surface } from "./thread.ts";
 
 export const CLEANUP_WORKFLOW = "fabrial.cleanup";
@@ -42,10 +43,11 @@ export async function cleanup(
 		});
 	const ref = (await execution
 		.step("post", async () => {
-			const io = await open(host, data.destination);
-			return (await io.post({
-				card: pendingCard(data.proposal, data.status, data.actions),
-			})) as unknown as JsonObject;
+			const card = { card: pendingCard(data.proposal, data.status, data.actions) };
+			const { destination } = data;
+			return (await (destination.kind === "surface"
+				? postTo(chat, destination.surface, card)
+				: postMessage(await openDM(chat, destination), card))) as unknown as JsonObject;
 		})
 		.catch((error: unknown) => {
 			warn("Approval card delivery failed", error);
@@ -59,12 +61,7 @@ export async function cleanup(
 				result.status === "completed"
 					? closed(result.output as unknown as DecisionResult)
 					: { label: "Cancelled", at: new Date().toISOString() };
-			const io = await chat.thread({
-				kind: "thread",
-				provider: ref.provider,
-				threadId: ref.threadId,
-			});
-			await io.update(ref, { card: finalCard(data.proposal, outcome) });
+			await editMessage(chat, ref, { card: finalCard(data.proposal, outcome) });
 		})
 		.catch((error: unknown) => {
 			warn("Approval card update failed", error);
@@ -84,13 +81,11 @@ function closed(result: DecisionResult): Outcome {
 	return { label: result.label, at: decidedAt, ...(reason ? { reason } : {}) };
 }
 
-async function open(host: FabrialHost, destination: CardDestination): Promise<ThreadIO> {
-	const chat = host.chat()!;
-	if (destination.kind === "surface")
-		return destination.surface.kind === "thread"
-			? chat.thread(destination.surface)
-			: chat.resolve(destination.surface);
-	const { approver, provider } = destination;
+/** The approver's DM, on their identity of the preferred provider first. */
+async function openDM(
+	chat: ChatConnection,
+	{ approver, provider }: Extract<CardDestination, { kind: "dm" }>,
+) {
 	const identities = approver.identities
 		.map((identity, index) => ({ identity, index }))
 		.sort(

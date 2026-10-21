@@ -1,3 +1,4 @@
+import { connectChat } from "../../../src/chat/index.ts";
 import { metadataOf } from "../../../src/context.ts";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -72,13 +73,13 @@ function fixture() {
 		workflows: [],
 		runtime,
 		clients: () => ({}),
-		chat: () => chat.connection().port,
+		chat: () => chat.connection(),
 		logger,
 		directory: { isMember: async () => true },
 		resolvePrincipal: async () => null,
 	} as unknown as FabrialHost;
 	// The fake platform behind `slack-test`, the provider of the tests' threads.
-	chat.connect({ ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
+	connectChat(chat, { ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
 	const integration = pi({ models, sql: sql(), settings: { retry: { enabled: false } } }).connect(
 		host,
 	);

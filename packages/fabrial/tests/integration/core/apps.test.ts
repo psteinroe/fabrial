@@ -1,3 +1,4 @@
+import { updateRoutingState } from "../../../src/chat/index.ts";
 import type { AnyWorkflow } from "../../../src/workflow.ts";
 import { until } from "../../conductor/helper.ts";
 import { describe, expect, it, vi } from "vitest";
@@ -182,8 +183,8 @@ describe("follow records", () => {
 		};
 		const { app, chat } = start(agents);
 		await app.start();
-		const thread = await app.host.chat()!.thread(ref);
-		await thread.updateState(() => ({
+		const connection = app.host.chat()!;
+		await updateRoutingState(connection, await connection.thread(ref), () => ({
 			follows: [
 				{ session: "app:one", agent: "support" },
 				{ session: "app:two", agent: "support" },

@@ -10,17 +10,29 @@ import {
 	type Logger,
 	type WebhookOptions,
 } from "chat";
-import type { ChatIntegration, FabrialHost } from "../app.ts";
+import type { FabrialHost } from "../app.ts";
 import type { ExternalIdentity } from "../identity.ts";
+import type { AnyPlugin } from "../plugin.ts";
+import type { ChatMessage } from "../thread.ts";
 import { chatIdentity, normalizeMessage, type ChatPluginCapability } from "./events.ts";
-import { createChatPort, type SDKState } from "./port.ts";
+import { ChatConnection, type SDKState } from "./threads.ts";
 
 export * from "./events.ts";
-export { renderMessage } from "./port.ts";
+export { literalCard, renderMessage } from "./render.ts";
+export * from "./threads.ts";
 
 export interface ChatOptions {
-	state: StateAdapter;
+	/** A factory runs when the app starts (production opens its Postgres state then). */
+	state: StateAdapter | (() => StateAdapter);
 	userName?: string;
+	/** Routes served besides the providers' webhooks. */
+	routes?: Record<string, (request: Request) => Promise<Response>>;
+	/** Internal (FakeChat): the chat capability each plugin runs with, instead of its own. */
+	capability?(plugin: AnyPlugin): ChatPluginCapability | undefined;
+	/** Internal (FakeChat): how core took an inbound message. */
+	received?(message: ChatMessage, result: "accepted" | "ignored"): void;
+	/** Internal (FakeChat): the connection, once connected. */
+	connected?(connection: ChatConnection): void;
 }
 
 /** Platform action receipts are not exposed uniformly by Chat SDK; prefer native receipt ids. */
@@ -71,21 +83,15 @@ export function ingressOptions(tasks: Promise<unknown>[]): WebhookOptions {
 	};
 }
 
-export type ChatConnection = ReturnType<ChatIntegration["connect"]> & {
-	readonly bot: Chat<Record<string, Adapter>, SDKState>;
-};
-
-export function chat(options: ChatOptions): ChatIntegration {
-	return { kind: "fabrial.chat", connect: (host) => connectChat(options, host) };
-}
-
-/** `chat(options).connect(host)`, with the SDK instance (for `FakeChat`). Internal. */
+/** One Chat SDK bot for every chat plugin of the app, dispatching into core. Internal. */
 export function connectChat(options: ChatOptions, host: FabrialHost): ChatConnection {
 	const adapters: Record<string, Adapter> = {};
 	const capabilities = new Map<string, ChatPluginCapability>();
 	for (const plugin of host.plugins) {
-		if (!plugin.chat) continue;
-		const config = plugin.chat as ChatPluginCapability;
+		const config = options.capability
+			? options.capability(plugin)
+			: (plugin.chat as ChatPluginCapability | undefined);
+		if (!config) continue;
 		if (!config.installationId)
 			throw new Error(`Chat plugin "${plugin.id}" must declare an installationId`);
 		if (capabilities.has(plugin.id)) throw new Error(`Duplicate chat plugin "${plugin.id}"`);
@@ -106,7 +112,7 @@ export function connectChat(options: ChatOptions, host: FabrialHost): ChatConnec
 	};
 	const bot = new Chat<Record<string, Adapter>, SDKState>({
 		adapters,
-		state: options.state,
+		state: typeof options.state === "function" ? options.state() : options.state,
 		userName: options.userName ?? "fabrial",
 		// Queue/debounce strategies coalesce messages; every message is an input of its own.
 		concurrency: { strategy: "concurrent", maxConcurrent: 1 },
@@ -125,7 +131,8 @@ export function connectChat(options: ChatOptions, host: FabrialHost): ChatConnec
 		if (normalized.isMention) events.push(`${provider}.mentioned`);
 		const dedupeId = JSON.stringify([provider, normalized.channelId, message.id]);
 		// The routing workflow subscribes the thread when something handles the message.
-		await host.receiveMessage(normalized, { events, dedupeId });
+		const result = await host.receiveMessage(normalized, { events, dedupeId });
+		options.received?.(normalized, result);
 		if (thread.signal.aborted) {
 			// A bare SDK abort carries no stopper identity. Never attribute it to the message
 			// author: Slack aborts the turn BEFORE delivering its actor-bearing stop event.
@@ -233,8 +240,7 @@ export function connectChat(options: ChatOptions, host: FabrialHost): ChatConnec
 			]),
 		});
 	});
-	const port = createChatPort(bot, capabilities, host);
-	const routes: Record<string, (request: Request) => Promise<Response>> = {};
+	const routes = options.routes ?? {};
 	for (const provider of capabilities.keys()) {
 		routes[`POST /${provider}/events`] = async (request) => {
 			const tasks: Promise<unknown>[] = [];
@@ -243,14 +249,7 @@ export function connectChat(options: ChatOptions, host: FabrialHost): ChatConnec
 			return response;
 		};
 	}
-	return {
-		bot,
-		port,
-		routes,
-		start: () => bot.initialize(),
-		async stop() {
-			await port.stop();
-			await bot.shutdown();
-		},
-	};
+	const connection = new ChatConnection(bot, capabilities, host.logger, routes);
+	options.connected?.(connection);
+	return connection;
 }

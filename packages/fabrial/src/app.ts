@@ -3,9 +3,9 @@ import type { Evaluator } from "./evaluate.ts";
 import type { ExternalIdentity, IdentityDirectory, Principal, UserDefinition } from "./identity.ts";
 import type { JsonObject } from "./json.ts";
 import type { AnyPlugin } from "./plugin.ts";
+import type { ChatConnection, ChatOptions } from "./chat/index.ts";
 import type {
 	AgentPort,
-	ChatPort,
 	DurableRuntime,
 	RuntimeEvent,
 	RuntimeWorkflow,
@@ -32,8 +32,8 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 	readonly logger: Logger;
 	/** Live clients of all plugins (built once per app; plugin `clients()` must be cheap and stateless). */
 	clients(): TClients;
-	/** Chat port, after app.start() connects chat. */
-	chat(): ChatPort | undefined;
+	/** The app's Chat SDK bot, after app.start() connects chat. */
+	chat(): ChatConnection | undefined;
 
 	/**
 	 * New work from a plugin: emits one `fabrial.ingress` event (deduped by `id`). The routing workflow
@@ -85,19 +85,10 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 	resolvePrincipal(identity: ExternalIdentity): Promise<Principal>;
 }
 
-/** A runtime module that plugs into the host (chat, agents). Internal. */
+/** A runtime module that plugs into the host (agents). Internal. */
 export interface HostIntegration<T> {
 	readonly kind: string;
 	connect(host: FabrialHost): T;
-}
-
-export interface ChatIntegration extends HostIntegration<{
-	port: ChatPort;
-	routes: Record<string, (request: Request) => Promise<Response>>;
-	start?(): Promise<void>;
-	stop?(): Promise<void>;
-}> {
-	readonly kind: "fabrial.chat";
 }
 
 export interface AgentIntegration extends HostIntegration<{
@@ -117,8 +108,8 @@ export interface CoreConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[
 	definitionScope?: object;
 	/** Durable workflow runtime (Conductor, or in memory for tests). */
 	runtime: DurableRuntime;
-	/** Chat SDK integration. Required when any plugin has a `chat` capability. */
-	chat?: ChatIntegration;
+	/** Chat SDK options. Required when any plugin has a `chat` capability. */
+	chat?: ChatOptions;
 	/** Agents, state, and evaluation. Required for `ctx.agent`, `ctx.state`, `ctx.evaluate`. */
 	agents?: AgentIntegration;
 	/** Owned resources (database pools): opened after plugin `init`, closed last on stop. */
