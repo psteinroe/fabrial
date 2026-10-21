@@ -26,7 +26,7 @@ import {
 	type JsonObject,
 } from "../../../src/index.ts";
 import { pi, PostgresStorage } from "../../../src/agents/index.ts";
-import { Conversations, Invocation, Runs } from "../../../src/agents/documents.ts";
+import { Conversations, Invocation, Obligations, Runs } from "../../../src/agents/documents.ts";
 import { WAITING_STATUS } from "../../../src/agents/errors.ts";
 import type { Logger } from "../../../src/app.ts";
 import { until } from "../../conductor/helper.ts";
@@ -274,13 +274,15 @@ it("steers a busy run with a second message, replies in the newest input's threa
 	const session = `chat:channel:${t.channel}`;
 	// Both inputs were answered by the same run (one answer entry), and each was submitted once.
 	const answers = await t.read(session, async (s, storage) => {
-		const runs = await s.snapshot(Runs, BACKGROUND_CONTEXT);
-		const requests = Object.values(runs!.runs).flatMap((run) => Object.entries(run.requests ?? {}));
-		const unique = new Map(requests);
+		const unique = new Map(await requestsOf(s));
 		expect(unique.size).toBe(2);
 		return Promise.all(
-			[...unique.values()].map(async (request) => {
-				const record = await storage.submission(request.submissionId as never, BACKGROUND_CONTEXT);
+			[...unique].map(async ([requestId, conversationId]) => {
+				const record = await storage.submissionByRequest(
+					conversationId as never,
+					requestId,
+					BACKGROUND_CONTEXT,
+				);
 				return record?.status === "done" ? record.answer : record?.status;
 			}),
 		);
@@ -585,11 +587,13 @@ it("an urgent notification during a tool call steers the running run and is answ
 	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Rolled back"]);
 	// Both inputs settled with the same answer: one run.
 	const answers = await t.read(session, async (s, storage) => {
-		const runs = await s.snapshot(Runs, BACKGROUND_CONTEXT);
-		const requests = Object.values(runs!.runs).flatMap((run) => Object.values(run.requests ?? {}));
 		return Promise.all(
-			requests.map(async (request) => {
-				const record = await storage.submission(request.submissionId as never, BACKGROUND_CONTEXT);
+			(await requestsOf(s)).map(async ([requestId, conversationId]) => {
+				const record = await storage.submissionByRequest(
+					conversationId as never,
+					requestId,
+					BACKGROUND_CONTEXT,
+				);
 				return record?.status === "done" ? record.answer : record?.status;
 			}),
 		);
@@ -628,12 +632,19 @@ async function intercept(
 	io.post = ((content: Parameters<typeof actual>[0]) =>
 		post(content, () => actual(content))) as typeof io.post;
 }
-/** The posts of the replies of a Session's runs, by intent key. */
-const deliveries = async (t: Awaited<ReturnType<typeof setup>>) => {
-	const runs = await t.read(`chat:channel:${t.channel}`, (s) =>
-		s.snapshot(Runs, BACKGROUND_CONTEXT),
+/** The requests the Session's runs admitted, with their conversation. */
+const requestsOf = async (s: Pick<ReturnType<typeof createSession>, "snapshot">) =>
+	Object.values((await s.snapshot(Runs, BACKGROUND_CONTEXT))!.runs).flatMap((run) =>
+		Object.keys(run.requests ?? {}).map((requestId) => [requestId, run.conversationId] as const),
 	);
-	return Object.values(runs?.runs ?? {}).flatMap((run) => Object.values(run.deliveries ?? {}));
+/** The posts of the replies the Session owed, by intent key. */
+const deliveries = async (t: Awaited<ReturnType<typeof setup>>) => {
+	const obligations = await t.read(`chat:channel:${t.channel}`, (s) =>
+		s.snapshot(Obligations, BACKGROUND_CONTEXT),
+	);
+	return Object.values(obligations?.requests ?? {}).flatMap((obligation) =>
+		Object.values(obligation.deliveries ?? {}),
+	);
 };
 
 const statuses = async (t: Awaited<ReturnType<typeof setup>>, thread: string) =>
@@ -771,6 +782,110 @@ it(
 		expect(posts).toHaveLength(1);
 		expect(posts[0]).toMatch(FAILED);
 		expect(await sessions(t.runtime.queue)).toEqual([{ status: "completed", attempts: 2 }]);
+	},
+	2 * RETRY_MS,
+);
+
+/** Pi submission ids per request id in a Session, from its commit log. */
+async function submissionIds(session: string): Promise<Map<string, Set<number>>> {
+	const rows =
+		await sql()`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${session} ORDER BY seq`;
+	const ids = new Map<string, Set<number>>();
+	for (const row of rows)
+		for (const write of JSON.parse(String(row.writes)) as StorageWrite[])
+			if (write.type === "submission" && write.value.requestId) {
+				const each = ids.get(write.value.requestId) ?? new Set();
+				each.add(write.value.id);
+				ids.set(write.value.requestId, each);
+			}
+	return ids;
+}
+
+it(
+	"a crash after an input's obligation committed and before its submission answers and posts it once",
+	async () => {
+		let crashed = false;
+		const logger: Logger = {
+			debug: (message) => {
+				if (message === "Submitting input" && !crashed) {
+					crashed = true;
+					throw new Error("driver crashed");
+				}
+			},
+			info() {},
+			warn() {},
+			error() {},
+		};
+		const t = await setup(undefined, { logger, sessionAttempts: 2 });
+		t.respond([fauxAssistantMessage("Answer one")]);
+		await t.chat.receive(t.message("m1", "t1"));
+		await t.settle(RETRY_MS);
+		expect(crashed).toBe(true);
+		const session = `chat:channel:${t.channel}`;
+		expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Answer one"]);
+		expect([...(await submissionIds(session)).values()].map((ids) => ids.size)).toEqual([1]);
+		expect(t.faux.state.callCount).toBe(1);
+		const obligations = await t.read(session, (s) => s.snapshot(Obligations, BACKGROUND_CONTEXT));
+		expect(Object.values(obligations!.requests)).toEqual([
+			expect.objectContaining({ owes: "reply", fulfilled: true }),
+		]);
+		expect(await sessions(t.runtime.queue)).toEqual([{ status: "completed", attempts: 2 }]);
+	},
+	2 * RETRY_MS,
+);
+
+it(
+	"a crash after a steering input's submission and before its signal is acknowledged answers it once",
+	async () => {
+		let submissions = 0;
+		let crashed!: () => void;
+		const crash = new Promise<void>((resolve) => (crashed = resolve));
+		const logger: Logger = {
+			debug: (message) => {
+				// The second message is submitted while its signal is handled: fail the handler right after.
+				if (message === "Submitted input" && ++submissions === 2) {
+					crashed();
+					throw new Error("driver crashed");
+				}
+			},
+			info() {},
+			warn() {},
+			error() {},
+		};
+		const t = await setup(() => [look], { logger, sessionAttempts: 2 });
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => (release = resolve));
+		let busy!: () => void;
+		const started = new Promise<void>((resolve) => (busy = resolve));
+		t.respond([
+			async () => {
+				busy();
+				await gate;
+				return fauxAssistantMessage(fauxToolCall("look", {}), { stopReason: "toolUse" });
+			},
+			fauxAssistantMessage("done"),
+			fauxAssistantMessage("done"),
+		]);
+		await t.chat.receive(t.message("m1", "t1"));
+		try {
+			await started;
+			expect(await t.chat.receive(t.message("m2", "t2", "also this"))).toBe("accepted");
+			await crash;
+		} finally {
+			release();
+		}
+		await t.settle(RETRY_MS);
+		const session = `chat:channel:${t.channel}`;
+		const ids = await submissionIds(session);
+		expect([...ids.values()].map((each) => each.size)).toEqual([1, 1]);
+		// One answer for both, posted once to the newest input's thread.
+		expect(await t.posts("t1")).toEqual([]);
+		expect((await t.posts("t2")).map((post) => post.content)).toEqual(["done"]);
+		const obligations = await t.read(session, (s) => s.snapshot(Obligations, BACKGROUND_CONTEXT));
+		expect(Object.values(obligations!.requests).map((each) => each.fulfilled)).toEqual([
+			true,
+			true,
+		]);
 	},
 	2 * RETRY_MS,
 );

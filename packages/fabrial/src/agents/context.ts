@@ -5,6 +5,7 @@ import { createContextKey } from "@earendil-works/chord/context";
 import type {
 	ConversationId,
 	Harness,
+	HookApi,
 	ToolExecutionApi,
 	ToolRegistration,
 } from "@earendil-works/pi-durable";
@@ -35,10 +36,11 @@ import {
 	applyState,
 	Binding,
 	ChildResults,
+	Conversations,
 	stateDraft,
-	Runs,
 	Invocation,
-	SubagentWork,
+	Obligations,
+	Subagent,
 	ChildIntents,
 	EFFECT_WORKFLOW,
 	type ChildIntent,
@@ -58,8 +60,6 @@ export interface BridgeFrame {
 	children: Map<number, { executionId: string; detached: boolean }>;
 	/** Subagent calls waiting for their child's answer; they do not keep the Session open. */
 	waiting: Set<number>;
-	/** The run a conversation's current request belongs to, and the agent whose conversation runs it. */
-	runOf(conversationId: ConversationId, context: Context): Promise<{ id: string; agent: string }>;
 	/**
 	 * Resolves with a workflow's result, memoized per child: once it settled, or as its `child` signal arrives. Without
 	 * one (cancelled, crashed) it waits until the Session closes, and the tool runs again when the Session's execution
@@ -97,12 +97,16 @@ export async function fields(
 	const bridge = frame(context);
 	const requestId = await currentRequest(bridge, conversationId, context);
 	const invocation = (await bridge.harness.snapshot(Invocation, requestId, context))!;
-	const run = await bridge.runOf(conversationId, context);
+	const obligation = (await bridge.harness.snapshot(Obligations, context))?.requests[requestId];
+	if (!obligation) throw new Error(`Missing Fabrial obligation for request ${requestId}`);
 	// Tools, and the workflows they start, follow in this conversation by default. A subagent's tools follow in the
-	// root conversation: the Session is the lead's, the run is the lead request's, and replyTo is that request's thread.
+	// root conversation: the Session is the lead's, the request is the lead's, and replyTo is that request's thread.
 	const metadata: InvocationMetadata = {
 		...(invocation as InvocationMetadata),
-		conversation: { session: bridge.session, agent: run.agent } satisfies ConversationRef,
+		conversation: {
+			session: bridge.session,
+			agent: await agentOf(bridge.harness, obligation.conversationId as ConversationId, context),
+		} satisfies ConversationRef,
 	};
 	const prefix = `fabrial:pi:${conversationId}:${api?.taskId ?? "section"}`;
 	const ids = new Map<string, number>();
@@ -118,7 +122,7 @@ export async function fields(
 		if (!result) {
 			await registerChild(
 				bridge,
-				run.id,
+				requestId,
 				api!.taskId,
 				{ executionId: child, detached: false },
 				context,
@@ -134,7 +138,7 @@ export async function fields(
 		const key = `${prefix}:${operationId(id)}`;
 		const child = await startChild(
 			bridge,
-			run.id,
+			requestId,
 			key,
 			EFFECT_WORKFLOW,
 			{ method, args },
@@ -154,7 +158,7 @@ export async function fields(
 		const key = operationId(id);
 		return startChild(
 			bridge,
-			run.id,
+			requestId,
 			`${prefix}:${key}`,
 			registered.name,
 			parsed,
@@ -264,9 +268,9 @@ export async function fields(
 
 /**
  * The request a conversation's current run acts for: the request of its newest placed input (a steer joins the run,
- * so what runs after it acts for it), the lead request a background child's input was sent for, or its binding (the
- * lead request a foreground child was called for). Children record their lead request when started, so a lead's
- * later steer leaves them acting for the request they were started for.
+ * so what runs after it acts for it), or the request a background child's task or report acts for (its obligation's
+ * origin), else its binding (the lead request a foreground child was called for). Children record their lead request
+ * before their input is submitted, so a lead's later steer leaves them acting for the request they were started for.
  */
 export async function currentRequest(
 	bridge: BridgeFrame,
@@ -279,30 +283,38 @@ export async function currentRequest(
 	// The bridge commits this request's identity before submission and never serializes live clients.
 	// Pi appends each input to the run as it is placed, so the newest participating input is the last one.
 	const live = await bridge.harness.snapshot(LiveDoc, conversationId, context);
+	const obligations = (await bridge.harness.snapshot(Obligations, context))?.requests ?? {};
 	for (const inputId of [...(live?.run?.inputs ?? [])].reverse()) {
 		const record = await (await bridge.harness.submission(inputId, context))?.status(context);
 		if (record?.status !== "placed" || !record.requestId) continue;
-		const { requestId } = record;
+		const requestId = obligations[record.requestId]?.origin ?? record.requestId;
 		if (await bridge.harness.snapshot(Invocation, requestId, context)) return requestId;
-		// A background child's task acts for the lead request that sent it, recorded before it was submitted.
-		const reporter = /^fabrial\.subagent:(\d+)$/.exec(requestId)?.[1];
-		const sent = reporter
-			? (await bridge.harness.snapshot(SubagentWork, context))?.reporters[reporter]?.request
-			: undefined;
-		if (sent && (await bridge.harness.snapshot(Invocation, sent, context))) return sent;
 	}
 	if (!(await bridge.harness.snapshot(Invocation, binding.requestId, context)))
 		throw new Error(`Missing Fabrial invocation ${binding.requestId}`);
 	return binding.requestId;
 }
 
+/** The agent a conversation runs, from the Session's own documents: a child's `Subagent` doc, else the lead's entry. */
+export async function agentOf(
+	reader: Pick<HookApi, "snapshot">,
+	conversationId: ConversationId,
+	context: Context,
+): Promise<string> {
+	const child = (await reader.snapshot(Subagent, conversationId, context))?.agent;
+	if (child) return child;
+	const ids = (await reader.snapshot(Conversations, context))?.ids ?? {};
+	return Object.keys(ids).find((name) => ids[name] === conversationId) ?? "unknown";
+}
+
 /**
- * Persist the run's intent BEFORE starting, so a stopped run cancels the child. Attached children are cancelled with
- * the Session's execution; a lost start receipt reconciles by global key.
+ * Persist the child's intent BEFORE starting, linked to the request it acts for (none for a reply's post), so stopping
+ * the request cancels the child. Attached children are cancelled with the Session's execution; a lost start receipt
+ * reconciles by global key.
  */
 export async function startChild(
 	bridge: BridgeFrame,
-	run: string,
+	request: string | null,
 	key: string,
 	workflow: string,
 	input: Json,
@@ -326,10 +338,12 @@ export async function startChild(
 			detached,
 			executionId: null,
 		});
-		const record = (await tx.doc(Runs)).runs[run];
-		if (!record) throw new Error("Missing Pi bridge run binding");
-		record.intents ??= [];
-		if (!record.intents.includes(key)) record.intents.push(key);
+		if (request !== null) {
+			const obligation = (await tx.doc(Obligations)).requests[request];
+			if (!obligation) throw new Error(`Missing Fabrial obligation for request ${request}`);
+			obligation.intents ??= [];
+			if (!obligation.intents.includes(key)) obligation.intents.push(key);
+		}
 		return cloneJson(saved) as ChildIntent;
 	}, context);
 	if (intent.executionId) return intent.executionId;
@@ -344,19 +358,45 @@ export async function startChild(
 	return executionId;
 }
 
+/** A tool's task waits on `child`: links it to the request the tool acts for, so stopping the request cancels it. */
 export async function registerChild(
 	bridge: BridgeFrame,
-	run: string,
+	request: string,
 	taskId: number,
 	child: { executionId: string; detached: boolean },
 	context: Context,
 ): Promise<void> {
 	bridge.children.set(taskId, child);
 	await bridge.harness.commit(async (tx) => {
-		const record = (await tx.doc(Runs)).runs[run];
-		if (!record) throw new Error("Missing Pi bridge run binding");
-		record.children[String(taskId)] = child;
+		const obligation = (await tx.doc(Obligations)).requests[request];
+		if (!obligation) throw new Error(`Missing Fabrial obligation for request ${request}`);
+		obligation.children ??= {};
+		obligation.children[String(taskId)] = child;
 	}, context);
+}
+
+/**
+ * Cancels the workflows and effects the tools of `requests` started or wait on, except detached ones. A child whose
+ * start receipt was lost is cancelled with the Session's execution.
+ */
+export async function cancelChildren(
+	harness: Pick<Harness, "snapshot">,
+	cancel: (executionId: string, reason: string) => Promise<unknown>,
+	requests: Iterable<string>,
+	reason: string,
+	context: Context,
+): Promise<void> {
+	const obligations = (await harness.snapshot(Obligations, context))?.requests ?? {};
+	for (const request of requests) {
+		const obligation = obligations[request];
+		if (!obligation) continue;
+		for (const key of obligation.intents ?? []) {
+			const intent = await harness.snapshot(ChildIntents, key, context);
+			if (intent?.executionId && !intent.detached) await cancel(intent.executionId, reason);
+		}
+		for (const child of Object.values(obligation.children ?? {}))
+			if (!child.detached) await cancel(child.executionId, reason);
+	}
 }
 
 export async function commitStaged(

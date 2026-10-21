@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Context as TranscriptContext } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -50,7 +51,12 @@ function fixture() {
 		ownerWorkflow: null,
 		triggerEvent: null,
 	};
-	const logger = { warn: vi.fn(), error: vi.fn(), debug() {}, info() {} };
+	const logger = {
+		warn: vi.fn(),
+		error: vi.fn(),
+		debug: (_message: string, _fields?: object) => {},
+		info() {},
+	};
 	const host = {
 		definitionScope: definitions,
 		plugins: [],
@@ -558,6 +564,54 @@ it("a background child returns its name at once; a call settles after the lead a
 	const statuses = (await f.chat.thread(f.metadata.replyTo as Parameters<typeof f.chat.thread>[0]))
 		.statuses;
 	expect(statuses).toContain(`${researcher.name}: Thinking…`);
+	await f.integration.stop();
+});
+
+it("a background report replayed after its submission is submitted and answered once", async () => {
+	const f = fixture();
+	const researcher = researcherOf(f);
+	const lead = leadOf(f, researcher);
+	const tool = toolName(researcher.name);
+	let replays = 0;
+	// The driver loses the Session right after Pi admitted the report, before the reporter ends: another process takes
+	// the lease while this one is blocked, so the reporter's next commit fails and its report phase replays on reopen.
+	f.logger.debug = (message: string) => {
+		if (message !== "Reported to the lead" || replays++) return;
+		execFileSync(
+			process.execPath,
+			[
+				"--input-type=module",
+				"-e",
+				`import postgres from "postgres";
+				const sql = postgres(process.env.URL, { max: 1, onnotice: () => {} });
+				await sql\`UPDATE fabrial_pi.sessions SET epoch = epoch + 1, owner = NULL, lease_until = NULL WHERE key = \${process.env.KEY}\`;
+				await sql.end();`,
+			],
+			{ cwd: import.meta.dirname, env: { ...process.env, URL: db.url, KEY: f.key() } },
+		);
+	};
+	route(f, (text) => {
+		if (text.includes("Why is the site down?"))
+			return use(tool, { task: "Find the root cause", background: true });
+		if (text.startsWith("Started")) return say("I asked a researcher.");
+		if (text === "Find the root cause") return say("It is DNS");
+		if (text.startsWith("<subagent")) return say("Final: DNS");
+		return say(`unexpected: ${text}`);
+	});
+	f.integration.workflows.find((workflow) => workflow.name === "fabrial.session")!.retries = {
+		maxAttempts: 3,
+	};
+	const { settled } = await f.call(lead, "Why is the site down?");
+	expect(await settled()).toEqual({ status: "completed", output: "Final: DNS" });
+	expect(replays).toBe(2);
+	const [report] = await requests(f, "fabrial.subagent-report:");
+	const ids = new Set(
+		(await f.writes()).flatMap((write) =>
+			write.type === "submission" && write.value.requestId === report ? [write.value.id] : [],
+		),
+	);
+	expect(ids.size).toBe(1);
+	expect(f.contexts.filter((context) => lastText(context).startsWith("<subagent"))).toHaveLength(1);
 	await f.integration.stop();
 });
 

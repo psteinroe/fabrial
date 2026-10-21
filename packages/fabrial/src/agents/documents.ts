@@ -73,18 +73,7 @@ export const SubagentWork = defineDoc({
 	initial: (): {
 		slots: Record<string, Record<string, string>>;
 		calls: Record<string, number>;
-		reporters: Record<
-			string,
-			{
-				lead: number;
-				child: number;
-				name: string;
-				run: string;
-				report: number | null;
-				/** The lead request this task acts for; the child's submission resolves to it. */
-				request?: string;
-			}
-		>;
+		reporters: Record<string, { lead: number; child: number; name: string }>;
 		reported: Record<string, number[]>;
 	} => ({ slots: {}, calls: {}, reporters: {}, reported: {} }),
 });
@@ -126,6 +115,53 @@ export const ChildIntents = defineDocFamily({
 });
 export const EFFECT_WORKFLOW = "fabrial.pi.effect";
 
+/** A `ctx.agent` call's Session execution returns its outcome: the answer, or why there is none. */
+export type CallOutcome =
+	| { status: "completed"; output: Json }
+	| { status: "failed"; error: string; executionId: string };
+
+/**
+ * What Fabrial owes for one request submitted to Pi, beyond what Pi tracks: committed before the request is submitted,
+ * so a crash in between leaves the obligation for its redelivery. Pi owns the submission and its lifecycle (looked up
+ * by request id); this holds only what Pi cannot know.
+ */
+export type Obligation = {
+	/** The conversation the request is submitted to. */
+	conversationId: number;
+	/**
+	 * `reply`: its answer posts to the reply thread of its invocation (sent input, or a background child's report).
+	 * `call`: its answer is a `ctx.agent` call's outcome. `task`: nothing; a background child's task acts for `origin`.
+	 */
+	owes: "reply" | "call" | "task";
+	/** The request whose invocation it acts for (follows, reply thread), when not its own: a background child's. */
+	origin?: string;
+	/** Nothing more is owed: its answer or error reply is posting or skipped, its call settled, or it was stopped. */
+	fulfilled?: true;
+	/** A settled call's outcome: its Session execution's result. */
+	outcome?: CallOutcome;
+	/** The error id of its error reply; assigned once. */
+	errorId?: string;
+	/**
+	 * Final and error replies posted for it, by their effect's intent key: the run settles only once each post's outcome
+	 * arrived. A post that failed for good stays `failed` (logged, never retried or answered with an error reply).
+	 */
+	deliveries?: Record<
+		string,
+		{ executionId: string; status: "pending" | "posted" | "failed"; error?: string }
+	>;
+	/** Workflows and effects its tools started, by intent key: stopping the request cancels the attached ones. */
+	intents?: string[];
+	/** Workflows its tools wait on, by task id. */
+	children?: Record<string, { executionId: string; detached: boolean }>;
+};
+export const Obligations = defineDoc({
+	kind: "fabrial.obligations",
+	scope: "session",
+	version: 1,
+	initial: (): { requests: Record<string, Obligation> } => ({ requests: {} }),
+});
+
+/** The hosting loop's admission queue: which requests a conversation's run takes, in arrival order. */
 export const Runs = defineDoc({
 	kind: "fabrial.runs",
 	scope: "session",
@@ -141,32 +177,8 @@ export const Runs = defineDoc({
 				call?: { requestId: string };
 				/** Settled: answered, failed, or stopped. */
 				done?: boolean;
-				/** A settled call's outcome: its Session execution's result. */
-				outcome?:
-					| { status: "completed"; output: Json }
-					| { status: "failed"; error: string; executionId: string };
-				children: Record<string, { executionId: string; detached: boolean }>;
-				intents?: string[];
-				/** Error ids of failed runs, by the request whose thread got the error reply; assigned once. */
-				errors?: Record<string, string>;
-				/**
-				 * Final and error replies, by their effect's intent key: the run settles only once each post's outcome
-				 * arrived. A post that failed for good stays `failed` (logged, never retried or answered with an error reply).
-				 */
-				deliveries?: Record<
-					string,
-					{ executionId: string; status: "pending" | "posted" | "failed"; error?: string }
-				>;
-				requests?: Record<
-					string,
-					{
-						content: string;
-						submissionId: number | null;
-						delivery?: import("../send.ts").Delivery;
-						/** Sent with `ctx.send` or a followed resource, so its answer posts to its reply thread. */
-						sent?: boolean;
-					}
-				>;
+				/** Requests to submit, by request id; Pi has the submission once submitted. */
+				requests?: Record<string, { content: string; delivery?: import("../send.ts").Delivery }>;
 			}
 		>;
 	} => ({ runs: {} }),

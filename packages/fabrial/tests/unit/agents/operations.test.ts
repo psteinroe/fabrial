@@ -15,13 +15,19 @@ import {
 } from "../../../src/index.ts";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
-import { BridgeKey, fields, type BridgeFrame } from "../../../src/agents/context.ts";
+import {
+	BridgeKey,
+	cancelChildren,
+	fields,
+	registerChild,
+	type BridgeFrame,
+} from "../../../src/agents/context.ts";
 import {
 	Binding,
 	ChildIntents,
 	ChildResults,
 	Invocation,
-	Runs,
+	Obligations,
 } from "../../../src/agents/documents.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
@@ -46,8 +52,10 @@ async function fixture(workflows: FabrialHost["workflows"] = []) {
 	await harness.commit(async (tx) => {
 		(await tx.doc(Binding, conversation.id)).requestId = "request";
 		await tx.doc(Invocation, "request", metadata);
-		(await tx.doc(Runs)).runs.a = { conversationId: conversation.id, children: {} };
-		(await tx.doc(Runs)).runs.b = { conversationId: conversation.id, children: {} };
+		(await tx.doc(Obligations)).requests.request = {
+			conversationId: conversation.id,
+			owes: "reply",
+		};
 	}, BACKGROUND_CONTEXT);
 	const start = vi.fn(async (key: string) => {
 		// The start intent must already be durable when the child can begin.
@@ -73,7 +81,6 @@ async function fixture(workflows: FabrialHost["workflows"] = []) {
 			chat: () => ({}),
 		} as unknown as FabrialHost,
 		session: "app:operations",
-		runOf: async () => ({ id: "a", agent: "agent" }),
 		execution: {
 			executionId: "a",
 			metadata: {
@@ -176,7 +183,9 @@ it("reconciles a lost child-start receipt from its persisted intent and stable g
 		).rejects.toThrow("receipt lost");
 		const key = f.start.mock.calls[0]![0];
 		const intent = await f.harness.snapshot(ChildIntents, key, BACKGROUND_CONTEXT);
-		expect((await f.harness.snapshot(Runs, BACKGROUND_CONTEXT))?.runs.a?.intents).toContain(key);
+		expect(
+			(await f.harness.snapshot(Obligations, BACKGROUND_CONTEXT))?.requests.request?.intents,
+		).toContain(key);
 		expect(intent?.executionId).toBeNull();
 		f.bridge.execution = { ...f.bridge.execution, executionId: "b" };
 		await (
@@ -202,6 +211,40 @@ it("uses collision-free # suffixes and rejects framework-reserved ids", async ()
 			"Reserved operation id",
 		);
 		await expect(ctx.thread!.post("x#1", "bad")).rejects.toThrow("Reserved operation id");
+	} finally {
+		await f.harness.close(BACKGROUND_CONTEXT);
+	}
+});
+
+it("stopping a request cancels the attached workflows its tools started or wait on, never detached ones", async () => {
+	const workflow = defineWorkflow({ name: "child", run: async () => null });
+	const f = await fixture([workflow]);
+	try {
+		await (
+			await fields(f.context, f.conversation.id, f.api)
+		).start("attached", workflow, null as never);
+		await (
+			await fields(f.context, f.conversation.id, f.api, undefined, true)
+		).start("detached", workflow, null as never);
+		await registerChild(
+			f.bridge,
+			"request",
+			7,
+			{ executionId: "waited", detached: false },
+			f.context,
+		);
+		await registerChild(f.bridge, "request", 8, { executionId: "kept", detached: true }, f.context);
+		const [attached, detached] = f.start.mock.calls.map(([key]) => `child:${key}`);
+		const cancel = vi.fn(async () => {});
+		// Another request's children are not linked to this one.
+		await cancelChildren(f.harness, cancel, ["other"], "Stopped", BACKGROUND_CONTEXT);
+		expect(cancel).not.toHaveBeenCalled();
+		await cancelChildren(f.harness, cancel, ["request"], "Stopped", BACKGROUND_CONTEXT);
+		expect(cancel.mock.calls).toEqual([
+			[attached, "Stopped"],
+			["waited", "Stopped"],
+		]);
+		expect(detached).toBeDefined();
 	} finally {
 		await f.harness.close(BACKGROUND_CONTEXT);
 	}

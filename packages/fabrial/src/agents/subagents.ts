@@ -12,7 +12,7 @@ import {
 	type EntryId,
 	type EntryRecord,
 	type Harness,
-	type SubmissionId,
+	type SubmissionRecord,
 	type TaskId,
 	type ToolExecutionResult,
 	type ToolRegistration,
@@ -21,7 +21,7 @@ import {
 import { SUBAGENT_DEFAULTS, type Agent, type ResolvedSubagent } from "../agent.ts";
 import type { Logger } from "../app.ts";
 import { BridgeKey, cloneJson, currentRequest, frame, type BridgeFrame } from "./context.ts";
-import { Binding, Invocation, Subagent, SubagentNames, SubagentWork } from "./documents.ts";
+import { Binding, Obligations, Subagent, SubagentNames, SubagentWork } from "./documents.ts";
 import { newErrorId } from "./errors.ts";
 
 export interface SubagentDeps {
@@ -322,7 +322,6 @@ async function background(
 			: await sourceOf(bridge, api, subagent, previous, context);
 		if (typeof source === "string") return error(source);
 		const requestId = await currentRequest(bridge, api.conversationId, context);
-		const run = (await bridge.runOf(api.conversationId, context)).id;
 		const created = await api.commit(async (tx) => {
 			const work = await tx.doc(SubagentWork);
 			if (work.calls[api.taskId] !== undefined) return work.calls[api.taskId]!;
@@ -359,15 +358,14 @@ async function background(
 				{ ownership: { kind: "conversation" }, background: true },
 			);
 			work.calls[api.taskId] = id;
-			work.reporters[id] = {
-				lead: api.conversationId,
-				child: child.id,
-				name: child.name,
-				run,
-				report: null,
-				request: requestId,
-			};
+			work.reporters[id] = { lead: api.conversationId, child: child.id, name: child.name };
 			work.slots[api.conversationId]![id] = child.name;
+			// Before the reporter submits the task: the child acts for this request, and stopping it reaches the child.
+			(await tx.doc(Obligations)).requests[taskRequest(id)] = {
+				conversationId: child.id,
+				owes: "task",
+				origin: requestId,
+			};
 			return id;
 		}, context);
 		if (typeof created === "string")
@@ -414,6 +412,10 @@ type ReporterInput = {
 };
 type ReporterState = { phase: "deliver" } | { phase: "report"; report?: string };
 
+/** Request ids of a background child's task and of its report to the lead, by reporter task. */
+const taskRequest = (reporter: number) => `fabrial.subagent:${reporter}`;
+const reportRequest = (reporter: number) => `fabrial.subagent-report:${reporter}`;
+
 /** The background task definitions; ship them with an installed extension so they resume after a restart. */
 export const subagentTasks = (deps: SubagentDeps) => [
 	Anchor,
@@ -438,7 +440,7 @@ const reporterTask = (deps: SubagentDeps) =>
 					{
 						type: "input",
 						content: task,
-						requestId: `fabrial.subagent:${reporter.id}`,
+						requestId: taskRequest(reporter.id),
 						whenBusy: "steer",
 					},
 					context,
@@ -464,14 +466,23 @@ const reporterTask = (deps: SubagentDeps) =>
 								error: settled.detail,
 							})
 						: undefined;
-				// One commit decides the report and records the answer as reported, so a restart does not decide again.
+				// One commit decides the report, records the answer as reported, and registers the report's reply obligation
+				// before it is submitted, so a restart neither decides again nor loses where the lead's answer posts.
 				await runtime.commit(async (tx) => {
 					await free(tx, reporter.input.lead, reporter.id);
-					const next = (report?: string) =>
-						({
+					const next = async (report?: string) => {
+						if (report !== undefined)
+							// The report acts for the request that started the child: the lead's answer posts to its reply thread.
+							(await tx.doc(Obligations)).requests[reportRequest(reporter.id)] ??= {
+								conversationId: reporter.input.lead,
+								owes: "reply",
+								origin: reporter.input.request,
+							};
+						return {
 							status: "running",
 							checkpoint: { phase: "report", ...(report === undefined ? {} : { report }) },
-						}) as const;
+						} as const;
+					};
 					// Stopped, or withdrawn while queued: nothing to report.
 					if (settled.status === "unanswered")
 						return next(failed && subagentResult(name, "failed", failed));
@@ -486,33 +497,24 @@ const reporterTask = (deps: SubagentDeps) =>
 			},
 			report: async (reporter, runtime, context) => {
 				const { report } = reporter.state.checkpoint as { report?: string };
-				let submissionId: number | null = null;
 				if (report !== undefined) {
-					const requestId = `fabrial.subagent-report:${reporter.id}`;
-					// The report acts for the request that started the child, so its answer posts to that request's reply thread.
-					const invocation = await runtime.snapshot(Invocation, reporter.input.request, context);
-					if (invocation)
-						await runtime.commit(async (tx) => {
-							await tx.doc(Invocation, requestId, cloneJson(invocation));
-							return undefined;
-						}, context);
-					// A follow-up starts a run on an idle lead or waits for its current answer.
+					const requestId = reportRequest(reporter.id);
+					// A follow-up starts a run on an idle lead or waits for its current answer. A replayed phase submits
+					// again: Pi dedupes by request id.
 					const lead = (await runtime.conversation(
 						reporter.input.lead as ConversationId,
 						context,
 					))!;
-					submissionId = (
-						await lead.submit(
-							{ type: "input", content: report, requestId, whenBusy: "followUp" },
-							context,
-						)
-					).id;
+					await lead.submit(
+						{ type: "input", content: report, requestId, whenBusy: "followUp" },
+						context,
+					);
+					deps.logger.debug("Reported to the lead", { requestId });
 				}
-				await runtime.commit(async (tx) => {
-					const entry = (await tx.doc(SubagentWork)).reporters[reporter.id];
-					if (entry) entry.report = submissionId;
-					return { status: "terminal", outcome: { status: "completed", result: null } };
-				}, context);
+				await runtime.commit(
+					() => ({ status: "terminal", outcome: { status: "completed", result: null } }),
+					context,
+				);
 			},
 		},
 		abort: (_reporter, runtime, context) =>
@@ -581,42 +583,48 @@ export async function backgroundPending(harness: Harness, context: Context): Pro
 	);
 }
 
-/** The lead's answer to the newest report of children a run started, once it has answered it. */
+/** The lead's answer to the newest report of the background children that acted for `request`, once answered. */
 export async function reportedAnswer(
 	harness: Harness,
-	run: string,
+	submissionOf: (
+		conversationId: ConversationId,
+		requestId: string,
+	) => Promise<SubmissionRecord | undefined>,
+	request: string,
 	lead: ConversationId,
 	context: Context,
 ): Promise<string | undefined> {
-	const work = await harness.snapshot(SubagentWork, context);
-	const reports = Object.values(work?.reporters ?? {})
-		.filter((entry) => entry.run === run && entry.lead === lead && entry.report !== null)
-		.map((entry) => entry.report!)
-		.sort((a, b) => a - b);
-	const newest = reports.at(-1);
-	if (newest === undefined) return undefined;
-	const status = await (await harness.submission(newest as SubmissionId, context))?.status(context);
-	if (status?.status !== "done" || status.type !== "input") return undefined;
-	return answerText(await harness.commit((tx) => tx.entry(status.answer), context));
+	const obligations = (await harness.snapshot(Obligations, context))?.requests ?? {};
+	let newest: SubmissionRecord | undefined;
+	for (const [requestId, obligation] of Object.entries(obligations)) {
+		if (obligation.origin !== request || obligation.conversationId !== lead) continue;
+		const record = await submissionOf(lead, requestId);
+		if (record && (!newest || record.id > newest.id)) newest = record;
+	}
+	if (newest?.status !== "done" || newest.type !== "input") return undefined;
+	const answer = newest.answer;
+	return answerText(await harness.commit((tx) => tx.entry(answer), context));
 }
 
 /**
- * Aborts the background children a run started or continued, for cancelling its interaction. Pi's background
- * boundary keeps them alive when only the lead's run is aborted; cancellation reaches past it explicitly.
+ * Aborts the background children that act for `requests`, for cancelling their interaction. Pi's background boundary
+ * keeps them alive when only the lead's run is aborted; cancellation reaches past it explicitly.
  */
 export async function abortBackground(
 	harness: Harness,
-	run: string,
+	requests: ReadonlySet<string>,
 	context: Context,
 ): Promise<void> {
 	const work = await harness.snapshot(SubagentWork, context);
+	const obligations = (await harness.snapshot(Obligations, context))?.requests ?? {};
 	const inspection = await harness.inspect(context);
 	const live = new Set(inspection.tasks.map((task) => task.record.id as number));
 	for (const [id, entry] of Object.entries(work?.reporters ?? {})) {
-		if (entry.run !== run || !live.has(Number(id))) continue;
+		const origin = obligations[taskRequest(Number(id))]?.origin;
+		if (!origin || !requests.has(origin) || !live.has(Number(id))) continue;
 		await harness.abortTask(Number(id) as TaskId, context);
 		for (const submission of inspection.submissions)
-			if (submission.requestId === `fabrial.subagent:${id}`)
+			if (submission.requestId === taskRequest(Number(id)))
 				await harness.abortSubmission(submission.id, context);
 		const child = await harness.snapshot(LiveDoc, entry.child as ConversationId, context);
 		if (child?.run) await harness.abortTask(child.run.taskId, context);

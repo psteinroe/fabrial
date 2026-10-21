@@ -22,12 +22,10 @@ import {
 	type ConversationId,
 	type Extension,
 	type HarnessSettings,
-	type HookApi,
 	type ToolRegistration,
 	LiveDoc,
 	type EntryId,
 	type Submission,
-	type SubmissionId,
 } from "@earendil-works/pi-durable";
 import {
 	parseSchema,
@@ -74,7 +72,9 @@ import {
 } from "./subagents.ts";
 import type { Sql } from "postgres";
 import {
+	agentOf,
 	BridgeKey,
+	cancelChildren,
 	cloneJson,
 	currentRequest,
 	fields,
@@ -100,14 +100,13 @@ import {
 	Binding,
 	ChildResults,
 	Conversations,
-	Subagent,
 	Invocation,
+	Obligations,
 	Runs,
-	SubagentWork,
 	Suspensions,
 	WorkflowReceipts,
-	ChildIntents,
 	EFFECT_WORKFLOW,
+	type CallOutcome,
 } from "./documents.ts";
 import { newErrorId, sentErrorReply, WAITING_STATUS } from "./errors.ts";
 import { createEvaluator } from "./evaluate.ts";
@@ -136,11 +135,6 @@ type SessionInput =
 	  }
 	| { kind: "stop"; agent: string; reason: string };
 
-/** A `ctx.agent` call's Session execution returns its outcome: the answer, or why there is none. */
-type CallOutcome =
-	| { status: "completed"; output: Json }
-	| { status: "failed"; error: string; executionId: string };
-
 /** A run of one conversation in the hosted Session: the requests it answers, until Pi has finished them. */
 interface HostedRun {
 	id: string;
@@ -148,13 +142,6 @@ interface HostedRun {
 	conversation: Conversation;
 	call?: { requestId: string; metadata: InvocationMetadata };
 	submissions: Map<string, Submission>;
-	/** Sent requests, whose answers post to their reply threads; the rest are the call's own. */
-	sent: Set<string>;
-	unanswered: Set<string>;
-	/** Answers posted (or skipped) already, by answer entry id. */
-	posted: Set<EntryId>;
-	/** Requests with their reply thread's invocation, or null for none. */
-	threads: Map<string, InvocationMetadata | null>;
 	started: boolean;
 	/** Whether `no_reply` is offered. */
 	replying: boolean;
@@ -256,18 +243,6 @@ function observerHooks(observers: AgentObservers[], host: FabrialHost) {
 			},
 		}),
 	];
-}
-
-/** The agent a conversation runs, from the Session's own documents: a child's `Subagent` doc, else the lead's entry. */
-async function agentOf(
-	reader: Pick<HookApi, "snapshot">,
-	conversationId: ConversationId,
-	context: Context,
-): Promise<string> {
-	const child = (await reader.snapshot(Subagent, conversationId, context))?.agent;
-	if (child) return child;
-	const ids = (await reader.snapshot(Conversations, context))?.ids ?? {};
-	return Object.keys(ids).find((name) => ids[name] === conversationId) ?? "unknown";
 }
 
 export interface PiOptions {
@@ -447,7 +422,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					};
 				await registerChild(
 					frame,
-					(await frame.runOf(api.conversationId, context)).id,
+					await currentRequest(frame, api.conversationId, context),
 					api.taskId,
 					{ executionId: child, detached: false },
 					context,
@@ -629,7 +604,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			session: key,
 			children: new Map(),
 			waiting: new Set(),
-			runOf: (conversationId, context) => runOf(frame, conversationId, context),
 			waitChild: (taskId, executionId, context) =>
 				awaitWithContext(
 					(async () => {
@@ -747,10 +721,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				conversation,
 				call,
 				submissions: new Map(),
-				sent: new Set(),
-				unanswered: new Set(),
-				posted: new Set(),
-				threads: new Map(),
 				started: false,
 				replying: false,
 			};
@@ -764,14 +734,13 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				(await tx.doc(Runs)).runs[id] ??= {
 					conversationId: run.conversation.id,
 					agent: agentName,
-					children: {},
 					...(call ? { call: { requestId: call.requestId } } : {}),
 				};
 			}, context);
 			return run;
 		}
 
-		// Persist admission intents before submit; re-opening submits the same durable request set.
+		// Persist the request's obligation and admission before submit; re-opening submits the same durable request set.
 		async function admit(
 			run: HostedRun,
 			requestId: string,
@@ -785,11 +754,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				(await tx.doc(Binding, run.conversation.id)).requestId ??= requestId;
 				const record = (await tx.doc(Runs)).runs[run.id]!;
 				record.requests ??= {};
-				record.requests[requestId] ??= {
-					content,
-					submissionId: null,
-					delivery,
-					...(sent ? { sent } : {}),
+				record.requests[requestId] ??= { content, delivery };
+				(await tx.doc(Obligations)).requests[requestId] ??= {
+					conversationId: run.conversation.id,
+					owes: sent ? "reply" : "call",
 				};
 			}, context);
 		}
@@ -823,6 +791,15 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					const run = [...runs.values()].find((r) => r.agent === input.agent && !r.call);
 					if (!run) return;
 					await cancelRun(harness, run.id, input.reason);
+					// Stopped: nothing more is owed for its requests, or for reports of the children that acted for them.
+					await harness.commit(async (tx) => {
+						const stopped = new Set(Object.keys((await tx.doc(Runs)).runs[run.id]?.requests ?? {}));
+						for (const [requestId, obligation] of Object.entries(
+							(await tx.doc(Obligations)).requests,
+						))
+							if (stopped.has(requestId) || stopped.has(obligation.origin ?? ""))
+								obligation.fulfilled = true;
+					}, context);
 					await finish(run, undefined);
 					return;
 				}
@@ -841,23 +818,37 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			run.replying = withNoReply;
 		}
 
+		const obligations = async () => (await harness.snapshot(Obligations, context))?.requests ?? {};
+		/** Pi's record of a request submitted to a conversation. */
+		const submissionOf = (conversationId: ConversationId, requestId: string) =>
+			storage.submissionByRequest(conversationId, requestId, context);
+		/** Requests with their reply thread's invocation, or null for none. */
+		const threads = new Map<string, InvocationMetadata | null>();
 		/** The invocation of sent input or a report on it, when its answer posts to a reply thread. */
-		async function replyThread(run: HostedRun, requestId: string) {
-			if (!run.threads.has(requestId)) {
-				const invocation = (await harness.snapshot(Invocation, requestId, context)) as
-					| InvocationMetadata
-					| undefined;
-				run.threads.set(requestId, invocation?.send && invocation.replyTo ? invocation : null);
+		async function replyThread(requestId: string) {
+			if (!threads.has(requestId)) {
+				const obligation = (await obligations())[requestId];
+				const invocation = (await harness.snapshot(
+					Invocation,
+					obligation?.origin ?? requestId,
+					context,
+				)) as InvocationMetadata | undefined;
+				threads.set(
+					requestId,
+					obligation?.owes === "reply" && invocation?.send && invocation.replyTo
+						? invocation
+						: null,
+				);
 			}
-			return run.threads.get(requestId) ?? undefined;
+			return threads.get(requestId) ?? undefined;
 		}
 
 		async function activate(run: HostedRun) {
 			run.started = true;
 			const record = (await harness.snapshot(Runs, context))!.runs[run.id]!;
 			let threaded = false;
-			for (const [requestId, request] of Object.entries(record.requests ?? {}))
-				if (request.sent && (await replyThread(run, requestId))) threaded = true;
+			for (const requestId of Object.keys(record.requests ?? {}))
+				if (await replyThread(requestId)) threaded = true;
 			await offer(run, threaded);
 			if (run.call) {
 				const requestId = run.call.requestId;
@@ -873,18 +864,21 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 
 		async function submitPending(run: HostedRun) {
 			const record = (await harness.snapshot(Runs, context))!.runs[run.id]!;
+			const owed = await obligations();
 			for (const [requestId, pending] of Object.entries(record.requests ?? {})) {
 				if (run.submissions.has(requestId)) continue;
-				if (pending.sent) {
-					run.sent.add(requestId);
-					if (!run.replying && (await replyThread(run, requestId))) await offer(run, true);
+				if (owed[requestId]?.owes === "reply") {
+					if (!run.replying && (await replyThread(requestId))) await offer(run, true);
 					await run.ui?.follow(requestId);
 				}
-				// Pi dedupes by request id, so a request re-admitted after a crash is submitted once.
-				const submission =
-					pending.submissionId !== null
-						? await harness.submission(pending.submissionId as SubmissionId, context)
-						: pending.delivery === "write"
+				// Pi has the submission once submitted: a request re-admitted after a crash is submitted once.
+				const submitted = await submissionOf(run.conversation.id, requestId);
+				let submission: Submission | undefined;
+				if (submitted) submission = await harness.submission(submitted.id, context);
+				else {
+					host.logger.debug("Submitting input", { requestId });
+					submission =
+						pending.delivery === "write"
 							? await run.conversation.submit(
 									{
 										type: "write",
@@ -905,12 +899,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 									},
 									context,
 								);
+					host.logger.debug("Submitted input", { requestId });
+				}
 				if (!submission) throw new Error(`Missing Pi submission ${requestId}`);
 				run.submissions.set(requestId, submission);
-				if (pending.submissionId === null)
-					await harness.commit(async (tx) => {
-						(await tx.doc(Runs)).runs[run.id]!.requests![requestId]!.submissionId = submission.id;
-					}, context);
 			}
 		}
 
@@ -926,65 +918,98 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		}
 
 		/**
-		 * Post a reply through an attached effect keyed by its intent, and keep the run open until the post settles. A
-		 * redelivered or restarted Session reuses the effect; the post is at-least-once: a crash after the provider
-		 * accepted it and before its receipt repeats it.
+		 * Post a reply through an attached effect keyed by its intent, to `requestId`'s reply thread, and fulfil the
+		 * obligations of `covered` with it; their runs stay open until the post settles. A redelivered or restarted Session
+		 * reuses the effect; the post is at-least-once: a crash after the provider accepted it and before its receipt
+		 * repeats it.
 		 */
-		async function deliver(run: HostedRun, key: string, text: string, requestId: string) {
+		async function deliver(key: string, text: string, requestId: string, covered: string[]) {
 			const executionId = await startChild(
 				frame,
-				run.id,
+				null,
 				key,
 				EFFECT_WORKFLOW,
 				{ method: "post", args: [text] },
-				(await replyThread(run, requestId))!,
+				(await replyThread(requestId))!,
 				false,
 				context,
 			);
+			const delivery = await harness.commit(async (tx) => {
+				const requests = (await tx.doc(Obligations)).requests;
+				const obligation = requests[requestId]!;
+				obligation.deliveries ??= {};
+				obligation.deliveries[key] ??= { executionId, status: "pending" };
+				for (const each of covered) if (requests[each]) requests[each].fulfilled = true;
+				return { ...obligation.deliveries[key], conversationId: obligation.conversationId };
+			}, context);
+			if (delivery.status === "pending")
+				track(delivery.executionId, requestId, key, delivery.conversationId);
+		}
+
+		/** Fulfils obligations that need no post. */
+		async function fulfil(requestIds: string[]) {
+			if (!requestIds.length) return;
 			await harness.commit(async (tx) => {
-				const record = (await tx.doc(Runs)).runs[run.id]!;
-				record.deliveries ??= {};
-				record.deliveries[key] ??= { executionId, status: "pending" };
+				const requests = (await tx.doc(Obligations)).requests;
+				for (const requestId of requestIds)
+					if (requests[requestId]) requests[requestId].fulfilled = true;
 			}, context);
 		}
 
-		async function postAnswer(run: HostedRun, answer: EntryId, requestId: string) {
-			run.posted.add(answer);
+		async function postAnswer(
+			run: HostedRun,
+			answer: EntryId,
+			requestId: string,
+			covered: string[],
+		) {
 			const text = await answerOf(run.conversation, answer);
-			if (!text?.trim()) return;
-			await deliver(run, `fabrial:pi:answer:${run.conversation.id}:${answer}`, text, requestId);
+			if (!text?.trim()) return fulfil(covered);
+			await deliver(`fabrial:pi:answer:${run.conversation.id}:${answer}`, text, requestId, covered);
 			host.logger.debug("Posting final reply", { requestId, answer });
 			await run.ui?.unfollow(requestId);
 		}
 
-		// A post's `child` signal re-evaluates its run at once; its outcome is read from the signal when it came first.
-		const watched = new Set<string>();
-		const watch = (executionId: string) => {
-			if (watched.has(executionId)) return;
-			watched.add(executionId);
-			reportOf(executionId).promise.then(schedule);
-		};
+		/**
+		 * Posts whose outcome is not recorded yet, by execution id. A post's outcome is read once as it is tracked (on
+		 * reopening, or as it starts) and again only once its `child` signal arrived, which also re-evaluates its run. One
+		 * that settles without a signal wakes the parked Session through its execution's wait branch.
+		 */
+		const posts = new Map<
+			string,
+			{ requestId: string; key: string; conversationId: number; stale: boolean }
+		>();
+		function track(executionId: string, requestId: string, key: string, conversationId: number) {
+			if (posts.has(executionId)) return;
+			posts.set(executionId, { requestId, key, conversationId, stale: true });
+			reportOf(executionId).promise.then(() => {
+				const post = posts.get(executionId);
+				if (post) post.stale = true;
+				schedule();
+			});
+		}
 		const reportedOutcome = (executionId: string) =>
 			Promise.race([reportOf(executionId).promise, Promise.resolve(undefined)]);
 
 		/**
-		 * Record the outcomes of the run's posts that settled; true while one is still pending. A post that failed for
-		 * good is logged and marked failed: the run settles without it, and nothing reruns the model or posts an error
-		 * reply for it.
+		 * Record the outcomes of the posts that settled, of one conversation's obligations or all; returns the posts
+		 * still pending. A post that failed for good is logged and marked failed: its run settles without it, and nothing
+		 * reruns the model or posts an error reply for it.
 		 */
-		async function deliveriesPending(run: HostedRun): Promise<boolean> {
-			const deliveries = (await harness.snapshot(Runs, context))?.runs[run.id]?.deliveries ?? {};
-			let pending = false;
-			for (const [key, delivery] of Object.entries(deliveries)) {
-				if (delivery.status !== "pending") continue;
-				watch(delivery.executionId);
-				const result =
-					((await reportedOutcome(delivery.executionId)) as ChildSignal["result"] | undefined) ??
-					(await host.runtime.getExecution(delivery.executionId))?.result;
+		async function deliveriesPending(conversationId?: ConversationId): Promise<string[]> {
+			const pending: string[] = [];
+			for (const [executionId, post] of posts) {
+				if (conversationId !== undefined && post.conversationId !== conversationId) continue;
+				const result = post.stale
+					? (((await reportedOutcome(executionId)) as ChildSignal["result"] | undefined) ??
+						(await host.runtime.getExecution(executionId))?.result)
+					: undefined;
+				post.stale = false;
 				if (!result) {
-					pending = true;
+					pending.push(executionId);
 					continue;
 				}
+				posts.delete(executionId);
+				const { requestId, key } = post;
 				const failed = result.status !== "completed";
 				const error =
 					result.status === "failed"
@@ -993,31 +1018,16 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 							? result.reason
 							: undefined;
 				const changed = await harness.commit(async (tx) => {
-					const entry = (await tx.doc(Runs)).runs[run.id]!.deliveries![key]!;
+					const entry = (await tx.doc(Obligations)).requests[requestId]!.deliveries![key]!;
 					if (entry.status !== "pending") return false;
 					entry.status = failed ? "failed" : "posted";
 					if (error !== undefined) entry.error = error;
 					return true;
 				}, context);
 				if (changed && failed)
-					host.logger.error("Reply post failed", {
-						run: run.id,
-						delivery: key,
-						executionId: delivery.executionId,
-						error,
-					});
+					host.logger.error("Reply post failed", { requestId, delivery: key, executionId, error });
 			}
 			return pending;
-		}
-
-		/** Posts of live runs still waiting for their outcome. */
-		async function pendingDeliveries(): Promise<string[]> {
-			const records = (await harness.snapshot(Runs, context))?.runs ?? {};
-			return [...runs.keys()].flatMap((id) =>
-				Object.values(records[id]?.deliveries ?? {}).flatMap((delivery) =>
-					delivery.status === "pending" ? [delivery.executionId] : [],
-				),
-			);
 		}
 
 		// Input Pi gave up on: one error reply for a model error or no model, in the newest input's reply thread.
@@ -1028,84 +1038,86 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			for (const { requestId } of failures) await run.ui?.unfollow(requestId);
 			const newest = failures.reduce((a, b) => (b.id > a.id ? b : a));
 			const { requestId, reason, detail } = newest;
+			const covered = failures.map((failure) => failure.requestId);
 			const error =
 				typeof detail === "string" ? detail : detail === null ? undefined : JSON.stringify(detail);
 			if (!sentErrorReply(reason, error, "")) {
 				host.logger.info("Sent input unanswered", { requestId, reason });
-				return;
+				return fulfil(covered);
 			}
 			const fresh = newErrorId();
-			const errorId = await harness.commit(async (tx) => {
-				const record = (await tx.doc(Runs)).runs[run.id]!;
-				record.errors ??= {};
-				return (record.errors[requestId] ??= fresh);
-			}, context);
+			const errorId = await harness.commit(
+				async (tx) => ((await tx.doc(Obligations)).requests[requestId]!.errorId ??= fresh),
+				context,
+			);
 			// A stable intent and global dedupe key: a redelivered or restarted Session reuses the post.
 			await deliver(
-				run,
 				`fabrial:pi:error:${requestId}`,
 				sentErrorReply(reason, error, errorId)!,
 				requestId,
+				covered,
 			);
 			if (errorId === fresh)
 				host.logger.error("Sent input failed", { requestId, reason, errorId, error });
 		}
 
-		/** Reports of background children to this run, submitted to the lead by their reporters. */
-		async function reports(run: HostedRun): Promise<[string, Submission][]> {
-			const work = await harness.snapshot(SubagentWork, context);
-			const found: [string, Submission][] = [];
-			for (const [id, entry] of Object.entries(work?.reporters ?? {})) {
-				if (entry.run !== run.id || entry.lead !== run.conversation.id || entry.report === null)
-					continue;
-				const submission = await harness.submission(entry.report as SubmissionId, context);
-				if (submission) found.push([`fabrial.subagent-report:${id}`, submission]);
-			}
-			return found;
-		}
-
 		/**
-		 * Post the answers to input with a reply thread: each answer once, to the thread of the newest input it answers
-		 * (steering inputs share their run's answer). Input that failed gets the error reply there instead. Returns whether
-		 * every sent request and report settled, from the same reads, so a run never finishes before its answers posted:
-		 * a report placed after its Session reopened has no live Pi run yet.
+		 * Fulfil the conversation's outstanding reply obligations (sent input and background reports on it) that Pi
+		 * settled: each answer posts once, to the thread of the newest input it answers (steering inputs share their run's
+		 * answer). Input that failed gets the error reply there instead. Returns whether every submitted one settled, from
+		 * the same reads, so a run never finishes before its answers posted: a report placed after its Session reopened
+		 * has no live Pi run yet. One not submitted yet (a later run's, or a report its reporter still submits) waits.
 		 */
 		async function postAnswers(run: HostedRun): Promise<{ settled: boolean; queued: boolean }> {
 			let settled = true;
 			let queued = false;
-			const answered = new Map<EntryId, { requestId: string; id: number }>();
+			const answered = new Map<EntryId, { requestId: string; id: number; covered: string[] }>();
 			const failures: { requestId: string; id: number; reason: string; detail: Json }[] = [];
-			const candidates = [
-				...[...run.submissions].filter(([requestId]) => run.sent.has(requestId)),
-				...(await reports(run)),
-			];
-			for (const [requestId, submission] of candidates) {
-				if (run.unanswered.has(requestId)) continue;
-				const status = await submission.status(context);
-				if (status.status !== "done" && status.status !== "unanswered") {
+			const skipped: string[] = [];
+			for (const [requestId, obligation] of Object.entries(await obligations())) {
+				if (
+					obligation.owes !== "reply" ||
+					obligation.fulfilled ||
+					obligation.conversationId !== run.conversation.id
+				)
+					continue;
+				const record = await submissionOf(run.conversation.id, requestId);
+				if (!record) continue;
+				if (record.status !== "done" && record.status !== "unanswered") {
 					settled = false;
-					queued ||= status.status === "queued";
+					queued ||= record.status === "queued";
+					continue;
 				}
-				if (status.status === "unanswered") {
-					run.unanswered.add(requestId);
-					if (await replyThread(run, requestId))
+				if (record.status === "unanswered") {
+					if (await replyThread(requestId))
 						failures.push({
 							requestId,
-							id: submission.id,
-							reason: status.reason,
-							detail: (status.detail ?? null) as Json,
+							id: record.id,
+							reason: record.reason,
+							detail: (record.detail ?? null) as Json,
 						});
-					else host.logger.info("Sent input unanswered", { requestId, reason: status.reason });
+					else {
+						host.logger.info("Sent input unanswered", { requestId, reason: record.reason });
+						skipped.push(requestId);
+					}
 					continue;
 				}
-				if (status.status !== "done" || status.type !== "input" || run.posted.has(status.answer))
+				if (record.type !== "input" || !(await replyThread(requestId))) {
+					skipped.push(requestId);
 					continue;
-				if (!(await replyThread(run, requestId))) continue;
-				const newest = answered.get(status.answer);
-				if (!newest || submission.id > newest.id)
-					answered.set(status.answer, { requestId, id: submission.id });
+				}
+				const newest = answered.get(record.answer);
+				const covered = [...(newest?.covered ?? []), requestId];
+				answered.set(
+					record.answer,
+					!newest || record.id > newest.id
+						? { requestId, id: record.id, covered }
+						: { ...newest, covered },
+				);
 			}
-			for (const [answer, { requestId }] of answered) await postAnswer(run, answer, requestId);
+			await fulfil(skipped);
+			for (const [answer, { requestId, covered }] of answered)
+				await postAnswer(run, answer, requestId, covered);
 			if (failures.length) await settleUnanswered(run, failures);
 			return { settled, queued };
 		}
@@ -1114,9 +1126,12 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		async function finish(run: HostedRun, outcome: CallOutcome | undefined) {
 			// A call that failed still settles its execution: the caller throws, and nothing retries the run.
 			await harness.commit(async (tx) => {
-				const record = (await tx.doc(Runs)).runs[run.id]!;
-				record.done = true;
-				if (run.call && outcome) record.outcome = cloneJson(outcome);
+				(await tx.doc(Runs)).runs[run.id]!.done = true;
+				const obligation = run.call && (await tx.doc(Obligations)).requests[run.call.requestId];
+				if (obligation && outcome) {
+					obligation.outcome = cloneJson(outcome);
+					obligation.fulfilled = true;
+				}
 			}, context);
 			if (run.call && outcome) outcomes.set(run.call.requestId, outcome);
 			runs.delete(run.id);
@@ -1134,8 +1149,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			const sent = await postAnswers(run);
 			complete = sent.settled;
 			queued = sent.queued;
+			const owed = await obligations();
 			for (const [requestId, submission] of run.submissions) {
-				if (run.sent.has(requestId)) continue;
+				if (owed[requestId]?.owes !== "call") continue;
 				const status = await submission.status(context);
 				// A failed run leaves the input queued behind it in Pi's inbox: keep running that.
 				if (status.status === "unanswered") {
@@ -1167,7 +1183,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			// only once the lead has answered the last of them.
 			if (complete && !failed && (background || (await live()))) complete = false;
 			// The run settles once its posts did: a failed post is surfaced, not retried.
-			if ((await deliveriesPending(run)) && complete) complete = false;
+			if (complete && (await deliveriesPending(run.conversation.id)).length) complete = false;
 			if (complete) {
 				if (failed)
 					return finish(run, {
@@ -1175,7 +1191,15 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 						error: `Pi run unanswered: ${failed}`,
 						executionId: execution.executionId,
 					});
-				answer = (await reportedAnswer(harness, run.id, run.conversation.id, context)) ?? answer;
+				if (run.call)
+					answer =
+						(await reportedAnswer(
+							harness,
+							submissionOf,
+							run.call.requestId,
+							run.conversation.id,
+							context,
+						)) ?? answer;
 				return finish(run, { status: "completed", output: run.call ? (answer ?? "") : null });
 			}
 			// Pi places queued input only at a boundary of a run or with the next submission. After a failed run nothing
@@ -1191,7 +1215,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			const live = inspection.tasks.filter((task) => !task.record.background);
 			if (!live.length && !inspection.submissions.length) {
 				if (await backgroundPending(harness, context)) return undefined;
-				return (await pendingDeliveries()).length ? "parked" : "done";
+				return (await deliveriesPending()).length ? "parked" : "done";
 			}
 			const runners = live.filter((task) => task.state.kind === "running");
 			const workflow = (id: number) => frame.children.has(id);
@@ -1221,10 +1245,13 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			if (runs.size !== before) return schedule();
 			if (scheduled || settled) return;
 			const state = await idleState();
-			if (state === "done") resolveIdle({ kind: "done" });
-			if (state !== "parked") return;
+			if (state === undefined) return;
+			const deliveries = state === "parked" ? await deliveriesPending() : [];
+			// A post that settled meanwhile (its commit schedules a pass) re-evaluates its run first: its signal is spent,
+			// so a wait would not see it.
+			if (scheduled) return;
+			if (state === "done") return resolveIdle({ kind: "done" });
 			// Every wait has its own name, so a resumed execution never reuses an earlier wait's winner.
-			const deliveries = await pendingDeliveries();
 			const n = await harness.commit(async (tx) => (await tx.doc(Suspensions)).count++, context);
 			resolveIdle({
 				kind: "parked",
@@ -1238,10 +1265,15 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 
 		storage.onCommit = schedule;
 		try {
+			for (const [requestId, obligation] of Object.entries(await obligations())) {
+				if (obligation.outcome) outcomes.set(requestId, obligation.outcome);
+				for (const [key, delivery] of Object.entries(obligation.deliveries ?? {}))
+					if (delivery.status === "pending")
+						track(delivery.executionId, requestId, key, obligation.conversationId);
+			}
 			for (const [id, record] of Object.entries(
 				(await harness.snapshot(Runs, context))?.runs ?? {},
 			)) {
-				if (record.call && record.outcome) outcomes.set(record.call.requestId, record.outcome);
 				if (record.done || !record.agent) continue;
 				const invocation = record.call
 					? ((await harness.snapshot(Invocation, record.call.requestId, context)) as
@@ -1304,25 +1336,6 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				}
 				return missed;
 			},
-		};
-	}
-
-	/** The run a conversation's tool acts for: the run of its current request, else the conversation's latest. */
-	async function runOf(
-		frame: BridgeFrame,
-		conversationId: ConversationId,
-		context: Context,
-	): Promise<{ id: string; agent: string }> {
-		const requestId = await currentRequest(frame, conversationId, context);
-		const records = Object.entries((await frame.harness.snapshot(Runs, context))?.runs ?? {});
-		const found =
-			records.find(([, run]) => run.requests?.[requestId]) ??
-			records.findLast(([, run]) => run.conversationId === conversationId) ??
-			records.findLast(([, run]) => !run.done);
-		if (!found) throw new Error("Missing Pi bridge run binding");
-		return {
-			id: found[0],
-			agent: found[1].agent ?? (await agentOf(frame.harness, conversationId, context)),
 		};
 	}
 
@@ -1407,20 +1420,18 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		const context = BACKGROUND_CONTEXT;
 		const run = (await harness.snapshot(Runs, context))?.runs[runId];
 		if (!run) return;
-		// The workflows its tools started; one whose start receipt was lost is cancelled with the Session's execution.
-		for (const key of run.intents ?? []) {
-			// Replies already posting are not cancelled: their answer exists.
-			if (run.deliveries?.[key]) continue;
-			const intent = await harness.snapshot(ChildIntents, key, context);
-			if (intent?.executionId && !intent.detached)
-				await host.runtime.cancel(intent.executionId, reason);
-		}
-		for (const child of Object.values(run.children))
-			if (!child.detached) await host.runtime.cancel(child.executionId, reason);
-		// Cancelling the interaction reaches past the background boundary to the children this run started.
-		await abortBackground(harness, runId, context);
-		const inspection = await harness.inspect(context);
 		const requests = new Set(Object.keys(run.requests ?? {}));
+		// The workflows its tools started or wait on; replies already posting are not cancelled: their answer exists.
+		await cancelChildren(
+			harness,
+			(executionId, why) => host.runtime.cancel(executionId, why),
+			requests,
+			reason,
+			context,
+		);
+		// Cancelling the interaction reaches past the background boundary to the children its requests started.
+		await abortBackground(harness, requests, context);
+		const inspection = await harness.inspect(context);
 		const ids = new Set<number>();
 		for (const submission of inspection.submissions) {
 			if (!submission.requestId || !requests.has(submission.requestId)) continue;
