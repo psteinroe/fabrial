@@ -102,7 +102,14 @@ it("runs durable structured answers and memoizes submissions; each call has a Se
 		description: "Answers test questions.",
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
-	f.faux.setResponses([fauxAssistantMessage('{"answer":42}'), fauxAssistantMessage("continued")]);
+	let asked = "";
+	f.faux.setResponses([
+		(context) => {
+			asked = String(context.messages.at(-1)?.content);
+			return fauxAssistantMessage('{"answer":42}');
+		},
+		fauxAssistantMessage("continued"),
+	]);
 	const workflow: RuntimeWorkflow = {
 		name: randomUUID(),
 		triggers: [],
@@ -124,6 +131,15 @@ it("runs durable structured answers and memoizes submissions; each call has a Se
 		output: { first: { answer: 42 }, again: "continued" },
 	});
 	expect(f.faux.state.callCount).toBe(2);
+	// The model is told the answer's shape: the output schema's JSON Schema.
+	const shape = JSON.stringify({
+		type: "object",
+		properties: { answer: { type: "number" } },
+		required: ["answer"],
+	});
+	expect(asked).toBe(
+		`Question\n\nReturn your final answer as a single JSON value matching this JSON Schema, without Markdown fences or surrounding prose:\n${shape}`,
+	);
 	for (const call of ["answer", "again"]) {
 		const commits =
 			await sql()`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${callSession(id, call)} ORDER BY seq`;

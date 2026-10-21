@@ -19,6 +19,13 @@ import { cloneJson, commitStaged, fields, type StagedState } from "./context.ts"
  * Schema libraries without it (or schemas it cannot express) are rejected when the app starts.
  */
 export function toJsonSchema(schema: Schema, label: string): Record<string, unknown> {
+	const json = jsonSchemaOf(schema, `${label}: the input schema`);
+	if (json.type !== "object") throw new Error(`${label}: the input schema must describe an object`);
+	return json;
+}
+
+/** The JSON Schema of the values `schema` accepts; it must implement Standard JSON Schema. */
+export function jsonSchemaOf(schema: Schema, label: string): Record<string, unknown> {
 	const converter = (
 		schema["~standard"] as {
 			jsonSchema?: { input(options: { target: string }): Record<string, unknown> };
@@ -26,10 +33,9 @@ export function toJsonSchema(schema: Schema, label: string): Record<string, unkn
 	).jsonSchema;
 	if (!converter)
 		throw new Error(
-			`${label}: the input schema must implement Standard JSON Schema (~standard.jsonSchema), e.g. zod >= 4.2`,
+			`${label} must implement Standard JSON Schema (~standard.jsonSchema), e.g. zod >= 4.2`,
 		);
 	const { $schema: _dialect, ...json } = converter.input({ target: "draft-07" });
-	if (json.type !== "object") throw new Error(`${label}: the input schema must describe an object`);
 	return json;
 }
 

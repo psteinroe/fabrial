@@ -56,7 +56,7 @@ import {
 	type Toolkit,
 } from "../agent.ts";
 import type { AnyWorkflow } from "../workflow.ts";
-import { instructionsSection, piToolOf, toJsonSchema } from "./tools.ts";
+import { instructionsSection, jsonSchemaOf, piToolOf, toJsonSchema } from "./tools.ts";
 import {
 	abortBackground,
 	backgroundPending,
@@ -165,6 +165,12 @@ type StateResponse =
 const STATE_EVENT = "fabrial.state.response";
 /** A workflow resends an unanswered state request (same operation) this often before failing. */
 const STATE_REQUESTS = 5;
+
+/** How a call with an `output` schema asks for its answer: one JSON value matching the schema's JSON Schema. */
+function outputInstruction(agent: string, schema: Schema): string {
+	const shape = jsonSchemaOf(schema, `ctx.agent(${agent}): the output schema`);
+	return `Return your final answer as a single JSON value matching this JSON Schema, without Markdown fences or surrounding prose:\n${JSON.stringify(shape)}`;
+}
 
 /** The Pi Session of one `ctx.agent` call, private to it: keyed by the calling execution and the call's id. */
 export const callSession = (executionId: string, id: string) =>
@@ -1693,6 +1699,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			const metadata = execution.metadata;
 			const key = callSession(execution.executionId, id);
 			const requestId = `${execution.executionId}:${id}`;
+			const instruction = request.output ? outputInstruction(agent.name, request.output) : "";
 			const content = await execution.step(`fabrial:pi:origin:${id}`, async () => {
 				const sections = metadata.origin
 					? await Promise.all(
@@ -1704,9 +1711,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				return [
 					sections.filter(Boolean).join("\n\n"),
 					typeof request.input === "string" ? request.input : JSON.stringify(request.input ?? null),
-					request.output
-						? "Return your final answer as a single JSON value, without Markdown fences or surrounding prose."
-						: "",
+					instruction,
 				]
 					.filter(Boolean)
 					.join("\n\n");

@@ -110,7 +110,7 @@ Keep the instance in a module that imports plugins and users only, never workflo
 
 `f.defineTool({ name, description, input, idempotent?, run })`: `input` is a Standard Schema with JSON Schema support (zod ≥ 4.2). The model sees its JSON Schema; invalid input goes back to the model as an error and never reaches `run`. `run` returns a string (sent as is) or any JSON value. `idempotent: true` tools run again after a crash interrupted them; other tools give the model an interrupted result. The tool `ctx` has `actor`, `clients`, `thread` (durable `post`/`update`/`history`, each with an id), `state`, `invoke`, `start`, `evaluate`, `send`, `follow`, `unfollow`, and `signal`.
 
-A workflow **calls** an agent with `ctx.agent`: it waits for the answer and posts nothing. With `output`, the answer is a JSON value validated against the schema and typed from it:
+A workflow **calls** an agent with `ctx.agent`: it waits for the answer and posts nothing. With `output` (a Standard Schema with JSON Schema support), the model is asked for a single JSON value matching the schema's JSON Schema, and the answer is validated against the schema and typed from it:
 
 ```ts check
 const triage = f.defineWorkflow({
