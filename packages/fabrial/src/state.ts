@@ -32,6 +32,23 @@ export function defineState<T extends JsonObject>(definition: {
 	return { kind: "fabrial.state", version: 1, ...definition };
 }
 
+/**
+ * The states each Fabrial instance defined, by name. A workflow's `ctx.state` runs in its Session's host, which
+ * resolves the definition by name: schemas, initializers and functions do not travel in signals.
+ */
+export const definedStates = new WeakMap<object, Map<string, StateDefinition>>();
+
+export function registerState<T extends JsonObject>(
+	definition: StateDefinition<T>,
+	scope: object,
+): StateDefinition<T> {
+	let states = definedStates.get(scope);
+	if (!states) definedStates.set(scope, (states = new Map()));
+	if (states.has(definition.name)) throw new Error(`State ${definition.name} is already defined`);
+	states.set(definition.name, definition as unknown as StateDefinition);
+	return definition;
+}
+
 /** `ctx.state(S)` in workflow code: durable operations with ids. */
 export interface WorkflowStateHandle<T extends JsonObject> {
 	get(id: string): Promise<T>;

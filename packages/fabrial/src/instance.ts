@@ -16,7 +16,7 @@ import { defineGroup, type GroupDefinition, type UserDefinition } from "./identi
 import type { Json, JsonObject } from "./json.ts";
 import type { AnyPlugin, PluginClients, ToolkitPlugin } from "./plugin.ts";
 import { production, type ProductionOverrides } from "./production.ts";
-import { defineState, type StateDefinition, type StateScope } from "./state.ts";
+import { defineState, registerState, type StateDefinition, type StateScope } from "./state.ts";
 import type { Schema } from "./schema.ts";
 import type { TriggerSpec } from "./trigger.ts";
 import {
@@ -132,7 +132,7 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 		defineAgent: (definition) => defineAgent(definition as AgentDefinition, instance),
 		defineTool: defineTool as Fabrial<P>["defineTool"],
 		defineToolkit,
-		defineState,
+		defineState: (definition) => registerState(defineState(definition), instance),
 		defineGroup,
 		app: (appConfig) => build(appConfig) as App<ClientsOf<P>>,
 		[INTERNAL]: { app: build },

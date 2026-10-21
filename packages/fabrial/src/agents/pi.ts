@@ -8,7 +8,6 @@ import {
 import type { Models, TSchema } from "@earendil-works/pi-ai";
 import {
 	createRegistry,
-	createSession,
 	defineExtension,
 	defineTool as piTool,
 	GenerationTask,
@@ -101,6 +100,8 @@ import {
 	Conversations,
 	Invocation,
 	Obligations,
+	stateDraft,
+	stateRevision,
 	Suspensions,
 	WorkflowReceipts,
 	EFFECT_WORKFLOW,
@@ -109,7 +110,8 @@ import {
 } from "./documents.ts";
 import { newErrorId, sentErrorReply, WAITING_STATUS } from "./errors.ts";
 import { createEvaluator } from "./evaluate.ts";
-import { LeaseLost, PostgresStorage, SessionBusy } from "./storage.ts";
+import { LeaseLost, PostgresStorage } from "./storage.ts";
+import { definedStates, type StateDefinition } from "../state.ts";
 import { duration } from "../internal.ts";
 import type { AgentIntegration, Logger } from "../app.ts";
 
@@ -138,7 +140,27 @@ type SessionInput =
 			content: string;
 			metadata: InvocationMetadata;
 	  }
-	| { kind: "stop"; agent: string; reason: string };
+	| { kind: "stop"; agent: string; reason: string }
+	| StateRequest;
+
+/**
+ * A workflow's `ctx.state` operation, handled by the Session's host: a read, or a replacement of the value read at
+ * `revision`. `operation` is stable across resends and dedupes it; the response event carries it back.
+ */
+type StateRequest = {
+	kind: "state";
+	operation: string;
+	state: string;
+	write?: { value: JsonObject; revision: number };
+};
+/** The response to a `StateRequest`: the value at its revision, a conflict (the revision moved on), or an error. */
+type StateResponse =
+	| { value: JsonObject; revision: number }
+	| { conflict: true; revision: number }
+	| { error: string };
+const STATE_EVENT = "fabrial.state.response";
+/** A workflow resends an unanswered state request (same operation) this often before failing. */
+const STATE_REQUESTS = 5;
 
 /** A run of one conversation in the hosted Session: the requests it answers, until Pi has finished them. */
 export const callSession = (executionId: string, id: string) => `run:${executionId}:${id}`;
@@ -153,13 +175,6 @@ export function sessionKey(metadata: InvocationMetadata): string {
 		);
 	return metadata.interactionId;
 }
-
-/**
- * Waits for a `ctx.state` update while the Session has an owner (its hosting execution, until it suspends, or a
- * crashed owner, until the lease expires). Conductor owns the wait: a durable sleep frees the worker and costs
- * no attempt, unlike a retry, which an app workflow has only a few of.
- */
-const STATE_BUSY_MS = [100, 250, 500, 1_000, 2_000, 5_000] as const;
 
 const THINKING: Record<ThinkingLevel, "off" | "low" | "medium" | "high"> = {
 	off: "off",
@@ -234,6 +249,8 @@ export interface PiOptions {
 	models: Models;
 	sql: Sql;
 	settings?: Omit<HarnessSettings, "extensions">;
+	/** How long a workflow's `ctx.state` waits for its Session to answer before it resends the request. */
+	stateTimeoutMs?: number;
 }
 
 export function pi(options: PiOptions): AgentIntegration {
@@ -247,6 +264,19 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	const configs = new Map<string, AgentChange>();
 	const active = new Map<BridgeFrame, Promise<void>>();
 	let started = false;
+	/** Workflow state resolves by name against this instance's definitions, on both sides of the Session's signal. */
+	const stateOf = (name: string): StateDefinition => {
+		const definition = definedStates.get(host.definitionScope ?? host)?.get(name);
+		if (!definition)
+			throw new Error(
+				`State ${name} is not defined on this Fabrial instance; define it with defineState`,
+			);
+		if (definition.scope !== "thread")
+			throw new Error(
+				`Agent state ${name} requires a Pi conversation; use it inside an agent tool`,
+			);
+		return definition;
+	};
 	const observers = host.plugins.flatMap((plugin) =>
 		plugin.hooks?.agent ? [plugin.hooks.agent] : [],
 	);
@@ -578,7 +608,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		execution: DurableExecution,
 		reportOf: (executionId: string) => PromiseWithResolvers<JsonObject>,
 	): Promise<SessionHost> {
-		// A crashed owner's lease lasts until it expires, and `ctx.state` takes the lease briefly: SessionBusy
+		// A crashed owner's lease lasts until it expires: SessionBusy
 		// fails the attempt, and Conductor retries it with backoff (the Session workflow's attempts cover a lease).
 		const storage = await PostgresStorage.open(options.sql, key);
 		const signal = AbortSignal.any([execution.signal, storage.lost.signal]);
@@ -840,8 +870,47 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			await closeView(conversation.id);
 		}
 
+		/**
+		 * A workflow's state operation, between Pi's passes: commits its response with its receipt (a write only if the
+		 * state is still at the revision it read), then emits it. A resent operation gets its receipt again.
+		 */
+		async function stateOperation(input: StateRequest) {
+			let response: StateResponse;
+			try {
+				const definition = stateOf(input.state);
+				const replacement = input.write
+					? await parseSchema(definition.schema, input.write.value, `state ${definition.name}`)
+					: undefined;
+				response = await harness.commit(async (tx) => {
+					const receipt = await tx.doc(WorkflowReceipts, input.operation, "");
+					if (receipt.value !== null) return cloneJson(receipt.value) as StateResponse;
+					const revision = await stateRevision(tx, definition);
+					const result: StateResponse = !input.write
+						? { value: cloneJson(await stateDraft(tx, definition)), revision }
+						: input.write.revision !== revision
+							? { conflict: true, revision }
+							: {
+									value: await applyState(tx, definition, undefined, [() => replacement!]),
+									revision: revision + 1,
+								};
+					receipt.value = cloneJson(result) as JsonObject;
+					return result;
+				}, context);
+			} catch (error) {
+				if (signal.aborted) throw error;
+				response = { error: error instanceof Error ? error.message : String(error) };
+			}
+			await execution.emit(STATE_EVENT, { operation: input.operation, ...response } as JsonObject, {
+				metadata: sessionMetadata(key),
+			});
+		}
+
 		const apply = (input: SessionInput) =>
-			input.kind === "stop" ? stop(input.agent, input.reason) : admit(input);
+			input.kind === "stop"
+				? stop(input.agent, input.reason)
+				: input.kind === "state"
+					? stateOperation(input)
+					: admit(input);
 
 		const obligations = async () => (await harness.snapshot(Obligations, context))?.requests ?? {};
 		/** Pi's record of a request submitted to a conversation. */
@@ -1232,7 +1301,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			idle,
 			outcomes,
 			async handle(input) {
-				if (settled) missed = true;
+				// A state operation gives Pi no work.
+				if (settled && input.kind !== "state") missed = true;
 				inflight++;
 				try {
 					await serial(() => apply(input));
@@ -1546,42 +1616,82 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			);
 		},
 	};
+	/**
+	 * Sends a state request to the Session's host through its input signal, subscribed to the response first; the
+	 * host's signal handling wakes a suspended Session and starts a closed one. Unanswered, the same operation is sent
+	 * again, and the host answers it from its receipt.
+	 */
+	async function stateRequest(
+		execution: DurableExecution,
+		id: string,
+		key: string,
+		request: Omit<StateRequest, "kind" | "operation">,
+	): Promise<Exclude<StateResponse, { error: string }>> {
+		const operation = `${execution.executionId}:${id}`;
+		const payload: StateRequest = { kind: "state", operation, ...request };
+		for (let n = 0; n < STATE_REQUESTS; n++) {
+			const at = n ? `${id}:${n}` : id;
+			const response = await execution.subscribe(`${at}:response`, {
+				event: STATE_EVENT,
+				filter: { operation: [operation] },
+			});
+			await execution.signalWithStart(`${at}:request`, {
+				workflow: SESSION_WORKFLOW,
+				key,
+				signal: {
+					name: "input",
+					id: `fabrial.state:${operation}${n ? `:${n}` : ""}`,
+					payload: payload as unknown as Json,
+				},
+				input: { session: key },
+				metadata: sessionMetadata(key),
+			});
+			const won = await execution.waitForAny(
+				`${at}:wait`,
+				{ response },
+				{ timeoutMs: options.stateTimeoutMs ?? 60_000 },
+			);
+			if (won.kind !== "event") continue;
+			const answer = won.event.payload as unknown as StateResponse;
+			if ("error" in answer) throw new Error(answer.error);
+			return answer;
+		}
+		throw new Error(
+			`State ${request.state}: Session ${key} did not answer operation ${id} after ${STATE_REQUESTS} requests`,
+		);
+	}
 	const state: StatePort = {
-		get: (execution, id, definition) => state.update(execution, id, definition, () => {}),
+		get: async (execution, id, definition) => {
+			const key = sessionKey(execution.metadata);
+			stateOf(definition.name);
+			const answer = await stateRequest(execution, id, key, { state: definition.name });
+			if ("conflict" in answer) throw new Error(`State ${definition.name}: a read cannot conflict`);
+			return answer.value as ReturnType<typeof definition.initial>;
+		},
+		/**
+		 * Optimistic: reads the value and its revision, applies `change` here (closures stay in the workflow), and
+		 * replaces the value if nothing changed it since; otherwise it reads again.
+		 */
 		update: async (execution, id, definition, change) => {
+			const key = sessionKey(execution.metadata);
+			stateOf(definition.name);
 			for (let n = 0; ; n++) {
-				const result = (await execution.step(n ? `${id}:busy:${n}` : id, async () => {
-					let storage: PostgresStorage;
-					try {
-						storage = await PostgresStorage.open(options.sql, sessionKey(execution.metadata));
-					} catch (error) {
-						if (error instanceof SessionBusy) return { busy: true };
-						throw error;
-					}
-					const context = withAbortSignal(execution.signal, BACKGROUND_CONTEXT);
-					const session = createSession(storage);
-					try {
-						const value = await session.commit(async (tx) => {
-							const receipt = await tx.doc(
-								WorkflowReceipts,
-								JSON.stringify([execution.executionId, id]),
-								"",
-							);
-							if (receipt.value !== null) return cloneJson(receipt.value) as JsonObject;
-							const value = await applyState(tx, definition, undefined, [change]);
-							receipt.value = cloneJson(value);
-							return value;
-						}, context);
-						return { value } as Json;
-					} finally {
-						await session.close(BACKGROUND_CONTEXT);
-					}
-				})) as { busy: true } | { value: ReturnType<typeof definition.initial> };
-				if ("value" in result) return result.value;
-				await execution.sleep(
-					`${id}:wait:${n}`,
-					STATE_BUSY_MS[Math.min(n, STATE_BUSY_MS.length - 1)]!,
-				);
+				const at = n ? `${id}:retry:${n}` : id;
+				const read = await stateRequest(execution, `${at}:read`, key, { state: definition.name });
+				if (!("value" in read)) throw new Error(`State ${definition.name}: a read cannot conflict`);
+				const value = await execution.step(`${at}:apply`, async () => {
+					const draft = cloneJson(read.value) as ReturnType<typeof definition.initial>;
+					return parseSchema(
+						definition.schema,
+						change(draft) ?? draft,
+						`state ${definition.name}`,
+					) as unknown as Json;
+				});
+				const written = await stateRequest(execution, `${at}:write`, key, {
+					state: definition.name,
+					write: { value: value as JsonObject, revision: read.revision },
+				});
+				if ("value" in written) return written.value as ReturnType<typeof definition.initial>;
 			}
 		},
 	};
@@ -1590,6 +1700,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		state,
 		evaluator,
 		workflows: [session, effect],
+		events: [{ name: STATE_EVENT, filterable: ["operation"] }],
 		async start() {
 			await PostgresStorage.migrate(options.sql);
 			for (const plugin of host.plugins)

@@ -8,7 +8,6 @@ import {
 } from "@earendil-works/pi-ai/providers/faux";
 import {
 	createFabrial,
-	type DurableExecution,
 	type FabrialHost,
 	type InvocationMetadata,
 	type RuntimeEvent,
@@ -33,7 +32,11 @@ const { defineAgent, defineTool, defineToolkit, defineState } = definitions;
  */
 const { db, sql, idle, open, all } = useAgents();
 
-function fixture(plugins: FabrialHost["plugins"] = [], definitionScope: object = definitions) {
+function fixture(
+	plugins: FabrialHost["plugins"] = [],
+	definitionScope: object = definitions,
+	stateTimeoutMs?: number,
+) {
 	const runtime = db.runtime();
 	const chat = new FakeChat();
 	const faux = fauxProvider();
@@ -63,9 +66,12 @@ function fixture(plugins: FabrialHost["plugins"] = [], definitionScope: object =
 			name: identity.subjectId,
 		}),
 	} as unknown as FabrialHost;
-	const integration = pi({ models, sql: sql(), settings: { retry: { enabled: false } } }).connect(
-		host,
-	);
+	const integration = pi({
+		models,
+		sql: sql(),
+		settings: { retry: { enabled: false } },
+		...(stateTimeoutMs ? { stateTimeoutMs } : {}),
+	}).connect(host);
 	return { runtime, chat, faux, integration, metadata, host };
 }
 async function execute(f: ReturnType<typeof fixture>, workflow: RuntimeWorkflow) {
@@ -83,7 +89,7 @@ function runtimeRegister(
 ) {
 	f.runtime.register({
 		workflows: [workflow, ...f.integration.workflows, ...others],
-		events,
+		events: [...events, ...(f.integration.events ?? [])],
 	});
 }
 
@@ -760,39 +766,188 @@ it("workflow state needs a posted thread; an unposted channel locator is not a S
 	await f.integration.stop();
 });
 
-it("replays a workflow state update after a lost runtime receipt without applying twice", async () => {
+const counter = () =>
+	defineState({
+		name: randomUUID(),
+		scope: "thread",
+		schema: z.object({ count: z.number().max(100) }),
+		initial: () => ({ count: 0 }),
+	});
+
+it("workflow state resolves by name on this instance: an unknown definition fails clearly", async () => {
 	const f = fixture();
-	const state = defineState({
+	const stranger = createFabrial({ plugins: [] }).defineState({
 		name: randomUUID(),
 		scope: "thread",
 		schema: z.object({ count: z.number() }),
 		initial: () => ({ count: 0 }),
 	});
-	const execution = {
-		executionId: randomUUID(),
-		metadata: f.metadata,
-		signal: new AbortController().signal,
-		step: async (_id: string, fn: () => Promise<unknown>) => fn(),
-	} as DurableExecution;
+	const { result } = await execute(f, {
+		name: randomUUID(),
+		triggers: [],
+		handler: async (_input, execution) => {
+			await expect(f.integration.state.get(execution, "read", stranger)).rejects.toThrow(
+				"is not defined on this Fabrial instance",
+			);
+			return "ok";
+		},
+	});
+	expect(result).toEqual({ status: "completed", output: "ok" });
+	expect(await all(f.runtime.queue, "fabrial.session")).toHaveLength(0);
+	await f.integration.stop();
+});
+
+it("a workflow update that fails its schema fails the workflow and changes nothing", async () => {
+	const f = fixture();
+	const state = counter();
+	const invalid: RuntimeWorkflow = {
+		name: randomUUID(),
+		triggers: [],
+		retries: { maxAttempts: 1 },
+		handler: async (_input, execution) => {
+			await f.integration.state.update(execution, "seed", state, (draft) => {
+				draft.count = 5;
+			});
+			return f.integration.state.update(execution, "invalid", state, (draft) => {
+				draft.count = 1_000;
+			});
+		},
+	};
+	const reader: RuntimeWorkflow = {
+		name: randomUUID(),
+		triggers: [],
+		handler: (_input, execution) => f.integration.state.get(execution, "read", state),
+	};
+	runtimeRegister(f, invalid, [reader]);
+	await f.integration.start();
+	await f.runtime.start();
+	const failed = await f.runtime.invoke(invalid.name, null, { metadata: f.metadata });
+	expect(await db.execution(failed).settled()).toMatchObject({
+		status: "failed",
+		error: expect.stringContaining(`state ${state.name}`),
+	});
+	const read = await f.runtime.invoke(reader.name, null, { metadata: f.metadata });
+	expect(await db.execution(read).settled()).toEqual({ status: "completed", output: { count: 5 } });
+	await f.integration.stop();
+});
+
+it("a lost state response is asked for again with the same operation: the update applies once", async () => {
+	const f = fixture([], definitions, 1_000);
+	const state = counter();
 	const change = vi.fn((draft: { count: number }) => {
 		draft.count++;
 	});
-	const step = vi.spyOn(execution, "step");
-	step.mockImplementationOnce(async (_id, fn) => {
-		await fn();
-		throw new Error("runtime receipt lost");
+	// The Session's first write response never arrives.
+	const session = f.integration.workflows.find((workflow) => workflow.name === "fabrial.session")!;
+	const handler = session.handler;
+	let dropped = 0;
+	session.handler = (input, execution, attempt) =>
+		handler(
+			input,
+			new Proxy(execution, {
+				get: (target, property) => {
+					const value = Reflect.get(target, property) as unknown;
+					if (property === "emit")
+						return async (event: string, payload: { operation?: string }, options: never) => {
+							if (payload.operation?.includes(":write") && !dropped++) return;
+							return execution.emit(event, payload as never, options);
+						};
+					return typeof value === "function" ? value.bind(target) : value;
+				},
+			}),
+			attempt,
+		);
+	const { result } = await execute(f, {
+		name: randomUUID(),
+		triggers: [],
+		handler: async (_input, execution) => {
+			const updated = await f.integration.state.update(execution, "increment", state, change);
+			return { updated, read: await f.integration.state.get(execution, "read", state) };
+		},
 	});
-	await expect(f.integration.state.update(execution, "increment", state, change)).rejects.toThrow(
-		"runtime receipt lost",
-	);
-	await f.integration.state.update(execution, "other", state, (draft) => {
-		draft.count += 10;
-	});
-	expect(await f.integration.state.update(execution, "increment", state, change)).toEqual({
-		count: 1,
+	expect(dropped).toBe(2);
+	expect(result).toEqual({
+		status: "completed",
+		output: { updated: { count: 1 }, read: { count: 1 } },
 	});
 	expect(change).toHaveBeenCalledTimes(1);
-	expect(await f.integration.state.get(execution, "read", state)).toEqual({ count: 11 });
+	await f.integration.stop();
+});
+
+it("a workflow restarted after sending its update waits for the same answer; nothing applies twice", async () => {
+	const f = fixture();
+	const state = counter();
+	const change = vi.fn((draft: { count: number }) => {
+		draft.count++;
+	});
+	let crashed = false;
+	const workflow: RuntimeWorkflow = {
+		name: randomUUID(),
+		triggers: [],
+		retries: { maxAttempts: 3 },
+		handler: async (_input, execution) => {
+			const crashing = new Proxy(execution, {
+				get: (target, property) => {
+					const value = Reflect.get(target, property) as unknown;
+					if (property === "signalWithStart")
+						return async (id: string, options: never) => {
+							const sent = await execution.signalWithStart(id, options);
+							if (id.endsWith(":write:request") && !crashed) {
+								crashed = true;
+								throw new Error("crashed after sending");
+							}
+							return sent;
+						};
+					return typeof value === "function" ? value.bind(target) : value;
+				},
+			});
+			const updated = await f.integration.state.update(crashing, "increment", state, change);
+			return { updated, read: await f.integration.state.get(execution, "read", state) };
+		},
+	};
+	const { result } = await execute(f, workflow);
+	expect(crashed).toBe(true);
+	expect(result).toEqual({
+		status: "completed",
+		output: { updated: { count: 1 }, read: { count: 1 } },
+	});
+	expect(change).toHaveBeenCalledTimes(1);
+	await f.integration.stop();
+});
+
+it("concurrent workflow updates of one Session's state lose nothing: a stale write reads again", async () => {
+	const f = fixture();
+	const state = counter();
+	const workflow: RuntimeWorkflow = {
+		name: randomUUID(),
+		triggers: [],
+		handler: async (_input, execution) => {
+			for (let n = 0; n < 4; n++)
+				await f.integration.state.update(execution, `increment:${n}`, state, (draft) => {
+					draft.count++;
+				});
+			return null;
+		},
+	};
+	const reader: RuntimeWorkflow = {
+		name: randomUUID(),
+		triggers: [],
+		handler: (_input, execution) => f.integration.state.get(execution, "read", state),
+	};
+	runtimeRegister(f, workflow, [reader]);
+	await f.integration.start();
+	await f.runtime.start();
+	const ids = await Promise.all(
+		[0, 1, 2].map(() => f.runtime.invoke(workflow.name, null, { metadata: f.metadata })),
+	);
+	for (const id of ids)
+		expect(await db.execution(id).settled()).toEqual({ status: "completed", output: null });
+	const read = await f.runtime.invoke(reader.name, null, { metadata: f.metadata });
+	expect(await db.execution(read).settled()).toEqual({
+		status: "completed",
+		output: { count: 12 },
+	});
+	await f.integration.stop();
 });
 
 it("stop joins driver routing cleanup after the harness has closed", async () => {

@@ -544,6 +544,7 @@ export function buildApp(config: CoreConfig): App {
 			),
 			{ name: INGRESS_EVENT, filterable: [] },
 			{ name: APPROVAL_DECIDED_EVENT, filterable: ["approvalId"] },
+			...(agents?.events ?? []),
 		],
 	});
 	return {

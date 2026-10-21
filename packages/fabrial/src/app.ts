@@ -3,7 +3,14 @@ import type { Evaluator } from "./evaluate.ts";
 import type { ExternalIdentity, IdentityDirectory, Principal, UserDefinition } from "./identity.ts";
 import type { JsonObject } from "./json.ts";
 import type { AnyPlugin } from "./plugin.ts";
-import type { AgentPort, ChatPort, DurableRuntime, RuntimeWorkflow, StatePort } from "./runtime.ts";
+import type {
+	AgentPort,
+	ChatPort,
+	DurableRuntime,
+	RuntimeEvent,
+	RuntimeWorkflow,
+	StatePort,
+} from "./runtime.ts";
 import type { ChatMessage, Surface, ThreadRef } from "./thread.ts";
 import type { AnyWorkflow } from "./workflow.ts";
 
@@ -98,6 +105,8 @@ export interface AgentIntegration extends HostIntegration<{
 	state: StatePort;
 	evaluator: Evaluator;
 	workflows: RuntimeWorkflow[];
+	/** Events its workflows emit and subscribe to. */
+	events?: RuntimeEvent[];
 	start(): Promise<void>;
 	stop(): Promise<void>;
 }> {
