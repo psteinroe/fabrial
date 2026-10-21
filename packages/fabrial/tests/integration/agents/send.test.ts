@@ -26,7 +26,7 @@ import {
 	type JsonObject,
 } from "../../../src/index.ts";
 import { pi, PostgresStorage } from "../../../src/agents/index.ts";
-import { Conversations, Invocation, Obligations, Runs } from "../../../src/agents/documents.ts";
+import { Conversations, Invocation, Obligations } from "../../../src/agents/documents.ts";
 import { WAITING_STATUS } from "../../../src/agents/errors.ts";
 import type { Logger } from "../../../src/app.ts";
 import { until } from "../../conductor/helper.ts";
@@ -349,14 +349,22 @@ it("maps notification priorities to write, followUp, and steer; written entries 
 	expect(seen[1]).toContain("urgent: changes requested");
 	expect(seen[1]).not.toContain("normal: new commit");
 	expect(seen[2]).toContain("normal: new commit");
-	const deliveries = await t.read(`app:ops-${t.channel}`, async (s) => {
-		const runs = await s.snapshot(Runs, BACKGROUND_CONTEXT);
-		return Object.values(runs!.runs)
-			.flatMap((run) => Object.values(run.requests ?? {}))
-			.map((request) => request.delivery ?? "")
-			.sort((a, b) => a.localeCompare(b));
-	});
-	expect(deliveries).toEqual(["followUp", "followUp", "steer", "write"]);
+	// Pi keeps how each was submitted: the low-priority one as a passive write, the others as input.
+	const types = await t.read(`app:ops-${t.channel}`, async (s, storage) =>
+		Promise.all(
+			(await requestsOf(s)).map(
+				async ([requestId, conversationId]) =>
+					(
+						await storage.submissionByRequest(
+							conversationId as never,
+							requestId,
+							BACKGROUND_CONTEXT,
+						)
+					)?.type ?? "",
+			),
+		),
+	);
+	expect(types.sort((a, b) => a.localeCompare(b))).toEqual(["input", "input", "input", "write"]);
 });
 
 it("a tool sends to another conversation through the same send path", async () => {
@@ -632,10 +640,11 @@ async function intercept(
 	io.post = ((content: Parameters<typeof actual>[0]) =>
 		post(content, () => actual(content))) as typeof io.post;
 }
-/** The requests the Session's runs admitted, with their conversation. */
+/** The requests the Session admitted, with their conversation. */
 const requestsOf = async (s: Pick<ReturnType<typeof createSession>, "snapshot">) =>
-	Object.values((await s.snapshot(Runs, BACKGROUND_CONTEXT))!.runs).flatMap((run) =>
-		Object.keys(run.requests ?? {}).map((requestId) => [requestId, run.conversationId] as const),
+	Object.entries((await s.snapshot(Obligations, BACKGROUND_CONTEXT))!.requests).flatMap(
+		([requestId, obligation]) =>
+			obligation.owes === "task" ? [] : [[requestId, obligation.conversationId] as const],
 	);
 /** The posts of the replies the Session owed, by intent key. */
 const deliveries = async (t: Awaited<ReturnType<typeof setup>>) => {
@@ -1015,6 +1024,8 @@ it(
 		expect(t.faux.state.callCount).toBe(1);
 		expect(await deliveries(t)).toEqual([expect.objectContaining({ status: "posted" })]);
 		expect((await sessions(t.runtime.queue)).at(0)).toEqual({ status: "completed", attempts: 2 });
+		// The crashed attempt cleared its progress; the reopened one, with only the post pending, shows none.
+		expect(await statuses(t, "t1")).toEqual(["Thinking…", null]);
 	},
 	2 * RETRY_MS,
 );

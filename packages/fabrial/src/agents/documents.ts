@@ -161,29 +161,6 @@ export const Obligations = defineDoc({
 	initial: (): { requests: Record<string, Obligation> } => ({ requests: {} }),
 });
 
-/** The hosting loop's admission queue: which requests a conversation's run takes, in arrival order. */
-export const Runs = defineDoc({
-	kind: "fabrial.runs",
-	scope: "session",
-	version: 1,
-	initial: (): {
-		runs: Record<
-			string,
-			{
-				conversationId: number;
-				/** The agent whose conversation runs; missing on runs of the removed per-request drivers. */
-				agent?: string;
-				/** A `ctx.agent` call: its request. The call's Session execution is a child of the caller. */
-				call?: { requestId: string };
-				/** Settled: answered, failed, or stopped. */
-				done?: boolean;
-				/** Requests to submit, by request id; Pi has the submission once submitted. */
-				requests?: Record<string, { content: string; delivery?: import("../send.ts").Delivery }>;
-			}
-		>;
-	} => ({ runs: {} }),
-});
-
 export const ToolReceipt = defineDoc({
 	kind: "fabrial.tool-result",
 	scope: "task",
