@@ -24,21 +24,6 @@ export interface InvocationMetadata extends JsonObject {
 	requestedBy: (Principal & JsonObject) | null;
 	// Requests delivered by `ctx.send` also carry `send: SentRequest` (kind and priority). Tools and the
 	// workflows they start carry `conversation: ConversationRef`, the agent conversation they belong to.
-	// Executions a Session waits on carry `notify`, the Session's execution id: they send it a `child`
-	// signal (`ChildSignal`) as they settle. Starts never inherit `notify`.
-}
-
-/** Name of the signal an execution started with `notify` metadata sends that execution as it settles. */
-export const CHILD_SIGNAL = "child";
-
-/**
- * Payload of a `child` signal (id `child:<executionId>`): the outcome the execution is about to settle with,
- * sent before Conductor commits it. Sent when the handler completes and when it fails on its final attempt;
- * cancellation sends nothing (the waiter's execution branch covers it).
- */
-export interface ChildSignal extends JsonObject {
-	executionId: string;
-	result: ExecutionResult & JsonObject;
 }
 
 export type DurationInput = string | number;

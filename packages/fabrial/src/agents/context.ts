@@ -44,6 +44,7 @@ import {
 	Subagent,
 	ChildIntents,
 	EFFECT_WORKFLOW,
+	REPORT_WORKFLOW,
 	type ChildIntent,
 } from "./documents.ts";
 
@@ -62,9 +63,10 @@ export interface BridgeFrame {
 	/** Subagent calls waiting for their child's answer; they do not keep the Session open. */
 	waiting: Set<number>;
 	/**
-	 * Resolves with a workflow's result, memoized per child: once it settled, or as its `child` signal arrives. Without
-	 * one (cancelled, crashed) it waits until the Session closes, and the tool runs again when the Session's execution
-	 * resumes on the child's settlement. Frees the task's slot in `children`.
+	 * Resolves with a waited child's committed result, memoized per child: once its reporter settled, or as the
+	 * reporter's `child` signal arrives. Without one (the reporter was cancelled, or signalled an earlier Session
+	 * execution) it waits until the Session closes, and the tool runs again when the Session's execution resumes on the
+	 * reporter's settlement. Frees the task's slot in `children`.
 	 */
 	waitChild(taskId: number, executionId: string, context: Context): Promise<JsonObject>;
 	/** Shows a status on the lead's progress surface, if it has one. */
@@ -118,6 +120,7 @@ export async function fields(
 		ids.set(id, count + 1);
 		return count ? `${id}#${count}` : id;
 	};
+	/** `child` is a reporter (`waited` start): its result is the committed outcome of the workflow it ran. */
 	const childResult = async (child: string): Promise<Json> => {
 		let result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
 		if (!result) {
@@ -144,12 +147,17 @@ export async function fields(
 			EFFECT_WORKFLOW,
 			{ method, args },
 			metadata,
-			false,
+			{ detached: false, waited: true },
 			context,
 		);
 		return childResult(child);
 	};
-	const start = async <W extends AnyWorkflow>(id: string, workflow: W, input: WorkflowInput<W>) => {
+	const launch = async <W extends AnyWorkflow>(
+		id: string,
+		workflow: W,
+		input: WorkflowInput<W>,
+		waited: boolean,
+	) => {
 		if (!api) throw new Error("Prompt sections cannot start workflows");
 		const registered = bridge.host.workflows.find((candidate) => candidate.name === workflow.name);
 		if (!registered) throw new Error(`Workflow ${workflow.name} is not registered`);
@@ -164,11 +172,13 @@ export async function fields(
 			registered.name,
 			parsed,
 			metadata,
-			detached,
+			{ detached, waited },
 			context,
 		);
 	};
-	return bindMetadata(
+	const start = <W extends AnyWorkflow>(id: string, workflow: W, input: WorkflowInput<W>) =>
+		launch(id, workflow, input, false);
+	const ctx = bindMetadata<FabrialFields>(
 		{
 			actor: metadata.requestedBy,
 			clients: bridge.host.clients(),
@@ -192,7 +202,7 @@ export async function fields(
 			start,
 			invoke: async (id, workflow, input) => {
 				if (!api) throw new Error("Prompt sections cannot invoke workflows");
-				const child = await start(id, workflow, input);
+				const child = await launch(id, workflow, input, true);
 				return (await childResult(child)) as WorkflowOutput<typeof workflow>;
 			},
 			// Sent from a managed child execution, through the same path as workflow `ctx.send`.
@@ -266,6 +276,29 @@ export async function fields(
 		},
 		metadata,
 	);
+	waitedStarts.set(ctx, (id, workflow, input) => launch(id, workflow, input as never, true));
+	return ctx;
+}
+
+const waitedStarts = new WeakMap<
+	object,
+	(id: string, workflow: AnyWorkflow, input: Json) => Promise<string>
+>();
+/** Starts a workflow a tool waits on, behind its reporter (see `startChild`); returns the reporter's execution id. */
+export function startWaited(
+	ctx: FabrialFields,
+	id: string,
+	workflow: AnyWorkflow,
+	input: Json,
+): Promise<string> {
+	return waitedStarts.get(ctx)!(id, workflow, input);
+}
+
+/** A reporter's result is `{ child, result }`, the committed outcome of the child it ran; else it never reported. */
+export function childOutcome(reporter: JsonObject): JsonObject {
+	return reporter.status === "completed"
+		? ((reporter.output as { result: JsonObject }).result ?? reporter)
+		: reporter;
 }
 
 /**
@@ -313,6 +346,10 @@ export async function agentOf(
  * Persist the child's intent BEFORE starting, linked to the request it acts for (none for a reply's post), so stopping
  * the request cancels the child. Attached children are cancelled with the Session's execution; a lost start receipt
  * reconciles by global key.
+ *
+ * A child the Session waits on (`waited`) runs behind a reporter: the reporter runs it as its own attached child,
+ * waits until Conductor committed its outcome, and only then signals this Session's execution. The intent, and the
+ * returned id, are the reporter's.
  */
 export async function startChild(
 	bridge: BridgeFrame,
@@ -321,21 +358,18 @@ export async function startChild(
 	workflow: string,
 	input: Json,
 	metadata: InvocationMetadata,
-	detached: boolean,
+	options: { detached: boolean; waited: boolean },
 	context: Context,
 ): Promise<string> {
+	const { detached, waited } = options;
 	const dedupeKey = JSON.stringify(["fabrial.pi.child", bridge.session, key]);
 	const intent = await bridge.harness.commit(async (tx) => {
 		const saved = await tx.doc(ChildIntents, key, {
-			workflow,
-			input: cloneJson(input ?? null),
-			metadata: {
-				...cloneJson(metadata),
-				triggerEvent: null,
-				ownerWorkflow: null,
-				// An attached child tells this Session's execution its outcome as it settles.
-				notify: detached ? null : bridge.execution.executionId,
-			},
+			workflow: waited ? REPORT_WORKFLOW : workflow,
+			input: waited
+				? { workflow, input: cloneJson(input ?? null), session: bridge.execution.executionId }
+				: cloneJson(input ?? null),
+			metadata: { ...cloneJson(metadata), triggerEvent: null, ownerWorkflow: null },
 			dedupeKey,
 			detached,
 			executionId: null,

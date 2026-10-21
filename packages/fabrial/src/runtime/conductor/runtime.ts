@@ -45,8 +45,7 @@ function mergeMetadata(
 	metadata: InvocationMetadata,
 	override?: Partial<InvocationMetadata>,
 ): InvocationMetadata {
-	// `notify` addresses only the execution it was given to.
-	const { notify: _notify, ...result } = metadata as InvocationMetadata & { notify?: unknown };
+	const result: InvocationMetadata = { ...metadata };
 	for (const [key, value] of Object.entries(override ?? {}))
 		if (value !== undefined) result[key] = value;
 	return result;

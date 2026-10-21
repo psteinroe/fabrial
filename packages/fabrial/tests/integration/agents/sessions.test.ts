@@ -14,6 +14,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from "vitest";
 import { z } from "zod";
 import {
 	createFabrial,
+	definePlugin,
 	defineUser,
 	type InvocationMetadata,
 	type Json,
@@ -33,7 +34,20 @@ const alice = defineUser({
 	name: "Alice",
 	identities: [{ provider: "slack-test", installationId: "w", subjectId: "alice" }],
 });
-const f = createFabrial({ plugins: [], identity: [alice] });
+/** Runs after each workflow attempt's handler returned, before Conductor settles it; a throw fails the attempt. */
+let afterAttempt: (workflow: string) => void = () => {};
+const interrupter = definePlugin({
+	id: "interrupter",
+	hooks: {
+		workflow: [
+			async (info, ctx, next) => {
+				await next(ctx);
+				afterAttempt(info.workflow);
+			},
+		],
+	},
+});
+const f = createFabrial({ plugins: [interrupter], identity: [alice] });
 const probe = fauxProvider();
 const model = `${probe.provider.id}/${probe.getModel().id}`;
 const debug = process.env.SESSIONS_DEBUG ? (...args: unknown[]) => console.log(...args) : () => {};
@@ -59,6 +73,7 @@ beforeEach(async () => {
 	sql = postgres(url, { max: 4, onnotice: () => {} });
 	requests.length = 0;
 	script = () => say("unscripted");
+	afterAttempt = () => {};
 });
 afterEach(async () => {
 	for (const stop of stops.splice(0).reverse()) await stop();
@@ -679,9 +694,10 @@ it("a workflow tool waiting on approval suspends the Session execution; after a 
 	// The executions a Session waits on outlive the wait: tool workflows and effects are never removed by default.
 	const kept = await sql<{ key: string; complete: number | null; fail: number | null }[]>`
 		select key, remove_on_complete_days as complete, remove_on_fail_days as fail
-		from pgconductor._private_tasks where key in (${runSql.name}, 'fabrial.pi.effect')`;
+		from pgconductor._private_tasks
+		where key in (${runSql.name}, 'fabrial.pi.effect', 'fabrial.pi.report')`;
 	expect(new Set(kept.map((task) => task.key))).toEqual(
-		new Set([runSql.name, "fabrial.pi.effect"]),
+		new Set([runSql.name, "fabrial.pi.effect", "fabrial.pi.report"]),
 	);
 	for (const task of kept) expect(task).toMatchObject({ complete: null, fail: null });
 	await a.stop();
@@ -811,7 +827,7 @@ it("a workflow tool's result reaches a Session busy with another subagent's mode
 	await released(await only());
 });
 
-it("a workflow tool whose execution is cancelled while the Session is busy resolves once the Session waits on it", async () => {
+it("a workflow tool whose execution is cancelled while the Session is busy gets the cancellation at once", async () => {
 	const busy = gate();
 	const { runSql, ask, reported } = busyAndWaiting((request) => busy.pass(request.signal));
 	const a = await launch("a", [runSql, ask]);
@@ -823,11 +839,49 @@ it("a workflow tool whose execution is cancelled while the Session is busy resol
 		select id from pgconductor._private_executions where task_key = ${runSql.name}`;
 	await a.runtime.cancel(tool!.id, "Withdrawn");
 	await expect.poll(() => execution(tool!.id), poll).toMatchObject({ cancelled: true });
-	busy.open();
-	// No signal for a cancellation: the Session's execution branch for the tool resumes it.
+	// The tool's reporter reports the cancellation: the fixer answers while the thinker's model call is still held.
 	await expect.poll(() => reported("Not fixed."), poll).toBe(true);
+	expect(reported("Thought.")).toBe(false);
+	busy.open();
 	await expect.poll(() => reported("Thought."), poll).toBe(true);
 	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
+	await released(await only());
+});
+
+it("a workflow tool's outcome reaches the Session only once committed: an attempt that fails after its handler returned is retried", async () => {
+	let attempts = 0;
+	const flaky = f.defineWorkflow({
+		name: `flaky-${short()}`,
+		description: "Runs.",
+		input: z.object({}),
+		retries: { maxAttempts: 2 },
+		run: async () => `attempt ${++attempts}`,
+	});
+	afterAttempt = (workflow) => {
+		if (workflow === flaky.name && attempts === 1) throw new Error("Interrupted after return");
+	};
+	const lead = f.defineAgent({
+		name: `lead-${short()}`,
+		description: "Runs.",
+		model,
+		tools: [flaky],
+	});
+	const ask = f.defineWorkflow({
+		name: `ask-${short()}`,
+		input: z.string(),
+		run: (input, ctx) => ctx.agent("answer", lead, { input }),
+	});
+	script = (request) => {
+		const text = lastText(request.context);
+		return text === "Go" ? use(toolName(flaky.name), {}) : say(`Got ${text}`);
+	};
+	const a = await launch("a", [flaky, ask]);
+	const caller = await a.runtime.invoke(ask.name, "Go", { metadata: metadataOf() });
+	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
+	// The first attempt's return value never reached the Session: only the committed one did.
+	expect(attempts).toBe(2);
+	expect(requests.map((request) => lastText(request.context))).toEqual(["Go", '"attempt 2"']);
+	expect(await output(caller)).toBe('Got "attempt 2"');
 	await released(await only());
 });
 

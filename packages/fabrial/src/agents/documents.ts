@@ -126,6 +126,15 @@ export const ChildIntents = defineDocFamily({
 	initial: (intent: ChildIntent): ChildIntent => intent,
 });
 export const EFFECT_WORKFLOW = "fabrial.pi.effect";
+/** Runs a child a Session waits on and reports its outcome once committed (see `startChild`). */
+export const REPORT_WORKFLOW = "fabrial.pi.report";
+/** Name of the signal a reporter sends the Session's execution, id `child:<child execution id>`. */
+export const CHILD_SIGNAL = "child";
+/** Payload of a `child` signal: the reporter's execution id, and the committed outcome of its child. */
+export interface ChildSignal extends JsonObject {
+	executionId: string;
+	result: JsonObject;
+}
 
 /** A `ctx.agent` call's Session execution returns its outcome: the answer, or why there is none. */
 export type CallOutcome =

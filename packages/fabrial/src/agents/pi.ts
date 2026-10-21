@@ -30,8 +30,7 @@ import {
 	type AgentPort,
 	type AgentRef,
 	type DurableExecution,
-	CHILD_SIGNAL,
-	type ChildSignal,
+	type ExecutionResult,
 	ExecutionError,
 	isCancelled,
 	type WaitBranch,
@@ -75,8 +74,10 @@ import {
 	cancelChildren,
 	cloneJson,
 	currentRequest,
+	childOutcome,
 	fields,
 	registerChild,
+	startWaited,
 	noReplyTool,
 	startChild,
 	type BridgeFrame,
@@ -105,6 +106,9 @@ import {
 	Suspensions,
 	WorkflowReceipts,
 	EFFECT_WORKFLOW,
+	REPORT_WORKFLOW,
+	CHILD_SIGNAL,
+	type ChildSignal,
 	type CallOutcome,
 	type Obligation,
 } from "./documents.ts";
@@ -438,7 +442,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				const frame = context.value(BridgeKey);
 				if (!frame) throw new Error("Workflow tools require a Fabrial bridge");
 				const ctx = await fields(context, api.conversationId, api);
-				const child = await ctx.start("workflow", workflow, input as never);
+				const child = await startWaited(ctx, "workflow", workflow, input as Json);
 				const result = (await frame.harness.snapshot(ChildResults, context))?.results[child];
 				if (result)
 					return {
@@ -533,16 +537,16 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				late.push({ payload: input, id, done: (error) => (error ? reject(error) : resolve()) }),
 			);
 		});
-		// Outcomes children sent with their `child` signal, by execution id: the waiting tool resumes in process, also
-		// when the Session is busy with other work. Kept for this attempt, across reopenings.
+		// Committed outcomes reporters sent with their `child` signal, by reporter id: the waiting tool resumes in
+		// process, also when the Session is busy with other work. Kept for this attempt, across reopenings.
 		const reported = new Map<string, PromiseWithResolvers<JsonObject>>();
 		const reportOf = (executionId: string) => {
 			let entry = reported.get(executionId);
 			if (!entry) reported.set(executionId, (entry = Promise.withResolvers<JsonObject>()));
 			return entry;
 		};
-		// Returns at once: a signal arriving while the Session closes does not win its wait, but the child's execution
-		// branch does once its outcome is committed. While suspended, the signal wins the wait.
+		// Returns at once: a signal arriving while the Session closes does not win its wait, but the reporter's execution
+		// branch does once it settled. While suspended, the signal wins the wait.
 		execution.onSignal(CHILD_SIGNAL, (payload) => {
 			const { executionId, result } = payload as unknown as ChildSignal;
 			reportOf(executionId).resolve(result);
@@ -648,9 +652,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					(async () => {
 						const settled = await host.runtime.getExecution(executionId);
 						if (!settled) throw new Error(`Execution ${executionId} not found`);
-						// The child's signal can arrive before its outcome is committed: it carries the outcome.
+						// The reporter signals once the outcome is committed, and settles right after.
 						const result = settled.result
-							? (cloneJson(settled.result) as unknown as JsonObject)
+							? childOutcome(cloneJson(settled.result) as unknown as JsonObject)
 							: await reportOf(executionId).promise;
 						return harness.commit(
 							async (tx) => ((await tx.doc(ChildResults)).results[executionId] ??= result),
@@ -979,7 +983,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				EFFECT_WORKFLOW,
 				{ method: "post", args: [text] },
 				(await replyThread(requestId))!,
-				false,
+				{ detached: false, waited: true },
 				context,
 			);
 			const delivery = await harness.commit(async (tx) => {
@@ -1047,10 +1051,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			const pending: string[] = [];
 			for (const [executionId, post] of posts) {
 				if (conversationId !== undefined && post.conversationId !== conversationId) continue;
-				const result = post.stale
+				const reported = post.stale
 					? (((await reportedOutcome(executionId)) as ChildSignal["result"] | undefined) ??
 						(await host.runtime.getExecution(executionId))?.result)
 					: undefined;
+				const result = reported && (childOutcome(reported as JsonObject) as ExecutionResult);
 				post.stale = false;
 				if (!result) {
 					pending.push(executionId);
@@ -1516,6 +1521,36 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			return { reclaimed, batches };
 		},
 	};
+	/**
+	 * Runs a child a Session waits on (a workflow tool, an effect) as its own attached child and signals the Session's
+	 * execution once Conductor committed the child's outcome, cancellations included: a retried, failed or interrupted
+	 * attempt never reaches the Session. Returns that outcome. Kept forever, like the executions Sessions wait on.
+	 */
+	const report: RuntimeWorkflow = {
+		name: REPORT_WORKFLOW,
+		triggers: [],
+		handler: async (input, execution) => {
+			const {
+				workflow,
+				input: data,
+				session,
+			} = input as {
+				workflow: string;
+				input: Json;
+				session: string;
+			};
+			const child = await execution.start("child", workflow, data, { cancelWithParent: true });
+			const result = (await execution.waitForResult("result", child)) as JsonObject;
+			await execution.step("report", async () => {
+				await host.runtime.signal(session, {
+					name: CHILD_SIGNAL,
+					id: `child:${child}`,
+					payload: { executionId: execution.executionId, result } satisfies ChildSignal,
+				});
+			});
+			return { child, result };
+		},
+	};
 	// Effects run in a stable child execution, never in the Session's replaceable execution.
 	const effect: RuntimeWorkflow = {
 		name: EFFECT_WORKFLOW,
@@ -1598,7 +1633,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		metadata: request.metadata,
 	});
 	const port: AgentPort = {
-		workflows: () => [session, effect],
+		workflows: () => [session, effect, report],
 		async stop(conversation, id, reason) {
 			await signalSession(
 				conversation.session,
@@ -1779,7 +1814,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		agents: port,
 		state,
 		evaluator,
-		workflows: [session, effect, reclaim],
+		workflows: [session, effect, report, reclaim],
 		events: [{ name: STATE_EVENT, filterable: ["operation"] }],
 		async start() {
 			await PostgresStorage.migrate(options.sql);
