@@ -717,43 +717,41 @@ export const lead = f.defineAgent({
 	name: "lead",
 	description: "Answers support questions in #help.",
 	model: "anthropic/claude-sonnet-5",
-	subagents: [researcher, reviewer, { agent: "self", context: "fork" }],
-	limits: { depth: 1, concurrent: 5 }, // defaults
+	subagents: [researcher, reviewer, { agent: "self", background: "never" }],
+	limits: { depth: 1 }, // default
 });
 ```
 
-Each entry is an agent, `"self"` (a copy of the lead), or `{ agent, context?, background? }`:
+Each entry is an agent, `"self"` (a fresh copy of the lead), or `{ agent, background? }`:
 
-| Option       | Values                                     | Meaning                                                                                     |
-| ------------ | ------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| `context`    | `"fresh"` (default), `"fork"`              | Fresh: the child sees only its task. Fork: the child inherits the lead's transcript so far. |
-| `background` | `"allow"` (default), `"always"`, `"never"` | Whether the model may, must, or must not run the child in the background.                   |
+| Option       | Values                                     | Meaning                                                                   |
+| ------------ | ------------------------------------------ | ------------------------------------------------------------------------- |
+| `background` | `"allow"` (default), `"always"`, `"never"` | Whether the model may, must, or must not run the child in the background. |
 
-**What the model sees.** One tool per subagent, named after the agent and described by its `description`: `researcher({ task, background?, name? })`. A foreground call waits and returns the child's answer as the tool result. A background call returns a name at once (`researcher-1`); the answer arrives later as an input to the lead, `<subagent name="researcher-1" status="done">…</subagent>`. Calling with the `name` of a running child continues it (steering it if busy). `subagent_stop({ name })` stops a child. A short section lists running children and their status.
+**What the model sees.** One tool per subagent, named after the agent and described by its `description`: `researcher({ task, background?, name? })`. A foreground call starts a fresh child that sees only its task, waits, and returns its answer as the tool result. A background call returns a name at once (`researcher-1`); the answer arrives later as an input to the lead, `<subagent name="researcher-1" status="done">…</subagent>`. Calling with the `name` of a background child sends it another task (steering it if busy). `subagent_stop({ name })` stops a background child.
 
 **How it maps to Pi.**
 
-| Fabrial           | Pi                                                                                                                                                                 |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Foreground call   | Child conversation owned by the tool call (Pi example 22): aborting the lead aborts it                                                                             |
-| Background child  | Child owned by a background anchor task, so the lead's Esc and idle waits stop there (Pi example 23)                                                               |
-| Background answer | Reporter task that submits the answer to the lead as a `followUp`, with a request ID                                                                               |
-| `context: "fork"` | `conversation.fork(entryId)`, owned the same way                                                                                                                   |
-| Continue, stop    | A running child: `submit` (`steer` if busy). An idle child: `fork()` at its newest entry, owned by the new call, so aborts still flow through ownership; `abort()` |
+| Fabrial           | Pi                                                                                                   |
+| ----------------- | ---------------------------------------------------------------------------------------------------- |
+| Foreground call   | Child conversation owned by the tool call (Pi example 22): aborting the lead aborts it               |
+| Background child  | Child owned by a background anchor task, so the lead's Esc and idle waits stop there (Pi example 23) |
+| Background answer | Reporter task that submits the answer to the lead as a `followUp`, with a request ID                 |
+| Continue, stop    | A new reporter that submits to the named background child (`steer` if busy); `abort()`               |
 
 **Rules.**
 
-- When the lead's run ends depends on how it was started. Under `ctx.agent` (call), the call settles only after its background children have reported, so a waiting workflow never gets an answer while work is still running. Otherwise reports arrive as follow-ups, and the lead's answer posts to the thread of the input that started the child.
-- Only the lead speaks in chat. Children have no chat binding; their activity shows in the lead's status ("researcher: searching docs…").
+- A `ctx.agent` call returns the lead's answer; background reports arrive later as follow-up inputs to the lead's Session, which stays open until they are answered. In a sent run the lead's answer to a report posts to the thread of the input that started the child.
+- Only the lead speaks in chat. Children have no chat binding and show no status lines; a subagent call shows in the lead's status like any tool.
 - Children act under the lead's request context: workflow tools they call (approvals included) see the same actor, thread, and approvers.
 - Child output is data: it is escaped inside the `<subagent>` tag. A failed child reports `status="failed"` with a generic message; provider errors go to logs, as in [Errors in sent runs](#decisions).
-- Limits: with `depth: 1` (default) children get no subagent tools; reaching `concurrent` returns a tool error the model can act on. A slot frees in the commit that settles the child's answer.
+- Limits: with `depth: 1` (default) children get no subagent tools.
+- Lean, close to Pi Durable's examples 22 and 23 (2026-10-21): forks, `limits.concurrent`, the call-waits-for-background-children rule, child status lines, the subagents prompt section, and continuing foreground children were dropped. A foreground child is one-shot; only background children are named and continued.
 - Hosting: the Session's execution stays open while background children work, suspends whenever every live task (the lead's or a child's) waits on a workflow, and resumes when any of them completes; other input to the Session is processed meanwhile.
-- A fork starts at the entry before the delegating response, found from Pi's tool task input (`assistant`) with one bounded entry query, however long the history.
 - Work that waits for days, such as an approval, is still a workflow in `tools`. Orchestration from code is `ctx.agent`; there is no separate API.
-- Background children are owned by tasks in the lead's Session, so their work continues through ordinary deliveries; a report is an input to the lead like any other. Cancelling a run aborts the background children that run started or continued; aborting only the lead's Pi run does not. A stopped child reports nothing. Continuing a background child keeps it in the background, even without `background: true`.
+- Background children are owned by tasks in the lead's Session, so their work continues through ordinary deliveries; a report is an input to the lead like any other. Stopping or cancelling the lead aborts its conversation past the background boundary (`abort({ background: true })`), so its background children stop too. A stopped child reports nothing. Continuing a background child keeps it in the background, even without `background: true`.
 
-Compared with others: one tool per subagent routed by `description` follows Mastra and Eve; fresh context by default with an opt-in fork follows Claude's Agent SDK and Eve (Mastra forwards the full parent conversation by default); continuing a named child and background reports come from Pi; the call-waits-for-children rule comes from Eve's "a turn can't end while tasks are working".
+Compared with others: one tool per subagent routed by `description` follows Mastra and Eve; fresh context follows Claude's Agent SDK and Eve (Mastra forwards the full parent conversation by default); continuing a named background child and background reports come from Pi.
 
 #### Permissions
 
@@ -770,7 +768,7 @@ Mastra's [signals](https://mastra.ai/docs/harness/signals), [signal providers](h
 | Input kinds and delivery    | `sendMessage`, `queueMessage`, `sendSignal`, notifications | Mastra's notification inbox (priority, coalescing, summaries) is richer; borrowed in part. |
 | Home and automatic follows  | Channels (one chat thread → one session)                   | Fabrial also follows threads and computes session keys, so routing needs no state.         |
 | `ctx.follow`                | Signal providers + `github_subscribe_pr`                   | Mastra's registry is in memory, GitHub allows one PR per thread and polls.                 |
-| Subagents (fresh, `fork`)   | Subagent definitions, `forked: true`                       | Same modes. Pi adds persistent background subagents.                                       |
+| Subagents (fresh)           | Subagent definitions, `forked: true`                       | Same modes. Pi adds persistent background subagents.                                       |
 | Tool approvals as workflows | Permission policies with `ask`                             | Mastra's approvals live in memory and go stale on restart.                                 |
 | Session lease in Postgres   | Leases over pub/sub (Redis Streams across instances)       | No extra infrastructure.                                                                   |
 

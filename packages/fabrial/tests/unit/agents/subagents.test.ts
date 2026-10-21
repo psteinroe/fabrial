@@ -2,12 +2,8 @@ import { expect, it } from "vitest";
 import { z } from "zod";
 import { createFabrial } from "../../internals.ts";
 import { resolveSubagents } from "../../../src/agent.ts";
-import {
-	activityOf,
-	subagentResult,
-	subagentTool,
-	type SubagentDeps,
-} from "../../../src/agents/subagents.ts";
+import { activityOf } from "../../../src/agents/pi.ts";
+import { subagentResult, subagentTool, type SubagentDeps } from "../../../src/agents/subagents.ts";
 
 const f = createFabrial({ plugins: [] });
 const researcher = f.defineAgent({
@@ -29,13 +25,13 @@ it("resolves entries: names follow workflow tools, self is the lead, options def
 		subagents: [
 			researcher,
 			{ agent: reviewer, background: "never" },
-			{ agent: "self", context: "fork" },
+			{ agent: "self", background: "always" },
 		],
 	});
 	expect(resolveSubagents(lead)).toEqual([
-		{ tool: "bug_researcher", agent: researcher, context: "fresh", background: "allow" },
-		{ tool: "reviewer", agent: reviewer, context: "fresh", background: "never" },
-		{ tool: "lead", agent: lead, context: "fork", background: "allow" },
+		{ tool: "bug_researcher", agent: researcher, background: "allow" },
+		{ tool: "reviewer", agent: reviewer, background: "never" },
+		{ tool: "lead", agent: lead, background: "always" },
 	]);
 });
 
@@ -50,7 +46,7 @@ it("rejects duplicate names, collisions with tools, workflows, and no_reply, and
 	const define = (definition: Partial<Parameters<typeof f.defineAgent>[0]>) => () =>
 		f.defineAgent({ name: "lead", description: "Leads.", ...definition });
 	expect(define({ subagents: [researcher, researcher] })).toThrow("already uses");
-	expect(define({ subagents: ["self", { agent: "self", context: "fork" }] })).toThrow(
+	expect(define({ subagents: ["self", { agent: "self", background: "never" }] })).toThrow(
 		"already uses",
 	);
 	expect(define({ tools: [lookup], subagents: [researcher] })).toThrow("already uses");
@@ -63,34 +59,27 @@ it("rejects duplicate names, collisions with tools, workflows, and no_reply, and
 	).toThrow("already uses");
 	const noReply = f.defineAgent({ name: "no_reply", description: "Clashes with no_reply." });
 	expect(define({ subagents: [noReply] })).toThrow("already uses");
-	// @ts-expect-error context is "fresh" or "fork".
-	expect(define({ subagents: [{ agent: researcher, context: "copy" }] })).toThrow("context");
 	// @ts-expect-error background is "allow", "always", or "never".
 	expect(define({ subagents: [{ agent: researcher, background: "yes" }] })).toThrow("background");
 	// @ts-expect-error entries are agents, "self", or options.
 	expect(define({ subagents: ["researcher"] })).toThrow("must be an agent");
 	expect(define({ limits: { depth: 0 } })).toThrow("limits.depth");
-	expect(define({ limits: { concurrent: 1.5 } })).toThrow("limits.concurrent");
+	expect(define({ limits: { depth: 1.5 } })).toThrow("limits.depth");
 });
 
-const deps = (): SubagentDeps => ({
-	childAgent: () => ({}),
-	logger: { warn() {}, error() {}, debug() {}, info() {} },
-	busy: new Map(),
-	subagentTools: new Set(),
-});
+const deps = (): SubagentDeps => ({ childAgent: () => ({}) });
 
-it("shows a started tool's description as the status, and none for a subagent call: its child shows its own", () => {
+// Children show no status lines of their own: a subagent call shows like any tool, by its description.
+it("shows a started tool's description as the status, a subagent's like any tool's", () => {
 	const tools = [
 		{ name: "lookup", description: "Looks up a row" },
 		{ name: "researcher", description: researcher.definition.description },
 	];
 	const start = (toolName: string) => ({ type: "tool_execution_start", toolName });
-	const subagents = new Set(["researcher"]);
-	expect(activityOf([{ type: "message_start" }], tools, subagents)).toBe("Thinking…");
-	expect(activityOf([start("lookup")], tools, subagents)).toBe("Looks up a row");
-	expect(activityOf([start("researcher")], tools, subagents)).toBeUndefined();
-	expect(activityOf([{ type: "tool_execution_update" }], tools, subagents)).toBeUndefined();
+	expect(activityOf([{ type: "message_start" }], tools)).toBe("Thinking…");
+	expect(activityOf([start("lookup")], tools)).toBe("Looks up a row");
+	expect(activityOf([start("researcher")], tools)).toBe(researcher.definition.description);
+	expect(activityOf([{ type: "tool_execution_update" }], tools)).toBeUndefined();
 });
 
 it("generates one replay-safe tool per subagent, described by the agent's description", () => {
@@ -111,11 +100,8 @@ it("generates one replay-safe tool per subagent, described by the agent's descri
 		"name",
 		"background",
 	]);
-	// A child that never runs in the background is not offered the option.
-	expect(Object.keys((second!.parameters as { properties: object }).properties)).toEqual([
-		"task",
-		"name",
-	]);
+	// A child that never runs in the background is not offered the option, nor names to continue.
+	expect(Object.keys((second!.parameters as { properties: object }).properties)).toEqual(["task"]);
 });
 
 it("refuses background calls to a subagent that never runs in the background", async () => {

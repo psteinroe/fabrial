@@ -11,7 +11,7 @@ const lead = f.defineAgent({
 	name: "lead",
 	description: "Answers hard order questions.",
 	model: "anthropic/claude-sonnet-5",
-	subagents: [researcher, { agent: "self", context: "fork" }],
-	limits: { depth: 1, concurrent: 5 }, // the defaults
+	subagents: [researcher, { agent: "self", background: "never" }],
+	limits: { depth: 1 }, // the default
 });
 export {};

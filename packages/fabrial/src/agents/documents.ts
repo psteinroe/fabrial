@@ -33,49 +33,14 @@ export const Binding = defineDoc({
 	version: 1,
 	initial: (): { requestId: string | null } => ({ requestId: null }),
 });
-/** A subagent's identity and the subagent levels left below it; initial on a lead conversation. */
+/** A subagent's agent and the subagent levels left below it; initial on a lead conversation. */
 export const Subagent = defineDoc({
 	kind: "fabrial.subagent",
 	scope: "conversation",
 	history: "latest",
 	fork: "initial",
 	version: 1,
-	initial: (): { agent: string | null; name: string | null; depth: number | null } => ({
-		agent: null,
-		name: null,
-		depth: null,
-	}),
-});
-/** Named children per calling conversation: a continued child is forked, so a name moves to its newest conversation. */
-export const SubagentNames = defineDoc({
-	kind: "fabrial.subagent-names",
-	scope: "session",
-	version: 1,
-	initial: (): {
-		leads: Record<
-			string,
-			{
-				next: Record<string, number>;
-				children: Record<string, { agent: string; conversationId: number; background?: boolean }>;
-			}
-		>;
-	} => ({ leads: {} }),
-});
-/**
- * Subagent work that outlives a Session's opening. `slots` count running children per lead for `limits.concurrent`: one per
- * holder task (a foreground call or a background reporter), released when the holder ends. `calls` make a rerun of a
- * background call find its reporter; `reported` keeps several inputs that end in one answer from reporting it twice.
- */
-export const SubagentWork = defineDoc({
-	kind: "fabrial.subagent-work",
-	scope: "session",
-	version: 1,
-	initial: (): {
-		slots: Record<string, Record<string, string>>;
-		calls: Record<string, number>;
-		reporters: Record<string, { lead: number; child: number; name: string }>;
-		reported: Record<string, number[]>;
-	} => ({ slots: {}, calls: {}, reporters: {}, reported: {} }),
+	initial: (): { agent: string | null; depth: number | null } => ({ agent: null, depth: null }),
 });
 export const ChildResults = defineDoc({
 	kind: "fabrial.children",

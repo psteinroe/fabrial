@@ -68,10 +68,6 @@ export interface BridgeFrame {
 	 * reporter's settlement. Frees the task's slot in `children`.
 	 */
 	waitChild(taskId: number, executionId: string, context: Context): Promise<JsonObject>;
-	/** Shows a status on the lead's progress surface, if it has one. */
-	status?: (text: string) => Promise<void>;
-	/** Clears a child's activity shown with `status` under `label`, once the child answered. */
-	clearStatus?: (label: string) => Promise<void>;
 }
 export const BridgeKey = createContextKey<BridgeFrame>("fabrial.pi.bridge");
 /** Tool context without the per-call signal. */

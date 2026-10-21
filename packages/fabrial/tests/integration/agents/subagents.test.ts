@@ -10,7 +10,7 @@ import {
 	fauxToolCall,
 	type FauxResponseStep,
 } from "@earendil-works/pi-ai/providers/faux";
-import { createSession, type StorageWrite } from "@earendil-works/pi-durable";
+import type { StorageWrite } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
@@ -26,11 +26,10 @@ import {
 } from "../../internals.ts";
 import { toolName } from "../../../src/agent.ts";
 import { callSession, connectAgents } from "../../../src/agents/pi.ts";
-import { PostgresStorage } from "../../../src/agents/storage.ts";
-import { SubagentWork } from "../../../src/agents/documents.ts";
 import type { ExternalIdentity } from "../../../src/identity.ts";
 import { FakeChat } from "../../../src/testing.ts";
 import { until } from "../../conductor/helper.ts";
+import { PostgresStorage } from "../../../src/agents/storage.ts";
 import { useAgents } from "./setup.ts";
 
 const definitions = createFabrial({ plugins: [] });
@@ -230,6 +229,15 @@ function researcherOf(f: Fixture, tools: Parameters<typeof defineAgent>[0]["tool
 	});
 }
 
+function leadOf(f: Fixture, researcher: Agent) {
+	return defineAgent({
+		name: `lead-${short()}`,
+		description: "Answers support questions.",
+		model: f.model,
+		subagents: [researcher],
+	});
+}
+
 it("a fresh foreground child answers its task and the lead uses the escaped result", async () => {
 	const f = fixture();
 	const researcher = researcherOf(f);
@@ -261,92 +269,16 @@ it("a fresh foreground child answers its task and the lead uses the escaped resu
 	expect(prompt(child!)).toContain("You research.");
 	expect(toolNames(child!)).toEqual([]);
 	expect(toolResults(last!)).toEqual([
-		`<subagent name="${tool}-1" status="done">It is &lt;b&gt;DNS&lt;/b&gt; &amp; &lt;/subagent&gt;</subagent>`,
+		`<subagent name="${tool}" status="done">It is &lt;b&gt;DNS&lt;/b&gt; &amp; &lt;/subagent&gt;</subagent>`,
 	]);
 	// Owned by the lead's tool call, in the lead's Session.
 	const conversations = (await f.writes()).filter((write) => write.type === "conversation");
 	expect(conversations).toHaveLength(2);
 	expect(conversations[1]!.value).toMatchObject({ owner: { taskId: expect.any(Number) } });
-	// Child activity shows on the lead's progress status.
+	// The child shows no status line of its own; the lead's shows the subagent tool like any tool.
 	const statuses = (await f.chat.thread(f.metadata.replyTo as Parameters<typeof f.chat.thread>[0]))
 		.statuses;
-	expect(statuses).toContain(`${researcher.name}: Thinking…`);
-	await f.integration.stop();
-});
-
-it("a forked self copy sees the lead's transcript and gets no subagent tools at depth 1", async () => {
-	const f = fixture();
-	const lead = defineAgent({
-		name: `lead-${short()}`,
-		description: "Answers support questions.",
-		model: f.model,
-		instructions: "You lead.",
-		subagents: [{ agent: "self", context: "fork", background: "never" }],
-	});
-	const tool = toolName(lead.name);
-	f.respond([
-		fauxAssistantMessage(fauxToolCall(tool, { task: "What was the code word?" }), {
-			stopReason: "toolUse",
-		}),
-		fauxAssistantMessage("pineapple"),
-		fauxAssistantMessage("done"),
-	]);
-	const { settled } = await f.call(lead, "The code word is pineapple.");
-	expect(await settled()).toMatchObject({ status: "completed", output: "done" });
-	const [first, child, last] = f.contexts;
-	expect(
-		Object.keys(toolsOf(first!).find((each) => each.name === tool)!.parameters.properties),
-	).toEqual(["task", "name"]);
-	expect(userTexts(child!)).toEqual(["The code word is pineapple.", "What was the code word?"]);
-	// The fork ends before the response that delegated, so it holds no dangling call.
-	expect(child!.messages.filter((message) => message.role === "assistant")).toEqual([]);
-	expect(prompt(child!)).toContain("You lead.");
-	expect(toolNames(child!)).toEqual([]);
-	expect(toolResults(last!)[0]).toBe(
-		`<subagent name="${tool}-1" status="done">pineapple</subagent>`,
-	);
-	await f.integration.stop();
-});
-
-it("forks at the delegating response behind a long history", async () => {
-	const f = fixture();
-	const note = defineTool({
-		name: "note",
-		description: "Takes a note",
-		input: z.object({ n: z.number() }),
-		run: ({ n }) => `noted ${n}`,
-	});
-	const lead = defineAgent({
-		name: `lead-${short()}`,
-		description: "Answers support questions.",
-		model: f.model,
-		tools: [note],
-		subagents: [{ agent: "self", context: "fork", background: "never" }],
-	});
-	const tool = toolName(lead.name);
-	const notes = (from: number, count: number) =>
-		Array.from({ length: count }, (_, i) => fauxToolCall("note", { n: from + i }));
-	// Far more than a page of entries before the delegating response, and more after it within the same response.
-	f.respond([
-		fauxAssistantMessage(notes(0, 120), { stopReason: "toolUse" }),
-		fauxAssistantMessage([...notes(120, 5), fauxToolCall(tool, { task: "Count the notes." })], {
-			stopReason: "toolUse",
-		}),
-		fauxAssistantMessage("120"),
-		fauxAssistantMessage("done"),
-	]);
-	const { settled } = await f.call(lead, "Take 120 notes.");
-	expect(await settled()).toMatchObject({ status: "completed", output: "done" });
-	const child = f.contexts[2]!;
-	expect(userTexts(child)).toEqual(["Take 120 notes.", "Count the notes."]);
-	expect(toolResults(child)).toEqual(Array.from({ length: 120 }, (_, n) => `noted ${n}`));
-	// The fork ends before the response that delegated, so it holds no dangling call.
-	const calls = child.messages.flatMap((message) =>
-		message.role === "assistant"
-			? message.content.filter((block) => block.type === "toolCall")
-			: [],
-	);
-	expect(calls).toHaveLength(120);
+	expect(statuses.filter((status) => status?.startsWith(`${researcher.name}: `))).toEqual([]);
 	await f.integration.stop();
 });
 
@@ -372,20 +304,16 @@ it("depth 2 passes one level down: a self copy gets the subagent tool, its child
 	const offered = [tool, "subagent_stop"];
 	expect(f.contexts.map(toolNames)).toEqual([offered, offered, [], offered, offered]);
 	expect(toolResults(f.contexts[3]!)).toEqual([
-		`<subagent name="${tool}-1" status="done">deepest</subagent>`,
+		`<subagent name="${tool}" status="done">deepest</subagent>`,
 	]);
 	await f.integration.stop();
 });
 
-it("continuing a named child keeps its history; unknown names are tool errors", async () => {
+// Foreground children are one-shot (Pi example 22): only background children have names to continue.
+it("a name continues only a background child; unknown names are tool errors", async () => {
 	const f = fixture();
 	const researcher = researcherOf(f);
-	const lead = defineAgent({
-		name: `lead-${short()}`,
-		description: "Answers support questions.",
-		model: f.model,
-		subagents: [researcher],
-	});
+	const lead = leadOf(f, researcher);
 	const tool = toolName(researcher.name);
 	f.respond([
 		fauxAssistantMessage(fauxToolCall(tool, { task: "Remember 7" }), { stopReason: "toolUse" }),
@@ -397,49 +325,15 @@ it("continuing a named child keeps its history; unknown names are tool errors", 
 			],
 			{ stopReason: "toolUse" },
 		),
-		fauxAssistantMessage("7"),
 		fauxAssistantMessage("done"),
 	]);
 	const { settled } = await f.call(lead, "Go");
-	await settled();
 	expect(await settled()).toMatchObject({ status: "completed", output: "done" });
-	const continued = f.contexts[3]!;
-	expect(userTexts(continued)).toEqual(["Remember 7", "What number?"]);
-	expect(toolResults(f.contexts[4]!)).toEqual([
-		`<subagent name="${tool}-1" status="done">Remembered.</subagent>`,
-		`<subagent name="${tool}-1" status="done">7</subagent>`,
+	expect(toolResults(f.contexts.at(-1)!)).toEqual([
+		`<subagent name="${tool}" status="done">Remembered.</subagent>`,
+		`There is no ${tool} child called ${tool}-1. Call ${tool} without a name to start one.`,
 		`There is no ${tool} child called nobody. Call ${tool} without a name to start one.`,
 	]);
-	await f.integration.stop();
-});
-
-it("limits.concurrent turns away calls beyond the limit with an error the model can act on", async () => {
-	const f = fixture();
-	const researcher = researcherOf(f);
-	const lead = defineAgent({
-		name: `lead-${short()}`,
-		description: "Answers support questions.",
-		model: f.model,
-		subagents: [researcher],
-		limits: { concurrent: 1 },
-	});
-	const tool = toolName(researcher.name);
-	f.respond([
-		fauxAssistantMessage(
-			[fauxToolCall(tool, { task: "one" }), fauxToolCall(tool, { task: "two" })],
-			{ stopReason: "toolUse" },
-		),
-		fauxAssistantMessage("answer"),
-		fauxAssistantMessage("done"),
-	]);
-	const { settled } = await f.call(lead, "Go");
-	expect(await settled()).toMatchObject({ status: "completed", output: "done" });
-	const results = toolResults(f.contexts[2]!);
-	expect(results).toHaveLength(2);
-	expect(results.filter((text) => text.includes('status="done">answer'))).toHaveLength(1);
-	expect(results.filter((text) => text.includes("the limit for this conversation"))).toHaveLength(
-		1,
-	);
 	await f.integration.stop();
 });
 
@@ -570,7 +464,7 @@ it("a child that fails returns a generic failed result and logs the provider err
 	const [result] = toolResults(f.contexts[2]!);
 	expect(result).toMatch(
 		new RegExp(
-			`^<subagent name="${tool}-1" status="failed">The subagent stopped without an answer \\(error id [0-9a-f]{12}\\)`,
+			`^<subagent name="${tool}" status="failed">The subagent stopped without an answer \\(error id [0-9a-f]{12}\\)`,
 		),
 	);
 	expect(result).not.toContain("x-api-key");
@@ -613,17 +507,10 @@ function gate() {
 	const opened = new Promise<void>((resolve) => (open = resolve));
 	return { open, opened };
 }
-function leadOf(f: Fixture, researcher: Agent, limits?: { concurrent?: number }) {
-	return defineAgent({
-		name: `lead-${short()}`,
-		description: "Answers support questions.",
-		model: f.model,
-		subagents: [researcher],
-		...(limits ? { limits } : {}),
-	});
-}
 
-it("a background child returns its name at once; a call settles after the lead answered its report", async () => {
+// A call no longer waits for its background children: it returns the lead's answer, and the report arrives later as
+// input to the lead's Session, which stays open until it was answered.
+it("a background child returns its name at once; the call returns the lead's answer, the report arrives later", async () => {
 	const f = fixture();
 	const researcher = researcherOf(f);
 	const lead = leadOf(f, researcher);
@@ -637,7 +524,7 @@ it("a background child returns its name at once; a call settles after the lead a
 		return say(`unexpected: ${text}`);
 	});
 	const { settled } = await f.call(lead, "Why is the site down?");
-	expect(await settled()).toEqual({ status: "completed", output: "Final: DNS" });
+	expect(await settled()).toEqual({ status: "completed", output: "I asked a researcher." });
 	const started = f.contexts.find((context) => lastText(context).startsWith("Started"))!;
 	expect(lastText(started)).toBe(
 		`Started ${tool}-1 in the background. Its answer arrives later as input <subagent name="${tool}-1">; continue meanwhile.`,
@@ -646,14 +533,7 @@ it("a background child returns its name at once; a call settles after the lead a
 	expect(lastText(report)).toBe(
 		`<subagent name="${tool}-1" status="done">It is &lt;DNS&gt;</subagent>`,
 	);
-	// The status section lists children from durable state, only once there are some.
-	expect(prompt(f.contexts[0]!)).not.toContain("Your subagents");
-	expect(prompt(report)).toMatch(
-		new RegExp(`- ${tool}-1 \\(${researcher.name}, background\\): (working|idle)`),
-	);
 	expect(await requests(f, "fabrial.subagent-report:")).toHaveLength(1);
-	// No status assertion: the lead's own status follows the child's within the chat thread's throttle window,
-	// so the child's never shows. Foreground children show theirs (above).
 	await f.integration.stop();
 });
 
@@ -692,7 +572,7 @@ it("a background report replayed after its submission is submitted and answered 
 		maxAttempts: 3,
 	};
 	const { settled } = await f.call(lead, "Why is the site down?");
-	expect(await settled()).toEqual({ status: "completed", output: "Final: DNS" });
+	expect(await settled()).toEqual({ status: "completed", output: "I asked a researcher." });
 	expect(replays).toBe(2);
 	const [report] = await requests(f, "fabrial.subagent-report:");
 	const ids = new Set(
@@ -747,7 +627,7 @@ it("continuing a busy background child steers it; an idle one gets new input; ea
 		}),
 	);
 	const { settled } = await f.call(lead, "Go");
-	expect(await settled()).toEqual({ status: "completed", output: "Final" });
+	expect(await settled()).toEqual({ status: "completed", output: "Waiting." });
 	const reports = f.contexts.map(lastText).filter((text) => text.startsWith("<subagent"));
 	expect(reports).toEqual([
 		`<subagent name="${name}" status="done">1 2 3 4</subagent>`,
@@ -854,69 +734,13 @@ it("a background child's report survives the Session being released and the driv
 			},
 		},
 	]);
-	expect(await settled()).toEqual({ status: "completed", output: "Final" });
+	expect(await settled()).toEqual({ status: "completed", output: "Working on it." });
 	expect(released).toBe(true);
 	expect(crashes).toBeGreaterThanOrEqual(1);
 	expect(await requests(f, "fabrial.subagent-report:")).toHaveLength(1);
 	expect(f.contexts.map(lastText).filter((text) => text.startsWith("<subagent"))).toEqual([
 		`<subagent name="${tool}-1" status="done">fixed</subagent>`,
 	]);
-	await f.integration.stop();
-});
-
-it("limits.concurrent counts a running background child durably across driver attempts", async () => {
-	const f = fixture();
-	const held = gate();
-	const crashed = gate();
-	let runs = 0;
-	const hold = defineTool({
-		name: "hold",
-		description: "Holds",
-		input: z.object({}),
-		run: async (_input, ctx) => {
-			// The first run replaces the Session owner: the driver loses its lease and is redelivered.
-			if (!runs++) {
-				await sql()`UPDATE fabrial_pi.sessions SET epoch = epoch + 1, owner = NULL, lease_until = NULL
-					WHERE key = ${f.key()}`;
-				crashed.open();
-			}
-			await Promise.race([
-				held.opened,
-				new Promise((_resolve, reject) =>
-					ctx.signal.addEventListener("abort", () => reject(ctx.signal.reason), { once: true }),
-				),
-			]);
-			return "held";
-		},
-	});
-	const researcher = researcherOf(f, [hold]);
-	const lead = leadOf(f, researcher, { concurrent: 1 });
-	const tool = toolName(researcher.name);
-	route(f, async (text) => {
-		if (text.includes("Go")) return use(tool, { task: "Hold on", background: true });
-		if (text.startsWith("Started")) {
-			// Ask for a second child only from the redelivered driver, which has no memory of the first.
-			await crashed.opened;
-			return use(tool, { task: "Another", background: true });
-		}
-		if (text.includes("already running")) {
-			held.open();
-			return say("Waiting for the first.");
-		}
-		if (text === "Hold on" || text.includes("hold was interrupted")) return use("hold", {});
-		if (text === "held") return say("held");
-		if (text.startsWith("<subagent")) return say("Final");
-		return say(`unexpected: ${text}`);
-	});
-	f.integration.workflows.find((workflow) => workflow.name === "fabrial.session")!.retries = {
-		maxAttempts: 3,
-	};
-	const { settled } = await f.call(lead, "Go");
-	expect(await settled()).toEqual({ status: "completed", output: "Final" });
-	expect(f.contexts.map(lastText)).toContain(
-		`1 subagents are already running, the limit for this conversation. Wait for one of them to answer, then call ${tool} again.`,
-	);
-	expect(await requests(f, "fabrial.subagent-report:")).toHaveLength(1);
 	await f.integration.stop();
 });
 
@@ -1034,7 +858,7 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 		expect(await db.execution(id).settled()).toMatchObject({
 			status: "completed",
 			output: {
-				answer: `Lead: <subagent name="${toolName(researcher.name)}-1" status="done">Fixed after approval.</subagent>`,
+				answer: `Lead: <subagent name="${toolName(researcher.name)}" status="done">Fixed after approval.</subagent>`,
 			},
 		});
 		// One card, decided in place.
@@ -1122,10 +946,11 @@ it.each([
 			.poll(() => f.contexts.map(lastText), { timeout: 10_000 })
 			.toContain(order[0] === "lead" ? '"lead went"' : '"child went"');
 		await waiters[order[1]].go();
-		expect(await settled()).toEqual({
-			status: "completed",
-			output: `Final: <subagent name="${tool}-1" status="done">child done</subagent>`,
-		});
+		// The call returns the lead's answer; the child's report arrives as input before the Session closes.
+		expect(await settled()).toEqual({ status: "completed", output: "Waiting for the researcher." });
+		expect(f.contexts.map(lastText)).toContain(
+			`<subagent name="${tool}-1" status="done">child done</subagent>`,
+		);
 		await f.integration.stop();
 	},
 );
@@ -1361,49 +1186,6 @@ it("a background child waiting for approval suspends the Session: a new message 
 			]);
 		await idle(client.queue);
 	}
-});
-
-it("a child's answer frees its concurrency slot as it settles, and its status line gives way to the lead's", async () => {
-	const f = fixture();
-	const researcher = researcherOf(f);
-	const lead = leadOf(f, researcher, { concurrent: 1 });
-	const tool = toolName(researcher.name);
-	route(f, (text) => {
-		if (text.includes("Go")) return use(tool, { task: "First" });
-		if (text === "First") return slowly(say("one"));
-		if (text.startsWith(`<subagent name="${tool}-1"`))
-			return use(tool, { task: "Second", background: true });
-		if (text === "Second") return slowly(say("two"));
-		if (text.startsWith("Started")) return say("Waiting.");
-		if (text.startsWith(`<subagent name="${tool}-2"`)) return say("Final");
-		return say(`unexpected: ${text}`);
-	});
-	const { settled } = await f.call(lead, "Go");
-	expect(await settled()).toEqual({ status: "completed", output: "Final" });
-	const storage = await PostgresStorage.open(sql(), f.key());
-	const session = createSession(storage);
-	try {
-		// Holders stay recorded, so a rerun is admitted, but none counts against the limit.
-		const slots = Object.values((await session.snapshot(SubagentWork, BACKGROUND_CONTEXT))!.slots);
-		const values = slots.flatMap((each) => Object.values(each));
-		expect(values.length).toBeGreaterThan(0);
-		expect(new Set(values)).toEqual(new Set([""]));
-	} finally {
-		await session.close(BACKGROUND_CONTEXT);
-	}
-	// Each child's activity is followed by the lead's own status, not left showing until the driver ends.
-	const statuses = (await f.chat.thread(f.metadata.replyTo as Parameters<typeof f.chat.thread>[0]))
-		.statuses;
-	const child = statuses.flatMap((status, index) =>
-		status?.startsWith(`${researcher.name}: `) ? [index] : [],
-	);
-	expect(child.length).toBeGreaterThan(0);
-	for (const index of child)
-		expect(
-			// Before the status the driver clears as it ends.
-			statuses.slice(index + 1, -1).find((status) => !status?.startsWith(`${researcher.name}: `)),
-		).not.toBeUndefined();
-	await f.integration.stop();
 });
 
 /**

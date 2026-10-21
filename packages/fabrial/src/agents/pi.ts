@@ -71,12 +71,8 @@ import {
 import type { AnyWorkflow } from "../workflow.ts";
 import { instructionsSection, jsonSchemaOf, piToolOf, toJsonSchema } from "./tools.ts";
 import {
-	abortBackground,
 	backgroundPending,
-	activityOf,
-	reportedAnswer,
 	stopTool,
-	subagentsSection,
 	subagentTasks,
 	subagentTool,
 	type SubagentDeps,
@@ -241,6 +237,22 @@ export interface PiOptions {
 
 const RECLAIM_WORKFLOW = "fabrial.sessions.reclaim";
 
+/**
+ * The status a batch of a conversation's Pi events shows: the newest started tool's description, or "Thinking…"; none
+ * for only detail updates.
+ */
+export function activityOf(
+	batch: readonly { type: string }[],
+	tools: readonly { name: string; description?: string }[],
+): string | undefined {
+	if (batch.every((event) => event.type === "tool_execution_update")) return undefined;
+	const tool = batch.findLast((event) => event.type === "tool_execution_start") as
+		| { toolName: string }
+		| undefined;
+	if (!tool) return "Thinking…";
+	return tools.find((each) => each.name === tool.toolName)?.description ?? "Using a tool…";
+}
+
 /** Pi's agents, their state and evaluation, connected to the host. Core calls it directly. */
 export type Agents = ReturnType<typeof connectAgents>;
 
@@ -261,17 +273,12 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		plugin.hooks?.agent ? [plugin.hooks.agent] : [],
 	);
 	const noReply = noReplyTool();
-	const subagentDeps: SubagentDeps = {
-		childAgent,
-		logger: host.logger,
-		busy: new Map(),
-		subagentTools: new Set(),
-	};
+	const subagentDeps: SubagentDeps = { childAgent };
 	const internal = defineExtension({
 		name: "fabrial.internal",
 		tools: [noReply],
 		// Background subagent tasks resume after a restart wherever a Session is opened.
-		tasks: subagentTasks(subagentDeps),
+		tasks: subagentTasks,
 		hooks: observers.length ? observerHooks(observers, host) : [],
 	});
 	registry.install(internal);
@@ -343,7 +350,6 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				throw new Error(
 					`Agent ${name}: subagent ${subagent.agent.name} is called ${subagent.tool}, which a toolkit tool already uses`,
 				);
-			subagentDeps.subagentTools.add(subagent.tool);
 			if (subagent.agent !== agent) install(subagent.agent);
 		}
 		const section = instructionsSection("agent-instructions", instructions);
@@ -373,7 +379,6 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 						...subagents.map((subagent) => subagentTool(agent, subagent, subagentDeps)),
 						stopTool(),
 					],
-					sections: [subagentsSection],
 				})
 			: undefined;
 		if (delegates) registry.install(delegates);
@@ -568,9 +573,8 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		const signal = AbortSignal.any([ctx.signal, storage.lost.signal]);
 		/** The agents' conversations this opening configured, by agent name. */
 		const conversations = new Map<string, Hosted>();
-		/** Progress of the conversations with outstanding obligations, by conversation id; the newest shows child status. */
+		/** Progress of the conversations with outstanding obligations, by conversation id. */
 		const views = new Map<number, View>();
-		let latest: View | undefined;
 		const outcomes = new Map<string, CallOutcome>();
 		const frame: BridgeFrame = {
 			host,
@@ -597,8 +601,6 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 					})(),
 					context,
 				).finally(() => frame.children.delete(taskId)),
-			status: async (text) => latest?.status(text),
-			clearStatus: async (label) => latest?.clearStatus(label),
 		};
 		const context = withContextValue(BridgeKey, frame, withAbortSignal(signal, BACKGROUND_CONTEXT));
 		let queue: Promise<unknown> = Promise.resolve();
@@ -733,7 +735,6 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				view = await progressOf(conversation, io, harness, context);
 				views.set(conversation.id, view);
 			}
-			latest = view;
 			return view;
 		}
 
@@ -741,7 +742,6 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 			const view = views.get(conversationId);
 			if (!view) return;
 			views.delete(conversationId);
-			if (latest === view) latest = [...views.values()].at(-1);
 			await view.stop();
 		}
 
@@ -787,8 +787,8 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		 * A stop in a followed thread aborts the agent's conversation through Pi: its queued inputs are withdrawn and its
 		 * live task tree is aborted. Its requests are marked stopped, answered or not, and the workflows their tools
 		 * started are cancelled: a background child's tools act for the lead's request, so its workflows go too, also
-		 * after the lead's answer posted. Background children acting for its requests are aborted past the background
-		 * boundary. Nothing more is owed for its requests, nor for reports on them. Calls have their own Session and
+		 * after the lead's answer posted. The abort reaches past the background boundary: the conversation's background
+		 * children and their reports stop too. Nothing more is owed for its requests, nor for reports on them. Calls have their own Session and
 		 * belong to their workflow.
 		 */
 		async function stop(agentName: string, reason: string) {
@@ -824,8 +824,8 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				reason,
 				context,
 			);
-			await abortBackground(harness, requests, context);
-			await conversation.abort(context);
+			// Past the background boundary: the lead's background children and their reports stop too.
+			await conversation.abort(context, { background: true });
 			await harness.commit(async (tx) => {
 				for (const [requestId, obligation] of Object.entries((await tx.doc(Obligations)).requests))
 					if (requests.has(requestId) || requests.has(obligation.origin ?? ""))
@@ -1102,13 +1102,11 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 
 		/**
 		 * Reconcile one conversation's outstanding obligations with Pi's submissions: post what Pi answered, and settle a
-		 * call once its answer is final. A call that failed settles at once; one that answered settles once its background
-		 * children reported and the lead answered the last report, and every post of the conversation settled.
+		 * call once its answer is final. A call that failed settles at once; one that answered settles with the lead's
+		 * answer once every post of the conversation settled.
 		 */
 		async function evaluate(conversationId: ConversationId) {
 			const { conversation } = await hostedOf(conversationId);
-			// Read before the reports: a reporter records its report as it ends, so one that ended by now is among them.
-			const background = await backgroundPending(harness, context);
 			const sent = await postAnswers(conversation);
 			let queued = sent.queued;
 			const live = async () => (await harness.snapshot(LiveDoc, conversationId, context))?.run;
@@ -1133,15 +1131,13 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				}
 				if (
 					record.status !== "done" ||
-					background ||
 					(await live()) ||
 					(await deliveriesPending(conversationId)).length
 				)
 					continue;
-				// A call returns its own answer, or the lead's answer to its children's last report.
+				// A call returns the lead's answer; its background children's reports arrive later as input.
 				const answer =
-					(await reportedAnswer(harness, submissionOf, requestId, conversationId, context)) ??
-					(record.type === "input" ? await answerOf(conversation, record.answer) : undefined);
+					record.type === "input" ? await answerOf(conversation, record.answer) : undefined;
 				await finishCall(conversationId, requestId, { status: "completed", output: answer ?? "" });
 			}
 			// Pi places queued input only at a boundary of a run or with the next submission. After a failed run nothing
@@ -1283,7 +1279,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 
 	/**
 	 * Progress of a conversation: on the thread a call owns (`io`), or on the reply thread of the latest sent request it
-	 * follows. Shows "Thinking…", tool activity, a subagent's activity, and "Waiting for the model provider…" while a
+	 * follows. Shows "Thinking…", tool activity, and "Waiting for the model provider…" while a
 	 * generation backs off.
 	 */
 	async function progressOf(
@@ -1295,7 +1291,6 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		let progress = io;
 		let progressRequest: string | undefined;
 		let waiting = false;
-		let childStatus: string | undefined;
 		const shown = new Map<string, SDKThread>();
 		const setStatus = async (thread: SDKThread | undefined, text: string | null) => {
 			if (thread)
@@ -1323,11 +1318,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 			}
 			// The chat thread throttles statuses.
 			if (waiting || !progress) return;
-			const text = activityOf(
-				batch,
-				(await conversation.agent(context)).tools,
-				subagentDeps.subagentTools,
-			);
+			const text = activityOf(batch, (await conversation.agent(context)).tools);
 			if (text) await showStatus(text);
 		});
 		await thinking();
@@ -1344,19 +1335,6 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				if (progressRequest !== requestId) return;
 				await setStatus(progress, null);
 				progress = undefined;
-			},
-			async status(text: string) {
-				if (waiting || text === childStatus) return;
-				childStatus = text;
-				await showStatus(text);
-			},
-			// A child that answered gives the status back to the lead: its own activity, or none when idle.
-			async clearStatus(label: string) {
-				if (!childStatus?.startsWith(`${label}: `)) return;
-				childStatus = undefined;
-				if (waiting) return;
-				if ((await harness.snapshot(LiveDoc, conversation.id, context))?.run) await thinking();
-				else await setStatus(progress, null);
 			},
 			async stop() {
 				await events.stop();

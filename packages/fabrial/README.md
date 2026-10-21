@@ -259,15 +259,15 @@ const lead = f.defineAgent({
 	name: "lead",
 	description: "Answers hard order questions.",
 	model: "anthropic/claude-sonnet-5",
-	subagents: [researcher, { agent: "self", context: "fork" }],
-	limits: { depth: 1, concurrent: 5 }, // the defaults
+	subagents: [researcher, { agent: "self", background: "never" }],
+	limits: { depth: 1 }, // the default
 });
 ```
 
-- Each entry is an agent, `"self"`, or `{ agent, context?: "fresh" | "fork", background?: "allow" | "always" | "never" }`, and becomes one tool named after the agent: `researcher({ task, name?, background? })`. Name collisions with tools fail at definition.
-- A call runs a child conversation in the lead's Session and returns `<subagent name="researcher-1" status="done">…</subagent>`; pass `name` to continue that child. `"fresh"` children see only their task, `"fork"` children the lead's transcript so far. Unset `model` and `thinking` follow the lead.
-- `background: true` returns at once; the answer reaches the lead later as input, once. `subagent_stop({ name })` aborts a child's current work.
-- Children post nothing themselves; their tools act for the lead's current request (same actor, thread, approvers). Cancelling the lead aborts them. More than `concurrent` running children is a tool error the model can act on.
+- Each entry is an agent, `"self"`, or `{ agent, background?: "allow" | "always" | "never" }`, and becomes one tool named after the agent: `researcher({ task, name?, background? })` (only `task` when `background: "never"`). Name collisions with tools fail at definition.
+- A foreground call runs a fresh child conversation in the lead's Session that sees only its task, and returns `<subagent name="researcher" status="done">…</subagent>` (escaped). Unset `model` and `thinking` follow the lead.
+- `background: true` returns a name at once (`researcher-1`); the answer reaches the lead later as input, once, `<subagent name="researcher-1" …>`. Pass `name` to send that child another task (it steers a busy child); `subagent_stop({ name })` aborts its current work. A `ctx.agent` call returns the lead's answer; reports to it arrive later in the call's Session.
+- Children post nothing themselves and show no status lines; their tools act for the lead request that sent them their task (same actor, thread, approvers). Cancelling or stopping the lead aborts them, background children included. With `depth: 1` children get no subagent tools.
 
 ### State
 
