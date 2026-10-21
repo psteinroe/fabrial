@@ -21,12 +21,14 @@ import {
 } from "./send.ts";
 import type { AnyWorkflow, ExecutionInfo, WorkflowContext } from "./workflow.ts";
 import type { Json, JsonObject } from "./json.ts";
-import type {
-	AgentRef,
-	DurableExecution,
-	Follow,
-	InvocationMetadata,
-	RuntimeWorkflow,
+import {
+	CHILD_SIGNAL,
+	type AgentRef,
+	type ChildSignal,
+	type DurableExecution,
+	type Follow,
+	type InvocationMetadata,
+	type RuntimeWorkflow,
 } from "./runtime.ts";
 import type { ChatMessage, ThreadRef } from "./thread.ts";
 import { createContext } from "./context.ts";
@@ -433,6 +435,40 @@ export function buildApp(config: CoreConfig): App {
 				: next(ctx);
 		return run(0, context);
 	};
+	/**
+	 * Runs a handler; an execution a Session waits on (a tool's workflow or effect, `notify` metadata) sends the Session
+	 * its outcome as it completes or fails for good, so a Session busy with other work resumes the tool at once.
+	 */
+	const settling = async (
+		execution: DurableExecution,
+		run: () => Promise<Json | void>,
+	): Promise<Json | void> => {
+		const target = execution.metadata.notify;
+		if (typeof target !== "string") return run();
+		const notify = (result: ChildSignal["result"]) =>
+			runtime.signal(target, {
+				name: CHILD_SIGNAL,
+				id: `child:${execution.executionId}`,
+				payload: { executionId: execution.executionId, result } satisfies ChildSignal,
+			});
+		let output: Json | void;
+		try {
+			output = await run();
+		} catch (error) {
+			// Suspended, cancelled or stopped attempts end without an outcome; a retried failure is not one either.
+			if (!execution.signal.aborted && (await execution.finalAttempt().catch(() => false)))
+				await notify({
+					status: "failed",
+					error: error instanceof Error ? error.message : String(error),
+				}).catch(() => {});
+			throw error;
+		}
+		await notify({
+			status: "completed",
+			output: JSON.parse(JSON.stringify(output ?? null)) as Json,
+		});
+		return output;
+	};
 	const workflows: RuntimeWorkflow[] = config.workflows.map((workflow) => ({
 		name: workflow.name,
 		// The routing workflow starts app workflows; they have no runtime triggers.
@@ -453,8 +489,8 @@ export function buildApp(config: CoreConfig): App {
 				next,
 			);
 		},
-		handler: (input, _execution, context) =>
-			workflow.definition.run(input, context as WorkflowContext),
+		handler: (input, execution, context) =>
+			settling(execution, () => workflow.definition.run(input, context as WorkflowContext)),
 	}));
 	const extraWorkflows = new Map((agents?.agents.workflows() ?? []).map((w) => [w.name, w]));
 	for (const workflow of agents?.workflows ?? []) extraWorkflows.set(workflow.name, workflow);
@@ -488,7 +524,7 @@ export function buildApp(config: CoreConfig): App {
 					next,
 				);
 			},
-			handler: (input, execution) => workflow.handler(input, execution),
+			handler: (input, execution) => settling(execution, () => workflow.handler(input, execution)),
 		});
 	// Routing is plumbing: no workflow context or plugin middleware.
 	workflows.push({

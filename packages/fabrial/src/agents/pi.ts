@@ -34,6 +34,8 @@ import {
 	type AgentPort,
 	type AgentRef,
 	type DurableExecution,
+	CHILD_SIGNAL,
+	type ChildSignal,
 	ExecutionError,
 	isCancelled,
 	type WaitBranch,
@@ -526,10 +528,24 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				late.push({ payload: input, id, done: (error) => (error ? reject(error) : resolve()) }),
 			);
 		});
+		// Outcomes children sent with their `child` signal, by execution id: the waiting tool resumes in process, also
+		// when the Session is busy with other work. Kept for this attempt, across reopenings.
+		const reported = new Map<string, PromiseWithResolvers<JsonObject>>();
+		const reportOf = (executionId: string) => {
+			let entry = reported.get(executionId);
+			if (!entry) reported.set(executionId, (entry = Promise.withResolvers<JsonObject>()));
+			return entry;
+		};
+		// Returns at once: a signal arriving while the Session closes does not win its wait, but the child's execution
+		// branch does once its outcome is committed. While suspended, the signal wins the wait.
+		execution.onSignal(CHILD_SIGNAL, (payload) => {
+			const { executionId, result } = payload as unknown as ChildSignal;
+			reportOf(executionId).resolve(result);
+		});
 		try {
 			for (;;) {
 				phase = "opening";
-				const session = await openSession(key, execution);
+				const session = await openSession(key, execution, reportOf);
 				hosted = session;
 				phase = "open";
 				for (const each of late.splice(0))
@@ -546,7 +562,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				// Input handled after Pi went idle has not run yet.
 				if (missed) continue;
 				if (idle.kind === "parked") {
-					const branches: Record<string, WaitBranch> = { input: { signal: "input" } };
+					const branches: Record<string, WaitBranch> = {
+						input: { signal: "input" },
+						child: { signal: CHILD_SIGNAL },
+					};
 					for (const [taskId, executionId] of idle.children)
 						branches[`task:${taskId}`] = { execution: executionId };
 					await execution.waitForAny(`idle:${idle.n}`, branches);
@@ -579,7 +598,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		outcomes: Map<string, CallOutcome>;
 	}
 
-	async function openSession(key: string, execution: DurableExecution): Promise<SessionHost> {
+	async function openSession(
+		key: string,
+		execution: DurableExecution,
+		reportOf: (executionId: string) => PromiseWithResolvers<JsonObject>,
+	): Promise<SessionHost> {
 		// A crashed owner's lease lasts until it expires, and `ctx.state` takes the lease briefly: SessionBusy
 		// fails the attempt, and Conductor retries it with backoff (the Session workflow's attempts cover a lease).
 		const storage = await PostgresStorage.open(options.sql, key);
@@ -605,8 +628,10 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					(async () => {
 						const settled = await host.runtime.getExecution(executionId);
 						if (!settled) throw new Error(`Execution ${executionId} not found`);
-						if (!settled.result) return new Promise<never>(() => {});
-						const result = cloneJson(settled.result) as unknown as JsonObject;
+						// The child's signal can arrive before its outcome is committed: it carries the outcome.
+						const result = settled.result
+							? (cloneJson(settled.result) as unknown as JsonObject)
+							: await reportOf(executionId).promise;
 						return harness.commit(
 							async (tx) => ((await tx.doc(ChildResults)).results[executionId] ??= result),
 							context,

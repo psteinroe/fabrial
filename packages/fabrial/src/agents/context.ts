@@ -61,8 +61,9 @@ export interface BridgeFrame {
 	/** The run a conversation's current request belongs to, and the agent whose conversation runs it. */
 	runOf(conversationId: ConversationId, context: Context): Promise<{ id: string; agent: string }>;
 	/**
-	 * Resolves with a workflow's result if it settled, memoized per child; else waits until the Session closes, and the
-	 * tool runs again when the Session's execution resumes. Frees the task's slot in `children`.
+	 * Resolves with a workflow's result, memoized per child: once it settled, or as its `child` signal arrives. Without
+	 * one (cancelled, crashed) it waits until the Session closes, and the tool runs again when the Session's execution
+	 * resumes on the child's settlement. Frees the task's slot in `children`.
 	 */
 	waitChild(taskId: number, executionId: string, context: Context): Promise<JsonObject>;
 	/** Shows a status on the lead's progress surface, if it has one. */
@@ -314,7 +315,13 @@ export async function startChild(
 		const saved = await tx.doc(ChildIntents, key, {
 			workflow,
 			input: cloneJson(input ?? null),
-			metadata: { ...cloneJson(metadata), triggerEvent: null, ownerWorkflow: null },
+			metadata: {
+				...cloneJson(metadata),
+				triggerEvent: null,
+				ownerWorkflow: null,
+				// An attached child tells this Session's execution its outcome as it settles.
+				notify: detached ? null : bridge.execution.executionId,
+			},
 			dedupeKey,
 			detached,
 			executionId: null,

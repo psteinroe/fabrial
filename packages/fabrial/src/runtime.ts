@@ -23,6 +23,21 @@ export interface InvocationMetadata extends JsonObject {
 	requestedBy: (Principal & JsonObject) | null;
 	// Requests delivered by `ctx.send` also carry `send: SentRequest` (kind and priority). Tools and the
 	// workflows they start carry `conversation: ConversationRef`, the agent conversation they belong to.
+	// Executions a Session waits on carry `notify`, the Session's execution id: they send it a `child`
+	// signal (`ChildSignal`) as they settle. Starts never inherit `notify`.
+}
+
+/** Name of the signal an execution started with `notify` metadata sends that execution as it settles. */
+export const CHILD_SIGNAL = "child";
+
+/**
+ * Payload of a `child` signal (id `child:<executionId>`): the outcome the execution is about to settle with,
+ * sent before Conductor commits it. Sent when the handler completes and when it fails on its final attempt;
+ * cancellation sends nothing (the waiter's execution branch covers it).
+ */
+export interface ChildSignal extends JsonObject {
+	executionId: string;
+	result: ExecutionResult & JsonObject;
 }
 
 export type DurationInput = string | number;
@@ -126,6 +141,8 @@ export interface DurableExecution {
 		branches: Record<string, WaitBranch>,
 		options?: { timeoutMs?: number },
 	): Promise<WaitForAnyResult>;
+	/** True when this attempt is the last one: a failure now settles the execution as failed. */
+	finalAttempt(): Promise<boolean>;
 	/** Memoized: wait until an execution settles. Throws if it is unknown or removed by retention. */
 	waitForResult(id: string, executionId: string): Promise<ExecutionResult>;
 	/** Start a child and wait for its result. Cancelled with the parent unless `detached` (Conductor item 5). */
@@ -239,7 +256,7 @@ export interface DurableRuntime {
 	signalWithStart(
 		options: SignalWithStartOptions & { metadata: InvocationMetadata },
 	): Promise<string>;
-	/** Store a signal for an execution (tests, scripts). False if it is settled or unknown. */
+	/** Store a signal for an execution (child signals, tests, scripts). False if it is settled or unknown. */
 	signal(executionId: string, signal: RuntimeSignal): Promise<boolean>;
 	start(): Promise<void>;
 	stop(): Promise<void>;

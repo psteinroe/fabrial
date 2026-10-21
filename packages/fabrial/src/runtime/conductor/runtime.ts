@@ -45,7 +45,8 @@ function mergeMetadata(
 	metadata: InvocationMetadata,
 	override?: Partial<InvocationMetadata>,
 ): InvocationMetadata {
-	const result = { ...metadata };
+	// `notify` addresses only the execution it was given to.
+	const { notify: _notify, ...result } = metadata as InvocationMetadata & { notify?: unknown };
 	for (const [key, value] of Object.entries(override ?? {}))
 		if (value !== undefined) result[key] = value;
 	return result;
@@ -329,6 +330,11 @@ class ConductorRuntime implements DurableRuntime {
 			metadata,
 			signal: raw.signal,
 			step: (id, fn) => raw.step(operationId(id), fn),
+			finalAttempt: async () => {
+				const info = await this.client!.getExecution(executionId);
+				// Conductor's default is 3 attempts; `attempts` counts this one.
+				return !info || info.attempts >= (this.definition(workflow).retries?.maxAttempts ?? 3);
+			},
 			sleep: async (id, ms) => {
 				operationId(id);
 				duration(ms);

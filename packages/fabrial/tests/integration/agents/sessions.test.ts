@@ -744,3 +744,117 @@ it("a ctx.agent call that times out on a workflow tool fails its caller and canc
 	await released(key);
 	await quiet(1);
 });
+
+/** A lead with two background subagents: `thinker` holds a long model call, `fixer` runs SQL after approval. */
+function busyAndWaiting(hold: (request: Request) => Promise<void>) {
+	const { runSql } = approvalTool();
+	const fixer = f.defineAgent({
+		name: `fixer-${short()}`,
+		description: "Fixes rows.",
+		model,
+		tools: [runSql],
+	});
+	const thinker = f.defineAgent({ name: `thinker-${short()}`, description: "Thinks.", model });
+	const lead = f.defineAgent({
+		name: `lead-${short()}`,
+		description: "Leads.",
+		model,
+		subagents: [fixer, thinker],
+	});
+	const ask = f.defineWorkflow({
+		name: `ask-${short()}`,
+		input: z.string(),
+		run: (input, ctx) => ctx.agent("answer", lead, { input }),
+	});
+	script = async (request) => {
+		const text = lastText(request.context);
+		if (text === "Go") return use(toolName(fixer.name), { task: "Fix it", background: true });
+		if (text.startsWith("Started"))
+			return transcript(request).split("Started").length > 2
+				? say("On it.")
+				: use(toolName(thinker.name), { task: "Think", background: true });
+		if (text === "Fix it") return use(toolName(runSql.name), { sql: "update x" });
+		if (text === '"ran"') return say("Fixed.");
+		if (text.includes('"cancelled"')) return say("Not fixed.");
+		if (text === "Think") {
+			await hold(request);
+			return say("Thought.");
+		}
+		if (text.startsWith("<subagent")) return say(`Reported: ${text}`);
+		return say(`unexpected: ${text}`);
+	};
+	const reported = (answer: string) =>
+		requests.some(
+			(request) =>
+				lastText(request.context).startsWith("<subagent") &&
+				lastText(request.context).includes(answer),
+		);
+	return { runSql, ask, reported };
+}
+
+it("a workflow tool's result reaches a Session busy with another subagent's model call: the click resumes it at once", async () => {
+	const busy = gate();
+	const { runSql, ask, reported } = busyAndWaiting((request) => busy.pass(request.signal));
+	const a = await launch("a", [runSql, ask]);
+	const card = await approvals(a);
+	const caller = await a.runtime.invoke(ask.name, "Go", { metadata: metadataOf() });
+	await expect.poll(() => !!card.action, poll).toBe(true);
+	await busy.entered;
+	await a.chat.click(card.ref!, card.action!, alice.identities[0]!);
+	// The fixer's tool resumes and its report reaches the lead while the thinker's model call is still held.
+	await expect.poll(() => reported("Fixed."), poll).toBe(true);
+	expect(reported("Thought.")).toBe(false);
+	busy.open();
+	await expect.poll(() => reported("Thought."), poll).toBe(true);
+	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
+	expect(requests.filter((request) => lastText(request.context) === '"ran"')).toHaveLength(1);
+	await released(await only());
+});
+
+it("a workflow tool whose execution is cancelled while the Session is busy resolves once the Session waits on it", async () => {
+	const busy = gate();
+	const { runSql, ask, reported } = busyAndWaiting((request) => busy.pass(request.signal));
+	const a = await launch("a", [runSql, ask]);
+	const card = await approvals(a);
+	const caller = await a.runtime.invoke(ask.name, "Go", { metadata: metadataOf() });
+	await expect.poll(() => !!card.action, poll).toBe(true);
+	await busy.entered;
+	const [tool] = await sql<{ id: string }[]>`
+		select id from pgconductor._private_executions where task_key = ${runSql.name}`;
+	await a.runtime.cancel(tool!.id, "Withdrawn");
+	await expect.poll(() => execution(tool!.id), poll).toMatchObject({ cancelled: true });
+	busy.open();
+	// No signal for a cancellation: the Session's execution branch for the tool resumes it.
+	await expect.poll(() => reported("Not fixed."), poll).toBe(true);
+	await expect.poll(() => reported("Thought."), poll).toBe(true);
+	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
+	await released(await only());
+});
+
+it("a workflow tool's result sent while its Session restarts on another instance reaches the waiting tool once", async () => {
+	const onA = gate();
+	const onB = gate();
+	const { runSql, ask, reported } = busyAndWaiting((request) =>
+		(request.instance === "a" ? onA : onB).pass(request.signal),
+	);
+	const a = await launch("a", [runSql, ask]);
+	const card = await approvals(a);
+	const caller = await a.runtime.invoke(ask.name, "Go", { metadata: metadataOf() });
+	await expect.poll(() => !!card.action, poll).toBe(true);
+	await onA.entered;
+	await a.stop();
+	const b = await launch("b", [runSql, ask]);
+	// The click lands while the Session reopens on b, or once it is open again.
+	await b.chat.click(card.ref!, card.action!, alice.identities[0]!);
+	await expect.poll(() => reported("Fixed."), poll).toBe(true);
+	await onB.entered;
+	expect(reported("Thought.")).toBe(false);
+	onB.open();
+	await expect.poll(() => reported("Thought."), poll).toBe(true);
+	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
+	expect(requests.filter((request) => lastText(request.context) === '"ran"')).toHaveLength(1);
+	expect(requests.filter((request) => lastText(request.context).includes("Fixed."))).toHaveLength(
+		1,
+	);
+	await released(await only());
+});
