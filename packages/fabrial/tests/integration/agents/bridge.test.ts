@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Message, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { Message, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
 	fauxAssistantMessage,
@@ -105,7 +105,13 @@ it("runs durable structured answers and memoizes submissions; each call has a Se
 	let asked = "";
 	f.faux.setResponses([
 		(context) => {
-			asked = String(context.messages.at(-1)?.content);
+			const content = context.messages.findLast(
+				(message): message is UserMessage => message.role === "user",
+			)!.content;
+			asked =
+				typeof content === "string"
+					? content
+					: content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
 			return fauxAssistantMessage('{"answer":42}');
 		},
 		fauxAssistantMessage("continued"),
