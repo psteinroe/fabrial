@@ -322,6 +322,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		childAgent,
 		logger: host.logger,
 		busy: new Map(),
+		subagentTools: new Set(),
 	};
 	const internal = defineExtension({
 		name: "fabrial.internal",
@@ -403,6 +404,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				throw new Error(
 					`Agent ${name}: subagent ${subagent.agent.name} is called ${subagent.tool}, which a toolkit tool already uses`,
 				);
+			subagentDeps.subagentTools.add(subagent.tool);
 			if (subagent.agent !== agent) install(subagent.agent);
 		}
 		const section = instructionsSection("agent-instructions", instructions);
@@ -1439,7 +1441,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			}
 			// The chat thread throttles statuses.
 			if (waiting || !progress) return;
-			const text = activityOf(batch, (await conversation.agent(context)).tools);
+			const text = activityOf(
+				batch,
+				(await conversation.agent(context)).tools,
+				subagentDeps.subagentTools,
+			);
 			if (text) await showStatus(text);
 		});
 		await thinking();

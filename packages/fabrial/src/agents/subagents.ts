@@ -33,6 +33,8 @@ export interface SubagentDeps {
 	busy: Map<string, number>;
 	/** This integration's reporter task, from `reporterTask`. */
 	reporter?: ReturnType<typeof reporterTask>;
+	/** The names of the subagent tools of this integration's agents. */
+	subagentTools: Set<string>;
 }
 
 /** Task kinds of background children; installed with Fabrial's internal extension so they resume after a restart. */
@@ -450,7 +452,7 @@ const reporterTask = (deps: SubagentDeps) =>
 				);
 				const bridge = context.value(BridgeKey);
 				const stop = bridge
-					? await watchActivity(bridge, child as ConversationId, agent, context)
+					? await watchActivity(bridge, child as ConversationId, agent, deps, context)
 					: undefined;
 				let settled: Awaited<ReturnType<typeof submission.wait>>;
 				try {
@@ -649,17 +651,20 @@ async function newestEntry(
 
 /**
  * The status a batch of a conversation's Pi events shows: the newest started tool's description, or "Thinking…". None
- * for only a subagent call's detail updates: the child shows its own activity.
+ * for only a subagent call's detail updates, or when the newest started tool calls a subagent (`subagentTools`): the
+ * child shows its own activity.
  */
 export function activityOf(
 	batch: readonly { type: string }[],
 	tools: readonly { name: string; description?: string }[],
+	subagentTools: ReadonlySet<string>,
 ): string | undefined {
 	if (batch.every((event) => event.type === "tool_execution_update")) return undefined;
 	const tool = batch.findLast((event) => event.type === "tool_execution_start") as
 		| { toolName: string }
 		| undefined;
 	if (!tool) return "Thinking…";
+	if (subagentTools.has(tool.toolName)) return undefined;
 	return tools.find((each) => each.name === tool.toolName)?.description ?? "Using a tool…";
 }
 
@@ -668,6 +673,7 @@ async function watchActivity(
 	bridge: BridgeFrame,
 	child: ConversationId,
 	label: string,
+	deps: SubagentDeps,
 	context: Context,
 ): Promise<() => Promise<void>> {
 	const status = bridge.status;
@@ -675,7 +681,7 @@ async function watchActivity(
 	const tools = (await (await bridge.harness.conversation(child, context))!.agent(context)).tools;
 	const events = await watchEvents(bridge.harness, child, context);
 	events.start(async (batch) => {
-		const text = activityOf(batch, tools);
+		const text = activityOf(batch, tools, deps.subagentTools);
 		if (text) await status(`${label}: ${text}`);
 	});
 	await status(`${label}: Thinking…`);
@@ -701,7 +707,7 @@ async function run(
 		{ type: "input", content: task, requestId: `fabrial.subagent:${api.taskId}` },
 		context,
 	);
-	const stop = await watchActivity(bridge, child, subagent.agent.name, context);
+	const stop = await watchActivity(bridge, child, subagent.agent.name, deps, context);
 	bridge.waiting.add(api.taskId);
 	let settled: Awaited<ReturnType<typeof submission.wait>>;
 	try {

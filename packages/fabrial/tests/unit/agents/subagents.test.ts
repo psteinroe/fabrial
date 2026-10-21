@@ -2,7 +2,12 @@ import { expect, it } from "vitest";
 import { z } from "zod";
 import { createFabrial } from "../../internals.ts";
 import { resolveSubagents } from "../../../src/agent.ts";
-import { subagentResult, subagentTool, type SubagentDeps } from "../../../src/agents/subagents.ts";
+import {
+	activityOf,
+	subagentResult,
+	subagentTool,
+	type SubagentDeps,
+} from "../../../src/agents/subagents.ts";
 
 const f = createFabrial({ plugins: [] });
 const researcher = f.defineAgent({
@@ -72,6 +77,20 @@ const deps = (): SubagentDeps => ({
 	childAgent: () => ({}),
 	logger: { warn() {}, error() {}, debug() {}, info() {} },
 	busy: new Map(),
+	subagentTools: new Set(),
+});
+
+it("shows a started tool's description as the status, and none for a subagent call: its child shows its own", () => {
+	const tools = [
+		{ name: "lookup", description: "Looks up a row" },
+		{ name: "researcher", description: researcher.definition.description },
+	];
+	const start = (toolName: string) => ({ type: "tool_execution_start", toolName });
+	const subagents = new Set(["researcher"]);
+	expect(activityOf([{ type: "message_start" }], tools, subagents)).toBe("Thinking…");
+	expect(activityOf([start("lookup")], tools, subagents)).toBe("Looks up a row");
+	expect(activityOf([start("researcher")], tools, subagents)).toBeUndefined();
+	expect(activityOf([{ type: "tool_execution_update" }], tools, subagents)).toBeUndefined();
 });
 
 it("generates one replay-safe tool per subagent, described by the agent's description", () => {
