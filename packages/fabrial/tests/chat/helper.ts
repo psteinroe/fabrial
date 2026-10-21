@@ -1,7 +1,7 @@
 import { createMockAdapter, createMockLogger } from "@chat-adapter/tests";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import type { ChatInstance, StateAdapter } from "chat";
-import type { FabrialHost, ThreadRoutingState } from "../../src/index.ts";
+import type { FabrialHost, ThreadRoutingState } from "../internals.ts";
 import { vi } from "vitest";
 import { chat, chatCapability, chatEvents } from "../../src/chat/index.ts";
 

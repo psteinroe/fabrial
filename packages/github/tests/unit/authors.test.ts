@@ -1,6 +1,6 @@
 // oxlint-disable typescript/unbound-method -- Referenced host methods are Vitest mocks.
 import type { GitHubAdapter } from "@chat-adapter/github";
-import type { ResourceKind } from "fabrial";
+import type { ResourceKind } from "fabrial/plugin";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { github } from "../../src/index.ts";
 import { alice, connect, options, request } from "../helper.ts";

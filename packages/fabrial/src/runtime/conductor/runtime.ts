@@ -12,7 +12,7 @@ import {
 	type Subscription,
 	type WaitBranch,
 	type ExecutionResult,
-} from "../../index.ts";
+} from "../../modules.ts";
 import { ExecutionError } from "../../runtime.ts";
 import {
 	Conductor,

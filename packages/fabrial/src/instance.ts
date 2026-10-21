@@ -9,7 +9,7 @@ import {
 	type Toolkit,
 	type ToolkitDefinition,
 } from "./agent.ts";
-import type { App, CoreConfig, Logger } from "./app.ts";
+import type { App, CoreConfig, HostedApp, Logger } from "./app.ts";
 import type { ModelCredentials } from "./agents/models.ts";
 import { buildApp } from "./core.ts";
 import { defineGroup, type GroupDefinition, type UserDefinition } from "./identity.ts";
@@ -102,7 +102,7 @@ export const INTERNAL = Symbol.for("fabrial.internal");
 export type InternalOverrides = ProductionOverrides &
 	Partial<Pick<CoreConfig, "runtime" | "chat" | "agents">>;
 export interface InternalInstance {
-	app(config: AppConfig, overrides: InternalOverrides): App;
+	app(config: AppConfig, overrides: InternalOverrides): HostedApp;
 }
 
 /** Create the instance: configuration and typed definitions. Nothing connects until app.start(). */
@@ -110,7 +110,7 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 	config: FabrialConfig<P>,
 ): Fabrial<P> {
 	const plugins = Object.freeze([...config.plugins]) as unknown as P;
-	const build = (appConfig: AppConfig, overrides: InternalOverrides = {}): App => {
+	const build = (appConfig: AppConfig, overrides: InternalOverrides = {}): HostedApp => {
 		const { runtime, chat, agents, ...settings } = overrides;
 		const integrations = runtime
 			? { runtime, chat, agents }

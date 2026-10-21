@@ -53,7 +53,7 @@ await app.start(); // migrates Postgres, validates credentials, starts workers
 
 `f.defineWorkflow`, `f.defineAgent`, `f.defineTool`, `f.defineToolkit`, `f.defineState`, and `f.defineGroup({ id, resolve(ctx) { … } })` infer precise `ctx.clients` and plugin toolkit ids from the instance. Definitions are plain data and can be reused by any app made from `f`; groups can be referenced directly as approvers. `f.plugins` is a readonly catalog for introspection.
 
-`f.app({ workflows, agents?, logger? })` builds the app and exposes `app.fetch`, `app.start`, `app.stop`, and authenticated adapter ingress through `app.host`. Plugins carry their values at definition and factories must stay side-effect free: importing the app with unset environment is safe. The database pool opens, credentials are validated, and connections start at `app.start()`, not at import or `f.app()`. Chat-capable plugins are served at `POST /<pluginId>/events`; routes await ingress before responding.
+`f.app({ workflows, agents?, logger? })` builds the app and exposes `app.fetch`, `app.start`, `app.stop`, `app.emit`, and `app.clients()`. Plugins carry their values at definition and factories must stay side-effect free: importing the app with unset environment is safe. The database pool opens, credentials are validated, and connections start at `app.start()`, not at import or `f.app()`. Chat-capable plugins are served at `POST /<pluginId>/events`; routes await ingress before responding.
 
 Durable operations require explicit, nonempty IDs. Repeated IDs are suffixed deterministically on replay. `fabrial:` is reserved for helper receipts. Completed receipts prevent repeated effects on replay; a crash during an external effect can still repeat it. Providers must supply idempotency or reconciliation when exactly-once effects matter.
 
@@ -111,6 +111,8 @@ Question types are `choice`, `score`, and `boolean`, on Pi AI's `models.classify
 
 ## Plugins
 
+Plugin authors import `definePlugin`, `defineEvent`, `trigger`, `resource`, the chat helpers, and hook types from `fabrial/plugin`; shared types (`ExternalIdentity`, `ThreadRef`, `ToolDefinition`, …) come from `fabrial`. Test helpers live in `fabrial/testing`.
+
 A plugin carries an `id` and optionally `events`, `routes` (`"METHOD /path"`, served by `app.fetch`), `clients`, `context`, `identity`, `hooks.workflow` middleware, and `init`/`shutdown` for resources it owns, acquired at `app.start()` and never in the factory. For agents it adds:
 
 - `toolkit: (clients) => ({ tools, instructions })` for agents that list the plugin id in `toolkits`. Listing a plugin without a toolkit fails at `app.start()`.
@@ -118,7 +120,7 @@ A plugin carries an `id` and optionally `events`, `routes` (`"METHOD /path"`, se
 - `chat: chatCapability({ … })` to connect a Chat SDK adapter, the one runtime type plugin authors see:
 
 ```ts
-import { chatCapability, chatEvents, chatTrigger } from "fabrial";
+import { chatCapability, chatEvents, chatTrigger } from "fabrial/plugin";
 
 const plugin = {
 	id: "github",

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { trigger } from "../../../src/index.ts";
+import { trigger } from "../../internals.ts";
 import {
 	alice,
 	approvalWorkflow,

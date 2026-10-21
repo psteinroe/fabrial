@@ -31,7 +31,7 @@ import {
 	type ToolStateHandle,
 	type WorkflowInput,
 	type WorkflowOutput,
-} from "../index.ts";
+} from "../modules.ts";
 import {
 	applyState,
 	Binding,

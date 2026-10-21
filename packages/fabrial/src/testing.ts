@@ -401,7 +401,7 @@ export function testApp<const P extends readonly import("./plugin.ts").AnyPlugin
 		/** `f.app({ agents })`: agents whose triggers receive events. */
 		routedAgents?: import("./instance.ts").AppConfig["agents"];
 	},
-): import("./app.ts").App<import("./instance.ts").ClientsOf<P>> {
+): import("./app.ts").HostedApp<import("./instance.ts").ClientsOf<P>> {
 	const { workflows, routedAgents, logger, ...overrides } = config;
 	return internal(instance).app({ workflows, agents: routedAgents, logger }, overrides) as never;
 }
@@ -427,7 +427,7 @@ export interface TestAppConfig extends Omit<import("./instance.ts").AppConfig, "
 }
 
 export interface TestApp<C> {
-	readonly app: import("./app.ts").App<C>;
+	readonly app: import("./app.ts").HostedApp<C>;
 	readonly chat: FakeChat;
 	readonly runtime: DurableRuntime;
 	/**
@@ -684,7 +684,7 @@ export function createIntegrationApp<const P extends readonly import("./plugin.t
 		/** Concurrent workflow executions per worker. Default 8. */
 		concurrency?: number;
 	},
-): import("./app.ts").App<import("./instance.ts").ClientsOf<P>> {
+): import("./app.ts").HostedApp<import("./instance.ts").ClientsOf<P>> {
 	const { workflows, agents: routed, logger, models, modelRetries = false } = config;
 	const poll = config.pollIntervalMs ?? 20;
 	return internal(instance).app(

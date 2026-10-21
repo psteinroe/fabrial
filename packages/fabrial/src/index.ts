@@ -1,3 +1,4 @@
+// The app author's API. Plugin authors add `fabrial/plugin`; tests add `fabrial/testing`.
 export {
 	createFabrial,
 	type AppConfig,
@@ -6,17 +7,18 @@ export {
 	type FabrialConfig,
 	type ToolkitIdsOf,
 } from "./instance.ts";
+export type { App, Logger } from "./app.ts";
 export type {
 	Agent,
 	AgentDefinition,
-	AgentObservers,
 	AgentTool,
 	InstructionContext,
 	Instructions,
-	ModelResponse,
+	SubagentEntry,
+	SubagentLimits,
+	SubagentOptions,
 	ThinkingLevel,
 	Tool,
-	ToolCall,
 	ToolContext,
 	ToolDefinition,
 	Toolkit,
@@ -25,49 +27,67 @@ export type {
 	ToolThread,
 } from "./agent.ts";
 export type { ModelCredentials } from "./agents/models.ts";
-export type { App, FabrialHost, Logger } from "./app.ts";
-export type * from "./approval.ts";
-export * from "./evaluate.ts";
-export * from "./events.ts";
-export * from "./identity.ts";
-export type * from "./json.ts";
-export * from "./plugin.ts";
-export * from "./runtime.ts";
-export * from "./schema.ts";
-export {
-	renderInput,
-	deliveryFor,
-	type Delivery,
-	type InputKind,
-	type InputPriority,
-	type SendOptions,
-	type ConversationReference,
-	type SendReceipt,
-	type SendRequest,
-	type SentRequest,
-	type SessionOption,
-} from "./send.ts";
-export type { ConversationRef, FollowOptions, FollowReceipt, UnfollowReceipt } from "./follows.ts";
-export type * from "./state.ts";
-export type * from "./thread.ts";
-export * from "./trigger.ts";
-export {
-	chatCapability,
-	chatEvents,
-	chatIdentity,
-	chatTrigger,
-	type ChatPluginCapability,
-	type ChatEventPayload,
-	type ChatEventName,
-} from "./chat/events.ts";
 export type {
-	WorkflowContext,
-	RaceResult,
-	ExecutionInfo,
-	WorkflowMiddleware,
-	WorkflowDefinition,
-	Workflow,
+	ApprovalDecision,
+	ApprovalHandle,
+	ApprovalOptions,
+	DecisionStatus,
+} from "./approval.ts";
+export type {
+	EvaluateAnswer,
+	EvaluateQuestion,
+	EvaluateRequest,
+	EvaluateResult,
+} from "./evaluate.ts";
+export type { EmitOptions, EventFilter, FilterAlternative, Origin } from "./events.ts";
+export type { ConversationRef, FollowOptions, FollowReceipt, UnfollowReceipt } from "./follows.ts";
+export {
+	defineGroup,
+	defineUser,
+	weeklyRotation,
+	type ExternalIdentity,
+	type GroupDefinition,
+	type GroupResolveContext,
+	type Principal,
+	type UserDefinition,
+} from "./identity.ts";
+export type { Json, JsonObject } from "./json.ts";
+export type { ResourceRef } from "./plugin.ts";
+export {
+	ExecutionError,
+	type AgentRef,
+	type AgentRunOptions,
+	type ExecutionResult,
+} from "./runtime.ts";
+export { SchemaValidationError, type InferOutput, type Schema } from "./schema.ts";
+export type {
+	ConversationReference,
+	InputKind,
+	InputPriority,
+	SendOptions,
+	SendReceipt,
+	SessionOption,
+} from "./send.ts";
+export type { StateDefinition, StateScope, ToolStateHandle, WorkflowStateHandle } from "./state.ts";
+export type {
+	Awaitable,
+	Card,
+	CardAction,
+	ChatMessage,
+	MessageRef,
+	OutboundMessage,
+	Surface,
+	Thread,
+	ThreadRef,
+} from "./thread.ts";
+export type { TriggerPayload, TriggerSpec } from "./trigger.ts";
+export type { ChatEventName, ChatEventPayload } from "./chat/events.ts";
+export type {
 	AnyWorkflow,
+	RaceResult,
+	Workflow,
+	WorkflowContext,
+	WorkflowDefinition,
 	WorkflowInput,
 	WorkflowOutput,
 } from "./workflow.ts";

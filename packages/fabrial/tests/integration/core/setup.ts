@@ -7,7 +7,7 @@ import {
 	definePlugin,
 	defineUser,
 	trigger,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import type {
 	AnyWorkflow,
 	ChatMessage,
@@ -16,7 +16,7 @@ import type {
 	Json,
 	JsonObject,
 	WorkflowContext,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import type { CoreConfig } from "../../../src/app.ts";
 import type { ExecutionInfo } from "../../../src/workflow.ts";
 import { FakeChat, testApp } from "../../../src/testing.ts";

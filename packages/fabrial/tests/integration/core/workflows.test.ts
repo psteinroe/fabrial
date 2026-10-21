@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { defineEvent, definePlugin, trigger } from "../../../src/index.ts";
+import { defineEvent, definePlugin, trigger } from "../../internals.ts";
 import { fakeAgents } from "../../../src/testing.ts";
 import { until } from "../../conductor/helper.ts";
 import {

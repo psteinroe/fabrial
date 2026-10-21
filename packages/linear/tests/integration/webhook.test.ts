@@ -1,5 +1,6 @@
 import { createHmac } from "node:crypto";
-import { createFabrial, definePlugin, type WorkflowContext } from "fabrial";
+import { createFabrial, type WorkflowContext } from "fabrial";
+import { definePlugin } from "fabrial/plugin";
 import { createTestApp, FakeChat } from "fabrial/testing";
 import { describe, expect, it, vi } from "vitest";
 import { linear, issueCreated, issueUpdated } from "../../src/index.ts";

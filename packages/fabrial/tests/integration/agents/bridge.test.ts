@@ -13,7 +13,7 @@ import {
 	type RuntimeEvent,
 	type RuntimeWorkflow,
 	type ToolCall,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import { FakeChat } from "../../../src/testing.ts";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";

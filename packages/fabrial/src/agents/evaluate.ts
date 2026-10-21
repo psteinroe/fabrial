@@ -5,7 +5,7 @@ import type {
 	EvaluateResult,
 	Evaluator,
 	Json,
-} from "../index.ts";
+} from "../modules.ts";
 import { parseModel } from "../agent.ts";
 
 export function createEvaluator(models: Models): Evaluator {

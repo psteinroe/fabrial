@@ -4,23 +4,25 @@ import {
 	type GitHubAdapterPATConfig,
 	type GitHubAdapterAppConfig,
 } from "@chat-adapter/github";
-import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "fabrial";
+import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "fabrial/plugin";
 import {
-	defineEvent,
-	definePlugin,
-	resource,
-	trigger,
 	type EmitOptions,
 	type EventFilter,
 	type ExternalIdentity,
 	type InputPriority,
 	type JsonObject,
-	type PluginEvent,
-	type ResourceKind,
-	type ResourceNotification,
 	type ThreadRef,
 	type ToolDefinition,
 } from "fabrial";
+import {
+	defineEvent,
+	definePlugin,
+	resource,
+	trigger,
+	type PluginEvent,
+	type ResourceKind,
+	type ResourceNotification,
+} from "fabrial/plugin";
 import { z } from "zod";
 
 export type GitHubOptions = (

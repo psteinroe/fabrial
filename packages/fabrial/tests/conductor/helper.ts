@@ -7,7 +7,7 @@ import type {
 	Json,
 	RuntimeEvent,
 	RuntimeWorkflow,
-} from "../../src/index.ts";
+} from "../internals.ts";
 import { conductor, type ConductorConfig } from "../../src/runtime/conductor/index.ts";
 import { createTestClock, type TestClock } from "../../src/testing.ts";
 // Declares the `fabrialDatabaseUrl` the global setup provides, also for other packages' tests.

@@ -1,4 +1,4 @@
-import type { App, CoreConfig, FabrialHost, Logger } from "./app.ts";
+import type { CoreConfig, FabrialHost, HostedApp, Logger } from "./app.ts";
 import { createDirectory } from "./directory.ts";
 import { filtersOverlap, matchesFilter } from "./internal.ts";
 import { definedAgents, type Agent } from "./agent.ts";
@@ -51,7 +51,7 @@ import {
 const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
 /** Compose integrations and register the core workflow/context protocol with the durable runtime. */
-export function buildApp(config: CoreConfig): App {
+export function buildApp(config: CoreConfig): HostedApp {
 	const runtime = config.runtime;
 	const now = () => runtime.now?.() ?? Date.now();
 	let chat: ReturnType<NonNullable<CoreConfig["chat"]>["connect"]> | undefined;
@@ -549,6 +549,7 @@ export function buildApp(config: CoreConfig): App {
 	});
 	return {
 		host,
+		clients: () => host.clients(),
 		async fetch(request) {
 			const key = `${request.method.toUpperCase()} ${new URL(request.url).pathname}`;
 			const chatRoute = chat?.routes[key];

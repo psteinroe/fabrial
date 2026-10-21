@@ -32,7 +32,7 @@ it("creates the application pool only on start, closes it on stop, and can resta
 		runtime: new StubRuntime(),
 		workflows: [],
 	});
-	const client = app.host.clients().database;
+	const client = app.clients().database;
 	expect(postgres).not.toHaveBeenCalled();
 	await expect(client.query("acme", "SELECT 1")).rejects.toThrow("not started");
 	await app.start();

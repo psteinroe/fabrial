@@ -20,7 +20,7 @@ import {
 	type ChatMessage,
 	type ExternalIdentity,
 	type JsonObject,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import { pi } from "../../../src/agents/index.ts";
 import { FakeChat } from "../../../src/testing.ts";
 import { useAgents } from "./setup.ts";

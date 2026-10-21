@@ -1,5 +1,5 @@
 import { beforeEach, expect, it } from "vitest";
-import type { InvocationMetadata, RuntimeWorkflow } from "../../../src/index.ts";
+import type { InvocationMetadata, RuntimeWorkflow } from "../../internals.ts";
 import { useConductor } from "../../conductor/helper.ts";
 
 // Runtime-port contracts the core relies on, on real Conductor.

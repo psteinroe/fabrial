@@ -2,10 +2,15 @@ import { createHmac } from "node:crypto";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { createMockLogger } from "@chat-adapter/tests";
 import { chat } from "../../fabrial/src/chat/index.ts";
-import type { AnyPlugin, FabrialHost } from "fabrial";
+import type { ChatIntegration, FabrialHost } from "../../fabrial/src/app.ts";
+import type { AnyPlugin } from "../../fabrial/src/plugin.ts";
 import { vi } from "vitest";
 
-export function connect(plugin: AnyPlugin) {
+export function connect(plugin: AnyPlugin): {
+	host: FabrialHost;
+	connection: ReturnType<ChatIntegration["connect"]>;
+	state: ReturnType<typeof createMemoryState>;
+} {
 	const state = createMemoryState();
 	const host: FabrialHost = {
 		plugins: [plugin],

@@ -1,7 +1,7 @@
 // Each child owns an independent Chat instance and Postgres pool (no shared JS mutex).
 import { createPostgresState } from "@chat-adapter/state-pg";
 import { Chat, type Adapter } from "chat";
-import type { FabrialHost } from "../../../src/index.ts";
+import type { FabrialHost } from "../../internals.ts";
 import { createChatPort, type SDKState } from "../../../src/chat/port.ts";
 import { chatCapability } from "../../../src/chat/events.ts";
 

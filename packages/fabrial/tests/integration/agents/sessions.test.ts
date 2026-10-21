@@ -18,7 +18,7 @@ import {
 	type InvocationMetadata,
 	type Json,
 	type ThreadRef,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import { toolName } from "../../../src/agent.ts";
 import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { conductor } from "../../../src/runtime/conductor/index.ts";

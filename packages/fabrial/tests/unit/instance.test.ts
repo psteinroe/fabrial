@@ -1,5 +1,5 @@
 import { expect, expectTypeOf, it, vi } from "vitest";
-import { createFabrial, definePlugin, defineUser } from "../../src/index.ts";
+import { createFabrial, definePlugin, defineUser } from "../internals.ts";
 import { testApp } from "fabrial/testing";
 import { StubRuntime } from "fabrial/testing";
 

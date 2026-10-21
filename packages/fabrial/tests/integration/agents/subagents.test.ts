@@ -20,7 +20,7 @@ import {
 	type InvocationMetadata,
 	type RuntimeEvent,
 	type RuntimeWorkflow,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import { toolName } from "../../../src/agent.ts";
 import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { SubagentWork } from "../../../src/agents/documents.ts";

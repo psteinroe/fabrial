@@ -1,7 +1,7 @@
 import postgres, { type Sql } from "postgres";
 import { afterAll, afterEach, beforeAll } from "vitest";
-import type { App } from "../../../src/app.ts";
-import type { RuntimeWorkflow } from "../../../src/index.ts";
+import type { HostedApp } from "../../../src/app.ts";
+import type { RuntimeWorkflow } from "../../internals.ts";
 import { PostgresStorage } from "../../../src/agents/index.ts";
 import { FakeChat, testApp } from "../../../src/testing.ts";
 import { until, useConductor } from "../../conductor/helper.ts";
@@ -16,7 +16,7 @@ type Config = Parameters<typeof testApp>[1];
 export function useAgents() {
 	const db = useConductor();
 	let pool: Sql | undefined;
-	const apps: App<never>[] = [];
+	const apps: HostedApp<never>[] = [];
 	beforeAll(async () => {
 		pool = postgres(db.url, { max: 10, onnotice: () => {} });
 		await PostgresStorage.migrate(pool);
@@ -54,7 +54,7 @@ export function useAgents() {
 		const chat = rest.chat ?? new FakeChat();
 		const app = testApp(instance, { ...rest, runtime, chat });
 		await app.start();
-		apps.push(app as App<never>);
+		apps.push(app as HostedApp<never>);
 		return { runtime, chat, app };
 	}
 

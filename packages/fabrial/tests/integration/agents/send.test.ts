@@ -24,7 +24,7 @@ import {
 	type ChatMessage,
 	type ExternalIdentity,
 	type JsonObject,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import { pi, PostgresStorage } from "../../../src/agents/index.ts";
 import { Conversations, Invocation, Obligations } from "../../../src/agents/documents.ts";
 import { WAITING_STATUS } from "../../../src/agents/errors.ts";

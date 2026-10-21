@@ -10,7 +10,7 @@ import {
 	type JsonObject,
 	type Json,
 	type StateDefinition,
-} from "../index.ts";
+} from "../modules.ts";
 
 export const Conversations = defineDoc({
 	kind: "fabrial.conversations",

@@ -1,6 +1,6 @@
 import { expect, it } from "vitest";
 import { z } from "zod";
-import { createFabrial } from "../../../src/index.ts";
+import { createFabrial } from "../../internals.ts";
 import { resolveSubagents } from "../../../src/agent.ts";
 import { subagentResult, subagentTool, type SubagentDeps } from "../../../src/agents/subagents.ts";
 

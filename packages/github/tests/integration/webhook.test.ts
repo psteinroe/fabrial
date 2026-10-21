@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
 import { GitHubAdapter } from "@chat-adapter/github";
-import { createFabrial, definePlugin, type WorkflowContext } from "fabrial";
+import { createFabrial, type WorkflowContext } from "fabrial";
+import { definePlugin } from "fabrial/plugin";
 import { createTestApp, FakeChat } from "fabrial/testing";
 import { describe, expect, it, vi } from "vitest";
 import { github, pullRequestOpened, issueOpened } from "../../src/index.ts";

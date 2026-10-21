@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defineGroup, defineUser } from "../../../src/index.ts";
+import { defineGroup, defineUser } from "../../internals.ts";
 import { until } from "../../conductor/helper.ts";
 import {
 	alice,

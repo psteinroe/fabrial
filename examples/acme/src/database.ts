@@ -1,4 +1,5 @@
-import { definePlugin, type Json } from "fabrial";
+import { type Json } from "fabrial";
+import { definePlugin } from "fabrial/plugin";
 import postgres, { type Options, type Sql } from "postgres";
 
 // postgres.js supports simple:false at runtime but omits it from UnsafeQueryOptions.

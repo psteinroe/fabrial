@@ -17,7 +17,7 @@ import {
 	type ExternalIdentity,
 	type JsonObject,
 	type ThreadRoutingState,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import { pi } from "../../../src/agents/index.ts";
 import { FakeChat } from "../../../src/testing.ts";
 import { github } from "../../../../github/src/index.ts";

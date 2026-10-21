@@ -4,15 +4,9 @@ import {
 	type LinearAdapterAPIKeyConfig,
 	type LinearAdapterOAuthConfig,
 } from "@chat-adapter/linear";
-import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "fabrial";
-import {
-	defineEvent,
-	defineGroup,
-	definePlugin,
-	trigger,
-	type EmitOptions,
-	type ExternalIdentity,
-} from "fabrial";
+import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "fabrial/plugin";
+import { defineGroup, type EmitOptions, type ExternalIdentity } from "fabrial";
+import { defineEvent, definePlugin, trigger } from "fabrial/plugin";
 import { z } from "zod";
 
 export type LinearOptions = (

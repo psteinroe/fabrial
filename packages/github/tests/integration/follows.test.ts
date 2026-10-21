@@ -1,4 +1,5 @@
-import { createFabrial, trigger, type JsonObject, type ResourceKind } from "fabrial";
+import { createFabrial, type JsonObject } from "fabrial";
+import { trigger, type ResourceKind } from "fabrial/plugin";
 import { createTestApp, fakeAgents, StubRuntime, testApp, FakeChat } from "fabrial/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { github, parsePullRequest, pullRequest } from "../../src/index.ts";

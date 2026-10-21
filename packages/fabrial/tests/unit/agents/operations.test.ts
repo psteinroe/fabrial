@@ -12,7 +12,7 @@ import {
 	type DurableExecution,
 	type FabrialHost,
 	type InvocationMetadata,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
 import {

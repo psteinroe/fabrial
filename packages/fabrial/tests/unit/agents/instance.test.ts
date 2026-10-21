@@ -1,6 +1,6 @@
 import { expect, expectTypeOf, it } from "vitest";
 import { z } from "zod";
-import { createFabrial, definePlugin } from "../../../src/index.ts";
+import { createFabrial, definePlugin } from "../../internals.ts";
 
 const f = createFabrial({
 	plugins: [

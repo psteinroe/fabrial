@@ -1,14 +1,14 @@
 import { SlackAdapter } from "@chat-adapter/slack";
-import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "fabrial";
+import { chatCapability, chatEvents, chatIdentity, chatTrigger } from "fabrial/plugin";
 import { WebClient } from "@slack/web-api";
 import {
 	defineGroup,
-	definePlugin,
 	type ExternalIdentity,
 	type GroupResolveContext,
 	type Surface,
 	type ToolDefinition,
 } from "fabrial";
+import { definePlugin } from "fabrial/plugin";
 import { z } from "zod";
 
 export interface SlackOptions {

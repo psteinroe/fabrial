@@ -21,7 +21,7 @@ export interface Logger {
 	error(message: string, data?: Record<string, unknown>): void;
 }
 
-/** What core exposes to its runtime modules and to tests (`app.host`). */
+/** What core exposes to its runtime modules and to tests (`HostedApp.host`). Internal. */
 export interface FabrialHost<TClients = Record<string, unknown>> {
 	/** Definition catalog identity, used by adapters to isolate instance-local definitions. */
 	readonly definitionScope?: object;
@@ -144,5 +144,11 @@ export interface App<TClients = Record<string, unknown>> {
 		payload: JsonObject,
 		options?: EmitOptions & { replyTo?: Surface },
 	): Promise<void>;
+	/** Live clients of the app's plugins (`ctx.clients` outside a run). */
+	clients(): TClients;
+}
+
+/** An app with its host, for Fabrial's runtime modules and tests. Internal. */
+export interface HostedApp<TClients = Record<string, unknown>> extends App<TClients> {
 	readonly host: FabrialHost<TClients>;
 }

@@ -23,7 +23,7 @@ import type {
 	ThreadIO,
 	ThreadRef,
 	ThreadRoutingState,
-} from "../index.ts";
+} from "../modules.ts";
 import { normalizeMessage, type ChatPluginCapability } from "./events.ts";
 
 export function renderMessage(message: OutboundMessage): AdapterPostableMessage {

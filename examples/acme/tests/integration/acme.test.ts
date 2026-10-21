@@ -29,7 +29,7 @@ interface SlackCall {
 let applicationSql: Sql;
 let sql: Sql;
 const url = process.env.DATABASE_URL!;
-let app: ReturnType<typeof f.app>;
+let app: ReturnType<typeof newApp>;
 let calls: SlackCall[];
 let faux: ScriptedModel;
 let models: ReturnType<typeof scriptedModels>;
@@ -136,7 +136,7 @@ afterEach(async () => {
 
 function newApp() {
 	const instance = createIntegrationApp(f, { workflows, agents, models, logger });
-	const adapter = instance.host.plugins.find((p) => p.id === "linear")!.chat!.adapter() as Adapter;
+	const adapter = f.plugins.find((p) => p.id === "linear")!.chat!.adapter() as Adapter;
 	vi.spyOn(adapter, "initialize").mockImplementation(async (sdk) => {
 		Object.assign(adapter, {
 			chat: sdk,
@@ -450,18 +450,16 @@ it("stops promptly once an in-flight approval-card delivery finishes", async () 
 	}
 });
 it("signed GitHub PR opened webhook has one PR-thread owner plus a changelog observer", async () => {
-	vi.spyOn(app.host.clients().github, "request").mockResolvedValue({
+	vi.spyOn(app.clients().github, "request").mockResolvedValue({
 		data: { id: 1, name: "Alice", login: "alice" },
 	} as never);
-	const comments = vi
-		.spyOn(app.host.clients().github.rest.issues, "createComment")
-		.mockResolvedValue({
-			data: {
-				id: 71,
-				body: "Review queued",
-				html_url: "https://github.com/acme/app/pull/7#issuecomment-71",
-			},
-		} as never);
+	const comments = vi.spyOn(app.clients().github.rest.issues, "createComment").mockResolvedValue({
+		data: {
+			id: 71,
+			body: "Review queued",
+			html_url: "https://github.com/acme/app/pull/7#issuecomment-71",
+		},
+	} as never);
 	const payload = {
 		action: "opened",
 		sender: { id: 1, login: "alice" },
@@ -521,7 +519,7 @@ it("signed GitHub PR opened webhook has one PR-thread owner plus a changelog obs
 });
 
 it("read-only query rejects writes at the database, not by a model instruction", async () => {
-	await expect(app.host.clients().database.query("org-acme", repair)).rejects.toMatchObject({
+	await expect(app.clients().database.query("org-acme", repair)).rejects.toMatchObject({
 		code: "25006",
 	});
 	expect(await balances()).toEqual([{ balance: 0 }, { balance: 100 }]);
@@ -580,7 +578,7 @@ it("mentions outside #help: two threads get independent support conversations", 
 	]);
 });
 it("signed Linear issue created webhook posts a triage comment", async () => {
-	const client = app.host.clients().linear;
+	const client = app.clients().linear;
 	vi.spyOn(client, "user").mockResolvedValue({ id: "lin_alice", displayName: "Alice" } as never);
 	const comments = vi.spyOn(client, "createComment").mockImplementation(
 		async (input) =>
@@ -636,9 +634,9 @@ it("signed Linear issue created webhook posts a triage comment", async () => {
 	await expect.poll(() => thread.getState(), poll).toBeNull();
 });
 it("read-only query cannot escape its transaction with multiple statements", async () => {
-	await expect(
-		app.host.clients().database.query("org-acme", `COMMIT; ${repair}`),
-	).rejects.toMatchObject({ code: "42601" });
+	await expect(app.clients().database.query("org-acme", `COMMIT; ${repair}`)).rejects.toMatchObject(
+		{ code: "42601" },
+	);
 	expect(await balances()).toEqual([{ balance: 0 }, { balance: 100 }]);
 });
 
@@ -686,7 +684,7 @@ it("support channel: two threads share one conversation, the final reply posts t
 });
 
 it("dev thread: the agent opens a PR and follows it; a requested change is answered on GitHub and in the Slack home; it unfollows after the merge", async () => {
-	const github = () => app.host.clients().github;
+	const github = () => app.clients().github;
 	const mockGitHub = () => {
 		vi.spyOn(github(), "request").mockResolvedValue({
 			data: { id: 1, name: "Alice", login: "alice" },
@@ -840,7 +838,7 @@ it("dev thread: the agent opens a PR and follows it; a requested change is answe
 });
 
 it("dev thread: the developer asks its researcher in the foreground and the background, and replies with both", async () => {
-	const search = vi.spyOn(app.host.clients().github.rest.search, "code").mockResolvedValue({
+	const search = vi.spyOn(app.clients().github.rest.search, "code").mockResolvedValue({
 		data: { items: [{ path: "tests/flaky.test.ts" }] },
 	} as never);
 	const last = (context: { messages: readonly ScriptedMessage[] }) => {

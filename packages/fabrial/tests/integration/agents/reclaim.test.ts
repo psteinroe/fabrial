@@ -12,7 +12,7 @@ import {
 	type FabrialHost,
 	type InvocationMetadata,
 	type RuntimeWorkflow,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import { FakeChat } from "../../../src/testing.ts";
 import { callSession, pi, PostgresStorage, type PiOptions } from "../../../src/agents/index.ts";
 import { until } from "../../conductor/helper.ts";

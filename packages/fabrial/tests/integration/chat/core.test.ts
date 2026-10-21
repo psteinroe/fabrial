@@ -7,7 +7,7 @@ import {
 	definePlugin,
 	trigger,
 	type WorkflowContext,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import { z } from "zod";
 import { testApp } from "../../../src/testing.ts";
 import { expect, it, vi } from "vitest";

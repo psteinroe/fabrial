@@ -13,7 +13,7 @@ import {
 	type Json,
 	type RuntimeWorkflow,
 	type WaitBranch,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import type { EventFilter } from "../../../src/events.ts";
 import { FakeChat, testApp } from "../../../src/testing.ts";
 import { z } from "zod";
@@ -838,7 +838,7 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 			return { output, event };
 		},
 	});
-	const executions = new Map<string, import("../../../src/index.ts").DurableExecution>();
+	const executions = new Map<string, import("../../internals.ts").DurableExecution>();
 	const register = runtime.register.bind(runtime);
 	runtime.register = (definition) =>
 		register({

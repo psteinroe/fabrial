@@ -43,7 +43,7 @@ import {
 	type Schema,
 	type StatePort,
 	type ThreadIO,
-} from "../index.ts";
+} from "../modules.ts";
 import {
 	definedAgents,
 	isWorkflow,

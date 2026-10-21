@@ -11,7 +11,7 @@ import {
 	type ChatMessage,
 	type ExternalIdentity,
 	type JsonObject,
-} from "../../../src/index.ts";
+} from "../../internals.ts";
 import { FakeChat, fakeAgents, testApp } from "../../../src/testing.ts";
 import { useConductor } from "../../conductor/helper.ts";
 

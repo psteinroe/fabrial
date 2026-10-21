@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import type { InvocationMetadata, Json, RuntimeWorkflow } from "../../../src/index.ts";
+import type { InvocationMetadata, Json, RuntimeWorkflow } from "../../internals.ts";
 import { until, useConductor } from "../../conductor/helper.ts";
 
 const db = useConductor();
