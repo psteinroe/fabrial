@@ -11,6 +11,7 @@ import type { Instructions, ToolDefinition, ToolResult } from "../agent.ts";
 import type { JsonObject } from "../json.ts";
 import type { Schema } from "../schema.ts";
 import { ToolReceipt } from "./documents.ts";
+import { bindMetadata, metadataOf } from "../context.ts";
 import { cloneJson, commitStaged, fields, type StagedState } from "./context.ts";
 
 /**
@@ -61,10 +62,14 @@ export function piToolOf(tool: ToolDefinition): ToolRegistration {
 				};
 			const staged = new Map<string, StagedState>();
 			const ctx = await fields(context, api.conversationId, api, staged);
-			const returned = await tool.run(validated.value, {
-				...ctx,
-				signal: context.abortSignal ?? new AbortController().signal,
-			});
+			// Spreading drops the context's metadata binding, so bind the tool context again.
+			const returned = await tool.run(
+				validated.value,
+				bindMetadata(
+					{ ...ctx, signal: context.abortSignal ?? new AbortController().signal },
+					metadataOf(ctx),
+				),
+			);
 			const result: ToolExecutionResult = {
 				content: [{ type: "text", text: toolContent(returned) }],
 			};
