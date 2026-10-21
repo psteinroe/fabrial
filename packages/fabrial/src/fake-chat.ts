@@ -24,6 +24,7 @@ export interface FakePost {
 class FakeThread implements ThreadIO {
 	readonly posts: FakePost[] = [];
 	readonly messages: ChatMessage[] = [];
+	/** The statuses shown, in order (`null` clears); setting the shown status again, as a chat thread does, adds none. */
 	readonly statuses: (string | null)[] = [];
 	/** Whether the thread is subscribed (Chat SDK delivers its messages as subscribed messages). */
 	subscribed = false;
@@ -68,7 +69,7 @@ class FakeThread implements ThreadIO {
 		if (message) message.text = messageText(content);
 	}
 	async setStatus(text: string | null): Promise<void> {
-		this.statuses.push(text);
+		if (this.statuses.at(-1) !== text) this.statuses.push(text);
 	}
 	async history(options: { limit?: number; sinceLastBotReply?: boolean }): Promise<ChatMessage[]> {
 		const lastBot = options.sinceLastBotReply
