@@ -16,6 +16,8 @@ export const APPROVAL_DECISION_WORKFLOW = "fabrial.approval.decision";
 export const APPROVAL_DELIVERY_WORKFLOW = "fabrial.approval.delivery";
 /** Authorized decisions only: the routing workflow emits a click after checking it. */
 export const APPROVAL_DECIDED_EVENT = "fabrial.approval.decided";
+/** `ApprovalHandle.cancel`: a signal to the decision execution, stored even before it first runs. */
+export const APPROVAL_CANCEL_SIGNAL = "fabrial.approval.cancel";
 
 /**
  * An approval request as stored in its execution's result. Assignment is by identity and group id, never
@@ -30,8 +32,10 @@ export interface ApprovalRequest {
 	approvers: Principal[];
 	/** The verified requester: may cancel the request from its status card, unless `requesterControls` is false. */
 	requester: Principal | null;
-	/** A link to the thread the request came from, or a description of it. */
+	/** The authenticated input the request came from: a link and its reference. */
 	source: string | null;
+	/** The thread replies go to, when it is not the source. */
+	thread: string | null;
 	/** Where the approver card goes instead of the approvers' DMs; grants no authority. */
 	destination: Surface | null;
 	/** Epoch ms. */
@@ -46,7 +50,8 @@ export type ApprovalAction = "approve" | "reject" | "cancel";
 
 /**
  * Longer than the longest approval (30 days), so a request stays readable while clicks can still
- * arrive and while waits on it register.
+ * arrive. Only the routing workflow and the decision execution wait on these; callers wait on the
+ * decision, which is kept forever.
  */
 const REQUEST_RETENTION_DAYS = 60;
 
@@ -118,88 +123,125 @@ export function approvalDecisionWorkflow(now: () => number): RuntimeWorkflow {
 	return {
 		name: APPROVAL_DECISION_WORKFLOW,
 		triggers: [],
-		retentionDays: REQUEST_RETENTION_DAYS,
+		// No retention: a caller may first wait on its decision any time later.
 		handler: async (input, execution) => {
 			const data = input as unknown as DecisionInput;
-			const decided = await execution.subscribe("decided", {
-				event: APPROVAL_DECIDED_EVENT,
-				filter: { approvalId: [data.approvalId] },
+			// Registered before any wait. The handler returns only once the reason is kept, so a crash in
+			// between redelivers it.
+			const cancel = Promise.withResolvers<string>();
+			const kept = Promise.withResolvers<void>();
+			execution.onSignal(APPROVAL_CANCEL_SIGNAL, async (payload) => {
+				cancel.resolve((payload as { reason: string }).reason);
+				await kept.promise;
 			});
-			const cleanups = await Promise.all(
-				data.cards.map((card, index) =>
-					execution.start(
-						`card:${index}`,
-						CLEANUP_WORKFLOW,
-						{
-							requestExecutionId: data.approvalId,
-							decisionId: execution.executionId,
-							proposal: data.proposal,
-							...card,
-						} satisfies CleanupInput as unknown as Json,
-						{ metadata: { replyTo: null, ownerWorkflow: null, triggerEvent: null } },
-					),
-				),
-			);
-			// The requester's status card is not an approver card.
-			const delivery = await execution.start(
-				"delivery",
-				APPROVAL_DELIVERY_WORKFLOW,
-				{ cleanups: cleanups.filter((_id, index) => data.cards[index]!.approver) },
-				{ metadata: { replyTo: null, ownerWorkflow: null, triggerEvent: null } },
-			);
-			const winner = await execution.waitForAny(
-				"decision",
-				{ decided, caller: { execution: data.callerId }, delivery: { execution: delivery } },
-				{ timeoutMs: Math.max(0, data.deadline - now()) },
-			);
-			if (winner.kind === "execution" && winner.key === "delivery") {
-				const error =
-					winner.result.status === "completed"
-						? UNREACHABLE
-						: `Approval delivery ${winner.result.status}`;
-				return {
-					error,
-					label: error,
-					at: new Date(now()).toISOString(),
-				} satisfies DecisionResult;
+			try {
+				return await decide(data, execution, now, cancel.promise);
+			} finally {
+				kept.resolve();
 			}
-			const decidedAt = new Date(now()).toISOString();
-			let result: DecisionResult;
-			if (winner.kind === "event") {
-				const event = winner.event.payload;
-				const status = event.status as ApprovalDecision["status"];
-				const actor = event.actor as unknown as Principal | null;
-				const name = actor?.name ?? actor?.id;
-				result = {
-					decision: {
-						status,
-						approved: status === "approved",
-						decidedBy: actor,
-						decidedAt,
-						...(typeof event.comment === "string" ? { comment: event.comment } : {}),
-					},
-					label:
-						status === "approved"
-							? `Approved by ${name}`
-							: status === "rejected"
-								? `Rejected by ${name}`
-								: event.reason === "superseded"
-									? "Superseded"
-									: "Cancelled",
-				};
-			} else
-				result = {
-					decision: {
-						status: winner.kind === "timeout" ? "expired" : "cancelled",
-						approved: false,
-						decidedBy: null,
-						decidedAt,
-					},
-					label: winner.kind === "timeout" ? "Expired" : "Cancelled",
-				};
-			return result as unknown as JsonObject;
 		},
 	};
+}
+
+async function decide(
+	data: DecisionInput,
+	execution: DurableExecution,
+	now: () => number,
+	cancelled: Promise<string>,
+): Promise<JsonObject> {
+	const decided = await execution.subscribe("decided", {
+		event: APPROVAL_DECIDED_EVENT,
+		filter: { approvalId: [data.approvalId] },
+	});
+	const cleanups = await Promise.all(
+		data.cards.map((card, index) =>
+			execution.start(
+				`card:${index}`,
+				CLEANUP_WORKFLOW,
+				{
+					requestExecutionId: data.approvalId,
+					decisionId: execution.executionId,
+					proposal: data.proposal,
+					...card,
+				} satisfies CleanupInput as unknown as Json,
+				{ metadata: { replyTo: null, ownerWorkflow: null, triggerEvent: null } },
+			),
+		),
+	);
+	// The requester's status card is not an approver card.
+	const delivery = await execution.start(
+		"delivery",
+		APPROVAL_DELIVERY_WORKFLOW,
+		{ cleanups: cleanups.filter((_id, index) => data.cards[index]!.approver) },
+		{ metadata: { replyTo: null, ownerWorkflow: null, triggerEvent: null } },
+	);
+	const winner = await execution.waitForAny(
+		"decision",
+		{
+			decided,
+			cancel: { signal: APPROVAL_CANCEL_SIGNAL },
+			caller: { execution: data.callerId },
+			delivery: { execution: delivery },
+		},
+		// At least 1ms: a deadline passed before the wait registered (a resume after a crash) still expires it.
+		{ timeoutMs: Math.max(1, data.deadline - now()) },
+	);
+	if (winner.kind === "execution" && winner.key === "delivery") {
+		const error =
+			winner.result.status === "completed"
+				? UNREACHABLE
+				: `Approval delivery ${winner.result.status}`;
+		return {
+			error,
+			label: error,
+			at: new Date(now()).toISOString(),
+		} satisfies DecisionResult;
+	}
+	const decidedAt = new Date(now()).toISOString();
+	let result: DecisionResult;
+	if (winner.kind === "signal") {
+		const reason = await execution.step("cancelled", () => cancelled);
+		result = {
+			decision: {
+				status: "cancelled",
+				approved: false,
+				decidedBy: null,
+				decidedAt,
+				comment: reason,
+			},
+			label: reason === "superseded" ? "Superseded" : "Cancelled",
+		};
+	} else if (winner.kind === "event") {
+		const event = winner.event.payload;
+		const status = event.status as ApprovalDecision["status"];
+		const actor = event.actor as unknown as Principal | null;
+		const name = actor?.name ?? actor?.id;
+		result = {
+			decision: {
+				status,
+				approved: status === "approved",
+				decidedBy: actor,
+				decidedAt,
+				...(typeof event.comment === "string" ? { comment: event.comment } : {}),
+			},
+			label:
+				status === "approved"
+					? `Approved by ${name}`
+					: status === "rejected"
+						? `Rejected by ${name}`
+						: "Cancelled",
+		};
+	} else
+		result = {
+			decision: {
+				status: winner.kind === "timeout" ? "expired" : "cancelled",
+				approved: false,
+				decidedBy: null,
+				decidedAt,
+			},
+			label: winner.kind === "timeout" ? "Expired" : "Cancelled",
+		};
+	return result as unknown as JsonObject;
 }
 
 /** The request of an approval id from a click: null for unknown ids and executions of other workflows. */

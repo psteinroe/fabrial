@@ -38,6 +38,12 @@ export function renderMessage(message: OutboundMessage): AdapterPostableMessage 
 		);
 		children.push(CardText(`${fence}${card.code.language ?? ""}\n${card.code.content}\n${fence}`));
 	}
+	if (card.section) {
+		children.push(CardText(card.section.title, { style: "bold" }));
+		if (card.section.text) children.push(CardText(card.section.text));
+		if (card.section.fields?.length)
+			children.push(Fields(card.section.fields.map((field) => Field(field))));
+	}
 	if (card.footer) children.push(CardText(card.footer));
 	if (card.actions?.length) children.push(Actions(card.actions.map((action) => Button(action))));
 	const rendered = toCardElement(SDKCard({ title: card.title, children }));

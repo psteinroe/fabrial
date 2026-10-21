@@ -12,8 +12,10 @@ export interface Proposal {
 	details: Json;
 	/** The verified requester, or null when no person requested it. */
 	requester: Principal | null;
-	/** A link to the source thread or a description of it; null without one. */
+	/** The authenticated input the request came from (a link and its reference); null without one. */
 	source: string | null;
+	/** The thread replies go to, when it is not the source; null otherwise. */
+	thread?: string | null;
 	/** Epoch ms. */
 	deadline: number;
 	content: ApprovalCardContent | null;
@@ -25,6 +27,26 @@ export interface Outcome {
 	/** ISO time. */
 	at: string;
 	reason?: string;
+}
+
+/** Labels only Fabrial sets: app content cannot pose as them. */
+export const RESERVED_LABELS = [
+	"Requested by",
+	"Source",
+	"Reply thread",
+	"Expires",
+	"Closed",
+	"Reason",
+	"Status",
+	"Approvers",
+	"Decided by",
+];
+
+/** The display name with the stable id it belongs to; unmapped identities are marked. */
+export function requesterLabel(requester: Principal | null): string {
+	if (!requester) return "No requester (automated)";
+	const id = requester.known ? requester.id : `unmapped ${requester.id}`;
+	return requester.name ? `${requester.name} (${id})` : id;
 }
 
 const time = (ms: number | string) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -42,21 +64,27 @@ function card(
 	fields: { label: string; value: string }[],
 	actions: CardAction[],
 ): Card {
-	const { requester, content } = proposal;
+	const { content } = proposal;
 	return {
 		title: proposal.title,
 		text,
 		fields: [
-			{
-				label: "Requested by",
-				value: requester ? (requester.name ?? requester.id) : "No requester (automated)",
-			},
+			{ label: "Requested by", value: requesterLabel(proposal.requester) },
 			{ label: "Source", value: proposal.source ?? "None" },
+			...(proposal.thread ? [{ label: "Reply thread", value: proposal.thread }] : []),
 			...fields,
-			...(content?.fields ?? []),
 		],
 		code: details(proposal.details),
-		...(content?.text ? { footer: content.text } : {}),
+		// The app's content, labelled as such: never among the fields Fabrial verified.
+		...(content?.text || content?.fields?.length
+			? {
+					section: {
+						title: "From the requesting app (not verified by Fabrial)",
+						...(content.text ? { text: content.text } : {}),
+						...(content.fields?.length ? { fields: content.fields } : {}),
+					},
+				}
+			: {}),
 		actions,
 	};
 }

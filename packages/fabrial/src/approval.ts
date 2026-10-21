@@ -2,7 +2,10 @@ import type { GroupDefinition, Principal, UserDefinition } from "./identity.ts";
 import type { Json } from "./json.ts";
 import type { Awaitable, Surface } from "./thread.ts";
 
-/** App content added to an approval card, after the proposal; it never replaces it. */
+/**
+ * App content added to an approval card in its own labelled section, after the proposal; it never
+ * replaces it. Field labels Fabrial sets ("Requested by", "Source", "Expires", …) are rejected.
+ */
 export interface ApprovalCardContent {
 	text?: string;
 	fields?: { label: string; value: string }[];
@@ -19,8 +22,8 @@ export interface ApprovalOptions {
 	/** Duration string ("24h") or ms. Must stay below 30 days (Chat SDK thread-state TTL). */
 	timeout?: string | number;
 	/**
-	 * Extra card content, shown after the proposal, the verified requester, the source thread, and the
-	 * deadline, which every card shows.
+	 * Extra card content, shown in a section labelled as the app's, after the proposal, the verified
+	 * requester, the source, the reply thread, and the deadline, which every card shows.
 	 */
 	card?: ApprovalCardContent;
 	/**

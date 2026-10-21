@@ -113,7 +113,7 @@ describe("Linear triage responsibility", () => {
 		vi.spyOn(clients.linear, "teams").mockResolvedValue({
 			nodes: [{ triageResponsibility: undefined }],
 		} as never);
-		const group = triageResponsibility({ id: "triage", team: "ENG" });
+		const group = triageResponsibility({ id: "triage-missing", team: "ENG" });
 		await expect(group.resolve!({ clients, now: new Date(), principal: vi.fn() })).rejects.toThrow(
 			"no current triage",
 		);

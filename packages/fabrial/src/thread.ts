@@ -40,6 +40,8 @@ export interface Card {
 	fields?: { label: string; value: string }[];
 	/** Pre-formatted block (e.g. SQL). */
 	code?: { language?: string; content: string };
+	/** A titled section after the code block, kept apart from `fields` (e.g. an approval's app content). */
+	section?: { title: string; text?: string; fields?: { label: string; value: string }[] };
 	/** Text after the other content, before the actions. */
 	footer?: string;
 	actions?: CardAction[];

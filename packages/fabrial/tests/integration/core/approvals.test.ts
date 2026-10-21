@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineGroup, defineUser } from "../../internals.ts";
-import type { Json, WorkflowContext } from "../../internals.ts";
+import type { DurableExecution, Json, RuntimeWorkflow, WorkflowContext } from "../../internals.ts";
 import { until } from "../../conductor/helper.ts";
 import {
 	alice,
@@ -17,6 +17,45 @@ import {
 } from "./setup.ts";
 
 const { db, setup, enter, card, eventually } = useCoreApp();
+const DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * A runtime whose approval decision executions pause on their first attempt until `release`: before their
+ * handler runs (`start`), or before their decision wait registers (`wait`), as after a crash there.
+ */
+function paused(at: "start" | "wait") {
+	const runtime = db.runtime();
+	const open = Promise.withResolvers<void>();
+	const reached = Promise.withResolvers<void>();
+	const pause = async () => {
+		reached.resolve();
+		await open.promise;
+	};
+	const hold = (definition: RuntimeWorkflow): RuntimeWorkflow =>
+		definition.name !== "fabrial.approval.decision"
+			? definition
+			: {
+					...definition,
+					handler: async (input, execution) => {
+						if (at === "start") {
+							await pause();
+							return definition.handler(input, execution);
+						}
+						const waitForAny: DurableExecution["waitForAny"] = async (id, ...rest) => {
+							if (id === "decision") await pause();
+							return execution.waitForAny(id, ...rest);
+						};
+						return definition.handler(
+							input,
+							Object.assign(Object.create(execution) as DurableExecution, { waitForAny }),
+						);
+					},
+				};
+	const register = runtime.register.bind(runtime);
+	runtime.register = (definition) =>
+		register({ ...definition, workflows: definition.workflows.map(hold) });
+	return { runtime, reached: reached.promise, release: () => open.resolve() };
+}
 const cardOf = (content: unknown) =>
 	(content as { card: { text?: string; actions: { id: string }[] } }).card;
 
@@ -554,6 +593,91 @@ describe("native approval waits", () => {
 		expect(row!.count).toBe(0);
 	});
 
+	it("cancels an approval whose decision execution has not run yet", async () => {
+		const decision = paused("start");
+		const test = setup(
+			[
+				workflow(async (_i, ctx) => {
+					const approval = await ctx.requestApproval("a", {
+						title: "Proposal",
+						details: {},
+						approvers: team,
+						timeout: "1h",
+					});
+					await approval.cancel("cancel", "Withdrawn");
+					const { status, comment } = await approval.wait("decision");
+					return [status, comment ?? null];
+				}),
+			],
+			{ runtime: decision.runtime },
+		);
+		const owner = await enter(test);
+		await decision.reached;
+		// The cancel is sent and the caller waits, before the decision execution first runs.
+		await owner.suspended("fabrial:decision:wait");
+		decision.release();
+		expect(await owner.output()).toEqual(["cancelled", "Withdrawn"]);
+		const dm = await test.chat.openDM(alice.identities[0]!);
+		await eventually("the cancelled card", () => cardOf(dm.posts[0]?.content).text === "Cancelled");
+	});
+
+	it("returns a decision first awaited after maintenance ran past 60 days", async () => {
+		const test = setup([
+			workflow(async (_i, ctx) => {
+				const approval = await ctx.requestApproval("a", {
+					title: "Proposal",
+					details: {},
+					approvers: team,
+					timeout: "1h",
+				});
+				await ctx.sleep("later", 90 * DAY);
+				return (await approval.wait("decision")).status;
+			}),
+		]);
+		const owner = await enter(test);
+		const c = await card(test);
+		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
+		await eventually("the final card", () => c.post.updates.length > 0);
+		await owner.suspended("later");
+		await db.clock.advance(61 * DAY);
+		// Conductor's maintenance: removes settled executions older than their task's retention.
+		const removed = await db.sql<{ task_key: string }[]>`
+			delete from pgconductor._private_executions e using pgconductor._private_tasks t
+			where t.key = e.task_key and t.queue = e.queue and e.queue = ${test.runtime.queue}
+			and ((e.completed_at is not null and t.remove_on_complete_days > 0
+					and e.completed_at < pgconductor._private_current_time() - t.remove_on_complete_days * interval '1 day')
+				or (e.failed_at is not null and t.remove_on_fail_days > 0
+					and e.failed_at < pgconductor._private_current_time() - t.remove_on_fail_days * interval '1 day'))
+			returning e.task_key`;
+		expect(removed.map((row) => row.task_key)).toContain("fabrial.approval.request");
+		await db.clock.advance(29 * DAY);
+		expect(await owner.output()).toBe("approved");
+	});
+
+	it("denies a click after the deadline while the decision has not registered its timeout", async () => {
+		const decision = paused("wait");
+		const test = setup([approvalWorkflow("1h")], { runtime: decision.runtime });
+		const owner = await enter(test);
+		await decision.reached;
+		const dm = await test.chat.openDM(alice.identities[0]!);
+		const post = await until("alice's approval card", async () => dm.posts[0]);
+		await db.clock.advance(60 * 60 * 1000 + 1000);
+		await test.chat.click(post.ref, cardOf(post.content).actions[0]!.id, alice.identities[0]!);
+		await eventually("the expiry notice", () => test.chat.ephemeral.length === 1);
+		expect(test.chat.ephemeral[0]).toMatchObject({ text: "This approval has expired." });
+		// Denied before it was emitted: the approval's subscription never holds it.
+		const approvalId = cardOf(post.content).actions[0]!.id.slice(
+			"fabrial.approval.approve:".length,
+		);
+		const [emitted] = await db.sql<{ count: number }[]>`
+			select count(*)::int as count from pgconductor._private_executions
+			where task_key = 'pgconductor.event-dispatch' and payload ->> 'eventKey' = 'fabrial.approval.decided'
+			and payload -> 'payload' ->> 'approvalId' = ${approvalId}`;
+		expect(emitted!.count).toBe(0);
+		expect((await owner.info())?.status).not.toBe("completed");
+		decision.release();
+	});
+
 	it("keeps executions that cleanup waits on past the longest approval", async () => {
 		const test = setup([approvalWorkflow()]);
 		await test.app.start();
@@ -561,9 +685,11 @@ describe("native approval waits", () => {
 			select key, remove_on_complete_days as complete, remove_on_fail_days as fail
 			from pgconductor._private_tasks where queue = ${test.runtime.queue}
 			and key in ('fabrial.approval.decision', 'owner')`;
-		const decision = rows.find((row) => row.key === "fabrial.approval.decision")!;
-		expect(decision.complete).toBeGreaterThan(30);
-		expect(decision.fail).toBeGreaterThan(30);
+		// Callers may first wait on a decision any time later: it is never removed.
+		expect(rows.find((row) => row.key === "fabrial.approval.decision")).toMatchObject({
+			complete: null,
+			fail: null,
+		});
 		// Callers are app workflows: kept until the app sets a retention.
 		expect(rows.find((row) => row.key === "owner")).toMatchObject({ complete: null, fail: null });
 	});
@@ -638,19 +764,25 @@ describe("approval authorization", () => {
 		expect(await owner.output()).toEqual(["approved", "bob"]);
 	});
 
-	it("fails an approval assigned to a group id defined more than once", async () => {
+	it("rejects a group id defined twice at once, keeping the first registration", async () => {
 		const one = defineGroup({ id: "twice", members: [alice] });
-		defineGroup({ id: "twice", members: [outsider] });
+		expect(() => defineGroup({ id: "twice", members: [outsider] })).toThrow(
+			"Group twice is already defined",
+		);
 		const test = setup([
 			workflow(async (_i, ctx) => {
-				await ctx.waitForApproval("approval", { title: "Proposal", details: {}, approvers: one });
+				const decision = await ctx.waitForApproval("approval", {
+					title: "Proposal",
+					details: {},
+					approvers: one,
+				});
+				return decision.decidedBy?.id ?? null;
 			}),
 		]);
 		const owner = await enter(test);
-		expect(await owner.settled()).toMatchObject({
-			status: "failed",
-			error: expect.stringContaining("defined once with defineGroup"),
-		});
+		const c = await card(test);
+		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
+		expect(await owner.output()).toBe("alice");
 	});
 
 	it("keeps the request readable past the longest approval", async () => {
@@ -731,20 +863,40 @@ describe("approval cards", () => {
 					content: JSON.stringify({ sql: "delete from users where id = 1" }, null, 2),
 				},
 			});
-			expect(field(content, "Requested by")).toBe("Alice");
-			expect(field(content, "Source")).toBe(`https://chat.test/chat/${surface.threadId}`);
+			expect(field(content, "Requested by")).toBe("Alice (alice)");
+			// The authenticated input: the chat message; replies go to its thread.
+			expect(field(content, "Source")).toBe("chat messageId initial");
+			expect(field(content, "Reply thread")).toBe(`https://chat.test/chat/${surface.threadId}`);
 			expect(field(content, "Expires")).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
 		}
 		expect(shown(c.post.content).text).toBe("Approval requested");
 		expect(shown(status.content).text).toBe("Waiting for approval");
 	});
-	it("adds custom content after the proposal, never replacing it", async () => {
+	it("shows the input that prompted the request as its source, apart from the reply thread", async () => {
+		const test = setup([decisionWorkflow()]);
+		await test.app.start();
+		// As a followed GitHub review delivers to a chat-hosted conversation: GitHub origin, chat reply thread.
+		const pr = { provider: "github", installationId: "1", repo: "acme/app", number: 5 };
+		await test.app.emit(event, message("review"), {
+			origin: { ...pr, threadId: "github:acme/app:5" },
+			replyTo: surface,
+			requestedBy: identity("Z"),
+		});
+		await test.execution();
+		const c = await card(test);
+		expect(field(c.post.content, "Source")).toBe(
+			"https://chat.test/github/github:acme/app:5 (github repo acme/app number 5)",
+		);
+		expect(field(c.post.content, "Reply thread")).toBe(
+			`https://chat.test/chat/${surface.threadId}`,
+		);
+		// A display name is not an identity: the stable id shows, marked when no user is defined for it.
+		expect(field(c.post.content, "Requested by")).toBe("unmapped chat:workspace:Z");
+	});
+	it("adds custom content in its own labelled section, never among the verified fields", async () => {
 		const test = setup([
 			decisionWorkflow({
-				card: {
-					text: "Nothing to see here",
-					fields: [{ label: "Requested by", value: "Mallory" }],
-				},
+				card: { text: "Nothing to see here", fields: [{ label: "Ticket", value: "OPS-1" }] },
 			}),
 		]);
 		await enter(test);
@@ -752,15 +904,30 @@ describe("approval cards", () => {
 		const content = shown(c.post.content);
 		expect(content.title).toBe("Run SQL?");
 		expect(content.code?.content).toContain("delete from users where id = 1");
-		expect(content.fields.slice(0, 3).map((each) => each.label)).toEqual([
+		expect(content.fields.map((each) => each.label)).toEqual([
 			"Requested by",
 			"Source",
+			"Reply thread",
 			"Expires",
 		]);
-		expect(content.fields[0]!.value).toBe("Alice");
-		expect(content.fields.at(-1)).toEqual({ label: "Requested by", value: "Mallory" });
-		expect(content.footer).toBe("Nothing to see here");
+		expect(content.fields[0]!.value).toBe("Alice (alice)");
+		expect((content as { section?: unknown }).section).toEqual({
+			title: "From the requesting app (not verified by Fabrial)",
+			text: "Nothing to see here",
+			fields: [{ label: "Ticket", value: "OPS-1" }],
+		});
 	});
+	it.each(["Requested by", " source ", "Expires", "Reply thread"])(
+		"rejects the reserved card field label %j",
+		async (label) => {
+			const test = setup([decisionWorkflow({ card: { fields: [{ label, value: "Mallory" }] } })]);
+			const owner = await enter(test);
+			expect(await owner.settled()).toMatchObject({
+				status: "failed",
+				error: expect.stringContaining("is reserved"),
+			});
+		},
+	);
 	it("keeps the proposal and adds the decision, its time and reason on final cards", async () => {
 		const test = setup([decisionWorkflow()]);
 		const owner = await enter(test);
@@ -783,7 +950,7 @@ describe("approval cards", () => {
 			actions: [],
 		});
 		expect(shown(content).code?.content).toContain("delete from users where id = 1");
-		expect(field(content, "Requested by")).toBe("Alice");
+		expect(field(content, "Requested by")).toBe("Alice (alice)");
 		expect(field(content, "Reason")).toBe("Too risky");
 		expect(field(content, "Closed")).toMatch(/Z$/);
 		expect(field(content, "Expires")).toBeUndefined();
@@ -809,7 +976,7 @@ describe("approval cards", () => {
 		expect(decision.comment).toBeUndefined();
 		await eventually("the final card", () => c.post.updates.length > 0);
 		expect(shown(c.post.content)).toMatchObject({ text: "Approved by Alice", actions: [] });
-		expect(field(c.post.content, "Requested by")).toBe("Alice");
+		expect(field(c.post.content, "Requested by")).toBe("Alice (alice)");
 	});
 	it("keeps the proposal on expired cards", async () => {
 		const test = setup([decisionWorkflow({ timeout: "1h" })]);
@@ -820,7 +987,7 @@ describe("approval cards", () => {
 		expect(await owner.output()).toMatchObject({ status: "expired" });
 		await eventually("the expired card", () => shown(c.post.content).text === "Expired");
 		expect(shown(c.post.content).code?.content).toContain("delete from users");
-		expect(field(c.post.content, "Requested by")).toBe("Alice");
+		expect(field(c.post.content, "Requested by")).toBe("Alice (alice)");
 	});
 	it("posts to a destination, where only assigned approvers may decide", async () => {
 		const destination = { kind: "channel", provider: "chat", channelId: "approvals" } as const;
@@ -833,7 +1000,7 @@ describe("approval cards", () => {
 		);
 		const [approve] = shown(post.content).actions;
 		expect(shown(post.content).text).toBe("Approval requested");
-		expect(field(post.content, "Requested by")).toBe("Alice");
+		expect(field(post.content, "Requested by")).toBe("Alice (alice)");
 		// No DMs: the destination replaces them.
 		expect((await test.chat.openDM(alice.identities[0]!)).posts).toHaveLength(0);
 		await owner.suspended();

@@ -1,7 +1,7 @@
 import type { ApprovalDecision, ApprovalHandle, ApprovalOptions } from "./approval.ts";
 import type { ContextOptions, InternalAwaitable } from "./context.ts";
 import {
-	APPROVAL_DECIDED_EVENT,
+	APPROVAL_CANCEL_SIGNAL,
 	APPROVAL_DECISION_WORKFLOW,
 	APPROVAL_REQUEST_WORKFLOW,
 	type ApprovalCard,
@@ -12,6 +12,8 @@ import {
 import { definedGroup, type Principal } from "./identity.ts";
 import { boundedTimeout } from "./internal.ts";
 import type { Json } from "./json.ts";
+import type { Origin } from "./events.ts";
+import { RESERVED_LABELS } from "./approval-card.ts";
 import type { FabrialHost } from "./app.ts";
 import type { Awaitable, Surface } from "./thread.ts";
 
@@ -30,15 +32,39 @@ function canonical(value: Json): string {
 	return JSON.stringify(value);
 }
 
-/** A link to the source surface, else a description of it. */
-async function describe(host: FabrialHost, surface: Surface | null): Promise<string | null> {
-	if (!surface) return null;
+/** A link to a thread, else a description of it. */
+async function describe(host: FabrialHost, surface: Surface): Promise<string> {
 	if (surface.kind === "channel") return `${surface.provider} channel ${surface.channelId}`;
 	const link = await host
 		.chat()
 		?.permalink?.(surface)
 		.catch(() => null);
 	return link ?? `${surface.provider} thread ${surface.threadId}`;
+}
+
+/**
+ * Where the request came from: the authenticated ingress origin (e.g. the GitHub review that steered an
+ * agent), linked when it names a thread, with its reference; and the reply thread when it differs.
+ */
+async function provenance(
+	host: FabrialHost,
+	origin: Origin | null,
+	replyTo: Surface | null,
+): Promise<{ source: string | null; thread: string | null }> {
+	const thread = replyTo ? await describe(host, replyTo) : null;
+	if (!origin) return { source: null, thread };
+	const { provider, installationId: _installation, threadId, ...rest } = origin;
+	const reference = [
+		provider,
+		...Object.entries(rest).map(([key, value]) => `${key} ${canonical(value)}`),
+	]
+		.join(" ")
+		.replace(/"/g, "");
+	if (typeof threadId !== "string") return { source: reference, thread };
+	const source = `${await describe(host, { kind: "thread", provider, threadId })} (${reference})`;
+	const same =
+		replyTo?.kind === "thread" && replyTo.provider === provider && replyTo.threadId === threadId;
+	return { source, thread: same ? null : thread };
 }
 
 export async function createApproval(
@@ -50,6 +76,9 @@ export async function createApproval(
 	if (!host.chat()) throw new Error("Approvals require a chat integration");
 	const originatingProvider = metadata.origin?.provider ?? metadata.replyTo?.provider;
 	const targets = Array.isArray(options.approvers) ? options.approvers : [options.approvers];
+	for (const field of options.card?.fields ?? [])
+		if (RESERVED_LABELS.some((label) => label.toLowerCase() === field.label.trim().toLowerCase()))
+			throw new Error(`Approval ${id}: card field label "${field.label}" is reserved`);
 	const request = (await execution.step(`fabrial:${id}:request`, async () => {
 		const resolved: Principal[] = [];
 		const users: Principal[] = [];
@@ -82,7 +111,7 @@ export async function createApproval(
 			},
 			approvers,
 			requester: metadata.requestedBy,
-			source: await describe(host, (metadata.replyTo as Surface | null) ?? null),
+			...(await provenance(host, metadata.origin, (metadata.replyTo as Surface | null) ?? null)),
 			destination: options.destination ?? null,
 			deadline: now() + boundedTimeout(options.timeout),
 			title: options.title,
@@ -147,6 +176,7 @@ export async function createApproval(
 				details: request.details,
 				requester: request.requester,
 				source: request.source,
+				thread: request.thread,
 				deadline: request.deadline,
 				content: request.content,
 			},
@@ -183,14 +213,16 @@ export async function createApproval(
 		wait: async (waitId) =>
 			(await ctx.race(ctx.op(waitId), { decision: awaitable }))
 				.value as unknown as ApprovalDecision,
-		// Decides the approval unless a decision came first; the decision execution ignores later ones.
+		// Decides the approval unless a decision came first. A signal, not an event: it is kept for the
+		// decision execution even when that has not subscribed yet.
 		cancel: async (cancelId, reason) => {
-			await execution.step(ctx.op(cancelId), async () => {
-				await execution.emit(
-					APPROVAL_DECIDED_EVENT,
-					{ approvalId, status: "cancelled", actor: null, comment: reason, reason },
-					{ id: `${approvalId}:cancel` },
-				);
+			const op = ctx.op(cancelId);
+			await execution.step(op, async () => {
+				await host.runtime.signal(decisionId, {
+					name: APPROVAL_CANCEL_SIGNAL,
+					id: op,
+					payload: { reason },
+				});
 			});
 		},
 	};

@@ -203,28 +203,45 @@ export function buildApp(config: CoreConfig): HostedApp {
 				});
 				return { authorized: false };
 			}
-			await execution.emit(
-				APPROVAL_DECIDED_EVENT,
-				{
-					approvalId: approvalId!,
-					status: verb === "approve" ? "approved" : verb === "reject" ? "rejected" : "cancelled",
-					actor: actor as unknown as Json,
-					messageId: action.messageId,
-					// A rejection's reason, from the reject modal; approve and cancel buttons carry none.
-					...(verb === "reject" && action.value?.trim()
-						? { comment: action.value.trim().slice(0, MAX_REASON) }
-						: {}),
-				},
-				{
-					id: ingress.id,
-					metadata: {
-						requestId: approvalId!,
-						origin: { provider: ingress.actor!.provider },
-						replyTo: null,
-						requestedBy: actor,
+			// The persisted deadline holds here too: the decision may not have registered its timeout yet,
+			// and a retry reuses the authorization above.
+			const decided = await execution.step("decide", async () => {
+				if (now() >= request!.deadline) return false;
+				await runtime.emit(
+					APPROVAL_DECIDED_EVENT,
+					{
+						approvalId: approvalId!,
+						status: verb === "approve" ? "approved" : verb === "reject" ? "rejected" : "cancelled",
+						actor: actor as unknown as Json,
+						messageId: action.messageId,
+						// A rejection's reason, from the reject modal; approve and cancel buttons carry none.
+						...(verb === "reject" && action.value?.trim()
+							? { comment: action.value.trim().slice(0, MAX_REASON) }
+							: {}),
 					},
-				},
-			);
+					{
+						id: ingress.id,
+						metadata: {
+							requestId: approvalId!,
+							origin: { provider: ingress.actor!.provider },
+							replyTo: null,
+							requestedBy: actor,
+						},
+					},
+				);
+				return true;
+			});
+			if (!decided) {
+				await execution.step("expired", async () => {
+					if (ingress.actor && ingress.replyTo)
+						await chat?.port.postEphemeral(
+							ingress.replyTo as ThreadRef,
+							ingress.actor,
+							"This approval has expired.",
+						);
+				});
+				return { authorized: true, expired: true };
+			}
 			return { authorized: true };
 		}
 		if (ingress.kind === "stop") {
