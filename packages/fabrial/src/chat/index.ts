@@ -85,7 +85,7 @@ export function chat(options: ChatOptions): ChatIntegration {
 			const bot = new Chat<Record<string, Adapter>, SDKState>({
 				adapters,
 				state: options.state,
-				userName: options.userName ?? "../index.ts",
+				userName: options.userName ?? "fabrial",
 				// Queue/debounce strategies coalesce messages; every message is an input of its own.
 				concurrency: { strategy: "concurrent", maxConcurrent: 1 },
 				logger,
