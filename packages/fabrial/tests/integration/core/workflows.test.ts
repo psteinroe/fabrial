@@ -1,7 +1,7 @@
 import { metadataOf } from "../../../src/context.ts";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { defineEvent, definePlugin, trigger } from "../../internals.ts";
+import { defineEvent, definePlugin, trigger, type Json } from "../../internals.ts";
 import { fakeAgents } from "../../../src/testing.ts";
 import { until } from "../../conductor/helper.ts";
 import {
@@ -10,6 +10,7 @@ import {
 	defineWorkflow,
 	event,
 	message,
+	once,
 	metadata,
 	plugin,
 	surface,
@@ -161,6 +162,26 @@ describe("durability and context", () => {
 		await db.clock.advance("1h");
 		expect(await owner.output()).toBe(3);
 		expect(effects).toBe(3);
+	});
+	const outputs = (output: z.ZodType<Json>, result: Json) =>
+		defineWorkflow({
+			name: "owner",
+			triggers: [trigger({ event })],
+			retries: once,
+			output,
+			run: async () => result,
+		});
+	it("fails a workflow whose result doesn't match its output schema", async () => {
+		const test = setup([outputs(z.number().positive(), -1)]);
+		expect(await (await enter(test)).settled()).toMatchObject({
+			status: "failed",
+			error: expect.stringContaining("Invalid workflow owner output"),
+		});
+	});
+	it("records a workflow's result as transformed by its output schema", async () => {
+		const length = z.string().transform((text) => text.length) as unknown as z.ZodType<Json>;
+		const test = setup([outputs(length, "four")]);
+		expect(await (await enter(test)).settled()).toEqual({ status: "completed", output: 4 });
 	});
 	it("rejects empty operation ids", async () => {
 		const test = setup([workflow(async (_i, ctx) => ctx.step("", () => 1))]);

@@ -21,6 +21,7 @@ import {
 } from "./send.ts";
 import type { AnyWorkflow, ExecutionInfo, WorkflowContext } from "./workflow.ts";
 import type { Json, JsonObject } from "./json.ts";
+import { parseSchema } from "./schema.ts";
 import {
 	type AgentRef,
 	type DurableExecution,
@@ -478,8 +479,17 @@ export function buildApp(config: CoreConfig): HostedApp {
 				next,
 			);
 		},
-		handler: (input, _execution, context) =>
-			workflow.definition.run(input, context as WorkflowContext),
+		handler: async (input, _execution, context) => {
+			const output = (await workflow.definition.run(input, context as WorkflowContext)) ?? null;
+			// The output schema validates (and transforms) the result before the run records it.
+			return workflow.definition.output
+				? ((await parseSchema(
+						workflow.definition.output,
+						output,
+						`workflow ${workflow.name} output`,
+					)) as Json)
+				: output;
+		},
 	}));
 	const extraWorkflows = new Map((agents?.agents.workflows() ?? []).map((w) => [w.name, w]));
 	for (const workflow of agents?.workflows ?? []) extraWorkflows.set(workflow.name, workflow);
