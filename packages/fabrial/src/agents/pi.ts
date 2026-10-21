@@ -92,7 +92,12 @@ import {
 	type SendOptions,
 	type SendRequest,
 } from "../send.ts";
-import { followResource, unfollowResource, type StoredFollowOptions } from "../follows.ts";
+import {
+	followResource,
+	unfollowResource,
+	type ConversationRef,
+	type StoredFollowOptions,
+} from "../follows.ts";
 import type { ResourceRefJson } from "../plugin.ts";
 import {
 	applyState,
@@ -177,8 +182,14 @@ export const callSession = (executionId: string, id: string) =>
 	`${CALL_SESSION}${executionId}:${id}`;
 const CALL_SESSION = "run:";
 
-/** The Session of a workflow's `ctx.state`: its thread's, else its own. */
+/**
+ * The Session of a workflow's `ctx.state`: the calling conversation's when an agent's tool started it (directly or
+ * through other workflows), so it shares state with that agent whatever its session kind; else its thread's, else
+ * its own.
+ */
 export function sessionKey(metadata: InvocationMetadata): string {
+	const conversation = metadata.conversation as ConversationRef | undefined;
+	if (conversation?.session) return conversation.session;
 	const surface = metadata.replyTo;
 	if (surface?.kind === "thread") return threadSession(surface.provider, surface.threadId);
 	if (surface?.kind === "channel")

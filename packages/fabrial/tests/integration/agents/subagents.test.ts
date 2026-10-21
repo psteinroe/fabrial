@@ -1491,7 +1491,7 @@ it("continuing a background child from another actor and thread runs its tools f
 	await idle(runtime.queue);
 });
 
-it("channel-session agents share session state across threads; a ctx.agent call's tools see their own", async () => {
+it("channel-session agents share session state across threads with their workflow tools; a ctx.agent call's tools see their own", async () => {
 	const g = createFabrial({ plugins: [] });
 	const faux = fauxProvider();
 	const models = createModels();
@@ -1516,11 +1516,29 @@ it("channel-session agents share session state across threads; a ctx.agent call'
 			return `count=${count}`;
 		},
 	});
+	// A workflow the agent calls as a tool uses the calling conversation's (channel) Session, not its thread's.
+	const flow = g.defineWorkflow({
+		name: `flow-${short()}`,
+		description: "Bumps the counter from a workflow",
+		input: z.object({}),
+		run: async (_input, ctx) => {
+			const { count } = await ctx.state(Counter).update("bump", (draft) => {
+				draft.count++;
+			});
+			seen.push(count);
+			return `count=${count}`;
+		},
+	});
+	// An independent workflow on the thread uses the thread's Session.
+	const read = g.defineWorkflow({
+		name: `read-${short()}`,
+		run: (_input, ctx) => ctx.state(Counter).get("read"),
+	});
 	const desk = g.defineAgent({
 		name: `desk-${short()}`,
 		description: "Bumps.",
 		model,
-		tools: [bump],
+		tools: [bump, flow],
 	});
 	const deliver = g.defineWorkflow({
 		name: `deliver-${short()}`,
@@ -1537,13 +1555,14 @@ it("channel-session agents share session state across threads; a ctx.agent call'
 	faux.setResponses(
 		Array.from({ length: 20 }, () => (context: TranscriptContext) => {
 			const text = lastText(context);
-			if (text.startsWith("count=")) return say(`Done ${text}.`);
+			if (text.replaceAll('"', "").startsWith("count=")) return say(`Done ${text}.`);
+			if (text.includes("Flow")) return use(toolName(flow.name), {});
 			if (text.includes("Bump")) return use("bump", {});
 			return say("ok");
 		}),
 	);
 	const { runtime } = await launch(g, {
-		workflows: [deliver, call],
+		workflows: [deliver, call, flow, read],
 		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
 	});
 	// The fake chat derives a thread's channel from its id (`<kind>:<channel>:<thread>`): both threads share one.
@@ -1568,5 +1587,14 @@ it("channel-session agents share session state across threads; a ctx.agent call'
 	expect(seen).toEqual([1, 2, 1]);
 	await runtime.invoke(deliver.name, "Bump", { metadata: metadata("a") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2, 1, 3]);
+	await runtime.invoke(deliver.name, "Flow", { metadata: metadata("b") });
+	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2, 1, 3, 4]);
+	await runtime.invoke(deliver.name, "Bump", { metadata: metadata("a") });
+	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2, 1, 3, 4, 5]);
+	const own = await runtime.invoke(read.name, null, { metadata: metadata("a") });
+	expect(await db.execution(own).settled()).toEqual({
+		status: "completed",
+		output: { count: 0 },
+	});
 	await idle(runtime.queue);
 });
