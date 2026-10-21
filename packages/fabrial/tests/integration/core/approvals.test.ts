@@ -23,7 +23,7 @@ const DAY = 24 * 60 * 60 * 1000;
  * A runtime whose approval decision executions pause on their first attempt until `release`: before their
  * handler runs (`start`), or before their decision wait registers (`wait`), as after a crash there.
  */
-function paused(at: "start" | "wait") {
+function paused(at: "start" | "cards") {
 	const runtime = db.runtime();
 	const open = Promise.withResolvers<void>();
 	const reached = Promise.withResolvers<void>();
@@ -41,13 +41,14 @@ function paused(at: "start" | "wait") {
 							await pause();
 							return definition.handler(input, execution);
 						}
-						const waitForAny: DurableExecution["waitForAny"] = async (id, ...rest) => {
-							if (id === "decision") await pause();
-							return execution.waitForAny(id, ...rest);
+						// After the cards started, before the decision's wait computes its timeout.
+						const start: DurableExecution["start"] = async (id, ...rest) => {
+							if (id === "delivery") await pause();
+							return execution.start(id, ...rest);
 						};
 						return definition.handler(
 							input,
-							Object.assign(Object.create(execution) as DurableExecution, { waitForAny }),
+							Object.assign(Object.create(execution) as DurableExecution, { start }),
 						);
 					},
 				};
@@ -655,7 +656,7 @@ describe("native approval waits", () => {
 	});
 
 	it("denies a click after the deadline while the decision has not registered its timeout", async () => {
-		const decision = paused("wait");
+		const decision = paused("cards");
 		const test = setup([approvalWorkflow("1h")], { runtime: decision.runtime });
 		const owner = await enter(test);
 		await decision.reached;
@@ -675,7 +676,9 @@ describe("native approval waits", () => {
 			and payload -> 'payload' ->> 'approvalId' = ${approvalId}`;
 		expect(emitted!.count).toBe(0);
 		expect((await owner.info())?.status).not.toBe("completed");
+		// Resumed past its deadline, the decision expires: the late click never approves it.
 		decision.release();
+		expect(await owner.output()).toBe("expired");
 	});
 
 	it("keeps executions that cleanup waits on past the longest approval", async () => {
