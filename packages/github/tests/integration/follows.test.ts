@@ -198,7 +198,7 @@ describe("follows in an app", () => {
 			expect((await app.fetch(deliver(hook, `${scope}:${delivery}`))).status).toBe(200);
 			await t.idle();
 		};
-		const records = async () => (await app.routing(prThread as never))?.resourceFollows;
+		const records = async () => (await app.routing(prThread as never)).resourceFollows;
 		return { app, agents, start, send, observed, slackThread, records };
 	}
 

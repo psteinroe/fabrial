@@ -289,7 +289,7 @@ async function finalReply(text: string) {
 			const [routing] =
 				await sql`SELECT count(*)::int AS count FROM pgconductor._private_executions WHERE task_key = 'fabrial.route' AND completed_at IS NULL`;
 			return {
-				follows: state?.follows?.map((each) => each.agent),
+				follows: state.follows.map((each) => each.agent),
 				pending: routing!.count > 0,
 			};
 		}, poll)
@@ -500,8 +500,8 @@ it("signed GitHub PR opened webhook has one PR-thread owner plus a changelog obs
 		.poll(async () => (await applicationSql`SELECT * FROM acme_changelog`).length, poll)
 		.toBe(1);
 	const thread = { kind: "thread", provider: "github", threadId: "github:acme/app:7" } as const;
-	// Lifecycle ingress emits directly; unlike chat messages it creates no routing tombstone.
-	await expect.poll(() => app.routing(thread), poll).toBeNull();
+	// Lifecycle ingress emits directly; unlike chat messages it starts no conversation on the thread.
+	await expect.poll(() => app.routing(thread), poll).toEqual({ follows: [], resourceFollows: [] });
 	await expect
 		.poll(async () => {
 			const [row] =
@@ -545,7 +545,7 @@ it("#bugs: the router investigates inline with ctx.agent and posts the analysis;
 		threadId: "slack:C_BUGS:1700000000.000001",
 	} as const;
 	// The investigation ran in the call's own Session: the thread has no follower.
-	expect((await app.routing(thread))?.follows).toBeUndefined();
+	expect((await app.routing(thread)).follows).toEqual([]);
 	expect(calls.some((c) => String(c.args.text).includes("I'll investigate this bug report"))).toBe(
 		true,
 	);
@@ -631,7 +631,7 @@ it("signed Linear issue created webhook posts a triage comment", async () => {
 		body: expect.stringContaining("ENG-1"),
 	});
 	const thread = { kind: "thread", provider: "linear", threadId: "linear:issue-1" } as const;
-	await expect.poll(() => app.routing(thread), poll).toBeNull();
+	await expect.poll(() => app.routing(thread), poll).toEqual({ follows: [], resourceFollows: [] });
 });
 it("read-only query cannot escape its transaction with multiple statements", async () => {
 	await expect(app.clients().database.query("org-acme", `COMMIT; ${repair}`)).rejects.toMatchObject(
@@ -741,7 +741,7 @@ it("dev thread: the agent opens a PR and follows it; a requested change is answe
 	// The follow is a record in the PR thread's Chat SDK state; notifications reply to the Slack home.
 	const follows = async () =>
 		(await app.routing({ kind: "thread", provider: "github", threadId: "github:acme/app:42" }))
-			?.resourceFollows ?? [];
+			.resourceFollows;
 	await expect.poll(follows, poll).toEqual([
 		{
 			session: `slack:slack:C_DEV:${ts}`,

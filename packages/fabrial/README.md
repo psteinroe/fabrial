@@ -361,14 +361,12 @@ Tests run on real Conductor and need Postgres; there is no in-memory engine. Sta
 import { createTestApp } from "fabrial/testing";
 
 const hello = f.defineWorkflow({ name: "hello", run: async () => "hi" });
-const { app, runtime, settled, stop } = createTestApp(f, {
+const { app, invoke, settled, stop } = createTestApp(f, {
 	database: process.env.DATABASE_URL!,
 	workflows: [hello],
 });
 await app.start();
-const id = await runtime.invoke("hello", null, {
-	metadata: { requestId: "r1", origin: null, replyTo: null, requestedBy: null },
-});
+const id = await invoke(hello);
 console.log(await settled(id)); // { status: "completed", output: "hi" }
 await stop();
 ```
@@ -392,7 +390,7 @@ const app = createIntegrationApp(f, { workflows: [], agents: [support], models }
 await app.start();
 ```
 
-Each model request consumes the next step; `model.calls` counts requests. Spy on `app.clients()` (or its client methods) to fake plugin clients; `app.routing(thread)` reads who follows a thread. `modelRetries: { maxRetries?, baseDelayMs?, maxDelayMs? }` turns durable model retries on with overrides of production's policy (e.g. tiny delays). Both functions return a `TestingApp`. [examples/acme](../../examples/acme) drives signed Slack, GitHub, and Linear webhooks through `app.fetch` this way.
+Each model request consumes the next step; `model.calls` counts requests. Spy on `app.clients()` (or its client methods) to fake plugin clients; `app.invoke(workflow, input?)` starts an execution and returns its id; `app.routing(thread)` reads who follows a thread (`{ follows, resourceFollows }`). `modelRetries: { maxRetries?, baseDelayMs?, maxDelayMs? }` turns durable model retries on with overrides of production's policy (e.g. tiny delays). Both functions return a `TestingApp`. [examples/acme](../../examples/acme) drives signed Slack, GitHub, and Linear webhooks through `app.fetch` this way.
 
 ## Guarantees and limits
 

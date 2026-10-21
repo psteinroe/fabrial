@@ -20,20 +20,21 @@ import {
 } from "./testing-internal.ts";
 
 export { FakeChat, type FakePost } from "./fake-chat.ts";
-export type { TestApp, TestAppConfig, TestingApp, ThreadRouting } from "./testing-internal.ts";
+export type { TestApp, TestAppConfig, TestingApp, ThreadFollowers } from "./testing-internal.ts";
 /** Conductor's test clock, as `TestApp.clock`. */
 export type { TestClock } from "pgconductor-js/testing";
 
 /**
  * Build an app on real Conductor from the same typed catalog as production, with fake chat and agents
- * and fast polling. Start it with `app.start()`; drive it through `chat`, `app.fetch` or
- * `runtime.invoke`, and wait for outcomes with `settled`.
+ * and fast polling. Start it with `app.start()`; drive it through `chat`, `app.fetch` or `invoke`,
+ * and wait for outcomes with `settled`.
  */
 export function createTestApp<const P extends readonly AnyPlugin[]>(
 	instance: Fabrial<P>,
 	config: TestAppConfig,
 ): TestApp<ClientsOf<P>> {
-	return create(instance, config);
+	const { runtime: _, ...app } = create(instance, config);
+	return app;
 }
 
 /** A scripted model reply, built with `reply.text()` or `reply.toolCall()`. */

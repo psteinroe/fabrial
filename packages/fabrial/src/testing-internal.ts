@@ -25,11 +25,11 @@ import type {
 	RuntimeEvent,
 	RuntimeWorkflow,
 	StatePort,
-	ThreadRoutingState,
 } from "./runtime.ts";
 import { parseSchema } from "./schema.ts";
 import { conversationReference, type SendRequest } from "./send.ts";
-import type { ThreadRef } from "./thread.ts";
+import type { Surface, ThreadRef } from "./thread.ts";
+import type { AnyWorkflow, WorkflowArgs } from "./workflow.ts";
 
 export { FakeChat } from "./fake-chat.ts";
 /** Conductor's test clock; pass it as `conductor(..., { clock })` over a single-connection pool. */
@@ -198,28 +198,61 @@ export interface TestAppConfig extends Omit<AppConfig, "agents"> {
 
 /** The app `createTestApp` and `createIntegrationApp` build: the production `App`, plus test inspection. */
 export interface TestingApp<C = Record<string, unknown>> extends App<C> {
-	/** The thread's routing state (who follows it and its resource), `null` when it has none. */
-	routing(thread: ThreadRef): Promise<ThreadRouting | null>;
+	/** Start an execution of the workflow, as a script would: no surface, origin, or requester. Returns its id. */
+	readonly invoke: <W extends AnyWorkflow>(
+		workflow: W,
+		...args: WorkflowArgs<W>
+	) => Promise<string>;
+	/** Who follows the thread; empty lists when nobody does. */
+	routing(thread: ThreadRef): Promise<ThreadFollowers>;
 }
 
-/** Fabrial's routing state of a thread, as `TestingApp.routing` reads it. */
-export type ThreadRouting = ThreadRoutingState;
+/** The conversations following a thread, as `TestingApp.routing` reads them. */
+export interface ThreadFollowers {
+	/** Conversations the thread's messages reach. */
+	readonly follows: readonly { readonly session: string; readonly agent: string }[];
+	/** Conversations following the thread's resource (`ctx.follow`), notified of its events. */
+	readonly resourceFollows: readonly {
+		readonly session: string;
+		readonly agent: string;
+		/** Resource key, e.g. `github:acme/app#42`. */
+		readonly resource: string;
+		/** Where the notifications' final replies go. */
+		readonly replyTo: Surface | null;
+	}[];
+}
 
 /** Add test inspection to a hosted app. */
 export function testingApp<C>(app: HostedApp<C>): TestingApp<C> {
 	return Object.assign(app, {
-		async routing(thread: ThreadRef) {
+		invoke: (workflow: AnyWorkflow, input: Json = null) =>
+			app.host.runtime.invoke(workflow.name, input, {
+				metadata: {
+					requestId: crypto.randomUUID(),
+					origin: null,
+					replyTo: null,
+					requestedBy: null,
+				},
+			}),
+		async routing(thread: ThreadRef): Promise<ThreadFollowers> {
 			const chat = app.host.chat();
 			if (!chat) throw new Error("The app has no chat integration");
-			return (await chat.thread(thread)).getState();
+			const state = await (await chat.thread(thread)).getState();
+			return {
+				follows: (state?.follows ?? []).map(({ session, agent }) => ({ session, agent })),
+				resourceFollows: (state?.resourceFollows ?? []).map(
+					({ session, agent, resource, replyTo }) => ({ session, agent, resource, replyTo }),
+				),
+			};
 		},
-	});
+	}) as never;
 }
 
 export interface TestApp<C> {
 	readonly app: TestingApp<C>;
 	readonly chat: FakeChat;
-	readonly runtime: DurableRuntime;
+	/** `app.invoke`. */
+	invoke: TestingApp<C>["invoke"];
 	/**
 	 * Conductor's test clock for the app's workers and database: `set` moves time to a date, from which
 	 * it keeps running, and `advance` jumps it forward. Advance only after the wait it should end is
@@ -242,9 +275,8 @@ export interface TestApp<C> {
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
 
 /**
- * Build an app on real Conductor from the same typed catalog as production, with fake chat and agents
- * and fast polling. Start it with `app.start()`; drive it through `chat`, `app.fetch` or
- * `runtime.invoke`, and wait for outcomes with `settled`.
+ * `fabrial/testing`'s `createTestApp`, with injectable agents and the app's runtime, for driving it below
+ * the public API.
  */
 export function createTestApp<const P extends readonly AnyPlugin[]>(
 	instance: Fabrial<P>,
@@ -252,7 +284,7 @@ export function createTestApp<const P extends readonly AnyPlugin[]>(
 		/** Defaults to `fakeAgents()`. */
 		agents?: AgentIntegration;
 	},
-): TestApp<ClientsOf<P>> {
+): TestApp<ClientsOf<P>> & { readonly runtime: DurableRuntime } {
 	const { database, chat: fake, ...appConfig } = config;
 	// The test clock is a session setting: it holds for queries on this one connection.
 	const sql = postgres(database, { max: 1, onnotice: () => {} });
@@ -328,9 +360,11 @@ export function createTestApp<const P extends readonly AnyPlugin[]>(
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}
 	};
+	const testing = testingApp(app);
 	return {
-		app: testingApp(app),
+		app: testing,
 		chat,
+		invoke: testing.invoke,
 		runtime,
 		clock,
 		result,
