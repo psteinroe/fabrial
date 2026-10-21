@@ -26,5 +26,6 @@ export {
 	chatTrigger,
 	type ChatPluginCapability,
 } from "./chat/events.ts";
+export { literalCard } from "./chat/port.ts";
 export type { AgentObservers, ModelResponse, ToolCall } from "./agent.ts";
 export type { ExecutionInfo, WorkflowMiddleware } from "./workflow.ts";

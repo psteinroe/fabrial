@@ -897,6 +897,11 @@ Pi Durable gaps Fabrial works around today:
 - **Atomic admission with host metadata.** `submit` takes no transaction callback, so Fabrial commits the invocation and obligation first and relies on signal redelivery to submit after a crash.
 - **Physical deletion.** Pi has no whole-storage deletion (`retireDoc` is logical); Fabrial deletes finished call Sessions as their storage backend. A call cancelled while suspended runs no cleanup of its own (a Conductor lifecycle gap); reclaim covers it later.
 
+Chat SDK gaps:
+
+- **Literal card text.** The Slack adapter runs every card text and field through emoji and Markdown conversion into `mrkdwn` (its bold rewrite applies inside code fences too) and has no raw-blocks option, so `**/secrets/**` shows as `*/secrets/*`. Fabrial attaches its card to the rendered element and `@fabrial/slack` builds those blocks itself: `plain_text` with `emoji: false`, details as `rich_text_preformatted`, buttons from the SDK. A literal/preformatted card text option (or raw blocks) in the SDK would remove the override.
+- **Block bodies in logs.** On `invalid_blocks` the Slack adapter logs the complete blocks at error level, approval details included; it should log paths and lengths.
+
 ## Conductor issues
 
 None outstanding. Everything Fabrial needed from Conductor has landed, and the adapter uses public APIs only, with no polling, private access, or Fabrial-owned engine state ([PGCONDUCTOR.md](./PGCONDUCTOR.md) lists the PRs). Execution outcomes are reported with small executions that `ctx.waitForResult` and signal, so Conductor needs no settlement hook.

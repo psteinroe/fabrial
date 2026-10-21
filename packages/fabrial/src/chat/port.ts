@@ -24,7 +24,23 @@ import type {
 	ThreadRef,
 	ThreadRoutingState,
 } from "../modules.ts";
+import type { Card } from "../thread.ts";
 import { normalizeMessage, type ChatPluginCapability } from "./events.ts";
+
+/** Keyed globally, so a plugin with its own copy of Fabrial still finds it. */
+const LITERAL_CARD = Symbol.for("fabrial.card");
+
+/**
+ * The Fabrial card a rendered message came from. Adapters that would transform card text (emoji,
+ * markdown, mentions) render this instead, so what it shows stays literal.
+ */
+export function literalCard(message: unknown): Card | undefined {
+	if (!message || typeof message !== "object") return undefined;
+	const card = (message as { [LITERAL_CARD]?: Card })[LITERAL_CARD];
+	if (card) return card;
+	const inner = (message as { card?: unknown }).card;
+	return inner && typeof inner === "object" ? literalCard(inner) : undefined;
+}
 
 export function renderMessage(message: OutboundMessage): AdapterPostableMessage {
 	if (typeof message === "string" || "markdown" in message) return message;
@@ -48,7 +64,8 @@ export function renderMessage(message: OutboundMessage): AdapterPostableMessage 
 	if (card.actions?.length) children.push(Actions(card.actions.map((action) => Button(action))));
 	const rendered = toCardElement(SDKCard({ title: card.title, children }));
 	if (!rendered) throw new Error("Invalid card");
-	return rendered;
+	// Enumerable, so the SDK's copies keep it; a symbol, so it never serializes.
+	return Object.assign(rendered, { [LITERAL_CARD]: card });
 }
 
 export type SDKState = { fabrial?: ThreadRoutingState | null } & Record<string, unknown>;

@@ -1,7 +1,8 @@
-import { SlackAdapter } from "@chat-adapter/slack";
+import { cardToBlockKit, SlackAdapter, type SlackBlock } from "@chat-adapter/slack";
 import { WebClient } from "@slack/web-api";
 import {
 	defineGroup,
+	type Card,
 	type ExternalIdentity,
 	type GroupResolveContext,
 	type Surface,
@@ -13,6 +14,7 @@ import {
 	chatIdentity,
 	chatTrigger,
 	definePlugin,
+	literalCard,
 } from "fabrial/plugin";
 import { z } from "zod";
 
@@ -48,6 +50,49 @@ class ScopedSlackAdapter extends SlackAdapter {
 		return Promise.resolve(false);
 	}
 
+	// Fabrial cards render literally (see literalBlocks); everything else goes through the SDK.
+	override async postMessage(...args: Parameters<SlackAdapter["postMessage"]>) {
+		const [threadId, message] = args;
+		const card = literalCard(message);
+		if (!card) return super.postMessage(...args);
+		const { channel, threadTs } = this.decodeThreadId(threadId);
+		try {
+			const result = await this._client.chat.postMessage(
+				await this.withToken({
+					channel,
+					thread_ts: threadTs || undefined,
+					text: escape(card.title),
+					blocks: literalBlocks(card, sdkCard(message)),
+					unfurl_links: false,
+					unfurl_media: false,
+				}),
+			);
+			return { id: result.ts!, threadId, raw: result };
+		} catch (error) {
+			return this.handleSlackError(error);
+		}
+	}
+
+	override async editMessage(...args: Parameters<SlackAdapter["editMessage"]>) {
+		const [threadId, messageId, message] = args;
+		const card = literalCard(message);
+		if (!card || messageId.startsWith("ephemeral:")) return super.editMessage(...args);
+		const { channel } = this.decodeThreadId(threadId);
+		try {
+			const result = await this._client.chat.update(
+				await this.withToken({
+					channel,
+					ts: messageId,
+					text: escape(card.title),
+					blocks: literalBlocks(card, sdkCard(message)),
+				}),
+			);
+			return { id: result.ts!, threadId, raw: result };
+		} catch (error) {
+			return this.handleSlackError(error);
+		}
+	}
+
 	override async handleWebhook(...args: Parameters<SlackAdapter["handleWebhook"]>) {
 		const [request] = args;
 		const body = await request.clone().text();
@@ -73,6 +118,61 @@ class ScopedSlackAdapter extends SlackAdapter {
 		}
 		return super.handleWebhook(...args);
 	}
+}
+
+/** Shown as typed: no emoji aliases, markdown, mentions or entities. */
+const plain = (text: string) => ({ type: "plain_text", text, emoji: false });
+/** Notification text is mrkdwn: escape it so a title cannot mention anyone. */
+const escape = (text: string) =>
+	text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+function fieldBlocks(fields: { label: string; value: string }[]): SlackBlock[] {
+	const blocks: SlackBlock[] = [];
+	// Slack allows ten fields per section.
+	for (let i = 0; i < fields.length; i += 10)
+		blocks.push({
+			type: "section",
+			fields: fields.slice(i, i + 10).map((field) => plain(`${field.label}\n${field.value}`)),
+		});
+	return blocks;
+}
+
+type SDKCard = Parameters<typeof cardToBlockKit>[0];
+
+/**
+ * A Fabrial card as literal Block Kit. The SDK's card renderer runs every text through emoji and
+ * markdown conversion into mrkdwn, so an approval could show something other than what was proposed.
+ * Buttons are the SDK's own, from the card it rendered, so clicks route as before.
+ */
+export function literalBlocks(card: Card, rendered: SDKCard): SlackBlock[] {
+	const blocks: SlackBlock[] = [{ type: "header", text: plain(card.title) }];
+	if (card.text) blocks.push({ type: "section", text: plain(card.text) });
+	if (card.fields?.length) blocks.push(...fieldBlocks(card.fields));
+	if (card.code?.content)
+		blocks.push({
+			type: "rich_text",
+			elements: [
+				{ type: "rich_text_preformatted", elements: [{ type: "text", text: card.code.content }] },
+			],
+		});
+	if (card.section) {
+		blocks.push({ type: "divider" }, { type: "header", text: plain(card.section.title) });
+		if (card.section.text) blocks.push({ type: "section", text: plain(card.section.text) });
+		if (card.section.fields?.length) blocks.push(...fieldBlocks(card.section.fields));
+	}
+	if (card.footer) blocks.push({ type: "context", elements: [plain(card.footer)] });
+	const actions = rendered.children.filter((child) => child.type === "actions");
+	if (actions.length) blocks.push(...cardToBlockKit({ type: "card", children: actions }));
+	return blocks;
+}
+
+function sdkCard(message: unknown): SDKCard {
+	const card =
+		(message as { type?: string; card?: SDKCard }).type === "card"
+			? message
+			: (message as { card?: SDKCard }).card;
+	if (!card) throw new Error("Fabrial card without a rendered card");
+	return card as SDKCard;
 }
 
 const workspaces = new WeakMap<WebClient, string>();
