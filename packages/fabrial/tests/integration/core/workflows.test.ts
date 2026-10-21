@@ -183,6 +183,14 @@ describe("durability and context", () => {
 		const test = setup([outputs(length, "four")]);
 		expect(await (await enter(test)).settled()).toEqual({ status: "completed", output: 4 });
 	});
+	it("invokes an inputless workflow without an argument; it runs with input null", async () => {
+		const child = defineWorkflow({ name: "child", run: async (input) => ({ input }) });
+		const test = setup([workflow(async (_i, ctx) => ctx.invoke("child", child)), child]);
+		expect(await (await enter(test)).settled()).toEqual({
+			status: "completed",
+			output: { input: null },
+		});
+	});
 	it("rejects empty operation ids", async () => {
 		const test = setup([workflow(async (_i, ctx) => ctx.step("", () => 1))]);
 		expect(await (await enter(test)).settled()).toMatchObject({

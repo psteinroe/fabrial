@@ -1,6 +1,7 @@
 import { expectTypeOf, it } from "vitest";
 import { z } from "zod";
 import type { AgentRef, ToolContext, WorkflowContext } from "../../src/index.ts";
+import { createFabrial } from "../../src/index.ts";
 import { defineState } from "../../src/state.ts";
 
 // Compile-only: `pnpm typecheck` checks these; the functions never run.
@@ -60,6 +61,33 @@ it("workflows accept session state and reject agent state", () => {
 		ctx.state(agent);
 		expectTypeOf(await tool.state(session).get()).toEqualTypeOf<{ count: number }>();
 		expectTypeOf(await tool.state(agent).get()).toEqualTypeOf<{ count: number }>();
+	};
+	expectTypeOf(check).toBeFunction();
+});
+
+it("inputless workflows are invoked and started without an argument", () => {
+	const f = createFabrial({ plugins: [] });
+	const hello = f.defineWorkflow({ name: "hello", run: async (): Promise<string> => "hi" });
+	const greet = f.defineWorkflow({
+		name: "greet",
+		input: z.object({ name: z.string() }),
+		run: async ({ name }) => name,
+	});
+	const check = async (ctx: WorkflowContext, tool: ToolContext) => {
+		expectTypeOf(ctx.invoke("hello", hello)).resolves.toEqualTypeOf<string>();
+		expectTypeOf(
+			ctx.invoke("hello", hello, null, { detached: true }),
+		).resolves.toEqualTypeOf<string>();
+		expectTypeOf(ctx.start("hello", hello)).resolves.toEqualTypeOf<string>();
+		expectTypeOf(tool.invoke("hello", hello)).resolves.toEqualTypeOf<string>();
+		expectTypeOf(tool.start("hello", hello)).resolves.toEqualTypeOf<string>();
+		// @ts-expect-error a workflow without input takes none
+		await ctx.invoke("hello", hello, { name: "x" });
+		// @ts-expect-error a workflow with input requires it
+		await ctx.invoke("greet", greet);
+		// @ts-expect-error a workflow with input requires it
+		await tool.start("greet", greet);
+		expectTypeOf(ctx.invoke("greet", greet, { name: "x" })).resolves.toEqualTypeOf<string>();
 	};
 	expectTypeOf(check).toBeFunction();
 });

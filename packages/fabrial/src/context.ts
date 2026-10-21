@@ -262,19 +262,24 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 				kind: "fabrial.awaitable",
 				timerMs: duration(value),
 			}) as InternalAwaitable as Awaitable<null>,
-		invoke: async (id, workflow, input, opts) => {
+		invoke: (async (
+			id: string,
+			workflow: AnyWorkflow,
+			input: Json = null,
+			opts?: { detached?: boolean },
+		) => {
 			const key = op(id);
 			const value = await execution.step(`fabrial:${key}:input`, () => checkInput(workflow, input));
 			return execution.invoke(key, workflow.name, value, {
 				...opts,
 				metadata: childMetadata(),
-			}) as never;
-		},
-		start: async (id, workflow, input) => {
+			});
+		}) as WorkflowContext["invoke"],
+		start: (async (id: string, workflow: AnyWorkflow, input: Json = null) => {
 			const key = op(id);
 			const value = await execution.step(`fabrial:${key}:input`, () => checkInput(workflow, input));
 			return execution.start(key, workflow.name, value, { metadata: childMetadata() });
-		},
+		}) as WorkflowContext["start"],
 		isMember: (principal, group) => host.directory.isMember(principal, group),
 	};
 	return bindMetadata(ctx, metadata);

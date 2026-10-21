@@ -68,11 +68,10 @@ export interface WorkflowContext<TClients = Record<string, unknown>> {
 	invoke<W extends AnyWorkflow>(
 		id: string,
 		workflow: W,
-		input: WorkflowInput<W>,
-		options?: { detached?: boolean },
+		...args: WorkflowArgs<W, [options?: { detached?: boolean }]>
 	): Promise<WorkflowOutput<W>>;
 	/** Start an independent execution without waiting; returns its execution id. */
-	start<W extends AnyWorkflow>(id: string, workflow: W, input: WorkflowInput<W>): Promise<string>;
+	start<W extends AnyWorkflow>(id: string, workflow: W, ...args: WorkflowArgs<W>): Promise<string>;
 	/** True when `principal` is a member of `group` (resolved now). */
 	isMember(principal: Principal, group: GroupDefinition): Promise<boolean>;
 }
@@ -138,6 +137,10 @@ export interface Workflow<
 export type AnyWorkflow = Workflow<string, any, any>;
 export type WorkflowInput<W> = W extends Workflow<string, infer I, any> ? I : never;
 export type WorkflowOutput<W> = W extends Workflow<string, any, infer O> ? O : never;
+/** The arguments of `invoke` and `start`: a workflow without `input` takes none, and runs with input `null`. */
+export type WorkflowArgs<W, Rest extends unknown[] = []> = [WorkflowInput<W>] extends [never]
+	? [input?: null, ...Rest]
+	: [input: WorkflowInput<W>, ...Rest];
 
 export function defineWorkflow<
 	const TName extends string,

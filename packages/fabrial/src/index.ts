@@ -88,6 +88,7 @@ export type {
 	RaceResult,
 	Workflow,
 	WorkflowContext,
+	WorkflowArgs,
 	WorkflowDefinition,
 	WorkflowInput,
 	WorkflowOutput,

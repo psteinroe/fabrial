@@ -130,7 +130,7 @@ Without `output`, `ctx.agent` returns the answer text. An answer that doesn't ma
 
 ## 3. Workflows
 
-`f.defineWorkflow({ name, description?, input?, output?, triggers?, cron?, concurrency?, retries?, run })`. `run(input, ctx)` receives the trigger's payload, or the typed `input` when the workflow is invoked, started, or called as a tool. `output` validates, and may transform, what `run` returns before the execution records it; a result that doesn't match fails the workflow.
+`f.defineWorkflow({ name, description?, input?, output?, triggers?, cron?, concurrency?, retries?, run })`. `run(input, ctx)` receives the trigger's payload, or the typed `input` when the workflow is invoked, started, or called as a tool. A workflow without `input` is invoked and started without one and receives `null`. `output` validates, and may transform, what `run` returns before the execution records it; a result that doesn't match fails the workflow.
 
 Workflows replay from the top after a suspension or crash. Every durable operation takes an explicit, nonempty id as its first argument, and a completed operation returns its saved result on replay. Repeated ids in one execution are suffixed (`a`, `a#1`, …); the `fabrial:` prefix is reserved. A renamed id runs again; there is no call-order determinism or version pinning.
 

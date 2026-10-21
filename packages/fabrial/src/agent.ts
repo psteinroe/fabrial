@@ -9,7 +9,7 @@ import type { FollowOptions, FollowReceipt, UnfollowReceipt } from "./follows.ts
 import type { StateDefinition, ToolStateHandle } from "./state.ts";
 import type { ChatMessage, MessageRef, OutboundMessage, Surface } from "./thread.ts";
 import type { TriggerPayload, TriggerSpec } from "./trigger.ts";
-import type { AnyWorkflow, WorkflowInput, WorkflowOutput } from "./workflow.ts";
+import type { AnyWorkflow, WorkflowArgs, WorkflowOutput } from "./workflow.ts";
 
 export type ThinkingLevel = "off" | "low" | "medium" | "high";
 
@@ -45,9 +45,9 @@ export interface ToolContext<
 	invoke<W extends AnyWorkflow>(
 		id: string,
 		workflow: W,
-		input: WorkflowInput<W>,
+		...args: WorkflowArgs<W>
 	): Promise<WorkflowOutput<W>>;
-	start<W extends AnyWorkflow>(id: string, workflow: W, input: WorkflowInput<W>): Promise<string>;
+	start<W extends AnyWorkflow>(id: string, workflow: W, ...args: WorkflowArgs<W>): Promise<string>;
 	evaluate<Q extends Record<string, EvaluateQuestion>>(
 		id: string,
 		request: EvaluateRequest<Q>,

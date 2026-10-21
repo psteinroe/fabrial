@@ -29,8 +29,6 @@ import {
 	type StateDefinition,
 	type ThreadIO,
 	type ToolStateHandle,
-	type WorkflowInput,
-	type WorkflowOutput,
 } from "../modules.ts";
 import { bindMetadata } from "../context.ts";
 import {
@@ -152,12 +150,7 @@ export async function fields(
 		);
 		return childResult(child);
 	};
-	const launch = async <W extends AnyWorkflow>(
-		id: string,
-		workflow: W,
-		input: WorkflowInput<W>,
-		waited: boolean,
-	) => {
+	const launch = async (id: string, workflow: AnyWorkflow, input: Json, waited: boolean) => {
 		if (!api) throw new Error("Prompt sections cannot start workflows");
 		const registered = bridge.host.workflows.find((candidate) => candidate.name === workflow.name);
 		if (!registered) throw new Error(`Workflow ${workflow.name} is not registered`);
@@ -176,7 +169,7 @@ export async function fields(
 			context,
 		);
 	};
-	const start = <W extends AnyWorkflow>(id: string, workflow: W, input: WorkflowInput<W>) =>
+	const start = (id: string, workflow: AnyWorkflow, input: Json = null) =>
 		launch(id, workflow, input, false);
 	const ctx = bindMetadata<FabrialFields>(
 		{
@@ -199,12 +192,11 @@ export async function fields(
 								operation(id, "history", [options ?? {}]) as ReturnType<ThreadIO["history"]>,
 						}
 					: undefined,
-			start,
-			invoke: async (id, workflow, input) => {
+			start: start as FabrialFields["start"],
+			invoke: (async (id: string, workflow: AnyWorkflow, input: Json = null) => {
 				if (!api) throw new Error("Prompt sections cannot invoke workflows");
-				const child = await launch(id, workflow, input, true);
-				return (await childResult(child)) as WorkflowOutput<typeof workflow>;
-			},
+				return childResult(await launch(id, workflow, input, true));
+			}) as FabrialFields["invoke"],
 			// Sent from a managed child execution, through the same path as workflow `ctx.send`.
 			send: async (id, agent, options) => {
 				if (!api) throw new Error("Prompt sections cannot send");
