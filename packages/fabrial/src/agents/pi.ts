@@ -498,11 +498,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		});
 
 	/**
-	 * The Session execution: hosts the Pi Session while it has work. Once every live task waits on a workflow, it closes
-	 * Pi (freeing the lease) and suspends until input arrives or one of those workflows settles; the next attempt
-	 * reopens Pi, and the waiting tools run again with their workflows' outcomes. Signals arriving while it opens or
-	 * closes wait for the next opening (and win the wait); a signal delivered after the handler returned is sent again,
-	 * which re-queues the execution.
+	 * The Session execution: hosts the Pi Session while it has work. Once every live task waits on a workflow, or only
+	 * the posts of its runs' replies are pending, it closes Pi (freeing the lease) and suspends until input arrives or
+	 * one of those workflows or posts settles; the next attempt reopens Pi, and the waiting tools run again with their
+	 * workflows' outcomes. Signals arriving while it opens or closes wait for the next opening (and win the wait); a
+	 * signal delivered after the handler returned is sent again, which re-queues the execution.
 	 *
 	 * A `ctx.agent` call's Session execution is a child of its caller and returns the call's outcome. Cancelled while
 	 * running, it aborts the call's Pi run before closing Pi; cancelled while suspended, nothing runs: its workflow tools
@@ -568,6 +568,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					};
 					for (const [taskId, executionId] of idle.children)
 						branches[`task:${taskId}`] = { execution: executionId };
+					for (const executionId of idle.deliveries)
+						branches[`delivery:${executionId}`] = { execution: executionId };
 					await execution.waitForAny(`idle:${idle.n}`, branches);
 					continue;
 				}
@@ -585,8 +587,13 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		}
 	}
 
-	/** Pi has no work left (`done`), or every live task waits on a workflow (`parked`, by task id). */
-	type Idle = { kind: "done" } | { kind: "parked"; n: number; children: Map<number, string> };
+	/**
+	 * Pi has no work left (`done`), or every live task waits on a workflow (`parked`, by task id) or Pi waits only on
+	 * the posts of its runs' replies (`deliveries`, by execution id).
+	 */
+	type Idle =
+		| { kind: "done" }
+		| { kind: "parked"; n: number; children: Map<number, string>; deliveries: string[] };
 
 	interface SessionHost {
 		handle(input: SessionInput): Promise<void>;
@@ -918,23 +925,99 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			return assistant.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
 		}
 
-		// Posted through a detached effect keyed by the answer, so a redelivered or restarted Session posts once.
+		/**
+		 * Post a reply through an attached effect keyed by its intent, and keep the run open until the post settles. A
+		 * redelivered or restarted Session reuses the effect; the post is at-least-once: a crash after the provider
+		 * accepted it and before its receipt repeats it.
+		 */
+		async function deliver(run: HostedRun, key: string, text: string, requestId: string) {
+			const executionId = await startChild(
+				frame,
+				run.id,
+				key,
+				EFFECT_WORKFLOW,
+				{ method: "post", args: [text] },
+				(await replyThread(run, requestId))!,
+				false,
+				context,
+			);
+			await harness.commit(async (tx) => {
+				const record = (await tx.doc(Runs)).runs[run.id]!;
+				record.deliveries ??= {};
+				record.deliveries[key] ??= { executionId, status: "pending" };
+			}, context);
+		}
+
 		async function postAnswer(run: HostedRun, answer: EntryId, requestId: string) {
 			run.posted.add(answer);
 			const text = await answerOf(run.conversation, answer);
 			if (!text?.trim()) return;
-			await startChild(
-				frame,
-				run.id,
-				`fabrial:pi:answer:${run.conversation.id}:${answer}`,
-				EFFECT_WORKFLOW,
-				{ method: "post", args: [text] },
-				(await replyThread(run, requestId))!,
-				true,
-				context,
-			);
+			await deliver(run, `fabrial:pi:answer:${run.conversation.id}:${answer}`, text, requestId);
 			host.logger.debug("Posting final reply", { requestId, answer });
 			await run.ui?.unfollow(requestId);
+		}
+
+		// A post's `child` signal re-evaluates its run at once; its outcome is read from the signal when it came first.
+		const watched = new Set<string>();
+		const watch = (executionId: string) => {
+			if (watched.has(executionId)) return;
+			watched.add(executionId);
+			reportOf(executionId).promise.then(schedule);
+		};
+		const reportedOutcome = (executionId: string) =>
+			Promise.race([reportOf(executionId).promise, Promise.resolve(undefined)]);
+
+		/**
+		 * Record the outcomes of the run's posts that settled; true while one is still pending. A post that failed for
+		 * good is logged and marked failed: the run settles without it, and nothing reruns the model or posts an error
+		 * reply for it.
+		 */
+		async function deliveriesPending(run: HostedRun): Promise<boolean> {
+			const deliveries = (await harness.snapshot(Runs, context))?.runs[run.id]?.deliveries ?? {};
+			let pending = false;
+			for (const [key, delivery] of Object.entries(deliveries)) {
+				if (delivery.status !== "pending") continue;
+				watch(delivery.executionId);
+				const result =
+					((await reportedOutcome(delivery.executionId)) as ChildSignal["result"] | undefined) ??
+					(await host.runtime.getExecution(delivery.executionId))?.result;
+				if (!result) {
+					pending = true;
+					continue;
+				}
+				const failed = result.status !== "completed";
+				const error =
+					result.status === "failed"
+						? result.error
+						: result.status === "cancelled"
+							? result.reason
+							: undefined;
+				const changed = await harness.commit(async (tx) => {
+					const entry = (await tx.doc(Runs)).runs[run.id]!.deliveries![key]!;
+					if (entry.status !== "pending") return false;
+					entry.status = failed ? "failed" : "posted";
+					if (error !== undefined) entry.error = error;
+					return true;
+				}, context);
+				if (changed && failed)
+					host.logger.error("Reply post failed", {
+						run: run.id,
+						delivery: key,
+						executionId: delivery.executionId,
+						error,
+					});
+			}
+			return pending;
+		}
+
+		/** Posts of live runs still waiting for their outcome. */
+		async function pendingDeliveries(): Promise<string[]> {
+			const records = (await harness.snapshot(Runs, context))?.runs ?? {};
+			return [...runs.keys()].flatMap((id) =>
+				Object.values(records[id]?.deliveries ?? {}).flatMap((delivery) =>
+					delivery.status === "pending" ? [delivery.executionId] : [],
+				),
+			);
 		}
 
 		// Input Pi gave up on: one error reply for a model error or no model, in the newest input's reply thread.
@@ -957,16 +1040,12 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				record.errors ??= {};
 				return (record.errors[requestId] ??= fresh);
 			}, context);
-			// A stable intent and global dedupe key: a redelivered or restarted Session posts once.
-			await startChild(
-				frame,
-				run.id,
+			// A stable intent and global dedupe key: a redelivered or restarted Session reuses the post.
+			await deliver(
+				run,
 				`fabrial:pi:error:${requestId}`,
-				EFFECT_WORKFLOW,
-				{ method: "post", args: [sentErrorReply(reason, error, errorId)!] },
-				(await replyThread(run, requestId))!,
-				true,
-				context,
+				sentErrorReply(reason, error, errorId)!,
+				requestId,
 			);
 			if (errorId === fresh)
 				host.logger.error("Sent input failed", { requestId, reason, errorId, error });
@@ -1087,6 +1166,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			// Background children keep the run: their reports arrive as follow-ups the lead answers, and a call settles
 			// only once the lead has answered the last of them.
 			if (complete && !failed && (background || (await live()))) complete = false;
+			// The run settles once its posts did: a failed post is surfaced, not retried.
+			if ((await deliveriesPending(run)) && complete) complete = false;
 			if (complete) {
 				if (failed)
 					return finish(run, {
@@ -1103,13 +1184,15 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				await run.conversation.submit({ type: "write", entry: { kind: "fabrial.wake" } }, context);
 		}
 
-		/** No work, or every running task waits on a workflow (or on a subagent that does). */
+		/** No work, or every running task waits on a workflow (or on a subagent that does) or on a reply's post. */
 		async function idleState(): Promise<Idle["kind"] | undefined> {
 			if (inflight || [...runs.values()].some((run) => !run.started)) return undefined;
 			const inspection = await harness.inspect(context);
 			const live = inspection.tasks.filter((task) => !task.record.background);
-			if (!live.length && !inspection.submissions.length)
-				return (await backgroundPending(harness, context)) ? undefined : "done";
+			if (!live.length && !inspection.submissions.length) {
+				if (await backgroundPending(harness, context)) return undefined;
+				return (await pendingDeliveries()).length ? "parked" : "done";
+			}
 			const runners = live.filter((task) => task.state.kind === "running");
 			const workflow = (id: number) => frame.children.has(id);
 			const parked = (id: number) => workflow(id) || frame.waiting.has(id);
@@ -1141,6 +1224,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			if (state === "done") resolveIdle({ kind: "done" });
 			if (state !== "parked") return;
 			// Every wait has its own name, so a resumed execution never reuses an earlier wait's winner.
+			const deliveries = await pendingDeliveries();
 			const n = await harness.commit(async (tx) => (await tx.doc(Suspensions)).count++, context);
 			resolveIdle({
 				kind: "parked",
@@ -1148,6 +1232,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				children: new Map(
 					[...frame.children].map(([taskId, child]) => [taskId, child.executionId]),
 				),
+				deliveries,
 			});
 		}
 
@@ -1324,6 +1409,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		if (!run) return;
 		// The workflows its tools started; one whose start receipt was lost is cancelled with the Session's execution.
 		for (const key of run.intents ?? []) {
+			// Replies already posting are not cancelled: their answer exists.
+			if (run.deliveries?.[key]) continue;
 			const intent = await harness.snapshot(ChildIntents, key, context);
 			if (intent?.executionId && !intent.detached)
 				await host.runtime.cancel(intent.executionId, reason);

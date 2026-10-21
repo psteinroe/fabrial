@@ -149,6 +149,14 @@ export const Runs = defineDoc({
 				intents?: string[];
 				/** Error ids of failed runs, by the request whose thread got the error reply; assigned once. */
 				errors?: Record<string, string>;
+				/**
+				 * Final and error replies, by their effect's intent key: the run settles only once each post's outcome
+				 * arrived. A post that failed for good stays `failed` (logged, never retried or answered with an error reply).
+				 */
+				deliveries?: Record<
+					string,
+					{ executionId: string; status: "pending" | "posted" | "failed"; error?: string }
+				>;
 				requests?: Record<
 					string,
 					{

@@ -78,6 +78,8 @@ async function setup(
 		researcher?: boolean;
 		/** Attempts of the Session workflow; Conductor retries a failed attempt after 15 seconds. */
 		sessionAttempts?: number;
+		/** Attempts of the effect workflow that posts replies. */
+		effectAttempts?: number;
 	} = {},
 ) {
 	const channel = `c${randomUUID().slice(0, 8)}`;
@@ -129,9 +131,14 @@ async function setup(
 				}),
 				...(options.logger ? { logger: options.logger } : {}),
 			},
-			options.sessionAttempts
-				? { "fabrial.session": { maxAttempts: options.sessionAttempts } }
-				: {},
+			{
+				...(options.sessionAttempts
+					? { "fabrial.session": { maxAttempts: options.sessionAttempts } }
+					: {}),
+				...(options.effectAttempts
+					? { "fabrial.pi.effect": { maxAttempts: options.effectAttempts } }
+					: {}),
+			},
 		);
 		const settle = (timeoutMs?: number) => idle(runtime.queue, timeoutMs);
 		return { runtime, chat, app, settle };
@@ -606,6 +613,29 @@ async function sessions(queue: string) {
 	);
 }
 
+/** Replace a thread's posts: `post` gets the content and the real post. */
+async function intercept(
+	t: Awaited<ReturnType<typeof setup>>,
+	thread: string,
+	post: (content: ChatMessage["text"] | object, actual: () => Promise<unknown>) => Promise<unknown>,
+) {
+	const io = await t.chat.thread({
+		kind: "thread",
+		provider: "chat",
+		threadId: `chat:${t.channel}:${thread}`,
+	});
+	const actual = io.post.bind(io);
+	io.post = ((content: Parameters<typeof actual>[0]) =>
+		post(content, () => actual(content))) as typeof io.post;
+}
+/** The posts of the replies of a Session's runs, by intent key. */
+const deliveries = async (t: Awaited<ReturnType<typeof setup>>) => {
+	const runs = await t.read(`chat:channel:${t.channel}`, (s) =>
+		s.snapshot(Runs, BACKGROUND_CONTEXT),
+	);
+	return Object.values(runs?.runs ?? {}).flatMap((run) => Object.values(run.deliveries ?? {}));
+};
+
 const statuses = async (t: Awaited<ReturnType<typeof setup>>, thread: string) =>
 	(
 		await t.chat.thread({
@@ -807,6 +837,9 @@ it("no_reply ends a run without posting and keeps its reason in the transcript",
 	expect(t.faux.state.callCount).toBe(1);
 	expect(await t.posts("t1")).toEqual([]);
 	expect((await statuses(t, "t1")).at(-1)).toBeNull();
+	// Nothing to deliver: the Session completed without waiting on a post.
+	expect(await deliveries(t)).toEqual([]);
+	expect(await sessions(t.runtime.queue)).toEqual([{ status: "completed", attempts: 1 }]);
 	await t.chat.receive(t.message("m2", "t1", "a real question"));
 	await t.settle();
 	expect(next).toContain("just chatter");
@@ -814,12 +847,12 @@ it("no_reply ends a run without posting and keeps its reason in the transcript",
 });
 
 it(
-	"posts a final reply exactly once across a restart and a redelivery",
+	"posts a final reply at least once across a restart, a redelivery, and a post repeated after the provider accepted it",
 	async () => {
 		let crashed = false;
 		const logger: Logger = {
 			debug: (message) => {
-				// Crash once right after the final reply's durable intent started.
+				// Crash once right after the final reply's durable intent started, while its post is in flight.
 				if (message === "Posting final reply" && !crashed) {
 					crashed = true;
 					throw new Error("driver crashed");
@@ -830,10 +863,17 @@ it(
 			error() {},
 		};
 		const t = await setup(undefined, { logger, sessionAttempts: 2 });
+		// The provider accepts the first post, but its receipt is lost: the effect's retry posts again.
+		let attempts = 0;
+		await intercept(t, "t1", async (_content, actual) => {
+			const posted = await actual();
+			if (++attempts === 1) throw new Error("connection reset after the post");
+			return posted;
+		});
 		const signals = vi.spyOn(t.runtime, "signalWithStart");
 		t.respond([fauxAssistantMessage("The answer"), fauxAssistantMessage("unexpected")]);
 		await t.chat.receive(t.message("m1", "t1"));
-		// The crashed attempt is retried after Conductor's backoff.
+		// The crashed attempt and the failed post are retried after Conductor's backoff.
 		await t.settle(RETRY_MS);
 		expect(crashed).toBe(true);
 		expect(await t.chat.receive(t.message("m1", "t1"))).toBe("accepted");
@@ -854,11 +894,93 @@ it(
 			},
 		});
 		await t.settle();
-		expect((await t.posts("t1")).map((post) => post.content)).toEqual(["The answer"]);
+		// At least once: the restarted Session reconnected to the same post, which repeated only the accepted one.
+		expect((await t.posts("t1")).map((post) => post.content)).toEqual(["The answer", "The answer"]);
+		expect(attempts).toBe(2);
 		expect(t.faux.state.callCount).toBe(1);
+		expect(await deliveries(t)).toEqual([expect.objectContaining({ status: "posted" })]);
+		expect((await sessions(t.runtime.queue)).at(0)).toEqual({ status: "completed", attempts: 2 });
 	},
 	2 * RETRY_MS,
 );
+
+it("a run waits for its final post; input arriving meanwhile is still answered", async () => {
+	const t = await setup();
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => (release = resolve));
+	let held = false;
+	await intercept(t, "t1", async (_content, actual) => {
+		held = true;
+		await gate;
+		return actual();
+	});
+	t.respond([fauxAssistantMessage("Answer one"), fauxAssistantMessage("Answer two")]);
+	await t.chat.receive(t.message("m1", "t1"));
+	await until("the held post", async () => (held ? true : undefined));
+	// The answer exists, but the run waits for its post: the Session does not complete.
+	await new Promise((resolve) => setTimeout(resolve, 500));
+	expect((await sessions(t.runtime.queue)).map((session) => session.status)).not.toContain(
+		"completed",
+	);
+	expect(await deliveries(t)).toEqual([expect.objectContaining({ status: "pending" })]);
+	// Another thread's message is handled while the post is pending.
+	await t.chat.receive(t.message("m2", "t2", "second"));
+	await until("the second answer", async () => ((await t.posts("t2")).length ? true : undefined));
+	expect((await t.posts("t2")).map((post) => post.content)).toEqual(["Answer two"]);
+	expect(await t.posts("t1")).toEqual([]);
+	expect((await sessions(t.runtime.queue)).map((session) => session.status)).not.toContain(
+		"completed",
+	);
+	release();
+	await t.settle();
+	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Answer one"]);
+	expect((await deliveries(t)).map((delivery) => delivery.status)).toEqual(["posted", "posted"]);
+	expect(await sessions(t.runtime.queue)).toEqual([{ status: "completed", attempts: 1 }]);
+	expect(t.faux.state.callCount).toBe(2);
+});
+
+it("a final post that fails for good is logged and recorded, without rerunning the model or an error reply", async () => {
+	const errors: { message: string; data?: Record<string, unknown> }[] = [];
+	const logger: Logger = {
+		debug() {},
+		info() {},
+		warn() {},
+		error: (message, data) => errors.push({ message, data }),
+	};
+	const t = await setup(undefined, { logger, effectAttempts: 1 });
+	const attempted: unknown[] = [];
+	await intercept(t, "t1", async (content) => {
+		attempted.push(content);
+		throw new Error("chat is down");
+	});
+	t.respond([fauxAssistantMessage("The answer"), fauxAssistantMessage("unexpected")]);
+	await t.chat.receive(t.message("m1", "t1"));
+	await t.settle();
+	// One post attempted, no error reply for it, and the model ran once.
+	expect(attempted).toEqual(["The answer"]);
+	expect(await t.posts("t1")).toEqual([]);
+	expect(t.faux.state.callCount).toBe(1);
+	expect(await deliveries(t)).toEqual([
+		expect.objectContaining({ status: "failed", error: "chat is down" }),
+	]);
+	expect(errors).toEqual([
+		expect.objectContaining({
+			message: "Reply post failed",
+			data: expect.objectContaining({ error: "chat is down" }),
+		}),
+	]);
+	expect(await sessions(t.runtime.queue)).toEqual([{ status: "completed", attempts: 1 }]);
+	// The conversation stays usable.
+	const posted: unknown[] = [];
+	await intercept(t, "t2", async (content, actual) => {
+		posted.push(content);
+		return actual();
+	});
+	t.respond([fauxAssistantMessage("Answer two")]);
+	await t.chat.receive(t.message("m2", "t2"));
+	await t.settle();
+	expect(posted).toEqual(["Answer two"]);
+});
 
 it("ctx.agent returns the answer and posts nothing, without offering no_reply", async () => {
 	const t = await setup();
