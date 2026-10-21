@@ -1,4 +1,4 @@
-// Generated from packages/fabrial/README.md:363 by ../snippets.ts. Do not edit.
+// Generated from packages/fabrial/README.md:362 by ../snippets.ts. Do not edit.
 /* oxlint-disable */
 import { f } from "../prelude.ts";
 import { createTestApp } from "fabrial/testing";

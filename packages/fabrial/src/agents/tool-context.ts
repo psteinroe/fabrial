@@ -27,7 +27,7 @@ import {
 	storedFollowOptions,
 	type UnfollowReceipt,
 } from "../routing/follows.ts";
-import { ChildResults, EFFECT_WORKFLOW, registerChild, startChild } from "../sessions/workflows.ts";
+import { ChildResults, EFFECT_WORKFLOW, startChild } from "../sessions/workflows.ts";
 import type { AnyWorkflow } from "../workflows/definition.ts";
 import type { Thread } from "../chat/messages.ts";
 import type { SendReceipt } from "../sessions/delivery.ts";
@@ -61,7 +61,7 @@ export interface BridgeFrame {
 }
 export const BridgeKey = createContextKey<BridgeFrame>("fabrial.pi.bridge");
 /** Tool context without the per-call signal. */
-export type FabrialFields = Omit<ToolContext, "signal">;
+type FabrialFields = Omit<ToolContext, "signal">;
 
 export function frame(context: Context): BridgeFrame {
 	const value = context.value(BridgeKey);
@@ -106,13 +106,7 @@ export async function fields(
 	const childResult = async (child: string): Promise<Json> => {
 		let result = (await bridge.harness.snapshot(ChildResults, context))?.results[child];
 		if (!result) {
-			await registerChild(
-				bridge,
-				requestId,
-				api!.taskId,
-				{ executionId: child, detached: false },
-				context,
-			);
+			bridge.children.set(api!.taskId, { executionId: child, detached: false });
 			result = await bridge.waitChild(api!.taskId, child, context);
 		}
 		if (result.status !== "completed") throw new Error(JSON.stringify(result));

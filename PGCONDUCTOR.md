@@ -1,6 +1,6 @@
 # PG Conductor changes for Fabrial
 
-[Fabrial](./PLAN.md) builds on [`psteinroe/postgres-conductor`](https://github.com/psteinroe/postgres-conductor), and its rule is that Conductor gaps are fixed in Conductor rather than worked around in Fabrial. Everything Fabrial needed has landed: its Conductor adapter (`packages/fabrial/src/runtime/conductor`) uses only public Conductor APIs, with no private access, no polling, and no tables, sequences, or receipts of its own. Nothing is outstanding.
+[Fabrial](./PLAN.md) builds on [`psteinroe/postgres-conductor`](https://github.com/psteinroe/postgres-conductor), and its rule is that Conductor gaps are fixed in Conductor rather than worked around in Fabrial. Fabrial uses Conductor directly (`packages/fabrial/src/conductor.ts`, the attempt middleware in `src/workflows/context.ts`), through public APIs only: no private access, no polling, and no tables, sequences, or receipts of its own. Everything it needed has landed except one pending item, #104, below.
 
 ## How Fabrial uses Conductor
 
@@ -34,6 +34,10 @@
 | Signal branches; metadata on `signalWithStart`/`emit` | #100                                                         |
 | Wait deadlines and child timeouts                     | #99                                                          |
 
+## Pending
+
+- **#104, the middleware wrapping contract.** Fabrial's attempt middleware merges its fields onto `ctx` and wraps Conductor's methods for policy, while Fabrial's own helpers call Conductor's unwrapped methods from the context's prototype. #104 makes what a middleware may add and wrap a documented contract; bump the submodule to it once merged.
+
 ## Not needed from Conductor
 
 - **A settlement hook.** `ctx.waitForResult` wakes on every terminal state, so Fabrial reports outcomes with executions of its own.
@@ -41,4 +45,4 @@
 - **Event cursors.** `ctx.subscribe` makes waits race-safe.
 - **Repeated step ids.** Fabrial suffixes repeated ids itself.
 
-What remains is publishing a version, so Fabrial can drop the vendored submodule.
+After #104, what remains is publishing a version, so Fabrial can drop the vendored submodule.

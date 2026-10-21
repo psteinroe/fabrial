@@ -1,5 +1,6 @@
 // Workflow definitions and their Conductor tasks.
-import type { TaskContext } from "pgconductor-js";
+import type { ExecutionOutcome, TaskContext } from "pgconductor-js";
+import type { Native } from "../execution.ts";
 import type { ClassifierResult } from "@earendil-works/pi-ai";
 import type { WorkflowTask } from "../conductor.ts";
 import { type Json, type JsonObject, parseSchema, type Schema } from "../schema.ts";
@@ -43,30 +44,12 @@ export function workflowTask(
 }
 
 /** Conductor's context methods Fabrial wraps (typed for Fabrial workflows below) or keeps to itself. */
-type WrappedNative =
-	| "invoke"
-	| "invokeAndWait"
-	| "waitForResult"
-	| "schedule"
-	| "unschedule"
-	| "sendSignal"
-	| "signalWithStart"
-	| "emit"
-	| "subscribe"
-	| "waitForEvent"
-	| "step"
-	| "sleep";
+type WrappedNative = Exclude<keyof Native, "waitForAny">;
 
 /** Fabrial's override of a child's metadata: merged onto this execution's (routing-only fields cleared). */
-export type ChildMetadata =
+type ChildMetadata =
 	| Partial<InvocationMetadata>
 	| ((metadata: InvocationMetadata) => Partial<InvocationMetadata>);
-
-export type ResultOutcome<T = JsonObject | null> =
-	| { status: "completed"; result: T }
-	| { status: "failed"; error: string }
-	| { status: "cancelled"; reason: string }
-	| { status: "timeout" };
 
 /**
  * A workflow's `ctx`: Conductor's `TaskContext` (durable steps, sleeps, waits, signals, child executions)
@@ -118,7 +101,7 @@ export interface WorkflowContext<TClients = Record<string, unknown>> extends Omi
 		key: string,
 		executionId: string,
 		options?: { timeout?: string | number },
-	): Promise<ResultOutcome>;
+	): Promise<ExecutionOutcome<JsonObject | null> | { status: "timeout" }>;
 	schedule<W extends AnyWorkflow>(
 		workflow: W,
 		name: string,
@@ -179,7 +162,7 @@ export interface WorkflowContext<TClients = Record<string, unknown>> extends Omi
 	isMember(principal: Principal, group: GroupDefinition): Promise<boolean>;
 	/** For Fabrial's own helpers: Conductor's unwrapped methods and this execution's metadata. */
 	readonly fabrial: {
-		readonly native: Pick<TaskContext, WrappedNative | "waitForAny">;
+		readonly native: Native;
 		readonly metadata: InvocationMetadata;
 	};
 }

@@ -57,13 +57,13 @@ export interface CardInput extends ApprovalCard {
 }
 
 /** Retried attempts repeat only the card's failed post or update; a card still failing is given up. */
-export const CARD_ATTEMPTS = 3;
+const CARD_ATTEMPTS = 3;
 
 /**
  * One independent execution per approval card: posts it, waits for the decision, and relabels it
  * without actions. It survives cancellation of the caller and restarts.
  */
-export async function deliverCard(input: Json, ctx: TaskContext, host: FabrialHost): Promise<void> {
+async function deliverCard(input: Json, ctx: TaskContext, host: FabrialHost): Promise<void> {
 	const native = nativeMethods(ctx);
 	const data = input as unknown as CardInput;
 	const chat = host.chat();

@@ -125,7 +125,7 @@ export interface UnfollowReceipt extends FollowReceipt {
 type ResourceRefLike = ResourceRef<any> | { provider: string; type: string; ref: JsonObject };
 
 /** The resource kind behind a reference, its prefixed key, and its thread. */
-export function resolveResource(
+function resolveResource(
 	plugins: readonly AnyPlugin[],
 	ref: ResourceRefLike,
 ): { kind: ResourceKind<any>; key: string; thread: ThreadRef } {
@@ -160,7 +160,7 @@ const same = (a: ConversationRef, b: ConversationRef) =>
 	a.session === b.session && a.agent === b.agent;
 
 /** Add or replace a conversation's follow record of a resource thread. */
-export function addResourceFollow(
+function addResourceFollow(
 	state: ThreadRoutingState | null,
 	follow: ResourceFollow,
 ): ThreadRoutingState {
@@ -232,10 +232,8 @@ export async function unfollowResource(
 }
 
 /**
- * Deliver a plugin event to the conversations following its resource threads, as notifications: the
- * plugin renders it (and drops untrusted authors), the follow's `events` selects kinds, its `priority`
- * overrides the plugin's default. Request ids derive from the event and the conversation, so a redelivery
- * is dropped. Returns the number of deliveries.
+ * Notify the conversations following a plugin event's resource. Request ids derive from the event and the
+ * conversation, so a redelivery is dropped.
  */
 export async function notifyFollowers(
 	host: FabrialHost,
@@ -299,11 +297,7 @@ export interface ConversationKey extends JsonObject {
 	agent: string;
 }
 
-/**
- * The thread a delivery makes the conversation follow: its reply thread, whatever the session kind (follow records
- * are the routing index). A channel home is followed once the first final reply creates its thread
- * (`metadata.follow`).
- */
+/** The reply thread a delivery follows, whatever the session kind; a channel home's once its first reply creates it. */
 export function followedThread(
 	replyTo: InvocationMetadata["replyTo"],
 ): (ThreadRef & JsonObject) | null {

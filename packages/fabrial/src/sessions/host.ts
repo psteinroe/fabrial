@@ -52,7 +52,7 @@ export const Conversations = defineDoc({
 	initial: (): { ids: Record<string, number> } => ({ ids: {} }),
 });
 /** How often the Session's execution suspended on its tools and inputs: names each wait. */
-export const Suspensions = defineDoc({
+const Suspensions = defineDoc({
 	kind: "fabrial.suspensions",
 	scope: "session",
 	version: 1,
@@ -77,10 +77,7 @@ export interface PiOptions {
 /** Pi's agents, their state and evaluation, connected to the host. Core calls it directly. */
 export type Agents = ReturnType<typeof connectAgents>;
 
-/**
- * Connect Pi to the host. Nothing touches Pi's storage, and no Pi workflow is registered, unless the instance
- * defines an agent: an app without one runs no Pi work.
- */
+/** Connect Pi to the host. An app without agents touches no Pi storage and registers no Pi workflow. */
 export function connectAgents(host: FabrialHost, options: PiOptions) {
 	const scope = host.definitionScope ?? host;
 	/** Whether the instance defines agents: decided when the app starts, after which none can be defined. */
@@ -589,7 +586,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
  * Pi has no work left (`done`), or every live task waits on a workflow (`parked`, by task id) or Pi waits only on
  * the posts of its replies (`deliveries`, by execution id).
  */
-export type Idle =
+type Idle =
 	| { kind: "done" }
 	| { kind: "parked"; n: number; children: Map<number, string>; deliveries: string[] };
 
@@ -599,7 +596,7 @@ export interface Hosted {
 	replying?: boolean;
 }
 
-export interface SessionHost {
+interface SessionHost {
 	handle(input: SessionInput): Promise<void>;
 	/** Resolves when Pi is idle; rejects when the lease is lost. */
 	idle: Promise<Idle>;

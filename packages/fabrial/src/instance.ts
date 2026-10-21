@@ -104,7 +104,7 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 
 /** Internal app construction for `fabrial/testing`. Not part of the public API. */
 export const INTERNAL = Symbol.for("fabrial.internal");
-export type InternalOverrides = Omit<ProductionOverrides, "conductor"> &
+type InternalOverrides = Omit<ProductionOverrides, "conductor"> &
 	Partial<Pick<CoreConfig, "chat" | "agents">> & {
 		/** With `sql`, the app runs on that pool instead of the instance's database. */
 		conductor?: Omit<CoreConfig["conductor"], "sql"> & { sql?: CoreConfig["conductor"]["sql"] };

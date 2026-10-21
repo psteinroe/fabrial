@@ -1,4 +1,4 @@
-// Generated from packages/fabrial/README.md:187 by ../snippets.ts. Do not edit.
+// Generated from packages/fabrial/README.md:186 by ../snippets.ts. Do not edit.
 /* oxlint-disable */
 import { f, billing, slack, z } from "../prelude.ts";
 const deploy = f.defineWorkflow({

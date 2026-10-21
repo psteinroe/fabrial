@@ -35,7 +35,7 @@ Helpers are named exports and properties on `github`:
 
 Identities are numeric GitHub account ids, the same ids webhooks and comments carry, so a `defineUser` identity matches inbound principals and approvals. Logins are not identities: they can be renamed and never match an inbound id.
 
-Lifecycle routes use core's `EmitOptions.replyTo` for the PR/issue thread and `requestedBy` for its author (not the webhook sender). One installation per app in this preview: the plugin id is the Chat SDK adapter's name, so a second GitHub plugin can't be added, and clients are not request-scoped.
+Webhook events use core's `EmitOptions.replyTo` for the PR/issue thread (checks have none) and `requestedBy` for the author of `issueOpened`/`pullRequestOpened`, otherwise the event's actor (sender, reviewer, or commenter). One installation per app in this preview: the plugin id is the Chat SDK adapter's name, so a second GitHub plugin can't be added, and clients are not request-scoped.
 
 Both ingress paths reject payloads outside the configured App installation. PATs restrict repository owners to `owner`, or default to the token's authenticated user (resolved via GitHub API and cached; failures remain retryable). An explicit `owner` additionally restricts App repositories. The owner in `repository.full_name` and, when present, `repository.owner.login` must agree with that scope. A numeric PAT `installationId` also rejects conflicting payload installation IDs when present; string installation IDs remain identity namespaces.
 
@@ -47,7 +47,7 @@ Comments and reviews reach agents only from `OWNER`, `MEMBER`, or `COLLABORATOR`
 - thread history: untrusted comments are left out of fetched history (so a history window may hold fewer than 50 messages);
 - `/github/webhook`: untrusted `pullRequestCommented` and `pullRequestReviewed` are not emitted, so neither workflows nor follows see them.
 
-The other lifecycle events (opened, closed, reopened, labeled, synchronize, checks) are deliberately public facts: anyone who can open an issue or pull request triggers `issueOpened`/`pullRequestOpened`, with their title and body. Their payloads carry the author or actor (`authorId`, `actorId`, `actorType`) and `requestedBy` the author's identity; a workflow that acts on an outsider's request should check them.
+The other lifecycle events (opened, closed, reopened, labeled, synchronize, checks) are deliberately public facts: anyone who can open an issue or pull request triggers `issueOpened`/`pullRequestOpened`, with their title and body. Their payloads carry the author or actor (`authorId`, `actorId`, `actorType`), and `requestedBy` is that person's identity; a workflow that acts on an outsider's request should check them.
 
 Chat SDK's GitHub adapter has no author filter, so the policy lives here; an upstream `shouldProcessMessage`/author-filter hook on the adapter would let it shrink to configuration.
 

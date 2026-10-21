@@ -53,23 +53,6 @@ export function settlement(info: ExecutionInfo): ExecutionResult | null {
 	return null;
 }
 
-type Native = Pick<
-	TaskContext,
-	| "step"
-	| "sleep"
-	| "subscribe"
-	| "waitForEvent"
-	| "waitForAny"
-	| "waitForResult"
-	| "invoke"
-	| "invokeAndWait"
-	| "schedule"
-	| "unschedule"
-	| "sendSignal"
-	| "signalWithStart"
-	| "emit"
->;
-
 const NATIVE = [
 	"step",
 	"sleep",
@@ -85,6 +68,9 @@ const NATIVE = [
 	"signalWithStart",
 	"emit",
 ] as const;
+
+/** Conductor's context methods Fabrial calls unwrapped. */
+export type Native = Pick<TaskContext, (typeof NATIVE)[number]>;
 
 /** Conductor's own methods of a context, from its prototype: unaffected by wrappers merged onto it. */
 export function nativeMethods(ctx: TaskContext): Native {

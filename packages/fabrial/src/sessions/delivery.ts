@@ -50,7 +50,7 @@ export const callSession = (executionId: string, id: string) =>
 export const CALL_SESSION = "run:";
 
 /** Metadata of a Session execution: it serves many requests, so it carries none of theirs. */
-export const sessionMetadata = (key: string): Partial<InvocationMetadata> => ({
+const sessionMetadata = (key: string): Partial<InvocationMetadata> => ({
 	replyTo: null,
 	ownerWorkflow: null,
 	triggerEvent: null,
@@ -74,7 +74,7 @@ export const signalSession = (
 		metadata: { ...metadata, ...sessionMetadata(key) } as InvocationMetadata,
 	} as never);
 
-export const sessionInput = (agent: AgentRef, request: SendRequest): SessionInput => ({
+const sessionInput = (agent: AgentRef, request: SendRequest): SessionInput => ({
 	kind: "input",
 	agent: agent.name,
 	requestId: request.requestId,
@@ -243,7 +243,7 @@ export interface ConversationReference extends JsonObject {
 	agent: string;
 }
 
-export const conversationReference = (agent: string, session: string): ConversationReference => ({
+const conversationReference = (agent: string, session: string): ConversationReference => ({
 	kind: "fabrial.conversation",
 	session,
 	agent,
@@ -279,10 +279,9 @@ export function deliveryFor(kind: InputKind, priority: InputPriority = "normal")
 
 /** Session key of a thread. The default Session, as for `ctx.agent`. */
 export const threadSession = (provider: string, threadId: string) => `${provider}:${threadId}`;
-export const channelSession = (provider: string, channelId: string) =>
-	`${provider}:channel:${channelId}`;
+const channelSession = (provider: string, channelId: string) => `${provider}:channel:${channelId}`;
 /** Namespaced so an app key never collides with a chat Session. */
-export const customSession = (key: string) => `app:${key}`;
+const customSession = (key: string) => `app:${key}`;
 
 const XML: Record<string, string> = {
 	"&": "&amp;",
@@ -385,8 +384,7 @@ export const threadOf = (message: ChatMessage): ThreadRef & JsonObject => ({
 });
 
 /**
- * The Session key of an agent's conversation for an event, as its trigger would compute it: from the message's
- * thread or channel, else from the reply surface (the trigger's thread or the agent's home). `fallback` keys a
+ * The Session key of an agent's conversation for an event, as its trigger would compute it. `fallback` keys a
  * `"thread"` conversation whose event has no thread yet (its home is a channel).
  */
 export function conversationSession(
@@ -472,9 +470,8 @@ export async function prepareInput(
 }
 
 /**
- * Resolve the Session, actor, and reply surface of a send, and render its input. Shared by workflow and
- * tool `ctx.send`; `surface.current` is the sender's chat surface. The conversation is found as if the
- * agent's trigger had matched the input: by its thread, or `home`; otherwise relative to the sender's surface.
+ * Resolve a send (workflow and tool `ctx.send`): its conversation is found as if the agent's trigger had matched the
+ * input, else relative to the sender's surface (`surface.current`).
  */
 export async function prepareSend(
 	host: FabrialHost,

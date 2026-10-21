@@ -90,10 +90,10 @@ export async function decideAction(
 	return { authorized: true };
 }
 
-export type ApprovalAction = "approve" | "reject" | "cancel";
+type ApprovalAction = "approve" | "reject" | "cancel";
 
 /** The request of an approval id from a click: null for unknown ids and executions of other workflows. */
-export async function loadRequest(
+async function loadRequest(
 	host: FabrialHost,
 	ctx: TaskContext,
 	approvalId: string,

@@ -21,9 +21,9 @@ import {
 } from "./decision.ts";
 import type { WorkflowTask } from "../conductor.ts";
 
-export const THREAD_TTL = 30 * 24 * 60 * 60 * 1000;
+const THREAD_TTL = 30 * 24 * 60 * 60 * 1000;
 
-export function boundedTimeout(value: string | number = "24h"): number {
+function boundedTimeout(value: string | number = "24h"): number {
 	const ms = duration(value);
 	if (ms >= THREAD_TTL) throw new Error("Timeout must be below 30 days");
 	return ms;

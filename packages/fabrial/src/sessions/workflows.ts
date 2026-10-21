@@ -35,7 +35,7 @@ export const ChildResults = defineDoc({
 	version: 1,
 	initial: (): { results: Record<string, JsonObject> } => ({ results: {} }),
 });
-export interface ChildIntent extends JsonObject {
+interface ChildIntent extends JsonObject {
 	workflow: string;
 	input: Json;
 	metadata: InvocationMetadata;
@@ -52,7 +52,7 @@ export const ChildIntents = defineDocFamily({
 });
 export const EFFECT_WORKFLOW = "fabrial.pi.effect";
 /** Runs a child a Session waits on and reports its outcome once committed (see `startChild`). */
-export const REPORT_WORKFLOW = "fabrial.pi.report";
+const REPORT_WORKFLOW = "fabrial.pi.report";
 /** Name of the signal a reporter sends the Session's execution, id `child:<child execution id>`. */
 export const CHILD_SIGNAL = "child";
 /** Payload of a `child` signal: the reporter's execution id, and the committed outcome of its child. */
@@ -140,23 +140,6 @@ async function launch(
 	return executionId;
 }
 
-/** A tool's task waits on `child`: links it to the request the tool acts for, so stopping the request cancels it. */
-export async function registerChild(
-	bridge: BridgeFrame,
-	request: string,
-	taskId: number,
-	child: { executionId: string; detached: boolean },
-	context: Context,
-): Promise<void> {
-	bridge.children.set(taskId, child);
-	await bridge.harness.commit(async (tx) => {
-		const obligation = (await tx.doc(Obligations)).requests[request];
-		if (!obligation) throw new Error(`Missing Fabrial obligation for request ${request}`);
-		obligation.children ??= {};
-		obligation.children[String(taskId)] = child;
-	}, context);
-}
-
 /**
  * Cancels the workflows and effects the tools of `requests` started or wait on, except detached ones. Call it once the
  * requests are `stopped`: an intent still starting (no execution id yet) is started or found by its start key, then
@@ -179,13 +162,11 @@ export async function cancelChildren(
 			if (!intent || intent.detached) continue;
 			await cancel(intent.executionId ?? (await launch(bridge, key, intent, context)), reason);
 		}
-		for (const child of Object.values(obligation.children ?? {}))
-			if (!child.detached) await cancel(child.executionId, reason);
 	}
 }
 
 /** The channel of an execution's reply surface, without the provider. */
-export async function channelOfExecution(
+async function channelOfExecution(
 	host: FabrialHost,
 	ctx: TaskContext,
 	what: string,

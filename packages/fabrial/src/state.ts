@@ -45,7 +45,7 @@ export async function stateDraft<T extends JsonObject>(
 	return tx.doc(token, "session", "");
 }
 
-export async function applyState<T extends JsonObject>(
+async function applyState<T extends JsonObject>(
 	tx: Tx,
 	definition: StateDefinition<T>,
 	conversationId: ConversationId | undefined,

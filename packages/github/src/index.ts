@@ -5,7 +5,6 @@ import {
 	type GitHubAdapterAppConfig,
 } from "@chat-adapter/github";
 import {
-	type EmitOptions,
 	type EventFilter,
 	type ExternalIdentity,
 	type InputPriority,
@@ -168,13 +167,14 @@ const webhook = z.object({
 });
 type Webhook = z.infer<typeof webhook>;
 type EventKey = Exclude<keyof typeof events, "mentioned" | "message" | "dm">;
+type WebhookEvent = { event: EventKey; payload: Record<string, unknown>; actor: number };
 
 /** The pull request event a webhook carries, if any, after `opened`. */
 function pullRequestEventOf(
 	kind: string,
 	payload: Webhook,
 	threadId: (number: number) => string,
-): { event: EventKey; payload: Record<string, unknown>; actor: number } | undefined {
+): WebhookEvent | undefined {
 	const repo = payload.repository.full_name;
 	const base = (
 		source: { number: number; title: string; html_url: string },
@@ -703,13 +703,41 @@ const createPlugin = definePlugin<
 				if (!(await adapter().acceptPayload(raw)))
 					return new Response("Wrong installation", { status: 403 });
 				const [owner, repo] = payload.repository.full_name.split("/") as [string, string];
-				if (payload.action !== "opened" || (kind !== "pull_request" && kind !== "issues")) {
-					const found = pullRequestEventOf(kind, payload, (prNumber) =>
+				let found: WebhookEvent | undefined;
+				if (payload.action === "opened" && (kind === "pull_request" || kind === "issues")) {
+					const source = kind === "pull_request" ? payload.pull_request : payload.issue;
+					if (!source) return new Response("Missing conversation", { status: 400 });
+					if (kind === "issues" && payload.issue?.pull_request)
+						return new Response(null, { status: 200 });
+					const threadId = adapter().encodeThreadId({
+						owner,
+						repo,
+						prNumber: source.number,
+						type: kind === "issues" ? "issue" : "pr",
+					});
+					// `opened` is attributed to the author; the other events to their actor.
+					found = {
+						event: kind === "issues" ? "issueOpened" : "pullRequestOpened",
+						payload: {
+							repo: payload.repository.full_name,
+							id: source.id,
+							number: source.number,
+							title: source.title,
+							body: source.body,
+							url: source.html_url,
+							authorId: String(source.user.id),
+							authorLogin: source.user.login,
+							threadId,
+						},
+						actor: source.user.id,
+					};
+				} else {
+					found = pullRequestEventOf(kind, payload, (prNumber) =>
 						adapter().encodeThreadId({ owner, repo, prNumber, type: "pr" }),
 					);
 					if (!found) return new Response(null, { status: 200 });
 					// Comments and reviews carry an author's words: only trusted ones are emitted. The other
-					// lifecycle events, and `opened` below, are public facts with the actor in the payload.
+					// events are public facts with the actor in the payload.
 					const association = found.payload.association as string | undefined;
 					if (
 						association !== undefined &&
@@ -720,61 +748,22 @@ const createPlugin = definePlugin<
 						)
 					)
 						return new Response(null, { status: 200 });
-					const delivery = request.headers.get("x-github-delivery");
-					if (!delivery) return new Response("Missing delivery id", { status: 400 });
-					const threadId = found.payload.threadId as string | undefined;
-					await ctx.emit(found.event, found.payload as never, {
-						id: JSON.stringify(["github", installationId, delivery]),
-						origin: {
-							provider: "github",
-							installationId,
-							repo: payload.repository.full_name,
-							...(threadId ? { number: found.payload.number as number, threadId } : {}),
-						},
-						replyTo: threadId ? { kind: "thread", provider: "github", threadId } : undefined,
-						requestedBy: identity({ installationId, userId: found.actor }),
-					});
-					return new Response(null, { status: 200 });
 				}
-				const source = kind === "pull_request" ? payload.pull_request : payload.issue;
-				if (!source) return new Response("Missing conversation", { status: 400 });
-				if (kind === "issues" && payload.issue?.pull_request)
-					return new Response(null, { status: 200 });
 				const delivery = request.headers.get("x-github-delivery");
 				if (!delivery) return new Response("Missing delivery id", { status: 400 });
-				const threadId = adapter().encodeThreadId({
-					owner,
-					repo,
-					prNumber: source.number,
-					type: kind === "issues" ? "issue" : "pr",
-				});
-				const ingress: EmitOptions = {
+				// Checks have no single thread to reply in.
+				const threadId = found.payload.threadId as string | undefined;
+				await ctx.emit(found.event, found.payload as never, {
 					id: JSON.stringify(["github", installationId, delivery]),
 					origin: {
 						provider: "github",
 						installationId,
 						repo: payload.repository.full_name,
-						number: source.number,
-						threadId,
+						...(threadId ? { number: found.payload.number as number, threadId } : {}),
 					},
-					replyTo: { kind: "thread", provider: "github", threadId },
-					requestedBy: identity({ installationId, userId: source.user.id }),
-				};
-				await ctx.emit(
-					kind === "issues" ? "issueOpened" : "pullRequestOpened",
-					{
-						repo: payload.repository.full_name,
-						id: source.id,
-						number: source.number,
-						title: source.title,
-						body: source.body,
-						url: source.html_url,
-						authorId: String(source.user.id),
-						authorLogin: source.user.login,
-						threadId,
-					},
-					ingress,
-				);
+					replyTo: threadId ? { kind: "thread", provider: "github", threadId } : undefined,
+					requestedBy: identity({ installationId, userId: found.actor }),
+				});
 				return new Response(null, { status: 200 });
 			},
 		},

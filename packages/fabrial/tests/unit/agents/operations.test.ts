@@ -12,7 +12,7 @@ import { TaskContext } from "pgconductor-js";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
 import { BridgeKey, fields, type BridgeFrame } from "../../../src/agents/tool-context.ts";
-import { cancelChildren, registerChild } from "../../../src/sessions/workflows.ts";
+import { cancelChildren } from "../../../src/sessions/workflows.ts";
 import { Binding, Invocation, Obligations } from "../../../src/sessions/obligations.ts";
 import { ChildIntents, ChildResults } from "../../../src/sessions/workflows.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
@@ -251,25 +251,20 @@ it("a stop that races a child's start still cancels it, and later starts for the
 	}
 });
 
-it("stopping a request cancels the attached workflows its tools started or wait on, never detached ones", async () => {
+it("stopping a request cancels the attached workflows its tools started or waited on, never detached ones", async () => {
 	const workflow = defineWorkflow({ name: "child", run: async () => null });
 	const f = await fixture([workflow]);
 	try {
-		await (
-			await fields(f.context, f.conversation.id, f.api)
-		).start("attached", workflow, null as never);
+		const ctx = await fields(f.context, f.conversation.id, f.api);
+		await ctx.start("attached", workflow, null as never);
+		// Waited: started behind a reporter, its intent linked to the request like any start.
+		await expect(ctx.invoke("waited", workflow, null as never)).resolves.toEqual({
+			messageId: "posted",
+		});
 		await (
 			await fields(f.context, f.conversation.id, f.api, undefined, true)
 		).start("detached", workflow, null as never);
-		await registerChild(
-			f.bridge,
-			"request",
-			7,
-			{ executionId: "waited", detached: false },
-			f.context,
-		);
-		await registerChild(f.bridge, "request", 8, { executionId: "kept", detached: true }, f.context);
-		const [attached, detached] = f.start.mock.calls.map(([key]) => `child:${key}`);
+		const [attached, waited, detached] = f.start.mock.calls.map(([key]) => `child:${key}`);
 		const cancel = vi.fn(async () => {});
 		// Another request's children are not linked to this one.
 		await cancelChildren(f.bridge, cancel, ["other"], "Stopped", BACKGROUND_CONTEXT);
@@ -277,7 +272,7 @@ it("stopping a request cancels the attached workflows its tools started or wait 
 		await cancelChildren(f.bridge, cancel, ["request"], "Stopped", BACKGROUND_CONTEXT);
 		expect(cancel.mock.calls).toEqual([
 			[attached, "Stopped"],
-			["waited", "Stopped"],
+			[waited, "Stopped"],
 		]);
 		expect(detached).toBeDefined();
 	} finally {

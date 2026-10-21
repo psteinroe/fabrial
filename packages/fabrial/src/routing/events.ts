@@ -108,7 +108,7 @@ function compare(value: number, operator: string, bound: number): boolean {
 	}
 }
 
-export function matchesAlternative(value: unknown, alternative: FilterAlternative): boolean {
+function matchesAlternative(value: unknown, alternative: FilterAlternative): boolean {
 	if (alternative === null || typeof alternative !== "object") return value === alternative;
 	if ("exists" in alternative) return (value !== undefined) === alternative.exists;
 	if ("prefix" in alternative)

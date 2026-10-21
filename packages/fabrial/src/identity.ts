@@ -113,7 +113,7 @@ export interface IdentityDirectory {
 	isMember(principal: Principal, group: GroupDefinition): Promise<boolean>;
 }
 
-export function identityKey(identity: ExternalIdentity): string {
+function identityKey(identity: ExternalIdentity): string {
 	return `${identity.provider}:${identity.installationId}:${identity.subjectId}`;
 }
 

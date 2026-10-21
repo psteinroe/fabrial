@@ -98,7 +98,7 @@ export interface Toolkit extends ToolkitDefinition<any> {
 }
 
 /** The event an agent's `session` function receives: its triggers' payloads, or any JSON for `ctx.send`. */
-export type AgentEvent<TTriggers extends readonly TriggerSpec<any>[]> = [
+type AgentEvent<TTriggers extends readonly TriggerSpec<any>[]> = [
 	TriggerPayload<TTriggers[number]>,
 ] extends [never]
 	? any

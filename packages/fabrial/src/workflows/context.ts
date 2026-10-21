@@ -83,7 +83,7 @@ export interface ContextOptions {
 }
 
 /** Operation keys beginning with `fabrial:` are Fabrial's; Conductor derives its own keys from a key and a suffix. */
-export function userKey(key: string): string {
+function userKey(key: string): string {
 	if (!key || typeof key !== "string")
 		throw new Error("Durable operations require a non-empty explicit key");
 	if (key.startsWith("fabrial:"))
@@ -99,7 +99,7 @@ const INTERNAL_SIGNALS = new Set(["input", CHILD_SIGNAL]);
  * middleware (`next(additions)`). Native methods are wrapped for Fabrial's policy (operation keys, metadata,
  * reserved destinations); `fabrial.native` keeps the originals for Fabrial's own helpers.
  */
-export async function createContext(options: ContextOptions) {
+async function createContext(options: ContextOptions) {
 	const { host, raw, metadata, agents } = options;
 	const native = nativeMethods(raw);
 	const op = userKey;

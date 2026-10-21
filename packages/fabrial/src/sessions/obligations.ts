@@ -55,7 +55,7 @@ export type CallOutcome =
  * so a crash in between leaves the obligation for its redelivery. Pi owns the submission and its lifecycle (looked up
  * by request id); this holds only what Pi cannot know.
  */
-export type Obligation = {
+type Obligation = {
 	/** The conversation the request is submitted to. */
 	conversationId: number;
 	/**
@@ -83,8 +83,6 @@ export type Obligation = {
 	>;
 	/** Workflows and effects its tools started, by intent key: stopping the request cancels the attached ones. */
 	intents?: string[];
-	/** Workflows its tools wait on, by task id. */
-	children?: Record<string, { executionId: string; detached: boolean }>;
 };
 export const Obligations = defineDoc({
 	kind: "fabrial.obligations",
@@ -100,7 +98,7 @@ export const outstanding = (obligation: Obligation, conversationId?: number) =>
 	(conversationId === undefined || obligation.conversationId === conversationId);
 
 /** What an opened Session's obligation handling works with: its host loop's state, read and changed in place. */
-export interface SessionScope {
+interface SessionScope {
 	host: FabrialHost;
 	ctx: TaskContext;
 	harness: Harness;
@@ -119,10 +117,7 @@ export interface SessionScope {
 	noReply: ToolRegistration;
 }
 
-/**
- * The obligations of an opened Session: what Fabrial owes for each request beyond what Pi tracks, reconciled with
- * Pi's submissions: final and error replies posted once, calls settled, stops.
- */
+/** What an opened Session owes each request beyond what Pi tracks: replies posted once, calls settled, stops. */
 export function sessionObligations(scope: SessionScope) {
 	const {
 		host,
@@ -368,10 +363,8 @@ export function sessionObligations(scope: SessionScope) {
 	}
 
 	/**
-	 * Fulfil the conversation's outstanding reply obligations (sent input and background reports on it) that Pi
-	 * settled: each answer posts once, to the thread of the newest input it answers (steering inputs share their run's
-	 * answer). Input that failed gets the error reply there instead. Returns whether every submitted one settled, and
-	 * whether one is still queued. One not submitted yet (a report its reporter still submits) waits.
+	 * Post each answer Pi settled once, to the thread of the newest input it answers (steering inputs share their run's
+	 * answer), or the error reply there. A report its reporter has not submitted yet waits.
 	 */
 	async function postAnswers(
 		conversation: Conversation,
@@ -447,11 +440,7 @@ export function sessionObligations(scope: SessionScope) {
 				.catch(() => {});
 	}
 
-	/**
-	 * Reconcile one conversation's outstanding obligations with Pi's submissions: post what Pi answered, and settle a
-	 * call once its answer is final. A call that failed settles at once; one that answered settles with the lead's
-	 * answer once every post of the conversation settled.
-	 */
+	/** Post what Pi answered; a call settles with the lead's answer only once every post of the conversation settled. */
 	async function evaluate(conversationId: ConversationId) {
 		const { conversation } = await hostedOf(conversationId);
 		const sent = await postAnswers(conversation);

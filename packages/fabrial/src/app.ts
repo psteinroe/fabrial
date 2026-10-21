@@ -386,7 +386,7 @@ export interface ProductionOverrides {
  * n while n <= maxRetries, after min(baseDelayMs * 2^(n-1), maxAgentDelayMs): 2+4+8+16+32+60+60+60+60 s, so
  * about 5 minutes of backoff before a sent request gets the "couldn't reach the model provider" reply.
  */
-export const MODEL_RETRY: ConversationRetryPolicy = {
+const MODEL_RETRY: ConversationRetryPolicy = {
 	enabled: true,
 	maxRetries: 9,
 	baseDelayMs: 2_000,

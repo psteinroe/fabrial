@@ -309,7 +309,7 @@ export function createRouter(config: CoreConfig, host: FabrialHost, agents: Agen
 /** The one event ingress emits; `fabrial.route` triggers on it. */
 export const INGRESS_EVENT = "fabrial.ingress";
 /** The internal workflow that routes every ingress event. */
-export const ROUTE_WORKFLOW = "fabrial.route";
+const ROUTE_WORKFLOW = "fabrial.route";
 
 /**
  * Verified, normalized input from a webhook or chat, as `fabrial.ingress` carries it. Ingress emits it once
@@ -334,7 +334,7 @@ export interface IngressEvent extends JsonObject {
 }
 
 /** The emit's dedupe key of an ingress event. */
-export const ingressKey = (ingress: IngressEvent): string =>
+const ingressKey = (ingress: IngressEvent): string =>
 	JSON.stringify(
 		ingress.kind === "event"
 			? [ingress.kind, ingress.events[0], ingress.id]
@@ -342,17 +342,13 @@ export const ingressKey = (ingress: IngressEvent): string =>
 	);
 
 /** A workflow the router starts, and the event category it starts on. */
-export interface RoutedWorkflow extends JsonObject {
+interface RoutedWorkflow extends JsonObject {
 	workflow: string;
 	event: string;
 }
 
-/**
- * How the router routed one ingress event, persisted in its `route` step: the conversations that receive it
- * (followers, or the agent whose trigger won), the owner workflow, and the observers. `ignored` when nothing
- * handles it: it leaves no follow record and no thread subscription.
- */
-export interface RouteDecision extends JsonObject {
+/** How the router routed one ingress event, persisted in its `route` step. `ignored` leaves no follow or subscription. */
+interface RouteDecision extends JsonObject {
 	route: "follow" | "new" | "ignored";
 	conversations: Follow[];
 	owner: RoutedWorkflow | null;

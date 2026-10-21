@@ -60,7 +60,7 @@ export interface FakePost {
 }
 
 /** A modal Fabrial opened, until it is submitted. */
-export interface FakeModal {
+interface FakeModal {
 	viewId: string;
 	modal: ModalElement;
 	contextId?: string;
@@ -70,7 +70,7 @@ export interface FakeModal {
  * What a thread shows: Fabrial's posts and the statuses it set. `post` and `update` are the platform
  * receiving them; wrap them to intercept a delivery.
  */
-export class FakeThread {
+class FakeThread {
 	readonly posts: FakePost[] = [];
 	/** The statuses shown, in order (`null` clears); setting the shown status again, as a chat thread does, adds none. */
 	readonly statuses: (string | null)[] = [];

@@ -44,7 +44,7 @@ export const RESERVED_LABELS = [
 ];
 
 /** The display name with the stable id it belongs to; unmapped identities are marked. */
-export function requesterLabel(requester: Principal | null): string {
+function requesterLabel(requester: Principal | null): string {
 	if (!requester) return "No requester (automated)";
 	const id = requester.known ? requester.id : `unmapped ${requester.id}`;
 	return requester.name ? `${requester.name} (${id})` : id;
