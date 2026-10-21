@@ -319,7 +319,7 @@ it("a ctx.agent call runs in its own Session and never follows the thread: later
 			name: `intake-${channel}`,
 			triggers: [chatTrigger("chat", "mentioned", { channel })],
 			async run(message, ctx) {
-				const answer = await ctx.agent<string>("investigate", investigator, {
+				const answer = await ctx.agent("investigate", investigator, {
 					input: message.text,
 				});
 				await ctx.thread!.post("analysis", answer);

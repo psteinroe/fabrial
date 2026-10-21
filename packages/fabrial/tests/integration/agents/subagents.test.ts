@@ -952,7 +952,7 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 	});
 	const entry = g.defineWorkflow({
 		name: `entry-${short()}`,
-		run: (_input, ctx) => ctx.agent<string>("lead", lead, { input: "Fix the row" }),
+		run: (_input, ctx) => ctx.agent("lead", lead, { input: "Fix the row" }),
 	});
 	faux.setResponses(
 		Array.from({ length: 10 }, () => (context: TranscriptContext) => {

@@ -56,6 +56,7 @@ export type { ResourceRef } from "./plugin.ts";
 export {
 	ExecutionError,
 	type AgentRef,
+	type AgentResult,
 	type AgentRunOptions,
 	type ExecutionResult,
 } from "./runtime.ts";

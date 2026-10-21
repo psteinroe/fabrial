@@ -25,7 +25,7 @@ export const generalAssistant = f.defineWorkflow({
 		) {
 			// The investigation is the support agent's answer here; nothing waits for replies in this thread.
 			await ctx.thread!.post("ack", "I'll investigate this bug report.");
-			const analysis = await ctx.agent<string>("investigate", supportAgent, {
+			const analysis = await ctx.agent("investigate", supportAgent, {
 				input: message.text,
 			});
 			await ctx.thread!.post("analysis", analysis);

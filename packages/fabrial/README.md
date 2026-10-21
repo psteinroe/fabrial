@@ -36,7 +36,7 @@ export const assistant = f.defineWorkflow({
 	name: "assistant",
 	triggers: [slack.mentioned()],
 	async run(message, ctx) {
-		const answer = await ctx.agent<string>("answer", support, { input: message.text });
+		const answer = await ctx.agent("answer", support, { input: message.text });
 		await ctx.thread!.post("reply", answer);
 	},
 });
@@ -65,7 +65,7 @@ Durable operations require explicit, nonempty IDs. Repeated IDs are suffixed det
 - `idempotent: true` tools run again after a crash interrupts them; other tools give the model an interrupted result instead.
 - `f.defineToolkit({ name, tools, instructions })` groups tools and instructions. Agents list app toolkits and plugin ids in `toolkits`.
 - `f.defineState({ name, scope, schema, initial, render? })` is state agents see and change. Tools change it with `ctx.state(def).update(fn)`; the changes commit atomically with the tool result. Workflows use `ctx.state(def).get(id)` / `.update(id, fn)`. Agents listing a state in `state` see its `render` output in the prompt.
-- `ctx.agent(id, agent, { input, output?, detached?, timeout? })` runs the agent durably and returns its final answer; it never posts automatically. With `output`, the agent is asked for a single JSON value, which is parsed and validated against the schema in a durable step. Invalid answers fail explicitly; there is no silent coercion or repair loop. The call is a child execution of its caller: cancelling the caller (or the caller failing permanently) cancels it and the workflows its tools started. `detached: true` keeps the agent run alive when the caller is cancelled. After `timeout` the caller fails; an attached call is cancelled, a detached one keeps running.
+- `ctx.agent(id, agent, { input, output?, detached?, timeout? })` runs the agent durably and returns its final answer text (`Promise<string>`); it never posts automatically. With `output`, the agent is asked for a single JSON value, which is parsed and validated against the schema in a durable step, and the result is typed from the schema (`Schema<T>` → `Promise<T>`). There is no caller-chosen result type. Invalid answers fail explicitly; there is no silent coercion or repair loop. The call is a child execution of its caller: cancelling the caller (or the caller failing permanently) cancels it and the workflows its tools started. `detached: true` keeps the agent run alive when the caller is cancelled. After `timeout` the caller fails; an attached call is cancelled, a detached one keeps running.
 
 ### Subagents
 

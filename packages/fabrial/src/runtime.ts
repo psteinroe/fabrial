@@ -11,6 +11,7 @@
 import type { EventFilter, Origin } from "./events.ts";
 import type { ExternalIdentity, Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
+import type { InferOutput, Schema } from "./schema.ts";
 import type { ChatMessage, MessageRef, OutboundMessage, Surface, ThreadRef } from "./thread.ts";
 
 /** Serializable invocation context carried by every execution (Conductor execution metadata, item 2). */
@@ -327,15 +328,18 @@ export interface ChatPort {
 	postEphemeral(thread: ThreadRef, identity: ExternalIdentity, text: string): Promise<void>;
 }
 
-export interface AgentRunOptions {
+export interface AgentRunOptions<O extends Schema | undefined = Schema | undefined> {
 	input: Json;
 	/** Let the agent execution survive cancellation of its caller (and a timeout). */
 	detached?: boolean;
 	/** Stop waiting after this long; an attached call is cancelled, a detached one keeps running. */
 	timeout?: DurationInput;
-	/** Standard Schema for a typed structured result. */
-	output?: unknown;
+	/** Standard Schema for a typed structured result. Without it, the result is the answer text. */
+	output?: O;
 }
+
+/** What `ctx.agent` returns: the schema's output with `output`, otherwise the answer text. */
+export type AgentResult<O extends Schema | undefined> = O extends Schema ? InferOutput<O> : string;
 
 /** Port implemented by the agents module. Core calls it from `ctx.agent`. */
 export interface AgentPort {

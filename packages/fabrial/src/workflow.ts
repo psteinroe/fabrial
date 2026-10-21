@@ -3,7 +3,7 @@ import type { EvaluateQuestion, EvaluateRequest, EvaluateResult } from "./evalua
 import type { GroupDefinition, Principal } from "./identity.ts";
 import type { Json } from "./json.ts";
 import type { Origin } from "./events.ts";
-import type { AgentRef, AgentRunOptions } from "./runtime.ts";
+import type { AgentRef, AgentResult, AgentRunOptions } from "./runtime.ts";
 import type { Schema } from "./schema.ts";
 import type { SendOptions, SendReceipt } from "./send.ts";
 import type { ResourceRef } from "./plugin.ts";
@@ -27,7 +27,11 @@ export interface WorkflowContext<TClients = Record<string, unknown>> {
 	sleep(id: string, duration: string | number): Promise<void>;
 
 	/** Call: submit to the agent and wait for its answer. */
-	agent<T extends Json = Json>(id: string, agent: AgentRef, options: AgentRunOptions): Promise<T>;
+	agent<O extends Schema | undefined = undefined>(
+		id: string,
+		agent: AgentRef,
+		options: AgentRunOptions<O>,
+	): Promise<AgentResult<O>>;
 	/**
 	 * Send: deliver input to the conversation `[session, agent]` and return. An idle conversation starts a
 	 * run; a busy one gets it by kind and priority. The agent's final answer posts to the input's reply thread.
