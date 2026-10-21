@@ -158,6 +158,8 @@ export type Obligation = {
 	origin?: string;
 	/** Nothing more is owed: its answer or error reply is posting or skipped, its call settled, or it was stopped. */
 	fulfilled?: true;
+	/** A stop cancelled the workflows its tools started; its tools start none afterwards. */
+	stopped?: true;
 	/** A settled call's outcome: its Session execution's result. */
 	outcome?: CallOutcome;
 	/** The error id of its error reply; assigned once. */

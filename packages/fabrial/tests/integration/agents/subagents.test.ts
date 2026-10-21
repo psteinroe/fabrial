@@ -1093,6 +1093,124 @@ it.each([
 	},
 );
 
+it("a stop after the lead answered cancels a background child's approval workflow: its card no longer approves", async () => {
+	const alice = defineUser({
+		id: `alice-${short()}`,
+		name: "Alice",
+		identities: [{ provider: "slack-test", installationId: "w", subjectId: `A${short()}` }],
+	});
+	const g = createFabrial({ plugins: [], identity: [alice] });
+	const faux = fauxProvider();
+	const models = createModels();
+	models.setProvider(faux.provider);
+	const model = `${faux.provider.id}/${faux.getModel().id}`;
+	const runSql = g.defineWorkflow({
+		name: `run-sql-${short()}`,
+		description: "Runs SQL after approval",
+		input: z.object({ sql: z.string() }),
+		async run(input, ctx) {
+			const approval = await ctx.waitForApproval("approve", {
+				title: "Run SQL?",
+				details: input.sql,
+				approvers: alice,
+			});
+			return approval.status === "approved" ? "ran" : "declined";
+		},
+	});
+	const researcher = g.defineAgent({
+		name: `researcher-${short()}`,
+		description: "Fixes rows.",
+		model,
+		tools: [runSql],
+	});
+	const lead = g.defineAgent({
+		name: `lead-${short()}`,
+		description: "Leads.",
+		model,
+		subagents: [researcher],
+	});
+	const tool = toolName(researcher.name);
+	const session = `ticket-${short()}`;
+	const thread = { kind: "thread", provider: "slack-test", threadId: randomUUID() } as const;
+	const ask = g.defineWorkflow({
+		name: `ask-${short()}`,
+		input: z.object({ text: z.string() }),
+		run: async (input, ctx) => {
+			await ctx.send("ask", lead, { session, input: input.text, home: thread });
+		},
+	});
+	faux.setResponses(
+		Array.from({ length: 20 }, () => (context: TranscriptContext) => {
+			const text = lastText(context);
+			if (text === "Fix it") return use(toolName(runSql.name), { sql: "update x" });
+			if (text === '"ran"') return say("Fixed after approval.");
+			if (text.includes("Fix the row")) return use(tool, { task: "Fix it", background: true });
+			if (text.startsWith("Started")) return say("On it.");
+			if (text.includes("Status?")) return say("Still waiting for approval.");
+			if (text.startsWith("<subagent")) return say(`Done: ${text}`);
+			return say(`unexpected: ${text}`);
+		}),
+	);
+	const chat = new FakeChat();
+	const dm = await chat.openDM(alice.identities[0]!);
+	const post = dm.post.bind(dm);
+	let approve: (() => Promise<void>) | undefined;
+	dm.post = async (content) => {
+		const ref = await post(content);
+		const action =
+			typeof content === "object" && "card" in content
+				? content.card.actions?.find((each) => each.id.startsWith("fabrial.approval.approve:"))
+				: undefined;
+		if (action) approve = () => chat.click(ref, action.id, alice.identities[0]!);
+		return ref;
+	};
+	const { runtime } = await launch(g, {
+		workflows: [runSql, ask],
+		chat,
+		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
+	});
+	const send = (text: string) =>
+		runtime.invoke(
+			ask.name,
+			{ text },
+			{
+				metadata: {
+					requestId: randomUUID(),
+					origin: null,
+					replyTo: null,
+					requestedBy: { id: alice.id, known: true, identities: [], name: "Alice" },
+					ownerWorkflow: null,
+					triggerEvent: null,
+				},
+			},
+		);
+	const posts = async () => {
+		// Replies only; the approval status card is posted here too.
+		return (await chat.thread(thread)).posts.flatMap((each) =>
+			typeof each.content === "string" ? [each.content] : [],
+		);
+	};
+	await send("Fix the row");
+	await expect.poll(posts, { timeout: 30_000 }).toEqual(["On it."]);
+	await until("the approval card", async () => (approve ? true : undefined));
+	const db = sql();
+	const approvalWorkflow = async () => {
+		const rows = await db<{ cancelled: boolean; done: boolean }[]>`
+			select cancelled, completed_at is not null as done
+			from pgconductor._private_executions where task_key = ${runSql.name}`;
+		return rows[0];
+	};
+	// The lead's reply is posted (its obligation fulfilled) while the worker's approval workflow still waits.
+	await chat.cancel(thread, alice.identities[0]!);
+	await expect
+		.poll(approvalWorkflow, { timeout: 30_000 })
+		.toMatchObject({ cancelled: true, done: false });
+	await approve!();
+	await idle(runtime.queue);
+	expect(await approvalWorkflow()).toMatchObject({ cancelled: true, done: false });
+	expect(await posts()).toEqual(["On it."]);
+});
+
 it("a background child waiting for approval suspends the Session: a new message is answered meanwhile, and the click resumes the child", async () => {
 	const alice = defineUser({
 		id: `alice-${short()}`,

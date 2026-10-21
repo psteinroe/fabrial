@@ -364,6 +364,11 @@ export async function startChild(
 	const { detached, waited } = options;
 	const dedupeKey = JSON.stringify(["fabrial.pi.child", bridge.session, key]);
 	const intent = await bridge.harness.commit(async (tx) => {
+		const obligation = request === null ? undefined : (await tx.doc(Obligations)).requests[request];
+		if (request !== null && !obligation)
+			throw new Error(`Missing Fabrial obligation for request ${request}`);
+		// A stop cancels what its requests' tools started; nothing starts for them afterwards.
+		if (obligation?.stopped) throw new Error(`Request ${request} was stopped`);
 		const saved = await tx.doc(ChildIntents, key, {
 			workflow: waited ? REPORT_WORKFLOW : workflow,
 			input: waited
@@ -374,15 +379,25 @@ export async function startChild(
 			detached,
 			executionId: null,
 		});
-		if (request !== null) {
-			const obligation = (await tx.doc(Obligations)).requests[request];
-			if (!obligation) throw new Error(`Missing Fabrial obligation for request ${request}`);
+		if (obligation) {
 			obligation.intents ??= [];
 			if (!obligation.intents.includes(key)) obligation.intents.push(key);
 		}
 		return cloneJson(saved) as ChildIntent;
 	}, context);
-	if (intent.executionId) return intent.executionId;
+	return intent.executionId ?? launch(bridge, key, intent, context);
+}
+
+/**
+ * Starts an intent's execution, or gets the one already started for it: the operation id and the global dedupe key
+ * are the intent's. Saves its execution id.
+ */
+async function launch(
+	bridge: Pick<BridgeFrame, "harness" | "execution">,
+	key: string,
+	intent: ChildIntent,
+	context: Context,
+): Promise<string> {
 	const executionId = await bridge.execution.start(key, intent.workflow, intent.input, {
 		metadata: intent.metadata,
 		dedupeKey: intent.dedupeKey,
@@ -412,23 +427,26 @@ export async function registerChild(
 }
 
 /**
- * Cancels the workflows and effects the tools of `requests` started or wait on, except detached ones. A child whose
- * start receipt was lost is cancelled with the Session's execution.
+ * Cancels the workflows and effects the tools of `requests` started or wait on, except detached ones. Call it once the
+ * requests are `stopped`: an intent still starting (no execution id yet) is started or found by its start key, then
+ * cancelled, and no later start joins them.
  */
 export async function cancelChildren(
-	harness: Pick<Harness, "snapshot">,
+	bridge: Pick<BridgeFrame, "harness" | "execution">,
 	cancel: (executionId: string, reason: string) => Promise<unknown>,
 	requests: Iterable<string>,
 	reason: string,
 	context: Context,
 ): Promise<void> {
+	const { harness } = bridge;
 	const obligations = (await harness.snapshot(Obligations, context))?.requests ?? {};
 	for (const request of requests) {
 		const obligation = obligations[request];
 		if (!obligation) continue;
 		for (const key of obligation.intents ?? []) {
 			const intent = await harness.snapshot(ChildIntents, key, context);
-			if (intent?.executionId && !intent.detached) await cancel(intent.executionId, reason);
+			if (!intent || intent.detached) continue;
+			await cancel(intent.executionId ?? (await launch(bridge, key, intent, context)), reason);
 		}
 		for (const child of Object.values(obligation.children ?? {}))
 			if (!child.detached) await cancel(child.executionId, reason);

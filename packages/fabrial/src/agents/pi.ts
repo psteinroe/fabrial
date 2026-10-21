@@ -856,9 +856,11 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 
 		/**
 		 * A stop in a followed thread aborts the agent's conversation through Pi: its queued inputs are withdrawn and its
-		 * live task tree is aborted. The workflows its outstanding requests' tools started are cancelled, and background
-		 * children acting for its requests are aborted past the background boundary. Nothing more is owed for its
-		 * requests, nor for reports on them. Calls have their own Session and belong to their workflow.
+		 * live task tree is aborted. Its requests are marked stopped, answered or not, and the workflows their tools
+		 * started are cancelled: a background child's tools act for the lead's request, so its workflows go too, also
+		 * after the lead's answer posted. Background children acting for its requests are aborted past the background
+		 * boundary. Nothing more is owed for its requests, nor for reports on them. Calls have their own Session and
+		 * belong to their workflow.
 		 */
 		async function stop(agentName: string, reason: string) {
 			const lead = (await harness.snapshot(Conversations, context))?.ids[agentName];
@@ -873,11 +875,23 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					(id) => owed[id]!.conversationId === lead && owed[id]!.owes === "reply",
 				),
 			);
-			const outstanding = [...requests].filter((id) => !owed[id]!.fulfilled);
+			// Stopped first, so a tool starting a workflow for them now either is refused or left an intent to cancel.
+			const stopping = await harness.commit(async (tx) => {
+				const stopped: string[] = [];
+				for (const [requestId, obligation] of Object.entries((await tx.doc(Obligations)).requests))
+					if (
+						!obligation.stopped &&
+						(requests.has(requestId) || requests.has(obligation.origin ?? ""))
+					) {
+						obligation.stopped = true;
+						stopped.push(requestId);
+					}
+				return stopped;
+			}, context);
 			await cancelChildren(
-				harness,
+				frame,
 				(executionId, why) => host.runtime.cancel(executionId, why),
-				new Set(outstanding.flatMap((id) => [id, owed[id]!.origin ?? id])),
+				stopping,
 				reason,
 				context,
 			);

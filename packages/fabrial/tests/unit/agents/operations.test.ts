@@ -216,6 +216,32 @@ it("uses collision-free # suffixes and rejects framework-reserved ids", async ()
 	}
 });
 
+it("a stop that races a child's start still cancels it, and later starts for the stopped request are refused", async () => {
+	const workflow = defineWorkflow({ name: "child", run: async () => null });
+	const f = await fixture([workflow]);
+	try {
+		const ctx = await fields(f.context, f.conversation.id, f.api);
+		// The intent committed, but its start did not return (the stop runs before it, or it crashed).
+		f.start.mockRejectedValueOnce(new Error("start interrupted"));
+		await expect(ctx.start("racing", workflow, null as never)).rejects.toThrow("start interrupted");
+		await f.harness.commit(async (tx) => {
+			(await tx.doc(Obligations)).requests.request!.stopped = true;
+		}, BACKGROUND_CONTEXT);
+		const cancel = vi.fn(async () => {});
+		await cancelChildren(f.bridge, cancel, ["request"], "Stopped", BACKGROUND_CONTEXT);
+		// Started (or found) by the same start key, then cancelled.
+		const [first, again] = f.start.mock.calls.map(([key]) => key);
+		expect(again).toBe(first);
+		expect(cancel.mock.calls).toEqual([[`child:${first}`, "Stopped"]]);
+		await expect(ctx.start("later", workflow, null as never)).rejects.toThrow(
+			"Request request was stopped",
+		);
+		expect(f.start).toHaveBeenCalledTimes(2);
+	} finally {
+		await f.harness.close(BACKGROUND_CONTEXT);
+	}
+});
+
 it("stopping a request cancels the attached workflows its tools started or wait on, never detached ones", async () => {
 	const workflow = defineWorkflow({ name: "child", run: async () => null });
 	const f = await fixture([workflow]);
@@ -237,9 +263,9 @@ it("stopping a request cancels the attached workflows its tools started or wait 
 		const [attached, detached] = f.start.mock.calls.map(([key]) => `child:${key}`);
 		const cancel = vi.fn(async () => {});
 		// Another request's children are not linked to this one.
-		await cancelChildren(f.harness, cancel, ["other"], "Stopped", BACKGROUND_CONTEXT);
+		await cancelChildren(f.bridge, cancel, ["other"], "Stopped", BACKGROUND_CONTEXT);
 		expect(cancel).not.toHaveBeenCalled();
-		await cancelChildren(f.harness, cancel, ["request"], "Stopped", BACKGROUND_CONTEXT);
+		await cancelChildren(f.bridge, cancel, ["request"], "Stopped", BACKGROUND_CONTEXT);
 		expect(cancel.mock.calls).toEqual([
 			[attached, "Stopped"],
 			["waited", "Stopped"],
