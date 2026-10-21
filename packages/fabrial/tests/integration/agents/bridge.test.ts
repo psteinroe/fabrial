@@ -18,7 +18,12 @@ import {
 import { FakeChat } from "../../../src/testing.ts";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
-import { callSession, pi, PostgresStorage, sessionKey } from "../../../src/agents/index.ts";
+import {
+	callSession,
+	connectAgents,
+	PostgresStorage,
+	sessionKey,
+} from "../../../src/agents/index.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { until } from "../../conductor/helper.ts";
 import { useAgents } from "./setup.ts";
@@ -74,13 +79,13 @@ function fixture(
 	} as unknown as FabrialHost;
 	// The fake platform behind `slack-test`, the provider of the tests' threads.
 	connectChat(chat, { ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
-	const integration = pi({
+	const integration = connectAgents(host, {
 		models,
 		sql: sql(),
 		settings: { retry: { enabled: false } },
 		...(stateTimeoutMs ? { stateTimeoutMs } : {}),
 		...(stateConflicts ? { stateConflicts } : {}),
-	}).connect(host);
+	});
 	return { runtime, chat, faux, integration, metadata, host };
 }
 async function execute(f: ReturnType<typeof fixture>, workflow: RuntimeWorkflow) {
@@ -128,11 +133,11 @@ it("runs durable structured answers and memoizes submissions; each call has a Se
 		triggers: [],
 		handler: async (_input, execution) => {
 			await execution.step("answer:output", () => "user receipt");
-			const first = await f.integration.agents.run(execution, "answer", agent, {
+			const first = await f.integration.run(execution, "answer", agent, {
 				input: "Question",
 				output: z.object({ answer: z.number() }),
 			});
-			const again = await f.integration.agents.run(execution, "again", agent, {
+			const again = await f.integration.run(execution, "again", agent, {
 				input: "Continue",
 			});
 			return { first, again };
@@ -216,7 +221,7 @@ it("binds adapter identity, clients, sections and durable posts; commits tool st
 			await f.integration.state.update(execution, "seed", state, (draft) => {
 				draft.notes.push("seed");
 			});
-			const answer = await f.integration.agents.run(execution, "agent", agent, { input: "Do it" });
+			const answer = await f.integration.run(execution, "agent", agent, { input: "Do it" });
 			return { answer, state: await f.integration.state.get(execution, "read", state) };
 		},
 	};
@@ -278,7 +283,7 @@ it("suspends the Session while a workflow tool waits and resumes it with a stabl
 		name: randomUUID(),
 		triggers: [],
 		handler: (_input, execution) =>
-			f.integration.agents.run(execution, "agent", agent, { input: "Run child" }),
+			f.integration.run(execution, "agent", agent, { input: "Run child" }),
 	};
 	runtimeRegister(f, workflow, [
 		{
@@ -320,7 +325,7 @@ it("rejects invalid structured answers", async () => {
 		triggers: [],
 		retries: { maxAttempts: 1 },
 		handler: (_input, execution) =>
-			f.integration.agents.run(execution, "agent", agent, {
+			f.integration.run(execution, "agent", agent, {
 				input: "Answer",
 				output: z.object({ answer: z.number() }),
 			}),
@@ -447,7 +452,7 @@ it.each([[false], [true]])(
 			name: randomUUID(),
 			triggers: [],
 			handler: (_input, execution) =>
-				f.integration.agents.run(execution, "agent", agent, { input: "Wait", detached }),
+				f.integration.run(execution, "agent", agent, { input: "Wait", detached }),
 		};
 		runtimeRegister(
 			f,
@@ -532,7 +537,7 @@ it("a timed-out agent call cancels its attached Session execution and the call's
 		triggers: [],
 		retries: { maxAttempts: 1 },
 		handler: (_input, execution) =>
-			f.integration.agents.run(execution, "agent", agent, { input: "Wait", timeout: "3s" }),
+			f.integration.run(execution, "agent", agent, { input: "Wait", timeout: "3s" }),
 	};
 	runtimeRegister(
 		f,
@@ -606,7 +611,7 @@ it("installs plugin observers globally but does not select unrequested plugin to
 		name: randomUUID(),
 		triggers: [],
 		handler: (_input, execution) =>
-			f.integration.agents.run(execution, "agent", agent, { input: "Hello" }),
+			f.integration.run(execution, "agent", agent, { input: "Hello" }),
 	});
 	expect(result).toEqual({ status: "completed", output: "ok" });
 	expect(requests).toBe(1);
@@ -638,7 +643,7 @@ it("observes each Session's agent on its own: two Sessions at once", async () =>
 		triggers: [],
 		handler: async (input, execution) => {
 			const agent = input === "a" ? a! : b!;
-			return f.integration.agents.run(execution, "agent", agent, {
+			return f.integration.run(execution, "agent", agent, {
 				input: `from ${String(input as string)}`,
 			});
 		},
@@ -695,7 +700,7 @@ it("notifies onToolCall after a tool settles and logs observers that throw", asy
 		name: randomUUID(),
 		triggers: [],
 		handler: (_input, execution) =>
-			f.integration.agents.run(execution, "agent", agent, { input: "Look up a" }),
+			f.integration.run(execution, "agent", agent, { input: "Look up a" }),
 	});
 	expect(result).toEqual({ status: "completed", output: "done" });
 	expect(calls).toEqual([
@@ -761,7 +766,7 @@ it("attributes observer calls to each Session's own agent while two Sessions int
 	const run = (agent: typeof waiting, input: string): RuntimeWorkflow => ({
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution) => f.integration.agents.run(execution, "agent", agent, { input }),
+		handler: (_input, execution) => f.integration.run(execution, "agent", agent, { input }),
 	});
 	const [a, b] = [run(waiting, "Wait"), run(other, "Look up b")];
 	runtimeRegister(f, a, [b]);
@@ -815,7 +820,7 @@ it("returns input that fails the tool schema to the model without running the to
 		name: randomUUID(),
 		triggers: [],
 		handler: (_input, execution) =>
-			f.integration.agents.run(execution, "agent", agent, { input: "Deploy" }),
+			f.integration.run(execution, "agent", agent, { input: "Deploy" }),
 	});
 	expect(result).toEqual({ status: "completed", output: "fixed nothing" });
 	expect(runs).toBe(0);
@@ -856,7 +861,7 @@ it("sends a non-string tool result to the model as serialized JSON", async () =>
 		name: randomUUID(),
 		triggers: [],
 		handler: (_input, execution) =>
-			f.integration.agents.run(execution, "agent", agent, { input: "Query" }),
+			f.integration.run(execution, "agent", agent, { input: "Query" }),
 	});
 	expect(result).toEqual({ status: "completed", output: "one row" });
 	expect(seen).toMatchObject([
@@ -1096,7 +1101,7 @@ it("a tool that changes the state between a workflow's read and write makes the 
 			// The first write waits until the agent's tool changed the state it read.
 			const forced = beforeWrites(execution, async (n) => {
 				if (n) return;
-				await f.integration.agents.deliver!(agent, {
+				await f.integration.deliver(agent, {
 					session: sessionKey(f.metadata),
 					requestId: randomUUID(),
 					content: "Bump it",
@@ -1274,7 +1279,7 @@ it("stop joins driver routing cleanup after the harness has closed", async () =>
 		name: randomUUID(),
 		triggers: [],
 		handler: (_input, execution) =>
-			f.integration.agents.run(execution, "agent", agent, { input: "Answer" }),
+			f.integration.run(execution, "agent", agent, { input: "Answer" }),
 	};
 	runtimeRegister(f, workflow);
 	await f.integration.start();

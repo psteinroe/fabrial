@@ -15,7 +15,12 @@ import {
 	type RuntimeWorkflow,
 } from "../../internals.ts";
 import { FakeChat } from "../../../src/testing.ts";
-import { callSession, pi, PostgresStorage, type PiOptions } from "../../../src/agents/index.ts";
+import {
+	callSession,
+	connectAgents,
+	PostgresStorage,
+	type PiOptions,
+} from "../../../src/agents/index.ts";
 import { until } from "../../conductor/helper.ts";
 import { useAgents } from "./setup.ts";
 
@@ -61,13 +66,13 @@ function fixture(options: Partial<PiOptions> = {}) {
 	} as unknown as FabrialHost;
 	// The fake platform behind `slack-test`, the provider of the tests' threads.
 	connectChat(chat, { ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
-	const integration = pi({
+	const integration = connectAgents(host, {
 		models,
 		sql: sql(),
 		settings: { retry: { enabled: false } },
 		reclaimSchedule: false,
 		...options,
-	}).connect(host);
+	});
 	const agent = defineAgent({
 		name: randomUUID(),
 		description: "Answers test questions.",
@@ -108,7 +113,7 @@ it("reclaims a completed call's Session once its execution settled 7 days ago, n
 		name: randomUUID(),
 		triggers: [],
 		handler: async (_input, execution) => {
-			const answer = await f.integration.agents.run(execution, "answer", f.agent, {
+			const answer = await f.integration.run(execution, "answer", f.agent, {
 				input: "Question",
 			});
 			const go = await execution.subscribe("go", { event: GO });
@@ -165,8 +170,7 @@ it("reclaims a call cancelled while suspended on a workflow tool, but not while 
 	const caller: RuntimeWorkflow = {
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution) =>
-			f.integration.agents.run(execution, "agent", agent, { input: "Wait" }),
+		handler: (_input, execution) => f.integration.run(execution, "agent", agent, { input: "Wait" }),
 	};
 	await f.start(
 		[
@@ -219,8 +223,7 @@ it("examines at most reclaimBatchSize Sessions per step", async () => {
 		name: randomUUID(),
 		triggers: [],
 		handler: async (_input, execution) => {
-			for (const call of calls)
-				await f.integration.agents.run(execution, call, f.agent, { input: call });
+			for (const call of calls) await f.integration.run(execution, call, f.agent, { input: call });
 			return null;
 		},
 	};
@@ -245,10 +248,13 @@ it("examines at most reclaimBatchSize Sessions per step", async () => {
 
 it("schedules the reclaim daily by default; call Session executions outlive the retention", () => {
 	const workflows = (options: Partial<PiOptions>) =>
-		pi({ models: createModels(), sql: sql(), ...options }).connect({
-			definitionScope: definitions,
-			plugins: [],
-		} as unknown as FabrialHost).workflows;
+		connectAgents(
+			{
+				definitionScope: definitions,
+				plugins: [],
+			} as unknown as FabrialHost,
+			{ models: createModels(), sql: sql(), ...options },
+		).workflows;
 	const reclaim = workflows({}).find((workflow) => workflow.name === RECLAIM)!;
 	expect(reclaim.cron).toEqual([{ schedule: "30 3 * * *", name: RECLAIM }]);
 	// Callers replay from a call's result and reclaim reads when it settled: never removed before both.

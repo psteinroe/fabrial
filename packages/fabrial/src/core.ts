@@ -1,4 +1,5 @@
 import type { CoreConfig, FabrialHost, HostedApp, Logger } from "./app.ts";
+import { connectAgents, type Agents } from "./agents/pi.ts";
 import {
 	connectChat,
 	routingState,
@@ -8,6 +9,7 @@ import {
 import { createDirectory } from "./directory.ts";
 import { filtersOverlap, matchesFilter } from "./internal.ts";
 import { definedAgents, type Agent } from "./agent.ts";
+import { sealDefinitions } from "./state.ts";
 import {
 	addFollow,
 	INGRESS_EVENT,
@@ -63,7 +65,8 @@ export function buildApp(config: CoreConfig): HostedApp {
 	const runtime = config.runtime;
 	const now = () => runtime.now?.() ?? Date.now();
 	let chat: ChatConnection | undefined;
-	let agents: ReturnType<NonNullable<CoreConfig["agents"]>["connect"]> | undefined;
+	// Connected once the host exists, before any workflow runs.
+	let agents!: Agents;
 	let liveClients: Record<string, unknown> | undefined;
 	const clients = (): Record<string, unknown> =>
 		(liveClients ??= Object.assign({}, ...config.plugins.map((p) => p.clients?.() ?? {})));
@@ -148,8 +151,6 @@ export function buildApp(config: CoreConfig): HostedApp {
 		input: import("./json.ts").JsonObject,
 		metadata: InvocationMetadata,
 	) => {
-		const port = agents?.agents;
-		if (!port?.deliver) throw new Error("Agents receiving events need the agent integration");
 		const request = await prepareInput(host, metadata, {
 			agent: agent.name,
 			session: conversation.session,
@@ -158,7 +159,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			kind: isChatMessage(input) ? "message" : "notification",
 			replyTo: metadata.replyTo,
 		});
-		await port.deliver(agent, request);
+		await agents.deliver(agent, request);
 		return request;
 	};
 	/** Store the request: one `fabrial.ingress` event, deduped by its provider id. `fabrial.route` routes it. */
@@ -260,7 +261,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			// A stop cancels the current run of each conversation following the thread; anyone there may stop.
 			for (const [index, conversation] of follows.entries())
 				await execution.step(`stop:${index}`, async () => {
-					await agents?.agents.stop?.(conversation, ingress.id, `Stopped by ${actor!.id}`);
+					await agents.stopConversation(conversation, ingress.id, `Stopped by ${actor!.id}`);
 				});
 			return null;
 		}
@@ -363,7 +364,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 		// Conversations following the event's resource threads get a notification; triggers still run.
 		if (ingress.kind === "event")
 			await execution.step("notify", async () => {
-				await notifyFollowers(host, agents?.agents, ingress.events[0]!, ingress.payload, {
+				await notifyFollowers(host, agents, ingress.events[0]!, ingress.payload, {
 					...metadata,
 					replyTo: null,
 				});
@@ -448,7 +449,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			);
 		},
 	};
-	agents = config.agents?.connect(host);
+	agents = connectAgents(host, config.agents);
 	const middleware = config.plugins.flatMap((p) => p.hooks?.workflow ?? []);
 	/** Plugin middleware around one attempt; the innermost `next` hands its context to the handler. */
 	const wrap = (
@@ -499,61 +500,67 @@ export function buildApp(config: CoreConfig): HostedApp {
 				: output;
 		},
 	}));
-	const extraWorkflows = new Map((agents?.agents.workflows() ?? []).map((w) => [w.name, w]));
-	for (const workflow of agents?.workflows ?? []) extraWorkflows.set(workflow.name, workflow);
-	extraWorkflows.set(APPROVAL_REQUEST_WORKFLOW, approvalRequestWorkflow());
-	extraWorkflows.set(APPROVAL_DECISION_WORKFLOW, approvalDecisionWorkflow(now));
-	extraWorkflows.set(APPROVAL_DELIVERY_WORKFLOW, approvalDeliveryWorkflow());
-	extraWorkflows.set(CLEANUP_WORKFLOW, {
-		name: CLEANUP_WORKFLOW,
-		triggers: [],
-		retries: { maxAttempts: CLEANUP_ATTEMPTS },
-		handler: (input, execution) => cleanup(input, execution, host),
-	});
-	for (const workflow of extraWorkflows.values())
-		workflows.push({
-			...workflow,
-			attempt: async (execution, next) => {
-				const context = await createContext({
-					host,
-					execution,
-					metadata: execution.metadata,
-					agents,
-					now,
-				});
-				await wrap(
-					{
-						executionId: execution.executionId,
-						workflow: workflow.name,
-						actor: execution.metadata.requestedBy,
-						origin: execution.metadata.origin,
-					},
-					context,
-					next,
-				);
-			},
+	/** Register every workflow with the runtime, once all definitions exist: Pi's only if the instance uses it. */
+	let registered = false;
+	const register = () => {
+		if (registered) return;
+		registered = true;
+		const extraWorkflows = new Map(agents.workflows.map((w) => [w.name, w]));
+		extraWorkflows.set(APPROVAL_REQUEST_WORKFLOW, approvalRequestWorkflow());
+		extraWorkflows.set(APPROVAL_DECISION_WORKFLOW, approvalDecisionWorkflow(now));
+		extraWorkflows.set(APPROVAL_DELIVERY_WORKFLOW, approvalDeliveryWorkflow());
+		extraWorkflows.set(CLEANUP_WORKFLOW, {
+			name: CLEANUP_WORKFLOW,
+			triggers: [],
+			retries: { maxAttempts: CLEANUP_ATTEMPTS },
+			handler: (input, execution) => cleanup(input, execution, host),
 		});
-	// Routing is plumbing: no workflow context or plugin middleware.
-	workflows.push({
-		name: ROUTE_WORKFLOW,
-		triggers: [{ event: INGRESS_EVENT }],
-		retries: { maxAttempts: 5 },
-		handler: (input, execution) => route(input as IngressEvent, execution),
-	});
-	runtime.register({
-		workflows,
-		events: [
-			...config.plugins.flatMap((p) =>
-				Object.entries(p.events ?? {}).map(([key, event]) => ({
-					name: `${p.id}.${key}`,
-					filterable: (event as { filterable: string[] }).filterable,
-				})),
-			),
-			{ name: INGRESS_EVENT, filterable: [] },
-			{ name: APPROVAL_DECIDED_EVENT, filterable: ["approvalId"] },
-			...(agents?.events ?? []),
-		],
-	});
+		for (const workflow of extraWorkflows.values())
+			workflows.push({
+				...workflow,
+				attempt: async (execution, next) => {
+					const context = await createContext({
+						host,
+						execution,
+						metadata: execution.metadata,
+						agents,
+						now,
+					});
+					await wrap(
+						{
+							executionId: execution.executionId,
+							workflow: workflow.name,
+							actor: execution.metadata.requestedBy,
+							origin: execution.metadata.origin,
+						},
+						context,
+						next,
+					);
+				},
+			});
+		// Routing is plumbing: no workflow context or plugin middleware.
+		workflows.push({
+			name: ROUTE_WORKFLOW,
+			triggers: [{ event: INGRESS_EVENT }],
+			retries: { maxAttempts: 5 },
+			handler: (input, execution) => route(input as IngressEvent, execution),
+		});
+		runtime.register({
+			workflows,
+			events: [
+				...config.plugins.flatMap((p) =>
+					Object.entries(p.events ?? {}).map(([key, event]) => ({
+						name: `${p.id}.${key}`,
+						filterable: (event as { filterable: string[] }).filterable,
+					})),
+				),
+				{ name: INGRESS_EVENT, filterable: [] },
+				{ name: APPROVAL_DECIDED_EVENT, filterable: ["approvalId"] },
+				...agents.events,
+			],
+		});
+	};
+	let unseal: (() => void) | undefined;
 	return {
 		host,
 		clients: () => host.clients(),
@@ -576,6 +583,9 @@ export function buildApp(config: CoreConfig): HostedApp {
 		async start() {
 			if (new Set(config.plugins.map((p) => p.id)).size !== config.plugins.length)
 				throw new Error("Duplicate plugin id");
+			// Agents and state are complete now: whether the app runs Pi is decided here, for good.
+			unseal ??= sealDefinitions(config.definitionScope ?? host);
+			register();
 			if (new Set(workflows.map((w) => w.name)).size !== workflows.length)
 				throw new Error("Duplicate workflow name");
 			if (config.plugins.some((p) => p.chat) && !config.chat)
@@ -583,8 +593,6 @@ export function buildApp(config: CoreConfig): HostedApp {
 			const routed = config.routedAgents ?? [];
 			if (new Set(routed.map((a) => a.name)).size !== routed.length)
 				throw new Error("Duplicate agent name");
-			if (routed.some((a) => a.definition.triggers?.length) && !agents?.agents.deliver)
-				throw new Error("Agents with triggers need the agent integration");
 			for (let i = 0; i < triggers.length; i++)
 				for (const b of triggers.slice(i + 1)) {
 					const a = triggers[i]!;
@@ -602,16 +610,18 @@ export function buildApp(config: CoreConfig): HostedApp {
 			await config.resources?.open();
 			chat = config.chat && connectChat(config.chat, host);
 			await chat?.start();
-			await agents?.start();
+			await agents.start();
 			await runtime.start();
 		},
 		async stop() {
 			await runtime.stop();
-			await agents?.stop();
+			await agents.stop();
 			await chat?.stop();
 			for (const plugin of [...config.plugins].reverse()) await plugin.shutdown?.();
 			await config.resources?.close();
 			liveClients = undefined;
+			unseal?.();
+			unseal = undefined;
 		},
 		async emit(event, payload, options = {}) {
 			await host.ingest(event, payload, options);

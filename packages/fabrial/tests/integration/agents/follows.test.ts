@@ -19,7 +19,6 @@ import {
 	type JsonObject,
 	type ThreadRoutingState,
 } from "../../internals.ts";
-import { pi } from "../../../src/agents/index.ts";
 import { FakeChat } from "../../../src/testing.ts";
 import { github } from "../../../../github/src/index.ts";
 import { deliver, outsider, webhooks } from "../../../../github/tests/webhooks.ts";
@@ -122,7 +121,7 @@ async function launch(routedAgents = [developer], queue?: string) {
 		routedAgents,
 		chat,
 		queue,
-		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
+		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
 	const settle = () => idle(runtime.queue);
 	const webhook = async (hook: { event: string; payload: unknown }, delivery: string) => {

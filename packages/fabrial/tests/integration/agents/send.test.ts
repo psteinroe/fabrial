@@ -25,7 +25,7 @@ import {
 	type ExternalIdentity,
 	type JsonObject,
 } from "../../internals.ts";
-import { pi, PostgresStorage } from "../../../src/agents/index.ts";
+import { PostgresStorage } from "../../../src/agents/index.ts";
 import { Conversations, Invocation, Obligations } from "../../../src/agents/documents.ts";
 import { WAITING_STATUS } from "../../../src/agents/errors.ts";
 import type { Logger } from "../../../src/app.ts";
@@ -124,11 +124,11 @@ async function setup(
 				...peer,
 				workflows: [notify, ask],
 				routedAgents: [agent],
-				agents: pi({
+				agents: {
 					models,
 					sql: sql(),
 					settings: { retry: options.retry ?? { enabled: false } },
-				}),
+				},
 				...(options.logger ? { logger: options.logger } : {}),
 			},
 			{

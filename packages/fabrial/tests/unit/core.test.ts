@@ -79,13 +79,14 @@ describe("routing table", () => {
 			});
 		await expect(setup([make("a", "a"), make("b", "b")]).app.start()).resolves.toBeUndefined();
 	});
-	it("preserves cron replyTo in the registered runtime contract", () => {
+	it("preserves cron replyTo in the registered runtime contract", async () => {
 		const cron = defineWorkflow({
 			name: "cron",
 			cron: [{ schedule: "0 * * * *", replyTo: surface }],
 			run: async () => {},
 		});
 		const test = setup([cron]);
+		await test.app.start();
 		expect((test.runtime as StubRuntime).workflows.get("cron")!.cron).toEqual([
 			{ schedule: "0 * * * *", name: "cron", replyTo: surface },
 		]);

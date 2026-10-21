@@ -1,9 +1,7 @@
 /**
- * Ports between Fabrial core and its runtimes. Core implements the workflow context, approvals, replies,
- * routing, and identity on top of these; adapters implement them:
- *
- * - `DurableRuntime` → `runtime/conductor` (PG Conductor; a thin mapping onto its public API)
- * - `AgentPort`, `StatePort`, `Evaluator` → `agents` (Pi Durable, pi-ai)
+ * The port between Fabrial core and its durable runtime. Core implements the workflow context, approvals,
+ * replies, routing, and identity on top of it; `runtime/conductor` (PG Conductor) maps it onto its public API.
+ * Agents and state are Pi's: core calls `agents/pi.ts` directly.
  *
  * Every durable operation maps onto the Conductor call of the same name (README, "Boundary").
  */
@@ -11,7 +9,6 @@ import type { EventFilter, Origin } from "./events.ts";
 import type { Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { InferOutput, Schema } from "./schema.ts";
-import type { Follow } from "./routing.ts";
 import type { Surface } from "./thread.ts";
 
 /** Serializable invocation context carried by every execution (Conductor execution metadata, item 2). */
@@ -264,49 +261,8 @@ export interface AgentRunOptions<O extends Schema | undefined = Schema | undefin
 /** What `ctx.agent` returns: the schema's output with `output`, otherwise the answer text. */
 export type AgentResult<O extends Schema | undefined> = O extends Schema ? InferOutput<O> : string;
 
-/** Port implemented by the agents module. Core calls it from `ctx.agent`. */
-export interface AgentPort {
-	/** Internal workflows the agent bridge needs (e.g. the execution hosting a Session). */
-	workflows(): RuntimeWorkflow[];
-	run(
-		execution: DurableExecution,
-		id: string,
-		agent: AgentRef,
-		options: AgentRunOptions,
-	): Promise<Json>;
-	/** Deliver a rendered input to the conversation `[request.session, agent]` without waiting. */
-	send(
-		execution: DurableExecution,
-		id: string,
-		agent: AgentRef,
-		request: import("./send.ts").SendRequest,
-	): Promise<import("./send.ts").SendReceipt>;
-	/** Deliver input from ingress, outside any execution: `signalWithStart` to the conversation's Session. */
-	deliver?(
-		agent: AgentRef,
-		request: import("./send.ts").SendRequest,
-	): Promise<import("./send.ts").SendReceipt>;
-	/** A stop in a followed thread: cancel the conversation's current run (Pi abort; the Session stays). */
-	stop?(conversation: Follow, id: string, reason: string): Promise<void>;
-}
-
 /** Minimal shape core needs from `f.defineAgent`. */
 export interface AgentRef {
 	readonly kind: "fabrial.agent";
 	readonly name: string;
-}
-
-/** Port implemented by the agents module for `ctx.state(S)` in workflow code. Each call is one durable operation. */
-export interface StatePort {
-	get<T extends JsonObject>(
-		execution: DurableExecution,
-		id: string,
-		state: import("./state.ts").StateDefinition<T>,
-	): Promise<T>;
-	update<T extends JsonObject>(
-		execution: DurableExecution,
-		id: string,
-		state: import("./state.ts").StateDefinition<T>,
-		fn: (draft: T) => void | T,
-	): Promise<T>;
 }

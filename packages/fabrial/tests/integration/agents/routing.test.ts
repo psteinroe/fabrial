@@ -21,7 +21,6 @@ import {
 	type ExternalIdentity,
 	type JsonObject,
 } from "../../internals.ts";
-import { pi } from "../../../src/agents/index.ts";
 import { FakeChat } from "../../../src/testing.ts";
 import { useAgents } from "./setup.ts";
 
@@ -63,7 +62,7 @@ async function setup(
 	} = await launch(f, {
 		workflows,
 		routedAgents: agents,
-		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
+		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
 	const settle = () => idle(runtime.queue);
 	const threadId = (thread: string, provider = "chat") => `${provider}:${channel}:${thread}`;
@@ -462,7 +461,7 @@ it("equal specificity between an agent's and a workflow's trigger fails at start
 			workflows: [workflow],
 			routedAgents: [agent],
 			chat: new FakeChat({ installationId: "w" }),
-			agents: pi({ models: createModels(), sql: sql() }),
+			agents: { models: createModels(), sql: sql() },
 		}),
 	).rejects.toThrow(
 		`Ambiguous trigger owners: tie-${channel}, agent tie-${channel} on chat.mentioned`,

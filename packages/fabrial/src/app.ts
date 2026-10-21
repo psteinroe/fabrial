@@ -1,16 +1,10 @@
 import type { EmitOptions, Origin } from "./events.ts";
-import type { Evaluator } from "./evaluate.ts";
 import type { ExternalIdentity, IdentityDirectory, Principal, UserDefinition } from "./identity.ts";
 import type { JsonObject } from "./json.ts";
 import type { AnyPlugin } from "./plugin.ts";
 import type { ChatConnection, ChatOptions } from "./chat/index.ts";
-import type {
-	AgentPort,
-	DurableRuntime,
-	RuntimeEvent,
-	RuntimeWorkflow,
-	StatePort,
-} from "./runtime.ts";
+import type { PiOptions } from "./agents/pi.ts";
+import type { DurableRuntime } from "./runtime.ts";
 import type { ChatMessage, Surface, ThreadRef } from "./thread.ts";
 import type { AnyWorkflow } from "./workflow.ts";
 
@@ -85,33 +79,14 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 	resolvePrincipal(identity: ExternalIdentity): Promise<Principal>;
 }
 
-/** A runtime module that plugs into the host (agents). Internal. */
-export interface HostIntegration<T> {
-	readonly kind: string;
-	connect(host: FabrialHost): T;
-}
-
-export interface AgentIntegration extends HostIntegration<{
-	agents: AgentPort;
-	state: StatePort;
-	evaluator: Evaluator;
-	workflows: RuntimeWorkflow[];
-	/** Events its workflows emit and subscribe to. */
-	events?: RuntimeEvent[];
-	start(): Promise<void>;
-	stop(): Promise<void>;
-}> {
-	readonly kind: "fabrial.agents";
-}
-
 export interface CoreConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[]> {
 	definitionScope?: object;
 	/** Durable workflow runtime (Conductor, or in memory for tests). */
 	runtime: DurableRuntime;
 	/** Chat SDK options. Required when any plugin has a `chat` capability. */
 	chat?: ChatOptions;
-	/** Agents, state, and evaluation. Required for `ctx.agent`, `ctx.state`, `ctx.evaluate`. */
-	agents?: AgentIntegration;
+	/** Pi: agents, state, and evaluation (`ctx.agent`, `ctx.send`, `ctx.state`, `ctx.evaluate`). */
+	agents: PiOptions;
 	/** Owned resources (database pools): opened after plugin `init`, closed last on stop. */
 	resources?: { open(): Promise<void> | void; close(): Promise<void> };
 	plugins: P;

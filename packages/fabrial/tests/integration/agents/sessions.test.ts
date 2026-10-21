@@ -21,7 +21,7 @@ import {
 	type ThreadRef,
 } from "../../internals.ts";
 import { toolName } from "../../../src/agent.ts";
-import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
+import { callSession, PostgresStorage } from "../../../src/agents/index.ts";
 import { conductor } from "../../../src/runtime/conductor/index.ts";
 import { FakeChat, testApp } from "../../../src/testing-internal.ts";
 
@@ -164,7 +164,7 @@ async function launch(name: string, workflows: Parameters<typeof testApp>[1]["wo
 		runtime,
 		chat,
 		logger,
-		agents: pi({ models, sql: pool, settings: { retry: { enabled: false } } }),
+		agents: { models, sql: pool, settings: { retry: { enabled: false } } },
 	});
 	await app.start();
 	let stopped = false;
@@ -239,12 +239,12 @@ async function only(): Promise<string> {
 	expect(rows).toHaveLength(1);
 	return rows[0]!.key;
 }
-/** Every Session execution has ended, and the Session's lease is free. */
+/** Every Session execution has ended, and then the Session's lease is free: a cancelled one ends before its host lets go. */
 async function released(key: string) {
 	await expect
 		.poll(async () => (await sessionExecutions()).every((row) => row.done), poll)
 		.toBe(true);
-	expect(await lease(key)).toBeNull();
+	await expect.poll(() => lease(key), poll).toBeNull();
 }
 
 /** No model request arrives for a while after a settlement: there are still `count`. */

@@ -8,7 +8,8 @@ import { routingState, updateRoutingState } from "./chat/threads.ts";
 import type { JsonObject } from "./json.ts";
 import type { AnyPlugin, ResourceKind, ResourceRef } from "./plugin.ts";
 import type { ResourceFollow, ThreadRoutingState } from "./routing.ts";
-import type { AgentPort, AgentRef, InvocationMetadata } from "./runtime.ts";
+import type { Agents } from "./agents/pi.ts";
+import type { AgentRef, InvocationMetadata } from "./runtime.ts";
 import {
 	deliveryFor,
 	renderInput,
@@ -198,7 +199,7 @@ export async function unfollowResource(
  */
 export async function notifyFollowers(
 	host: FabrialHost,
-	port: AgentPort | undefined,
+	agents: Pick<Agents, "deliver">,
 	event: string,
 	payload: JsonObject,
 	metadata: InvocationMetadata,
@@ -221,10 +222,9 @@ export async function notifyFollowers(
 				const requestId = `${metadata.requestId}:${follow.session}:${follow.agent}`;
 				if (delivered.has(requestId)) continue;
 				delivered.add(requestId);
-				if (!port?.deliver) throw new Error("Following resources needs the agent integration");
 				const priority = follow.priority?.[notification.kind] ?? notification.priority ?? "normal";
 				const agent: AgentRef = { kind: "fabrial.agent", name: follow.agent };
-				await port.deliver(agent, {
+				await agents.deliver(agent, {
 					session: follow.session,
 					requestId,
 					content: renderInput({

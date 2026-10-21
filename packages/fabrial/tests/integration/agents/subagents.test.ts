@@ -25,7 +25,7 @@ import {
 	type RuntimeWorkflow,
 } from "../../internals.ts";
 import { toolName } from "../../../src/agent.ts";
-import { callSession, pi, PostgresStorage } from "../../../src/agents/index.ts";
+import { callSession, connectAgents, PostgresStorage } from "../../../src/agents/index.ts";
 import { SubagentWork } from "../../../src/agents/documents.ts";
 import type { ExternalIdentity } from "../../../src/identity.ts";
 import { FakeChat } from "../../../src/testing.ts";
@@ -80,9 +80,11 @@ function fixture() {
 	} as unknown as FabrialHost;
 	// The fake platform behind `slack-test`, the provider of the tests' threads.
 	connectChat(chat, { ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
-	const integration = pi({ models, sql: sql(), settings: { retry: { enabled: false } } }).connect(
-		host,
-	);
+	const integration = connectAgents(host, {
+		models,
+		sql: sql(),
+		settings: { retry: { enabled: false } },
+	});
 	const model = `${faux.provider.id}/${faux.getModel().id}`;
 	/** Scripted responses that record the context each request saw. */
 	const contexts: TranscriptContext[] = [];
@@ -109,7 +111,7 @@ function fixture() {
 		const workflow: RuntimeWorkflow = {
 			name: randomUUID(),
 			triggers: [],
-			handler: (_input, execution) => integration.agents.run(execution, "agent", agent, { input }),
+			handler: (_input, execution) => integration.run(execution, "agent", agent, { input }),
 		};
 		runtime.register({
 			workflows: [workflow, ...integration.workflows, ...others],
@@ -1000,7 +1002,7 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 	const { runtime } = await launch(g, {
 		workflows: [runSql, entry],
 		chat,
-		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
+		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
 	{
 		const id = await runtime.invoke(entry.name, null, {
@@ -1178,7 +1180,7 @@ it("a stop after the lead answered cancels a background child's approval workflo
 	const { runtime } = await launch(g, {
 		workflows: [runSql, ask],
 		chat,
-		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
+		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
 	const send = (text: string) =>
 		runtime.invoke(
@@ -1288,7 +1290,7 @@ it("a background child waiting for approval suspends the Session: a new message 
 	const { runtime } = await launch(g, {
 		workflows: [runSql, ask],
 		chat,
-		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
+		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
 	const send = (text: string) =>
 		runtime.invoke(
@@ -1468,7 +1470,7 @@ it("continuing a background child from another actor and thread runs its tools f
 	);
 	const { runtime } = await launch(g, {
 		workflows: [ask],
-		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
+		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
 	const threads = [`slack-test:general:${randomUUID()}`, `slack-test:general:${randomUUID()}`];
 	const send = (text: string, index: number) =>
@@ -1566,7 +1568,7 @@ it("channel-session agents share session state across threads with their workflo
 	);
 	const { runtime } = await launch(g, {
 		workflows: [deliver, call, flow, read],
-		agents: pi({ models, sql: sql(), settings: { retry: { enabled: false } } }),
+		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
 	// The fake chat derives a thread's channel from its id (`slack-test:<channel>:<thread>`): both threads share one.
 	const channel = `C-${short()}`;

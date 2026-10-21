@@ -1,5 +1,5 @@
 // `fabrial/testing`: apps on real Conductor with fake chat or scripted models.
-import type { AssistantMessage, MutableModels } from "@earendil-works/pi-ai";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { createModels as createPiModels } from "@earendil-works/pi-ai/models";
 import {
 	fauxAssistantMessage,
@@ -13,6 +13,7 @@ import type { AnyPlugin } from "./plugin.ts";
 import {
 	createTestApp as create,
 	internal,
+	scriptedPi as scripted,
 	testingApp,
 	type TestApp,
 	type TestAppConfig,
@@ -25,15 +26,19 @@ export type { TestApp, TestAppConfig, TestingApp, ThreadFollowers } from "./test
 export type { TestClock } from "pgconductor-js/testing";
 
 /**
- * Build an app on real Conductor from the same typed catalog as production, with fake chat and agents
- * and fast polling. Start it with `app.start()`; drive it through `chat`, `app.fetch` or `invoke`,
- * and wait for outcomes with `settled`.
+ * Build an app on real Conductor from the same typed catalog as production, with fake chat, agents on
+ * scripted `models` and fast polling. Start it with `app.start()`; drive it through `chat`, `app.fetch`
+ * or `invoke`, and wait for outcomes with `settled`.
  */
 export function createTestApp<const P extends readonly AnyPlugin[]>(
 	instance: Fabrial<P>,
-	config: TestAppConfig,
+	config: TestAppConfig & { models?: ScriptedModels },
 ): TestApp<ClientsOf<P>> {
-	const { runtime: _, ...app } = create(instance, config);
+	const { models, ...rest } = config;
+	const { runtime: _, ...app } = create(instance, {
+		...rest,
+		...(models ? { models: scripted.get(models) } : {}),
+	});
 	return app;
 }
 
@@ -77,8 +82,6 @@ export interface ScriptedModels {
 	/** A classifier for `ctx.evaluate`; answers keyed by question. */
 	classifier(name: string, answers: (questions: string[]) => Record<string, ScriptedAnswer>): void;
 }
-
-const scripted = new WeakMap<ScriptedModels, MutableModels>();
 
 /** Scripted models for `createIntegrationApp`, without credentials or network. */
 export function scriptedModels(): ScriptedModels {

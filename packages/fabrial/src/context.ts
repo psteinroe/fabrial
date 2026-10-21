@@ -1,4 +1,5 @@
-import type { AgentIntegration, FabrialHost } from "./app.ts";
+import type { FabrialHost } from "./app.ts";
+import type { Agents } from "./agents/pi.ts";
 import {
 	channelOf,
 	channelOfSurface,
@@ -36,7 +37,7 @@ export interface ContextOptions {
 	host: FabrialHost;
 	execution: DurableExecution;
 	metadata: InvocationMetadata;
-	agents?: ReturnType<AgentIntegration["connect"]>;
+	agents: Agents;
 	now: () => number;
 }
 
@@ -214,11 +215,9 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 		step: (id, fn) => execution.step(op(id), fn),
 		sleep: (id, value) => execution.sleep(op(id), duration(value)),
 		agent: async (id, agent, opts) => {
-			if (!agents) throw new Error("Agent integration required");
-			return (await agents.agents.run(execution, op(id), agent, opts)) as never;
+			return (await agents.run(execution, op(id), agent, opts)) as never;
 		},
 		send: async (id, agent, opts) => {
-			if (!agents) throw new Error("Agent integration required");
 			const key = op(id);
 			const request = await execution.step(`fabrial:${key}:send`, async () => {
 				const prepared = await prepareSend(
@@ -233,7 +232,7 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 				await follow(host, prepared.follow, { session: prepared.session, agent: agent.name });
 				return prepared;
 			});
-			return agents.agents.send(execution, key, agent, request);
+			return agents.send(execution, key, agent, request);
 		},
 		follow: (id, resource, opts) =>
 			execution.step(op(id), () =>
@@ -244,7 +243,6 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 				unfollowResource(host, metadata, surfaces(), resource, storedFollowOptions(opts)),
 			),
 		evaluate: async (id, request) => {
-			if (!agents) throw new Error("Agent integration required");
 			return (await execution.step(
 				op(id),
 				async () => (await agents.evaluator.evaluate(request, execution.signal)) as unknown as Json,
@@ -252,11 +250,9 @@ export async function createContext(options: ContextOptions): Promise<WorkflowCo
 		},
 		state: (state) => ({
 			get: (id) => {
-				if (!agents) throw new Error("State integration required");
 				return agents.state.get(execution, op(id), state);
 			},
 			update: (id, fn) => {
-				if (!agents) throw new Error("State integration required");
 				return agents.state.update(execution, op(id), state, fn);
 			},
 		}),

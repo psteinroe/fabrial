@@ -2,7 +2,7 @@ import { createPostgresState } from "@chat-adapter/state-pg";
 import type { MutableModels } from "@earendil-works/pi-ai";
 import type { ConversationRetryPolicy } from "@earendil-works/pi-durable";
 import postgres, { type Sql } from "postgres";
-import { pi, type PiOptions } from "./agents/pi.ts";
+import type { PiOptions } from "./agents/pi.ts";
 import { createModels, type ModelCredentials } from "./agents/models.ts";
 import type { CoreConfig } from "./app.ts";
 import { conductor, type ConductorConfig } from "./runtime/conductor/index.ts";
@@ -64,14 +64,14 @@ export function production(
 		runtime: conductor({ sql: pool.sql }, overrides.conductor),
 		// Opened when the app starts.
 		chat: { state: () => (state = createPostgresState({ url: pool.url! })) },
-		agents: pi({
+		agents: {
 			models: overrides.models ?? credentials.models,
 			sql: pool.sql,
 			settings: {
 				...overrides.agentSettings,
 				retry: { ...MODEL_RETRY, ...overrides.agentSettings?.retry },
 			},
-		}),
+		},
 		resources: {
 			open() {
 				if (!overrides.models) credentials.validate();

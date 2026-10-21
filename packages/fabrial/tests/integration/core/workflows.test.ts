@@ -2,11 +2,10 @@ import { metadataOf } from "../../../src/context.ts";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { defineEvent, definePlugin, trigger, type Json } from "../../internals.ts";
-import { fakeAgents } from "../../../src/testing-internal.ts";
+import { reply, scriptedModels } from "../../../src/testing.ts";
 import { until } from "../../conductor/helper.ts";
 import {
 	alice,
-	defineState,
 	defineWorkflow,
 	event,
 	mention,
@@ -242,45 +241,50 @@ describe("durability and context", () => {
 	});
 	it("memoizes evaluation, agents, and shared state", async () => {
 		let evaluations = 0;
-		const agents = fakeAgents({
-			evaluate: async (request) => {
-				evaluations++;
-				return { stopReason: "stop", model: request.model, answers: {} };
-			},
-		});
-		const counter = defineState({
-			name: "count",
-			scope: "session",
-			schema: z.object({ count: z.number() }),
-			initial: () => ({ count: 0 }),
+		const models = scriptedModels();
+		const model = models.model("test/model");
+		model.respond([reply.text("echo")]);
+		models.classifier("judge/classifier", () => {
+			evaluations++;
+			return { relevant: { probability: 1 } };
 		});
 		const test = setup(
-			[
-				workflow(async (_i, ctx) => {
-					await ctx.state(counter).update("count", (draft) => {
-						draft.count++;
-					});
-					await ctx.evaluate("evaluate", {
-						model: "test/test",
-						state: {},
-						questions: {},
-					});
-					const answer = await ctx.agent(
-						"agent",
-						{ kind: "fabrial.agent", name: "echo" },
-						{ input: "echo" },
-					);
-					await ctx.sleep("sleep", "1h");
-					return { answer, count: (await ctx.state(counter).get("read")).count };
-				}),
-			],
-			{ agents },
+			(f) => {
+				const counter = f.defineState({
+					name: "count",
+					scope: "session",
+					schema: z.object({ count: z.number() }),
+					initial: () => ({ count: 0 }),
+				});
+				const echo = f.defineAgent({
+					name: "echo",
+					description: "Echoes its input.",
+					model: "test/model",
+				});
+				return [
+					workflow(async (_i, ctx) => {
+						await ctx.state(counter).update("count", (draft) => {
+							draft.count++;
+						});
+						await ctx.evaluate("evaluate", {
+							model: "judge/classifier",
+							state: {},
+							questions: { relevant: { type: "boolean", instructions: "Relevant?" } },
+						});
+						const answer = await ctx.agent("agent", echo, { input: "echo" });
+						await ctx.sleep("sleep", "1h");
+						return { answer, count: (await ctx.state(counter).get("read")).count };
+					}),
+				];
+			},
+			{ models },
 		);
 		const owner = await enter(test);
 		await owner.suspended("sleep");
 		await db.clock.advance("1h");
 		expect(await owner.output()).toEqual({ answer: "echo", count: 1 });
 		expect(evaluations).toBe(1);
+		expect(model.calls).toBe(1);
 	});
 	it("loads bounded history durably", async () => {
 		const test = setup([
@@ -317,20 +321,22 @@ describe("durability and context", () => {
 	});
 	it("initializes state once and validates initial values", async () => {
 		let initializations = 0;
-		const state = defineState({
-			name: "state",
-			scope: "session",
-			schema: z.object({ count: z.number() }),
-			initial: () => ({ count: ++initializations }),
-		});
 		const test = setup(
-			[
-				workflow(async (_i, ctx) => [
-					(await ctx.state(state).get("one")).count,
-					(await ctx.state(state).get("two")).count,
-				]),
-			],
-			{ agents: fakeAgents() },
+			(f) => {
+				const state = f.defineState({
+					name: "state",
+					scope: "session",
+					schema: z.object({ count: z.number() }),
+					initial: () => ({ count: ++initializations }),
+				});
+				return [
+					workflow(async (_i, ctx) => [
+						(await ctx.state(state).get("one")).count,
+						(await ctx.state(state).get("two")).count,
+					]),
+				];
+			},
+			{ models: scriptedModels() },
 		);
 		expect(await (await enter(test)).output()).toEqual([1, 1]);
 	});
@@ -705,63 +711,108 @@ describe("provider route response context", () => {
 		expect(await db.execution(id).output()).toEqual({ thread: surface.threadId, owner: null });
 	});
 	it("uses receipt-derived metadata for state and agents after lazy channel posts", async () => {
-		const counter = defineState({
-			name: "counter",
-			scope: "session",
-			schema: z.object({ count: z.number() }),
-			initial: () => ({ count: 0 }),
-		});
-		const child = defineWorkflow({
-			name: "child",
-			input: z.object({}),
-			run: async (_i, ctx) => (await ctx.state(counter).get("get")).count,
-		});
-		const owner = defineWorkflow({
-			name: "owner",
-			triggers: [
-				trigger({ event, replyTo: { kind: "channel", provider: "chat", channelId: "lazy" } }),
-			],
-			run: async (_i, ctx) => {
-				const ref = await ctx.thread!.post("first", "first");
-				if (metadataOf(ctx).replyTo?.threadId !== ref.threadId) throw new Error("Unbound metadata");
-				await ctx.state(counter).update("update", (draft) => {
-					draft.count++;
+		const test = setup(
+			(f) => {
+				const counter = f.defineState({
+					name: "counter",
+					scope: "session",
+					schema: z.object({ count: z.number() }),
+					initial: () => ({ count: 0 }),
 				});
-				return ctx.invoke("child", child, {});
+				const child = defineWorkflow({
+					name: "child",
+					input: z.object({}),
+					run: async (_i, ctx) => (await ctx.state(counter).get("get")).count,
+				});
+				const owner = defineWorkflow({
+					name: "owner",
+					triggers: [
+						trigger({ event, replyTo: { kind: "channel", provider: "chat", channelId: "lazy" } }),
+					],
+					run: async (_i, ctx) => {
+						const ref = await ctx.thread!.post("first", "first");
+						if (metadataOf(ctx).replyTo?.threadId !== ref.threadId)
+							throw new Error("Unbound metadata");
+						await ctx.state(counter).update("update", (draft) => {
+							draft.count++;
+						});
+						return ctx.invoke("child", child, {});
+					},
+				});
+				return [owner, child];
 			},
-		});
-		const test = setup([owner, child], { agents: fakeAgents() });
+			{ models: scriptedModels() },
+		);
 		await test.app.start();
 		await test.app.emit(event, {});
 		expect(await (await test.execution()).output()).toBe(1);
 	});
 });
 
-describe("agent port workflows", () => {
-	it("registers agent port workflows once and wraps their middleware and terminal settlement", async () => {
-		const seen: string[] = [];
-		const agents = fakeAgents({
-			workflows: [{ name: "agent-run", triggers: [], handler: async () => "agent-result" }],
-		});
-		const test = setup([], {
-			agents,
-			plugins: [
-				definePlugin({
-					id: "hook",
-					hooks: {
-						workflow: [
-							async (execution, ctx, next) => {
-								seen.push(execution.workflow);
-								return next(ctx);
-							},
-						],
+describe("Pi workflows", () => {
+	const hook = (seen: string[]) =>
+		definePlugin({
+			id: "hook",
+			hooks: {
+				workflow: [
+					async (execution, ctx, next) => {
+						seen.push(execution.workflow);
+						return next(ctx);
 					},
-				}),
-			],
+				],
+			},
 		});
+	it("registers Pi's workflows once and wraps them in plugin middleware", async () => {
+		const seen: string[] = [];
+		const test = setup(
+			(f) => {
+				f.defineAgent({ name: "echo", description: "Echoes its input.", model: "test/model" });
+				return [];
+			},
+			{ models: scriptedModels(), plugins: [hook(seen)] },
+		);
 		await test.app.start();
-		const id = await test.runtime.invoke("agent-run", {}, { metadata });
-		expect(await db.execution(id).output()).toBe("agent-result");
-		expect(seen).toEqual(["agent-run"]);
+		const id = await test.runtime.invoke("fabrial.sessions.reclaim", null, { metadata });
+		expect(await db.execution(id).output()).toMatchObject({ reclaimed: 0 });
+		expect(seen).toEqual(["fabrial.sessions.reclaim"]);
+	});
+	it("decides at start: an agent defined after f.app() runs; defining one while the app runs throws, after stop works", async () => {
+		const models = scriptedModels();
+		models.model("test/model").respond([reply.text("late")]);
+		let late: { kind: "fabrial.agent"; name: string } | undefined;
+		const test = setup(
+			[workflow(async (_i, ctx) => ctx.agent("agent", late!, { input: "hello" }))],
+			{ models },
+		);
+		late = test.instance.defineAgent({
+			name: "late",
+			description: "Defined after the app.",
+			model: "test/model",
+		});
+		expect(await (await enter(test)).output()).toBe("late");
+		expect(() =>
+			test.instance.defineAgent({ name: "later", description: "Too late.", model: "test/model" }),
+		).toThrow("Agent later is defined after app.start()");
+		expect(() =>
+			test.instance.defineState({
+				name: "later",
+				scope: "session",
+				schema: z.object({}),
+				initial: () => ({}),
+			}),
+		).toThrow("State later is defined after app.start()");
+		await test.app.stop();
+		expect(
+			test.instance.defineAgent({ name: "later", description: "In time.", model: "test/model" })
+				.name,
+		).toBe("later");
+		expect(
+			test.instance.defineState({
+				name: "later",
+				scope: "session",
+				schema: z.object({}),
+				initial: () => ({}),
+			}).name,
+		).toBe("later");
 	});
 });

@@ -1,5 +1,6 @@
 import { metadataOf } from "../../../src/context.ts";
-import { beforeEach } from "vitest";
+import { afterAll, beforeEach } from "vitest";
+import postgres, { type Sql } from "postgres";
 import { z } from "zod";
 import {
 	createFabrial,
@@ -19,8 +20,11 @@ import type {
 	WorkflowContext,
 } from "../../internals.ts";
 import type { CoreConfig } from "../../../src/app.ts";
+import type { AnyPlugin } from "../../../src/plugin.ts";
 import type { ExecutionInfo } from "../../../src/workflow.ts";
-import { FakeChat, testApp } from "../../../src/testing-internal.ts";
+import type { Fabrial } from "../../../src/instance.ts";
+import type { ScriptedModels } from "../../../src/testing.ts";
+import { FakeChat, scriptedPi, testApp } from "../../../src/testing-internal.ts";
 import { until, useConductor } from "../../conductor/helper.ts";
 
 export const { defineState, defineWorkflow } = createFabrial({ plugins: [] });
@@ -114,8 +118,20 @@ export const approvalWorkflow = (timeout: string | number = "24h", requesterCont
 export function useCoreApp() {
 	const db = useConductor();
 	beforeEach(() => db.clock.set(new Date()));
+	// Pi's storage, off the test clock's connection; opened by the first app on scripted models.
+	let pool: Sql | undefined;
+	afterAll(async () => {
+		await pool?.end();
+	});
 
-	function setup(workflows: AnyWorkflow[], extra: Partial<CoreConfig> = {}) {
+	/**
+	 * An app of `workflows`, or of those `define` returns after defining agents and state on the app's instance.
+	 * With `models`, Pi runs on them.
+	 */
+	function setup(
+		workflows: AnyWorkflow[] | ((f: Fabrial<readonly AnyPlugin[]>) => AnyWorkflow[]),
+		extra: Omit<Partial<CoreConfig>, "agents"> & { models?: ScriptedModels } = {},
+	) {
 		const runtime = db.runtime();
 		const chat = new FakeChat();
 		const attempts: (ExecutionInfo & { metadata: InvocationMetadata })[] = [];
@@ -134,13 +150,23 @@ export function useCoreApp() {
 			plugins = [plugin, source],
 			identity: identities = [alice, bob, outsider],
 			logger,
+			models,
 			...config
-		} = { workflows, ...extra };
-		const app = testApp(createFabrial({ plugins: [...plugins, recorder], identity: identities }), {
+		} = extra;
+		const f = createFabrial({ plugins: [...plugins, recorder], identity: identities });
+		const app = testApp(f, {
 			runtime,
 			chat,
 			...config,
+			workflows: typeof workflows === "function" ? workflows(f) : workflows,
 			logger,
+			...(models && {
+				agents: {
+					models: scriptedPi.get(models)!,
+					sql: (pool ??= postgres(db.url, { max: 4, onnotice: () => {} })),
+					settings: { retry: { enabled: false } },
+				},
+			}),
 		});
 		const routes = async () =>
 			(
@@ -154,6 +180,8 @@ export function useCoreApp() {
 			...new Set(attempts.filter((a) => a.workflow === name).map((a) => a.executionId)),
 		];
 		return {
+			/** The app's instance: agents and state defined on it before `app.start()` are the app's. */
+			instance: f,
 			runtime,
 			chat,
 			app,

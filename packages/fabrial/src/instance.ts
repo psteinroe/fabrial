@@ -112,9 +112,12 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 	const plugins = Object.freeze([...config.plugins]) as unknown as P;
 	const build = (appConfig: AppConfig, overrides: InternalOverrides = {}): HostedApp => {
 		const { runtime, chat, agents, ...settings } = overrides;
-		const integrations = runtime
-			? { runtime, chat, agents }
-			: production({ database: config.database, models: config.models ?? {} }, settings);
+		if (runtime && !agents)
+			throw new Error("An app on an explicit runtime needs agents (Pi options)");
+		const integrations =
+			runtime && agents
+				? { runtime, chat, agents }
+				: production({ database: config.database, models: config.models ?? {} }, settings);
 		return buildApp({
 			...integrations,
 			plugins,

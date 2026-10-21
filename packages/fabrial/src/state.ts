@@ -46,10 +46,34 @@ export function defineState<T extends JsonObject, S extends StateScope>(definiti
  */
 export const definedStates = new WeakMap<object, Map<string, StateDefinition>>();
 
+/**
+ * Running apps per instance. An app decides at `start()` whether it runs Pi, from the agents and states
+ * defined by then, so neither can be defined while one of the instance's apps runs; after they stop it can.
+ */
+const startedScopes = new WeakMap<object, number>();
+
+/** Counts a started app of `scope`; the returned function counts it stopped. */
+export function sealDefinitions(scope: object): () => void {
+	startedScopes.set(scope, (startedScopes.get(scope) ?? 0) + 1);
+	return () => {
+		const running = (startedScopes.get(scope) ?? 1) - 1;
+		if (running > 0) startedScopes.set(scope, running);
+		else startedScopes.delete(scope);
+	};
+}
+
+export function assertDefinable(scope: object, what: string): void {
+	if (startedScopes.has(scope))
+		throw new Error(
+			`${what} is defined after app.start(); define agents and state before starting the app`,
+		);
+}
+
 export function registerState<T extends JsonObject, S extends StateScope>(
 	definition: StateDefinition<T, S>,
 	scope: object,
 ): StateDefinition<T, S> {
+	assertDefinable(scope, `State ${definition.name}`);
 	let states = definedStates.get(scope);
 	if (!states) definedStates.set(scope, (states = new Map()));
 	if (states.has(definition.name)) throw new Error(`State ${definition.name} is already defined`);

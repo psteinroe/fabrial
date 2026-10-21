@@ -27,8 +27,8 @@ import {
 } from "@earendil-works/pi-durable";
 import {
 	parseSchema,
-	type AgentPort,
 	type AgentRef,
+	type AgentRunOptions,
 	type DurableExecution,
 	type ExecutionResult,
 	ExecutionError,
@@ -42,7 +42,6 @@ import {
 	type OutboundMessage,
 	type RuntimeWorkflow,
 	type Schema,
-	type StatePort,
 } from "../modules.ts";
 import {
 	channelOfSurface,
@@ -99,6 +98,7 @@ import {
 	type ConversationKey,
 	type Delivery,
 	type SendOptions,
+	type SendReceipt,
 	type SendRequest,
 } from "../send.ts";
 import {
@@ -131,7 +131,8 @@ import { createEvaluator } from "./evaluate.ts";
 import { LeaseLost, PostgresStorage } from "./storage.ts";
 import { definedStates, type StateDefinition } from "../state.ts";
 import { duration } from "../internal.ts";
-import type { AgentIntegration, Logger } from "../app.ts";
+import type { Logger } from "../app.ts";
+import type { Follow } from "../routing.ts";
 
 const SESSION_WORKFLOW = "fabrial.session";
 
@@ -298,11 +299,17 @@ export interface PiOptions {
 
 const RECLAIM_WORKFLOW = "fabrial.sessions.reclaim";
 
-export function pi(options: PiOptions): AgentIntegration {
-	return { kind: "fabrial.agents", connect: (host) => connect(options, host) };
-}
+/** Pi's agents, their state and evaluation, connected to the host. Core calls it directly. */
+export type Agents = ReturnType<typeof connectAgents>;
 
-function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegration["connect"]> {
+/**
+ * Connect Pi to the host. Nothing touches Pi's storage, and no Pi workflow is registered, unless the instance
+ * defines an agent or a state: an app without them runs no Pi work.
+ */
+export function connectAgents(host: FabrialHost, options: PiOptions) {
+	const scope = host.definitionScope ?? host;
+	/** Whether the instance defines agents or state: decided when the app starts, after which neither can be defined. */
+	const used = () => !!definedAgents.get(scope)?.size || !!definedStates.get(scope)?.size;
 	const registry = createRegistry();
 	const evaluator = createEvaluator(options.models);
 	const agents = new Map<string, Agent>();
@@ -311,7 +318,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 	let started = false;
 	/** Workflow state resolves by name against this instance's definitions, on both sides of the Session's signal. */
 	const stateOf = (name: string): StateDefinition => {
-		const definition = definedStates.get(host.definitionScope ?? host)?.get(name);
+		const definition = definedStates.get(scope)?.get(name);
 		if (!definition)
 			throw new Error(
 				`State ${name} is not defined on this Fabrial instance; define it with defineState`,
@@ -1686,9 +1693,9 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		delivery: request.delivery,
 		metadata: request.metadata,
 	});
-	const port: AgentPort = {
-		workflows: () => [session, effect, report],
-		async stop(conversation, id, reason) {
+	const port = {
+		/** A stop in a followed thread: cancel the conversation's current run (Pi abort; the Session stays). */
+		async stopConversation(conversation: Follow, id: string, reason: string): Promise<void> {
 			await signalSession(
 				conversation.session,
 				`fabrial.stop:${id}:${conversation.agent}`,
@@ -1696,7 +1703,8 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				{ requestId: id, origin: null, replyTo: null, requestedBy: null },
 			);
 		},
-		async deliver(agent, request) {
+		/** Deliver input from ingress, outside any execution: `signalWithStart` to the conversation's Session. */
+		async deliver(agent: AgentRef, request: SendRequest): Promise<SendReceipt> {
 			if (!agents.has(agent.name))
 				throw new Error(
 					`Agent ${agent.name} is not installed; defineAgent must be evaluated before app.start()`,
@@ -1712,7 +1720,13 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				conversation: conversationReference(agent.name, request.session),
 			};
 		},
-		async send(execution, id, agent, request) {
+		/** Deliver a rendered input to the conversation `[request.session, agent]` without waiting. */
+		async send(
+			execution: DurableExecution,
+			id: string,
+			agent: AgentRef,
+			request: SendRequest,
+		): Promise<SendReceipt> {
 			const input = sessionInput(agent, request);
 			await execution.signalWithStart(`fabrial:pi:deliver:${id}`, {
 				workflow: SESSION_WORKFLOW,
@@ -1726,7 +1740,12 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				conversation: conversationReference(agent.name, request.session),
 			};
 		},
-		async run(execution, id, agent: AgentRef, request) {
+		async run(
+			execution: DurableExecution,
+			id: string,
+			agent: AgentRef,
+			request: AgentRunOptions,
+		): Promise<Json> {
 			// A call has its own Session, keyed by the workflow run: it never shares a transcript with a thread's
 			// conversation and never follows a thread. Its Session execution is a child of the caller, so cancelling or
 			// failing the caller cancels it (and the workflows its tools started), unless detached.
@@ -1824,19 +1843,29 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			`State ${request.state}: Session ${key} did not answer operation ${id} after ${STATE_REQUESTS} requests`,
 		);
 	}
-	const state: StatePort = {
-		get: async (execution, id, definition) => {
+	/** `ctx.state(S)` in workflow code. Each call is one durable operation. */
+	const state = {
+		get: async <T extends JsonObject>(
+			execution: DurableExecution,
+			id: string,
+			definition: StateDefinition<T>,
+		): Promise<T> => {
 			const key = sessionKey(execution.metadata);
 			stateOf(definition.name);
 			const answer = await stateRequest(execution, id, key, { state: definition.name });
 			if ("conflict" in answer) throw new Error(`State ${definition.name}: a read cannot conflict`);
-			return answer.value as ReturnType<typeof definition.initial>;
+			return answer.value as T;
 		},
 		/**
 		 * Optimistic: reads the value and its revision, applies `change` here (closures stay in the workflow), and
 		 * replaces the value if nothing changed it since; otherwise it reads again, up to `stateConflicts` times.
 		 */
-		update: async (execution, id, definition, change) => {
+		update: async <T extends JsonObject>(
+			execution: DurableExecution,
+			id: string,
+			definition: StateDefinition<T>,
+			change: (draft: T) => void | T,
+		): Promise<T> => {
 			const key = sessionKey(execution.metadata);
 			stateOf(definition.name);
 			const conflicts = options.stateConflicts ?? 20;
@@ -1845,7 +1874,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 				const read = await stateRequest(execution, `${at}:read`, key, { state: definition.name });
 				if (!("value" in read)) throw new Error(`State ${definition.name}: a read cannot conflict`);
 				const value = await execution.step(`${at}:apply`, async () => {
-					const draft = cloneJson(read.value) as ReturnType<typeof definition.initial>;
+					const draft = cloneJson(read.value) as T;
 					return parseSchema(
 						definition.schema,
 						change(draft) ?? draft,
@@ -1856,7 +1885,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					state: definition.name,
 					write: { value: value as JsonObject, revision: read.revision },
 				});
-				if ("value" in written) return written.value as ReturnType<typeof definition.initial>;
+				if ("value" in written) return written.value as T;
 			}
 			throw new Error(
 				`State ${definition.name}: update ${id} conflicted ${conflicts} times; the state kept changing between its read and its write`,
@@ -1864,12 +1893,18 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 		},
 	};
 	return {
-		agents: port,
+		...port,
 		state,
 		evaluator,
-		workflows: [session, effect, report, reclaim],
-		events: [{ name: STATE_EVENT, filterable: ["operation"] }],
+		/** Pi's workflows, if the instance defines agents or state (core registers them when the app starts). */
+		get workflows(): RuntimeWorkflow[] {
+			return used() ? [session, effect, report, reclaim] : [];
+		},
+		get events() {
+			return used() ? [{ name: STATE_EVENT, filterable: ["operation"] }] : [];
+		},
 		async start() {
+			if (!used()) return;
 			await PostgresStorage.migrate(options.sql);
 			for (const plugin of host.plugins)
 				if (plugin.toolkit) {
@@ -1883,7 +1918,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 					pluginToolkits.set(plugin.id, extension);
 					registry.install(extension);
 				}
-			for (const agent of definedAgents.get(host.definitionScope ?? host) ?? []) install(agent);
+			for (const agent of definedAgents.get(scope) ?? []) install(agent);
 			await abortOrphans(
 				options.sql,
 				registry

@@ -6,7 +6,7 @@ import type { Schema } from "./schema.ts";
 import type { AgentSession, SendOptions, SendReceipt } from "./send.ts";
 import type { ResourceRef } from "./plugin.ts";
 import type { FollowOptions, FollowReceipt, UnfollowReceipt } from "./follows.ts";
-import type { StateDefinition, ToolStateHandle } from "./state.ts";
+import { assertDefinable, type StateDefinition, type ToolStateHandle } from "./state.ts";
 import type { ChatMessage, MessageRef, OutboundMessage, Surface } from "./thread.ts";
 import type { TriggerPayload, TriggerSpec } from "./trigger.ts";
 import type { AnyWorkflow, WorkflowArgs, WorkflowOutput } from "./workflow.ts";
@@ -207,6 +207,7 @@ export const definedAgents = new WeakMap<object, Set<Agent>>();
 
 export function defineAgent(definition: AgentDefinition<string, any>, scope: object): Agent {
 	if (!definition.name) throw new Error("Agent name must not be empty");
+	assertDefinable(scope, `Agent ${definition.name}`);
 	if (typeof definition.description !== "string" || !definition.description.trim())
 		throw new Error(`Agent ${definition.name} needs a description`);
 	if (definition.model !== undefined) parseModel(definition.model);

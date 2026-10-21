@@ -1,12 +1,13 @@
 import { createFabrial, type JsonObject } from "fabrial";
-import { trigger, type ResourceKind } from "fabrial/plugin";
+import { definePlugin, trigger, type ResourceKind } from "fabrial/plugin";
 import {
 	createTestApp,
-	fakeAgents,
+	scriptedPi,
 	StubRuntime,
 	testApp,
 	FakeChat,
 } from "fabrial/internal/testing";
+import { reply, scriptedModels } from "fabrial/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { github, parsePullRequest, pullRequest } from "../../src/index.ts";
 import { options } from "../helper.ts";
@@ -132,8 +133,13 @@ describe("follows in an app", () => {
 		for (const each of apps.splice(0)) await each.stop();
 	});
 	async function setup() {
-		const f = createFabrial({ plugins: [plugin()] });
-		const agent = f.defineAgent({ name: "dev", description: "Answers test questions." });
+		// The follow's home is a Slack thread, where the agent answers.
+		const f = createFabrial({ plugins: [plugin(), definePlugin({ id: "slack" })] });
+		const agent = f.defineAgent({
+			name: "dev",
+			description: "Answers test questions.",
+			model: "test/model",
+		});
 		const pr = pullRequest("acme/app#5");
 		const slackThread = { kind: "thread" as const, provider: "slack", threadId: "slack:C1:1" };
 		const watch = f.defineWorkflow({
@@ -177,10 +183,12 @@ describe("follows in an app", () => {
 				observed(input);
 			},
 		});
-		const agents = fakeAgents();
+		// The agent answers every notification; the tests observe what its Session receives.
+		const models = scriptedModels();
+		models.model("test/model").respond(Array.from({ length: 20 }, () => reply.text("ok")));
 		const t = createTestApp(f, {
 			database: db.url,
-			agents,
+			models: scriptedPi.get(models),
 			workflows: [watch, unwatch, orphan, owner, sendAndWatch],
 		});
 		apps.push(t);
@@ -199,7 +207,9 @@ describe("follows in an app", () => {
 			await t.idle();
 		};
 		const records = async () => (await app.routing(prThread as never)).resourceFollows;
-		return { app, agents, start, send, observed, slackThread, records };
+		/** Inputs delivered to the agent's conversations, in order. */
+		const sent = async () => (await t.sessionSignals()).filter((signal) => signal.kind === "input");
+		return { app, sent, start, send, observed, slackThread, records };
 	}
 
 	it("delivers notifications to the follower, once per delivery, until it unfollows", async () => {
@@ -217,8 +227,8 @@ describe("follows in an app", () => {
 		await t.send(webhooks.review("changes_requested"), "r1");
 		await t.send(webhooks.review("changes_requested"), "r1");
 		await t.send(webhooks.comment("NONE", outsider), "c1");
-		expect(t.agents.sent).toHaveLength(1);
-		const [review] = t.agents.sent;
+		expect(await t.sent()).toHaveLength(1);
+		const [review] = await t.sent();
 		expect(review).toMatchObject({
 			agent: "dev",
 			session: "app:pr-5",
@@ -234,25 +244,25 @@ describe("follows in an app", () => {
 		expect(t.observed).toHaveBeenCalledOnce();
 
 		await t.send(webhooks.comment(), "c2");
-		expect(t.agents.sent.at(-1)).toMatchObject({ delivery: "followUp" });
+		expect((await t.sent()).at(-1)).toMatchObject({ delivery: "followUp" });
 		// Labels and CI are not default kinds; `events: "all"` adds them, `priority` overrides per kind.
 		await t.send(webhooks.labeled(), "l1");
-		expect(t.agents.sent).toHaveLength(2);
+		expect(await t.sent()).toHaveLength(2);
 		await t.start("watch", { all: true });
 		expect(await t.records()).toHaveLength(1);
 		await t.send(webhooks.labeled(), "l2");
-		expect(t.agents.sent.at(-1)).toMatchObject({ delivery: "steer" });
+		expect((await t.sent()).at(-1)).toMatchObject({ delivery: "steer" });
 		await t.send(webhooks.checkSuite("success"), "cs1");
-		expect(t.agents.sent.at(-1)).toMatchObject({ delivery: "write" });
+		expect((await t.sent()).at(-1)).toMatchObject({ delivery: "write" });
 
 		// A merge is delivered; the follow lasts until unfollow.
 		await t.send(webhooks.closed(true), "m1");
-		expect(t.agents.sent.at(-1)!.content).toContain("was merged");
+		expect((await t.sent()).at(-1)!.content).toContain("was merged");
 		expect(await t.records()).toHaveLength(1);
 		expect(await t.start("unwatch")).toMatchObject({ output: { removed: true } });
 		expect(await t.start("unwatch")).toMatchObject({ output: { removed: false } });
 		await t.send(webhooks.reopened(), "o1");
-		expect(t.agents.sent).toHaveLength(5);
+		expect(await t.sent()).toHaveLength(5);
 		await t.app.stop();
 	});
 
@@ -271,7 +281,7 @@ describe("follows in an app", () => {
 		]);
 		await t.send(webhooks.review("changes_requested"), "r1");
 		// The notification reaches the conversation the send started.
-		expect(t.agents.sent.map((each) => [each.session, each.agent])).toEqual([
+		expect((await t.sent()).map((each) => [each.session, each.agent])).toEqual([
 			["app:ops", "dev"],
 			["app:ops", "dev"],
 		]);

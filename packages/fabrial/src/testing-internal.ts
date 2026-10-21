@@ -2,10 +2,12 @@
 // the dev-only `fabrial/internal/testing` entry, omitted from the published exports.
 import { createTestClock, type TestClock } from "pgconductor-js/testing";
 import { Conductor, TaskSchemas } from "pgconductor-js";
-import postgres from "postgres";
-import type { AgentIntegration, App, HostedApp } from "./app.ts";
+import { createModels as createPiModels } from "@earendil-works/pi-ai/models";
+import type { MutableModels } from "@earendil-works/pi-ai";
+import postgres, { type Sql } from "postgres";
+import type { PiOptions } from "./agents/pi.ts";
+import type { App, HostedApp } from "./app.ts";
 import { routingState, type ChatOptions } from "./chat/index.ts";
-import type { Evaluator } from "./evaluate.ts";
 import { FakeChat } from "./fake-chat.ts";
 import {
 	INTERNAL,
@@ -18,17 +20,12 @@ import type { Json, JsonObject } from "./json.ts";
 import type { AnyPlugin } from "./plugin.ts";
 import { conductor } from "./runtime/conductor/index.ts";
 import type {
-	AgentPort,
-	DurableExecution,
 	DurableRuntime,
 	ExecutionResult,
 	InvocationMetadata,
 	RuntimeEvent,
 	RuntimeWorkflow,
-	StatePort,
 } from "./runtime.ts";
-import { parseSchema } from "./schema.ts";
-import { conversationReference, type SendRequest } from "./send.ts";
 import type { Surface, ThreadRef } from "./thread.ts";
 import type { AnyWorkflow, WorkflowArgs } from "./workflow.ts";
 
@@ -80,88 +77,36 @@ export class StubRuntime implements DurableRuntime {
 	}
 }
 
-/** Injectable agent/evaluator hooks and memoized, schema-checked state for core/adapter unit tests. */
-export function fakeAgents(
-	options: {
-		run?: AgentPort["run"];
-		send?: AgentPort["send"];
-		evaluate?: Evaluator["evaluate"];
-		state?: StatePort;
-		workflows?: RuntimeWorkflow[];
-	} = {},
-): AgentIntegration & {
-	values: Map<string, JsonObject>;
-	/** Inputs delivered with `ctx.send`, in order (default `send` only). */
-	sent: (SendRequest & { agent: string })[];
-} {
-	const values = new Map<string, JsonObject>();
-	const sent: (SendRequest & { agent: string })[] = [];
-	const key = (execution: DurableExecution, state: { name: string; scope: string }) =>
-		`${state.scope}:${state.scope === "session" ? (execution.metadata.replyTo?.kind === "thread" ? execution.metadata.replyTo.threadId : execution.metadata.requestId) : state.scope === "agent" ? execution.executionId : execution.metadata.requestId}:${state.name}`;
-	const state: StatePort = {
-		get: (execution, id, definition) =>
-			execution.step(id, async () => {
-				const value = await parseSchema(
-					definition.schema,
-					clone(values.get(key(execution, definition)) ?? definition.initial()),
-				);
-				values.set(key(execution, definition), clone(value));
-				return value;
-			}) as never,
-		update: (execution, id, definition, fn) =>
-			execution.step(id, async () => {
-				const draft = clone(values.get(key(execution, definition)) ?? definition.initial());
-				const value = await parseSchema(definition.schema, fn(draft as never) ?? draft);
-				values.set(key(execution, definition), clone(value));
-				return value;
-			}) as never,
-	};
-	return {
-		kind: "fabrial.agents",
-		values,
-		sent,
-		connect: () => ({
-			agents: {
-				workflows: () => options.workflows ?? [],
-				run: options.run ?? ((execution, id, _agent, opts) => execution.step(id, () => opts.input)),
-				send:
-					options.send ??
-					((execution, id, agent, request) =>
-						execution.step(`fabrial:fake:send:${id}`, () => {
-							sent.push({ ...request, agent: agent.name });
-							return {
-								requestId: request.requestId,
-								conversation: conversationReference(agent.name, request.session),
-							};
-						})),
-				async deliver(agent, request) {
-					// Like a conversation, dedupe a redelivered request per session.
-					if (
-						!sent.some(
-							(s) =>
-								s.requestId === request.requestId &&
-								s.agent === agent.name &&
-								s.session === request.session,
-						)
-					)
-						sent.push(clone({ ...request, agent: agent.name }));
-					return {
-						requestId: request.requestId,
-						conversation: conversationReference(agent.name, request.session),
-					};
-				},
-			},
-			state: options.state ?? state,
-			evaluator: {
-				evaluate:
-					options.evaluate ??
-					(async (request) => ({ stopReason: "stop", answers: {}, model: request.model })),
-			},
-			workflows: options.workflows ?? [],
-			async start() {},
-			async stop() {},
-		}),
-	};
+/** The Pi models behind each `scriptedModels()`, for tests building apps below the public API. */
+export const scriptedPi = new WeakMap<object, MutableModels>();
+
+/** Stands in for Pi's database in apps that define no agents or state, which never touch it. */
+const noDatabase = new Proxy(function () {} as unknown as Sql, {
+	apply() {
+		throw new Error("This test app has no database for Pi; pass agents: { models, sql }");
+	},
+	get() {
+		throw new Error("This test app has no database for Pi; pass agents: { models, sql }");
+	},
+});
+
+/** One input signalled to a conversation's Session: a delivery (`kind: "input"`), a stop, or a state request. */
+export type SessionSignal = JsonObject & {
+	session: string;
+	id: string;
+	kind: string;
+	agent?: string;
+};
+
+/** The input signals of the Sessions on `queue`, in the order they were sent (Conductor's tables). */
+export async function sessionSignals(sql: Sql, queue: string): Promise<SessionSignal[]> {
+	const rows = await sql<{ session: string; id: string; payload: JsonObject }[]>`
+		select coalesce(e.payload->'input'->>'session', e.payload->>'session') as session, s.id, s.payload
+		from pgconductor._private_execution_signals s
+		join pgconductor._private_executions e on e.id = s.execution_id and e.queue = s.queue
+		where s.queue = ${queue} and e.task_key = 'fabrial.session' and s.name = 'input'
+		order by s.seq`;
+	return rows.map((row) => ({ ...row.payload, session: row.session, id: row.id }) as SessionSignal);
 }
 
 /** Build an app from an instance with explicit test ports (a runtime, fake or real chat, agents). */
@@ -170,13 +115,17 @@ export function testApp<const P extends readonly AnyPlugin[]>(
 	config: Omit<AppConfig, "agents"> & {
 		runtime: DurableRuntime;
 		chat?: ChatOptions;
-		agents?: AgentIntegration;
+		/** Pi. Defaults to no models and no database: enough for apps that define no agents or state. */
+		agents?: PiOptions;
 		/** `f.app({ agents })`: agents whose triggers receive events. */
 		routedAgents?: AppConfig["agents"];
 	},
 ): HostedApp<ClientsOf<P>> {
-	const { workflows, routedAgents, logger, ...overrides } = config;
-	return internal(instance).app({ workflows, agents: routedAgents, logger }, overrides) as never;
+	const { workflows, routedAgents, logger, agents, ...overrides } = config;
+	return internal(instance).app(
+		{ workflows, agents: routedAgents, logger },
+		{ ...overrides, agents: agents ?? { models: createPiModels(), sql: noDatabase } },
+	) as never;
 }
 
 export function internal(instance: object): InternalInstance {
@@ -269,6 +218,8 @@ export interface TestApp<C> {
 	 * app settled, suspended waits included: for asserting that something did not happen.
 	 */
 	idle: (options?: { timeoutMs?: number }) => Promise<void>;
+	/** Inputs signalled to the app's Pi Sessions so far, in order. */
+	sessionSignals: () => Promise<SessionSignal[]>;
 	/** Stop the app and close its connection. */
 	stop: () => Promise<void>;
 }
@@ -276,17 +227,14 @@ export interface TestApp<C> {
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
 
 /**
- * `fabrial/testing`'s `createTestApp`, with injectable agents and the app's runtime, for driving it below
- * the public API.
+ * `fabrial/testing`'s `createTestApp`, with the app's runtime, for driving it below the public API. Pi
+ * runs on `models` (none by default) over a pool of its own, opened only if the app defines agents or state.
  */
 export function createTestApp<const P extends readonly AnyPlugin[]>(
 	instance: Fabrial<P>,
-	config: TestAppConfig & {
-		/** Defaults to `fakeAgents()`. */
-		agents?: AgentIntegration;
-	},
+	config: TestAppConfig & { models?: MutableModels },
 ): TestApp<ClientsOf<P>> & { readonly runtime: DurableRuntime } {
-	const { database, chat: fake, ...appConfig } = config;
+	const { database, chat: fake, models, ...appConfig } = config;
 	// The test clock is a session setting: it holds for queries on this one connection.
 	const sql = postgres(database, { max: 1, onnotice: () => {} });
 	const queue = `test_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -301,11 +249,17 @@ export function createTestApp<const P extends readonly AnyPlugin[]>(
 		},
 	);
 	const chat = fake ?? new FakeChat();
+	let pi: Sql | undefined;
 	const app = testApp(instance, {
 		...appConfig,
 		runtime,
 		chat,
-		agents: config.agents ?? fakeAgents(),
+		// Off the clock's connection: Pi's leases run on database time.
+		agents: {
+			models: models ?? createPiModels(),
+			sql: (pi = postgres(database, { max: 4, onnotice: () => {} })),
+			settings: { retry: { enabled: false } },
+		},
 	});
 	// Reads any execution by id; runs no tasks.
 	const inspector = Conductor.create({
@@ -369,6 +323,7 @@ export function createTestApp<const P extends readonly AnyPlugin[]>(
 		runtime,
 		clock,
 		result,
+		sessionSignals: () => sessionSignals(sql, queue),
 		async idle(options = {}) {
 			await drained("events to dispatch", "pgconductor.internal", options.timeoutMs);
 			await drained("the app's executions to settle", queue, options.timeoutMs);
@@ -386,6 +341,7 @@ export function createTestApp<const P extends readonly AnyPlugin[]>(
 			try {
 				await app.stop();
 			} finally {
+				await pi?.end();
 				await sql.end();
 			}
 		},
