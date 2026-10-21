@@ -16,6 +16,7 @@ import {
 	type TaskId,
 	type ToolExecutionResult,
 	type ToolRegistration,
+	type ToolTaskInput,
 	type Tx,
 } from "@earendil-works/pi-durable";
 import { SUBAGENT_DEFAULTS, type Agent, type ResolvedSubagent } from "../agent.ts";
@@ -35,8 +36,8 @@ export interface SubagentDeps {
 }
 
 /** Task kinds of background children; installed with Fabrial's internal extension so they resume after a restart. */
-export const ANCHOR_TASK = "fabrial.subagent-anchor";
-export const REPORTER_TASK = "fabrial.subagent-reporter";
+const ANCHOR_TASK = "fabrial.subagent-anchor";
+const REPORTER_TASK = "fabrial.subagent-reporter";
 
 const escape = (text: string) =>
 	text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -83,8 +84,8 @@ async function free(tx: Tx, lead: number, holder: number): Promise<void> {
 
 /**
  * Takes a slot of the lead's `limits.concurrent` for `holder`, or only checks for one without a holder. Slots are
- * durable and held by a task, so they count background children across driver cycles. A slot frees with the
- * commit that settles its child's answer, or when its holder ends without one. Returns the number running when the limit is reached.
+ * durable and held by a task, so they count background children across restarts and Session reopenings. A slot frees
+ * with the commit that settles its child's answer, or when its holder ends without one. Returns the number running when the limit is reached.
  */
 async function admit(
 	tx: Tx,
@@ -238,23 +239,25 @@ async function sourceOf(
 	context: Context,
 ): Promise<Source | string> {
 	if (previous) {
-		const at = (await entries(bridge, previous.conversationId as ConversationId, context))[0];
-		if (!at) return "That child has no history to continue.";
-		return { conversationId: previous.conversationId as ConversationId, at: at.id };
+		const at = await newestEntry(bridge, previous.conversationId as ConversationId, {}, context);
+		if (at === undefined) return "That child has no history to continue.";
+		return { conversationId: previous.conversationId as ConversationId, at };
 	}
 	if (subagent.context !== "fork") return undefined;
-	// The lead's transcript up to the response that made this call.
-	const list = await entries(bridge, api.conversationId, context);
-	const call = list.findIndex((entry) =>
-		entry.model?.some(
-			(message) =>
-				message.role === "assistant" &&
-				message.content.some((block) => block.type === "toolCall" && block.id === api.callId),
-		),
-	);
-	const at = call < 0 ? undefined : list[call + 1];
-	if (!at) return "Could not find this conversation's position to fork from.";
-	return { conversationId: api.conversationId, at: at.id };
+	// The lead's transcript up to the response that made this call: Pi's tool task records that response's entry.
+	const call = await api.commit((tx) => tx.task(api.taskId), context);
+	const assistant = (call?.input as ToolTaskInput | undefined)?.assistant;
+	const at =
+		assistant === undefined
+			? undefined
+			: await newestEntry(
+					bridge,
+					api.conversationId,
+					{ maxEntryId: (assistant - 1) as EntryId },
+					context,
+				);
+	if (at === undefined) return "Could not find this conversation's position to fork from.";
+	return { conversationId: api.conversationId, at };
 }
 
 /** Creates and names a child in the caller's commit. A continued child keeps its name and its own children. */
@@ -631,9 +634,17 @@ export async function abortBackground(
 	}
 }
 
-async function entries(bridge: BridgeFrame, conversationId: ConversationId, context: Context) {
+/** The newest visible entry of a conversation, at or before `maxEntryId` if given. */
+async function newestEntry(
+	bridge: BridgeFrame,
+	conversationId: ConversationId,
+	query: { maxEntryId?: EntryId },
+	context: Context,
+): Promise<EntryId | undefined> {
 	const conversation = await bridge.harness.conversation(conversationId, context);
-	return conversation ? (await conversation.entries({}, 100, undefined, context)).items : [];
+	return conversation
+		? (await conversation.entries(query, 1, undefined, context)).items[0]?.id
+		: undefined;
 }
 
 /** Shows a child's activity on the lead's status ("researcher: Thinking…") until the returned stop is called. */

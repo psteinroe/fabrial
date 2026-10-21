@@ -534,6 +534,55 @@ it("installs plugin observers globally but does not select unrequested plugin to
 	await f.integration.stop();
 });
 
+it("observes each Session's agent on its own: two Sessions at once", async () => {
+	const seen: { agent: string; text: string }[] = [];
+	const f = fixture([
+		{
+			id: "records",
+			hooks: { agent: { onModelResponse: ({ agent, text }) => void seen.push({ agent, text }) } },
+		},
+	]);
+	const model = `${f.faux.provider.id}/${f.faux.getModel().id}`;
+	const [a, b] = [randomUUID(), randomUUID()].map((name) =>
+		defineAgent({ name, description: "Answers test questions.", model }),
+	);
+	// Each answer echoes the question its own Session asked, whichever Session asks first.
+	const echo = (context: { messages: readonly Message[] }) => {
+		const user = context.messages.findLast((message) => message.role === "user")!;
+		return fauxAssistantMessage(
+			`echo ${typeof user.content === "string" ? user.content : JSON.stringify(user.content)}`,
+		);
+	};
+	f.faux.setResponses([echo, echo]);
+	const workflow: RuntimeWorkflow = {
+		name: randomUUID(),
+		triggers: [],
+		handler: async (input, execution) => {
+			const agent = input === "a" ? a! : b!;
+			return f.integration.agents.run(execution, "agent", agent, {
+				input: `from ${String(input as string)}`,
+			});
+		},
+	};
+	runtimeRegister(f, workflow);
+	await f.integration.start();
+	await f.runtime.start();
+	const ids = await Promise.all(
+		["a", "b"].map((input) => f.runtime.invoke(workflow.name, input, { metadata: f.metadata })),
+	);
+	const results = await Promise.all(ids.map((id) => db.execution(id).settled()));
+	expect(results).toEqual([
+		{ status: "completed", output: "echo from a" },
+		{ status: "completed", output: "echo from b" },
+	]);
+	expect(new Set(ids.map((id) => callSession(id, "agent"))).size).toBe(2);
+	expect(seen.toSorted((x, y) => x.text.localeCompare(y.text))).toEqual([
+		{ agent: a!.name, text: "echo from a" },
+		{ agent: b!.name, text: "echo from b" },
+	]);
+	await f.integration.stop();
+});
+
 /** The tool results the model sees on its next request. */
 function toolResults(messages: readonly Message[]): ToolResultMessage[] {
 	return messages.filter((message): message is ToolResultMessage => message.role === "toolResult");

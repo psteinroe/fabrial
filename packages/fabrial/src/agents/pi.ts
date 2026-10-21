@@ -162,7 +162,7 @@ const STATE_EVENT = "fabrial.state.response";
 /** A workflow resends an unanswered state request (same operation) this often before failing. */
 const STATE_REQUESTS = 5;
 
-/** A run of one conversation in the hosted Session: the requests it answers, until Pi has finished them. */
+/** The Pi Session of one `ctx.agent` call, private to it: keyed by the calling execution and the call's id. */
 export const callSession = (executionId: string, id: string) =>
 	`${CALL_SESSION}${executionId}:${id}`;
 const CALL_SESSION = "run:";
@@ -1811,37 +1811,27 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 }
 
 /**
- * Aborts live Pi tasks whose kind is no longer installed (e.g. a removed toolkit), using Pi's abort
- * cascade. Finds them from the latest task records without taking leases, then acquires only the
- * affected Sessions; a Session held by another owner is skipped with a warning.
+ * Aborts live Pi tasks whose kind is no longer installed (e.g. a removed toolkit), using Pi's abort cascade: a startup
+ * policy of the deployment. The commit log only finds candidate Sessions (the latest record of such a task is not
+ * terminal), without taking leases; each is then opened and Pi's own inspection decides what is live. A Session held
+ * by another owner is skipped with a warning.
  */
 export async function abortOrphans(
 	sql: Sql,
 	installedKinds: readonly string[],
 	logger: Logger,
 ): Promise<number> {
-	const rows =
-		await sql`SELECT session_key, writes FROM fabrial_pi.commits ORDER BY session_key, seq`;
-	type Task = Extract<import("@earendil-works/pi-durable").StorageWrite, { type: "task" }>["value"];
-	const tasks = new Map<string, Map<Task["id"], Task>>();
-	for (const row of rows)
-		for (const write of JSON.parse(
-			String(row.writes),
-		) as import("@earendil-works/pi-durable").StorageWrite[]) {
-			if (write.type !== "task") continue;
-			const key = String(row.session_key);
-			const session = tasks.get(key) ?? new Map();
-			session.set(write.value.id, write.value);
-			tasks.set(key, session);
-		}
+	const candidates = await sql<{ session_key: string }[]>`
+		SELECT DISTINCT session_key FROM (
+			SELECT DISTINCT ON (c.session_key, w.value->'value'->>'id') c.session_key, w.value->'value' AS task
+			FROM fabrial_pi.commits c, jsonb_array_elements(c.writes::jsonb) WITH ORDINALITY AS w(value, n)
+			WHERE w.value->>'type' = 'task'
+			ORDER BY c.session_key, w.value->'value'->>'id', c.seq DESC, w.n DESC
+		) latest
+		WHERE task->'state'->>'status' <> 'terminal' AND NOT (task->>'kind' = ANY(${[...installedKinds]}))
+		ORDER BY session_key`;
 	let aborted = 0;
-	for (const [key, session] of tasks) {
-		const orphans = new Map(
-			[...session].filter(
-				([, task]) => task.state.status !== "terminal" && !installedKinds.includes(task.kind),
-			),
-		);
-		if (!orphans.size) continue;
+	for (const { session_key: key } of candidates) {
 		const counts = new Map<string, number>();
 		try {
 			const storage = await PostgresStorage.open(sql, key);
@@ -1852,9 +1842,12 @@ export async function abortOrphans(
 				BACKGROUND_CONTEXT,
 			);
 			try {
-				for (const [id, task] of orphans) {
-					await harness.abortTask(id, BACKGROUND_CONTEXT);
-					await harness.waitForTask(id, BACKGROUND_CONTEXT);
+				const orphans = (await harness.inspect(BACKGROUND_CONTEXT)).tasks
+					.map((task) => task.record)
+					.filter((task) => !installedKinds.includes(task.kind));
+				for (const task of orphans) {
+					await harness.abortTask(task.id, BACKGROUND_CONTEXT);
+					await harness.waitForTask(task.id, BACKGROUND_CONTEXT);
 					counts.set(task.kind, (counts.get(task.kind) ?? 0) + 1);
 					aborted++;
 				}

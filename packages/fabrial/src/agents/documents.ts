@@ -62,7 +62,7 @@ export const SubagentNames = defineDoc({
 	} => ({ leads: {} }),
 });
 /**
- * Subagent work that outlives a driver cycle. `slots` count running children per lead for `limits.concurrent`: one per
+ * Subagent work that outlives a Session's opening. `slots` count running children per lead for `limits.concurrent`: one per
  * holder task (a foreground call or a background reporter), released when the holder ends. `calls` make a rerun of a
  * background call find its reporter; `reported` keeps several inputs that end in one answer from reporting it twice.
  */
@@ -99,7 +99,7 @@ export const WorkflowReceipts = defineDocFamily({
 	initial: (_seed: string): { value: JsonObject | null } => ({ value: null }),
 });
 /** Thread state revisions, by state name: every change advances its state's, so a workflow's update can compare. */
-export const StateRevisions = defineDoc({
+const StateRevisions = defineDoc({
 	kind: "fabrial.state-revisions",
 	scope: "session",
 	version: 1,

@@ -259,6 +259,48 @@ it("a forked self copy sees the lead's transcript and gets no subagent tools at 
 	await f.integration.stop();
 });
 
+it("forks at the delegating response behind a long history", async () => {
+	const f = fixture();
+	const note = defineTool({
+		name: "note",
+		description: "Takes a note",
+		input: z.object({ n: z.number() }),
+		run: ({ n }) => `noted ${n}`,
+	});
+	const lead = defineAgent({
+		name: `lead-${short()}`,
+		description: "Answers support questions.",
+		model: f.model,
+		tools: [note],
+		subagents: [{ agent: "self", context: "fork", background: "never" }],
+	});
+	const tool = toolName(lead.name);
+	const notes = (from: number, count: number) =>
+		Array.from({ length: count }, (_, i) => fauxToolCall("note", { n: from + i }));
+	// Far more than a page of entries before the delegating response, and more after it within the same response.
+	f.respond([
+		fauxAssistantMessage(notes(0, 120), { stopReason: "toolUse" }),
+		fauxAssistantMessage([...notes(120, 5), fauxToolCall(tool, { task: "Count the notes." })], {
+			stopReason: "toolUse",
+		}),
+		fauxAssistantMessage("120"),
+		fauxAssistantMessage("done"),
+	]);
+	const { settled } = await f.call(lead, "Take 120 notes.");
+	expect(await settled()).toMatchObject({ status: "completed", output: "done" });
+	const child = f.contexts[2]!;
+	expect(userTexts(child)).toEqual(["Take 120 notes.", "Count the notes."]);
+	expect(toolResults(child)).toEqual(Array.from({ length: 120 }, (_, n) => `noted ${n}`));
+	// The fork ends before the response that delegated, so it holds no dangling call.
+	const calls = child.messages.flatMap((message) =>
+		message.role === "assistant"
+			? message.content.filter((block) => block.type === "toolCall")
+			: [],
+	);
+	expect(calls).toHaveLength(120);
+	await f.integration.stop();
+});
+
 it("depth 2 passes one level down: a self copy gets the subagent tool, its child does not", async () => {
 	const f = fixture();
 	const lead = defineAgent({
