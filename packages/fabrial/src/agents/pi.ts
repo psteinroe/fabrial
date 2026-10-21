@@ -1892,15 +1892,26 @@ export async function abortOrphans(
 	installedKinds: readonly string[],
 	logger: Logger,
 ): Promise<number> {
-	const candidates = await sql<{ session_key: string }[]>`
-		SELECT DISTINCT session_key FROM (
-			SELECT DISTINCT ON (c.session_key, w.value->'value'->>'id') c.session_key, w.value->'value' AS task
-			FROM fabrial_pi.commits c, jsonb_array_elements(c.writes::jsonb) WITH ORDINALITY AS w(value, n)
-			WHERE w.value->>'type' = 'task'
-			ORDER BY c.session_key, w.value->'value'->>'id', c.seq DESC, w.n DESC
-		) latest
-		WHERE task->'state'->>'status' <> 'terminal' AND NOT (task->>'kind' = ANY(${[...installedKinds]}))
-		ORDER BY session_key`;
+	// Writes are JSON text (JSON.stringify), which may escape lone surrogates or NUL: Postgres JSON rejects the former
+	// and jsonb the latter. Surrogate escapes become U+FFFD and only the task fields read here are unescaped.
+	let candidates: { session_key: string }[];
+	try {
+		candidates = await sql<{ session_key: string }[]>`
+			SELECT DISTINCT session_key FROM (
+				SELECT DISTINCT ON (c.session_key, w.value->'value'->>'id') c.session_key,
+					w.value->'value'->>'kind' AS kind, w.value->'value'->'state'->>'status' AS status
+				FROM fabrial_pi.commits c, json_array_elements(
+					regexp_replace(c.writes, '\\\\u[dD][89a-fA-F][0-9a-fA-F]{2}', '\\\\ufffd', 'g')::json
+				) WITH ORDINALITY AS w(value, n)
+				WHERE c.writes LIKE '%"type":"task"%' AND w.value->>'type' = 'task'
+				ORDER BY c.session_key, w.value->'value'->>'id', c.seq DESC, w.n DESC
+			) latest
+			WHERE status <> 'terminal' AND NOT (kind = ANY(${[...installedKinds]}))
+			ORDER BY session_key`;
+	} catch (error) {
+		logger.warn("Could not look for orphaned agent work", { error });
+		return 0;
+	}
 	let aborted = 0;
 	for (const { session_key: key } of candidates) {
 		const counts = new Map<string, number>();

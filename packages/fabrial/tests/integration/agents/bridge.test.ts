@@ -368,6 +368,53 @@ it("aborts live task kinds that are no longer installed at start and logs them",
 	await again.integration.stop();
 });
 
+it("starts when an unrelated commit holds a lone surrogate", async () => {
+	// Storage persists JSON text: Pi strings may hold lone surrogates and NUL, which Postgres JSON types reject.
+	const unrelated = await PostgresStorage.open(sql(), randomUUID());
+	await unrelated.commit(
+		[
+			{
+				type: "conversation",
+				value: { id: 1 as never, title: "broken \ud800 \u0000 \\ud800 text" } as never,
+			},
+		],
+		BACKGROUND_CONTEXT,
+	);
+	await unrelated.close(BACKGROUND_CONTEXT);
+	const session = randomUUID();
+	const storage = await PostgresStorage.open(sql(), session);
+	const id = await storage.mintId();
+	await storage.commit(
+		[
+			{ type: "conversation", value: { id: 1 as never } },
+			{
+				type: "task",
+				value: {
+					id: id as never,
+					conversationId: 1 as never,
+					kind: "removed.extension",
+					version: 1,
+					input: { text: "\udc00" },
+					background: false,
+					abortRequested: false,
+					state: { status: "pending", checkpoint: { phase: "run" } },
+				},
+			},
+		],
+		BACKGROUND_CONTEXT,
+	);
+	await storage.close(BACKGROUND_CONTEXT);
+	const f = fixture();
+	const warn = vi.spyOn(f.host.logger, "warn");
+	await f.integration.start();
+	expect(warn).toHaveBeenCalledWith("Aborted orphaned agent work", {
+		session,
+		kind: "removed.extension",
+		count: 1,
+	});
+	await f.integration.stop();
+});
+
 it.each([[false], [true]])(
 	"honors agent detached=%s and cancels workflow tools with the agent",
 	async (detached) => {
