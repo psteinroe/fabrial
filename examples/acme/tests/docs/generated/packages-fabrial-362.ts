@@ -3,13 +3,13 @@
 import { f } from "../prelude.ts";
 import { createTestApp } from "fabrial/testing";
 
-const hello = f.defineWorkflow({ name: "hello", run: async () => "hi" });
+const hello = f.defineWorkflow({ name: "hello", run: async () => ({ greeting: "hi" }) });
 const { app, invoke, settled, stop } = createTestApp(f, {
 	database: process.env.DATABASE_URL!,
 	workflows: [hello],
 });
 await app.start();
 const id = await invoke(hello);
-console.log(await settled(id)); // { status: "completed", output: "hi" }
+console.log(await settled(id)); // { status: "completed", output: { greeting: "hi" } }
 await stop();
 export {};

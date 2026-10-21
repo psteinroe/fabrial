@@ -55,7 +55,7 @@ describe("instances", () => {
 	const workflow = f.defineWorkflow({
 		name: "query",
 		async run(_input, ctx) {
-			return ctx.clients.database.query();
+			return { rows: ctx.clients.database.query() };
 		},
 	});
 
@@ -83,7 +83,7 @@ describe("instances", () => {
 						requestedBy: null,
 					},
 				});
-				expect(await db.execution(id).output()).toBe(value);
+				expect(await db.execution(id).output()).toEqual({ rows: value });
 				// This group was never registered in identity.
 				expect(await fixture.app.host.directory.members(group)).toMatchObject([{ id: "alice" }]);
 				expect(fixture.app.host.clients().database.query()).toBe(value);

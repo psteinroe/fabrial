@@ -13,17 +13,12 @@ import {
 import { createApproval } from "./protocol.ts";
 import { duration } from "./internal.ts";
 import type { Json, JsonObject } from "./json.ts";
-import type {
-	DurableExecution,
-	InvocationMetadata,
-	WaitBranch,
-	WaitForAnyResult,
-} from "./runtime.ts";
+import type { DurableExecution, InvocationMetadata } from "./runtime.ts";
 import { parseSchema } from "./schema.ts";
 import { follow, prepareSend } from "./send.ts";
 import { followResource, storedFollowOptions, unfollowResource } from "./follows.ts";
-import type { Awaitable, MessageRef, OutboundMessage, Thread, Surface } from "./thread.ts";
-import type { AnyWorkflow } from "./workflow.ts";
+import type { MessageRef, OutboundMessage, Thread, Surface } from "./thread.ts";
+import { workflowObject, type AnyWorkflow } from "./workflow.ts";
 import type { TaskContext } from "pgconductor-js";
 import { CHILD_SIGNAL } from "./agents/documents.ts";
 import type { AgentRef, AgentRunOptions } from "./runtime.ts";
@@ -34,14 +29,6 @@ import type { EvaluateRequest } from "./evaluate.ts";
 import type { StateDefinition } from "./state.ts";
 import type { ApprovalOptions } from "./approval.ts";
 import type { GroupDefinition, Principal } from "./identity.ts";
-
-/** An awaitable is a native wait branch, or a timer that starts when its race first runs. */
-export interface InternalAwaitable extends Awaitable {
-	branch?: WaitBranch;
-	timerMs?: number;
-	/** Turn the winning branch into the awaitable's value. */
-	accept?: (winner: WaitForAnyResult) => Json;
-}
 
 export interface ContextOptions {
 	host: FabrialHost;
@@ -125,7 +112,7 @@ const INTERNAL_SIGNALS = new Set(["input", CHILD_SIGNAL]);
  * reserved destinations); `fabrial.native` keeps the originals for Fabrial's own helpers.
  */
 export async function createContext(options: ContextOptions) {
-	const { host, execution, raw, metadata, agents, now } = options;
+	const { host, execution, raw, metadata, agents } = options;
 	const native = nativeMethods(raw);
 	const op = userKey;
 	const chat = host.chat();
@@ -158,58 +145,6 @@ export async function createContext(options: ContextOptions) {
 		}
 	};
 
-	/**
-	 * One native wait: branches race, and the earliest timer is its timeout. Timers are fixed when the
-	 * race first runs; losing subscriptions close, losing executions keep running.
-	 */
-	const race = async (
-		id: string,
-		awaitables: Record<string, Awaitable>,
-	): Promise<{ key: string; value: Json }> => {
-		const entries = Object.entries(awaitables) as [string, InternalAwaitable][];
-		if (!entries.length) throw new Error("race needs at least one awaitable");
-		for (const [, awaitable] of entries)
-			if (!awaitable.branch && awaitable.timerMs === undefined)
-				throw new Error("Invalid Fabrial awaitable");
-		const deadlines = (await execution.step(`fabrial:${id}:timers`, () =>
-			Object.fromEntries(
-				entries.flatMap(([key, awaitable]) =>
-					awaitable.timerMs === undefined ? [] : [[key, now() + awaitable.timerMs]],
-				),
-			),
-		)) as Record<string, number>;
-		// Ties go to the timer listed first.
-		const timer = Object.entries(deadlines).reduce<[string, number] | undefined>(
-			(earliest, entry) => (!earliest || entry[1] < earliest[1] ? entry : earliest),
-			undefined,
-		);
-		const branches = Object.fromEntries(
-			entries.flatMap(([key, awaitable]) =>
-				awaitable.branch ? [[`branch:${key}`, awaitable.branch]] : [],
-			),
-		);
-		const remaining = timer && Math.max(0, timer[1] - now());
-		if (!Object.keys(branches).length) {
-			await execution.sleep(`fabrial:${id}:wait`, remaining!);
-			return { key: timer![0], value: null };
-		}
-		const winner = await execution.waitForAny(
-			`fabrial:${id}:wait`,
-			branches,
-			remaining === undefined ? undefined : { timeoutMs: remaining },
-		);
-		if (winner.kind === "timeout") return { key: timer![0], value: null };
-		const key = winner.key.slice("branch:".length);
-		const awaitable = awaitables[key] as InternalAwaitable;
-		const value = awaitable.accept
-			? awaitable.accept(winner)
-			: winner.kind === "event"
-				? winner.event.payload
-				: winner.kind === "execution"
-					? (winner.result as unknown as Json)
-					: (winner.signal as unknown as Json);
-		return { key, value };
-	};
 	const surface = metadata.replyTo as Surface | null;
 	const thread: Thread | undefined =
 		surface && chat
@@ -249,22 +184,17 @@ export async function createContext(options: ContextOptions) {
 		if (!registered) throw new Error(`Unknown or reserved workflow: ${name}`);
 		return { registered, task: { name, queue: raw.queue } };
 	};
-	const input = async (
-		key: string,
-		workflow: AnyWorkflow,
-		value: Json = null,
-	): Promise<JsonObject> => {
+	/** A workflow's input is the JSON object Conductor stores: checked by its schema once, before the start. */
+	const input = async (key: string, workflow: AnyWorkflow, value?: Json): Promise<JsonObject> => {
 		const { registered } = target(workflow);
-		const checked = await native.step(`fabrial:${key}:input`, () =>
-			registered.definition.input
-				? (parseSchema(
-						registered.definition.input,
-						value,
-						`${workflow.name} input`,
-					) as Promise<Json>)
-				: value,
-		);
-		return { input: checked };
+		return (await native.step(`fabrial:${key}:input`, async () =>
+			workflowObject(
+				registered.definition.input
+					? await parseSchema(registered.definition.input, value, `${workflow.name} input`)
+					: (value ?? {}),
+				`${workflow.name} input`,
+			),
+		)) as JsonObject;
 	};
 	// Children inherit this execution's metadata (after a lazy post, `replyTo` is the thread it created),
 	// minus routing-only fields; an explicit override merges onto it.
@@ -284,14 +214,6 @@ export async function createContext(options: ContextOptions) {
 			name: event(typeof definition.event === "string" ? definition.event : definition.event.name),
 		},
 	});
-	const output = <R>(outcome: R): R => {
-		const completed = outcome as { status?: string; result?: { output?: Json } | null };
-		return (
-			completed.status === "completed"
-				? { ...completed, result: completed.result?.output ?? null }
-				: outcome
-		) as R;
-	};
 	const surfaces = () => ({
 		current: metadata.replyTo,
 		channelId: async () => {
@@ -318,7 +240,7 @@ export async function createContext(options: ContextOptions) {
 				{ result: { execution: executionId } },
 				opts as never,
 			);
-			return winner.key === "timeout" ? { status: "timeout" } : output(winner.outcome);
+			return winner.key === "timeout" ? { status: "timeout" } : winner.outcome;
 		},
 		invoke: async (
 			key: string,
@@ -336,23 +258,16 @@ export async function createContext(options: ContextOptions) {
 			value?: Json,
 			opts?: { metadata?: unknown },
 		) =>
-			(
-				(await native.invokeAndWait(
-					op(key),
-					target(workflow).task,
-					await input(key, workflow, value),
-					{
-						...opts,
-						metadata: childMetadata(opts?.metadata),
-					} as never,
-				)) as { output: Json }
-			).output,
+			native.invokeAndWait(op(key), target(workflow).task, await input(key, workflow, value), {
+				...opts,
+				metadata: childMetadata(opts?.metadata),
+			} as never),
 		schedule: async (workflow: AnyWorkflow, name: string, opts: { cron: string }, value?: Json) =>
 			native.schedule(
 				target(workflow).task,
 				name,
 				opts as never,
-				{ input: value ?? null } as never,
+				workflowObject(value ?? {}, `${name} input`) as never,
 			),
 		unschedule: (workflow: AnyWorkflow, name: string) =>
 			native.unschedule(target(workflow).task, name),
@@ -375,7 +290,7 @@ export async function createContext(options: ContextOptions) {
 				...opts,
 				task: target(opts.task).task.name,
 				queue: raw.queue,
-				input: { input: opts.input ?? null },
+				input: workflowObject(opts.input ?? {}, `${opts.key} input`),
 				metadata: childMetadata(opts.metadata),
 			} as never),
 		emit: (name: string, payload: JsonObject, opts?: { dedupe_key?: string; metadata?: unknown }) =>
@@ -424,15 +339,12 @@ export async function createContext(options: ContextOptions) {
 			update: (id: string, fn: never) => agents.state.update(execution, op(id), state, fn),
 		}),
 		requestApproval: async (id: string, opts: ApprovalOptions) =>
-			createApproval(op(id), opts, { ...options, race, op }),
+			createApproval(op(id), opts, { ...options, native, op }),
 		waitForApproval: async (id: string, opts: ApprovalOptions) => {
 			const key = op(id);
-			const approval = await createApproval(key, opts, { ...options, race, op });
-			return (await race(`${key}:decision`, { decision: approval.decision() })).value;
+			const approval = await createApproval(key, opts, { ...options, native, op });
+			return approval.wait(`${key}:decision`);
 		},
-		race: async (id: string, awaitables: Record<string, Awaitable>) => race(op(id), awaitables),
-		timer: (value: string | number) =>
-			({ kind: "fabrial.awaitable", timerMs: duration(value) }) as InternalAwaitable,
 		isMember: (principal: Principal, group: GroupDefinition) =>
 			host.directory.isMember(principal, group),
 		fabrial: { native, metadata },

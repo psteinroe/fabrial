@@ -1,5 +1,5 @@
 import type { ExternalIdentity } from "./identity.ts";
-import type { Json, JsonObject } from "./json.ts";
+import type { JsonObject } from "./json.ts";
 
 /** Serializable reference to a chat thread. `threadId` is Chat SDK's full id (`adapter:channel:thread`). */
 export interface ThreadRef {
@@ -71,11 +71,4 @@ export interface Thread {
 
 	/** Messages for model context (bounded, attributed). Durable: loaded once per id. */
 	history(id: string, options?: { limit?: number }): Promise<ChatMessage[]>;
-}
-
-/** Something `ctx.race` can wait on. Produced by Fabrial helpers; opaque to apps. */
-export interface Awaitable<T extends Json = Json> {
-	readonly kind: "fabrial.awaitable";
-	/** @internal */
-	readonly __type?: T;
 }

@@ -483,7 +483,7 @@ it("a child's workflow tool acts for the lead's request; the Session is released
 		name: `approve-${short()}`,
 		description: "Run SQL after approval",
 		input: z.object({ sql: z.string() }),
-		run: async () => "unused",
+		run: async () => ({}),
 	});
 	const researcher = researcherOf(f, [approve]);
 	const lead = defineAgent({
@@ -796,7 +796,7 @@ it("a background child's report survives the Session being released and the driv
 		name: `approve-${short()}`,
 		description: "Run SQL after approval",
 		input: z.object({ sql: z.string() }),
-		run: async () => "unused",
+		run: async () => ({}),
 	});
 	let crashes = 0;
 	const flaky = defineTool({
@@ -969,7 +969,7 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 				details: input.sql,
 				approvers: alice,
 			});
-			return approval.status === "approved" ? "ran" : "declined";
+			return { result: approval.status === "approved" ? "ran" : "declined" };
 		},
 	});
 	const researcher = g.defineAgent({
@@ -986,14 +986,16 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 	});
 	const entry = g.defineWorkflow({
 		name: `entry-${short()}`,
-		run: (_input, ctx) => ctx.agent("lead", lead, { input: "Fix the row" }),
+		run: async (_input, ctx) => ({
+			answer: await ctx.agent("lead", lead, { input: "Fix the row" }),
+		}),
 	});
 	faux.setResponses(
 		Array.from({ length: 10 }, () => (context: TranscriptContext) => {
 			const text = lastText(context);
 			if (text === "Fix it") return use(toolName(runSql.name), { sql: "update x" });
 			if (text.includes("Fix the row")) return use(toolName(researcher.name), { task: "Fix it" });
-			if (text === '"ran"') return say("Fixed after approval.");
+			if (text === '{"result":"ran"}') return say("Fixed after approval.");
 			if (text.startsWith("<subagent")) return say(`Lead: ${text}`);
 			return say(`unexpected: ${text}`);
 		}),
@@ -1018,7 +1020,9 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 		await (await approvalCard(chat, alice.identities[0]!)).approve();
 		expect(await db.execution(id).settled()).toMatchObject({
 			status: "completed",
-			output: `Lead: <subagent name="${toolName(researcher.name)}-1" status="done">Fixed after approval.</subagent>`,
+			output: {
+				answer: `Lead: <subagent name="${toolName(researcher.name)}-1" status="done">Fixed after approval.</subagent>`,
+			},
 		});
 		// One card, decided in place.
 		expect((await chat.openDM(alice.identities[0]!)).posts).toHaveLength(1);
@@ -1037,7 +1041,7 @@ it.each([
 				name: `wait-${who}-${short()}`,
 				description: `Waits for ${who}`,
 				input: z.object({}),
-				run: async () => "unused",
+				run: async () => ({}),
 			});
 			(f.host.workflows as unknown as (typeof workflow)[]).push(workflow);
 			const runtime: RuntimeWorkflow = {
@@ -1135,7 +1139,7 @@ it("a stop after the lead answered cancels a background child's approval workflo
 				details: input.sql,
 				approvers: alice,
 			});
-			return approval.status === "approved" ? "ran" : "declined";
+			return { result: approval.status === "approved" ? "ran" : "declined" };
 		},
 	});
 	const researcher = g.defineAgent({
@@ -1168,7 +1172,7 @@ it("a stop after the lead answered cancels a background child's approval workflo
 		Array.from({ length: 20 }, () => (context: TranscriptContext) => {
 			const text = lastText(context);
 			if (text === "Fix it") return use(toolName(runSql.name), { sql: "update x" });
-			if (text === '"ran"') return say("Fixed after approval.");
+			if (text === '{"result":"ran"}') return say("Fixed after approval.");
 			if (text.includes("Fix the row")) return use(tool, { task: "Fix it", background: true });
 			if (text.startsWith("Started")) return say("On it.");
 			if (text.includes("Status?")) return say("Still waiting for approval.");
@@ -1245,7 +1249,7 @@ it("a background child waiting for approval suspends the Session: a new message 
 				details: input.sql,
 				approvers: alice,
 			});
-			return approval.status === "approved" ? "ran" : "declined";
+			return { result: approval.status === "approved" ? "ran" : "declined" };
 		},
 	});
 	const researcher = g.defineAgent({
@@ -1278,7 +1282,7 @@ it("a background child waiting for approval suspends the Session: a new message 
 		Array.from({ length: 20 }, () => (context: TranscriptContext) => {
 			const text = lastText(context);
 			if (text === "Fix it") return use(toolName(runSql.name), { sql: "update x" });
-			if (text === '"ran"') return say("Fixed after approval.");
+			if (text === '{"result":"ran"}') return say("Fixed after approval.");
 			if (text.includes("Fix the row")) return use(tool, { task: "Fix it", background: true });
 			if (text.startsWith("Started")) return say("On it.");
 			if (text.includes("Status?")) return say("Still waiting for approval.");
@@ -1518,7 +1522,7 @@ it("channel-session agents share session state across threads with their workflo
 				draft.count++;
 			});
 			seen.push(count);
-			return `count=${count}`;
+			return { result: `count=${count}` };
 		},
 	});
 	// A workflow the agent calls as a tool uses the calling conversation's (channel) Session, not its thread's.
@@ -1531,7 +1535,7 @@ it("channel-session agents share session state across threads with their workflo
 				draft.count++;
 			});
 			seen.push(count);
-			return `count=${count}`;
+			return { result: `count=${count}` };
 		},
 	});
 	// An independent workflow on the thread uses the thread's Session.
@@ -1547,20 +1551,21 @@ it("channel-session agents share session state across threads with their workflo
 	});
 	const deliver = g.defineWorkflow({
 		name: `deliver-${short()}`,
-		input: z.string(),
-		run: async (input, ctx) => {
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => {
 			await ctx.send("ask", desk, { session: "channel", input });
 		},
 	});
 	const call = g.defineWorkflow({
 		name: `call-${short()}`,
-		input: z.string(),
-		run: (input, ctx) => ctx.agent("call", desk, { input }),
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => ({ answer: await ctx.agent("call", desk, { input }) }),
 	});
 	faux.setResponses(
 		Array.from({ length: 20 }, () => (context: TranscriptContext) => {
 			const text = lastText(context);
-			if (text.replaceAll('"', "").startsWith("count=")) return say(`Done ${text}.`);
+			if (text.includes("count="))
+				return say(`Done ${(JSON.parse(text) as { result: string }).result}.`);
 			if (text.includes("Flow")) return use(toolName(flow.name), {});
 			if (text.includes("Bump")) return use("bump", {});
 			return say("ok");
@@ -1584,21 +1589,21 @@ it("channel-session agents share session state across threads with their workflo
 		ownerWorkflow: null,
 		triggerEvent: null,
 	});
-	await runtime.invoke(deliver.name, "Bump", { metadata: metadata("a") });
+	await runtime.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("a") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1]);
-	await runtime.invoke(deliver.name, "Bump", { metadata: metadata("b") });
+	await runtime.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("b") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2]);
-	const id = await runtime.invoke(call.name, "Bump", { metadata: metadata("a") });
+	const id = await runtime.invoke(call.name, { text: "Bump" }, { metadata: metadata("a") });
 	expect(await db.execution(id).settled()).toEqual({
 		status: "completed",
-		output: "Done count=1.",
+		output: { answer: "Done count=1." },
 	});
 	expect(seen).toEqual([1, 2, 1]);
-	await runtime.invoke(deliver.name, "Bump", { metadata: metadata("a") });
+	await runtime.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("a") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2, 1, 3]);
-	await runtime.invoke(deliver.name, "Flow", { metadata: metadata("b") });
+	await runtime.invoke(deliver.name, { text: "Flow" }, { metadata: metadata("b") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2, 1, 3, 4]);
-	await runtime.invoke(deliver.name, "Bump", { metadata: metadata("a") });
+	await runtime.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("a") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2, 1, 3, 4, 5]);
 	const own = await runtime.invoke(read.name, null, { metadata: metadata("a") });
 	expect(await db.execution(own).settled()).toEqual({

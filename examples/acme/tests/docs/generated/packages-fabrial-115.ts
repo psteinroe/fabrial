@@ -9,7 +9,7 @@ const triage = f.defineWorkflow({
 			input: text,
 			output: z.object({ urgent: z.boolean(), summary: z.string() }),
 		});
-		return verdict.urgent ? `Urgent: ${verdict.summary}` : verdict.summary;
+		return { summary: verdict.urgent ? `Urgent: ${verdict.summary}` : verdict.summary };
 	},
 });
 export {};

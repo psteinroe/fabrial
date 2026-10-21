@@ -71,7 +71,6 @@ export type {
 } from "./send.ts";
 export type { StateDefinition, StateScope, ToolStateHandle, WorkflowStateHandle } from "./state.ts";
 export type {
-	Awaitable,
 	Card,
 	CardAction,
 	ChatMessage,
@@ -85,7 +84,6 @@ export type { TriggerPayload, TriggerSpec } from "./trigger.ts";
 export type { ChatEventName, ChatEventPayload } from "./chat/events.ts";
 export type {
 	AnyWorkflow,
-	RaceResult,
 	Workflow,
 	WorkflowContext,
 	WorkflowArgs,

@@ -213,10 +213,15 @@ async function execution(id: string) {
 		from pgconductor._private_executions where id = ${id}::uuid`;
 	return row;
 }
-async function output(id: string): Promise<Json> {
-	const [row] = await sql<{ result: { output: Json } | null }[]>`
+/** A completed execution's output object. */
+async function result(id: string): Promise<Record<string, Json> | null> {
+	const [row] = await sql<{ result: Record<string, Json> | null }[]>`
 		select result from pgconductor._private_executions where id = ${id}::uuid`;
-	return row?.result?.output ?? null;
+	return row?.result ?? null;
+}
+/** A caller's answer: `ask` workflows return `{ answer }`. */
+async function output(id: string): Promise<Json> {
+	return (await result(id))?.answer ?? null;
 }
 /** Request ids Pi accepted in a Session, in order, read from its commit log without taking the lease. */
 async function submitted(key: string): Promise<string[]> {
@@ -280,8 +285,8 @@ it("a message ingested on another instance steers the run its host is busy with;
 	const replyTo = thread();
 	const deliver = f.defineWorkflow({
 		name: `deliver-${short()}`,
-		input: z.string(),
-		run: async (input, ctx) => {
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => {
 			// Plain workflow input is a notification; urgent ones steer a busy run like a chat message.
 			await ctx.send("send", lead, {
 				session,
@@ -300,7 +305,7 @@ it("a message ingested on another instance steers the run its host is busy with;
 		return say("done");
 	};
 	const a = await launch("a", [deliver]);
-	await a.runtime.invoke(deliver.name, "first question", { metadata: metadataOf() });
+	await a.runtime.invoke(deliver.name, { text: "first question" }, { metadata: metadataOf() });
 	await busy.entered;
 	// B starts while A hosts the Session, so A's worker holds its execution.
 	const b = await launch("b", [deliver]);
@@ -314,7 +319,7 @@ it("a message ingested on another instance steers the run its host is busy with;
 			() => {},
 		);
 	}, 25);
-	await b.runtime.invoke(deliver.name, "second question", { metadata: metadataOf() });
+	await b.runtime.invoke(deliver.name, { text: "second question" }, { metadata: metadataOf() });
 	await expect.poll(async () => (await submitted(await only())).length, poll).toBe(2);
 	expect(await sessionExecutions()).toEqual([hosting]);
 	expect(requests).toHaveLength(1);
@@ -345,8 +350,8 @@ it("a message is answered while only a background child works; the child's repor
 	const replyTo = thread();
 	const deliver = f.defineWorkflow({
 		name: `deliver-${short()}`,
-		input: z.string(),
-		run: async (input, ctx) => {
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => {
 			await ctx.send("send", lead, { session, input, ...(replyTo ? { home: replyTo } : {}) });
 		},
 	});
@@ -368,10 +373,10 @@ it("a message is answered while only a background child works; the child's repor
 		(await a.chat.thread(replyTo)).posts.flatMap((post) =>
 			typeof post.content === "string" ? [post.content] : [],
 		);
-	await a.runtime.invoke(deliver.name, "Fix the row", { metadata: metadataOf() });
+	await a.runtime.invoke(deliver.name, { text: "Fix the row" }, { metadata: metadataOf() });
 	await child.entered;
 	await expect.poll(posts, poll).toEqual(["On it."]);
-	await a.runtime.invoke(deliver.name, "Status?", { metadata: metadataOf() });
+	await a.runtime.invoke(deliver.name, { text: "Status?" }, { metadata: metadataOf() });
 	// Answered while the child's model call is still held.
 	await expect.poll(posts, poll).toEqual(["On it.", "Still working."]);
 	expect(requests.filter((request) => lastText(request.context).startsWith("<subagent"))).toEqual(
@@ -387,8 +392,8 @@ for (const from of ["the same", "another"] as const)
 		const lead = f.defineAgent({ name: `lead-${short()}`, description: "Answers.", model });
 		const ask = f.defineWorkflow({
 			name: `ask-${short()}`,
-			input: z.string(),
-			run: (input, ctx) => ctx.agent("answer", lead, { input }),
+			input: z.object({ text: z.string() }),
+			run: async ({ text: input }, ctx) => ({ answer: await ctx.agent("answer", lead, { input }) }),
 		});
 		const held = gate();
 		script = async ({ signal }) => {
@@ -397,7 +402,7 @@ for (const from of ["the same", "another"] as const)
 		};
 		const a = await launch("a", [ask]);
 		const metadata = metadataOf();
-		const caller = await a.runtime.invoke(ask.name, "Take your time", { metadata });
+		const caller = await a.runtime.invoke(ask.name, { text: "Take your time" }, { metadata });
 		await held.entered;
 		const canceller = from === "another" ? (await launch("b", [ask])).runtime : a.runtime;
 		await canceller.cancel(caller, "user cancelled");
@@ -411,7 +416,7 @@ for (const from of ["the same", "another"] as const)
 		expect(requests.map((request) => request.instance)).toEqual(["a"]);
 		// A later call of the same interaction runs in its own Session and answers.
 		script = () => say("fresh");
-		const next = await a.runtime.invoke(ask.name, "Again", { metadata });
+		const next = await a.runtime.invoke(ask.name, { text: "Again" }, { metadata });
 		await expect.poll(() => execution(next), poll).toMatchObject({ done: true, cancelled: false });
 		expect(await output(next)).toBe("fresh");
 	});
@@ -437,12 +442,12 @@ it("a crashed owner's lease delays the Session until it expires; Conductor retri
 	});
 	const ask = f.defineWorkflow({
 		name: `ask-${short()}`,
-		input: z.string(),
-		run: (input, ctx) => ctx.agent("answer", lead, { input }),
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => ({ answer: await ctx.agent("answer", lead, { input }) }),
 	});
 	script = ({ context }) => (lastText(context) === "waited" ? say("all done") : use("wait", {}));
 	const a = await launch("a", [ask]);
-	const caller = await a.runtime.invoke(ask.name, "Go", { metadata: metadataOf() });
+	const caller = await a.runtime.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
 	await slow.entered;
 	await a.stop();
 	// A crashed owner: it holds the lease and never renews or releases it.
@@ -455,7 +460,7 @@ it("a crashed owner's lease delays the Session until it expires; Conductor retri
 	// The opening failed while the lease was held, and Conductor's retry took the expired lease.
 	const [session] = await sql<{ attempts: number; last_error: string | null }[]>`
 		select attempts, last_error from pgconductor._private_executions
-		where task_key = ${SESSION} and payload -> 'input' ->> 'session' = ${key}`;
+		where task_key = ${SESSION} and payload ->> 'session' = ${key}`;
 	expect(session!.last_error).toContain("already has an owner");
 	await expect(crashed.commit([], BACKGROUND_CONTEXT)).rejects.toThrow();
 	expect(await lease(key)).toBeNull();
@@ -490,8 +495,8 @@ it("a run resumes on a fresh instance after its host stops mid-run; each model r
 	});
 	const ask = f.defineWorkflow({
 		name: `ask-${short()}`,
-		input: z.string(),
-		run: (input, ctx) => ctx.agent("answer", lead, { input }),
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => ({ answer: await ctx.agent("answer", lead, { input }) }),
 	});
 	script = ({ context }) => {
 		const text = lastText(context);
@@ -502,7 +507,7 @@ it("a run resumes on a fresh instance after its host stops mid-run; each model r
 	};
 	const a = await launch("a", [ask]);
 	const metadata = metadataOf();
-	const caller = await a.runtime.invoke(ask.name, "Go", { metadata });
+	const caller = await a.runtime.invoke(ask.name, { text: "Go" }, { metadata });
 	await slow.entered;
 	await a.stop();
 	expect(await lease(metadata.requestId)).toBeNull();
@@ -591,8 +596,8 @@ it("a host that loses its Session lease during a model call closes its harness a
 	const replyTo = thread();
 	const deliver = f.defineWorkflow({
 		name: `deliver-${short()}`,
-		input: z.string(),
-		run: async (input, ctx) => {
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => {
 			await ctx.send("send", lead, { session, input, ...(replyTo ? { home: replyTo } : {}) });
 		},
 	});
@@ -604,7 +609,7 @@ it("a host that loses its Session lease during a model call closes its harness a
 		return use("lookup", {});
 	};
 	const a = await launch("a", [deliver]);
-	await a.runtime.invoke(deliver.name, "Go", { metadata: metadataOf() });
+	await a.runtime.invoke(deliver.name, { text: "Go" }, { metadata: metadataOf() });
 	await held.entered;
 	const owner = await lease(await only());
 	expect(owner).not.toBeNull();
@@ -645,7 +650,7 @@ const approvalTool = () => {
 				details: input.sql,
 				approvers: alice,
 			});
-			return approval.status === "approved" ? "ran" : "declined";
+			return { result: approval.status === "approved" ? "ran" : "declined" };
 		},
 	});
 	const lead = f.defineAgent({
@@ -656,13 +661,13 @@ const approvalTool = () => {
 	});
 	const ask = f.defineWorkflow({
 		name: `ask-${short()}`,
-		input: z.string(),
-		run: (input, ctx) => ctx.agent("answer", lead, { input }),
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => ({ answer: await ctx.agent("answer", lead, { input }) }),
 	});
 	script = ({ context }) => {
 		const text = lastText(context);
 		if (text === "Fix the row") return use(toolName(runSql.name), { sql: "update x" });
-		if (text === '"ran"') return say("Ran it.");
+		if (text === '{"result":"ran"}') return say("Ran it.");
 		return say(`unexpected: ${text}`);
 	};
 	return { runSql, ask };
@@ -689,7 +694,7 @@ it("a workflow tool waiting on approval suspends the Session execution; after a 
 	const a = await launch("a", [runSql, ask]);
 	const card = await approvals(a);
 	const metadata = metadataOf();
-	const caller = await a.runtime.invoke(ask.name, "Fix the row", { metadata });
+	const caller = await a.runtime.invoke(ask.name, { text: "Fix the row" }, { metadata });
 	await expect.poll(() => !!card.action, poll).toBe(true);
 	// Waiting on the approval, the Session's execution is suspended (not ended) and the lease is free.
 	const key = await only();
@@ -709,7 +714,10 @@ it("a workflow tool waiting on approval suspends the Session execution; after a 
 	await b.chat.click(card.ref!, card.action!, alice.identities[0]!);
 	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
 	expect(await output(caller)).toBe("Ran it.");
-	expect(requests.map((request) => lastText(request.context))).toEqual(["Fix the row", '"ran"']);
+	expect(requests.map((request) => lastText(request.context))).toEqual([
+		"Fix the row",
+		'{"result":"ran"}',
+	]);
 	await released(key);
 });
 
@@ -717,7 +725,11 @@ it("cancelling a run suspended on a workflow tool cancels the tool's execution",
 	const { runSql, ask } = approvalTool();
 	const a = await launch("a", [runSql, ask]);
 	const card = await approvals(a);
-	const caller = await a.runtime.invoke(ask.name, "Fix the row", { metadata: metadataOf() });
+	const caller = await a.runtime.invoke(
+		ask.name,
+		{ text: "Fix the row" },
+		{ metadata: metadataOf() },
+	);
 	await expect.poll(() => !!card.action, poll).toBe(true);
 	const key = await only();
 	await suspended(key);
@@ -744,13 +756,19 @@ it("a ctx.agent call that times out on a workflow tool fails its caller and canc
 	});
 	const ask = f.defineWorkflow({
 		name: `ask-${short()}`,
-		input: z.string(),
+		input: z.object({ text: z.string() }),
 		retries: { maxAttempts: 1 },
-		run: (input, ctx) => ctx.agent("answer", lead, { input, timeout: "3s" }),
+		run: async ({ text: input }, ctx) => ({
+			answer: await ctx.agent("answer", lead, { input, timeout: "3s" }),
+		}),
 	});
 	const a = await launch("a", [runSql, ask]);
 	const card = await approvals(a);
-	const caller = await a.runtime.invoke(ask.name, "Fix the row", { metadata: metadataOf() });
+	const caller = await a.runtime.invoke(
+		ask.name,
+		{ text: "Fix the row" },
+		{ metadata: metadataOf() },
+	);
 	await expect.poll(() => !!card.action, poll).toBe(true);
 	const key = await only();
 	const [tool] = await sql<{ id: string }[]>`
@@ -783,8 +801,8 @@ function busyAndWaiting(hold: (request: Request) => Promise<void>) {
 	});
 	const ask = f.defineWorkflow({
 		name: `ask-${short()}`,
-		input: z.string(),
-		run: (input, ctx) => ctx.agent("answer", lead, { input }),
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => ({ answer: await ctx.agent("answer", lead, { input }) }),
 	});
 	script = async (request) => {
 		const text = lastText(request.context);
@@ -794,7 +812,7 @@ function busyAndWaiting(hold: (request: Request) => Promise<void>) {
 				? say("On it.")
 				: use(toolName(thinker.name), { task: "Think", background: true });
 		if (text === "Fix it") return use(toolName(runSql.name), { sql: "update x" });
-		if (text === '"ran"') return say("Fixed.");
+		if (text === '{"result":"ran"}') return say("Fixed.");
 		if (text.includes('"cancelled"')) return say("Not fixed.");
 		if (text === "Think") {
 			await hold(request);
@@ -817,7 +835,7 @@ it("a workflow tool's result reaches a Session busy with another subagent's mode
 	const { runSql, ask, reported } = busyAndWaiting((request) => busy.pass(request.signal));
 	const a = await launch("a", [runSql, ask]);
 	const card = await approvals(a);
-	const caller = await a.runtime.invoke(ask.name, "Go", { metadata: metadataOf() });
+	const caller = await a.runtime.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
 	await expect.poll(() => !!card.action, poll).toBe(true);
 	await busy.entered;
 	await a.chat.click(card.ref!, card.action!, alice.identities[0]!);
@@ -827,7 +845,9 @@ it("a workflow tool's result reaches a Session busy with another subagent's mode
 	busy.open();
 	await expect.poll(() => reported("Thought."), poll).toBe(true);
 	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
-	expect(requests.filter((request) => lastText(request.context) === '"ran"')).toHaveLength(1);
+	expect(
+		requests.filter((request) => lastText(request.context) === '{"result":"ran"}'),
+	).toHaveLength(1);
 	await released(await only());
 });
 
@@ -836,7 +856,7 @@ it("a workflow tool whose execution is cancelled while the Session is busy gets 
 	const { runSql, ask, reported } = busyAndWaiting((request) => busy.pass(request.signal));
 	const a = await launch("a", [runSql, ask]);
 	const card = await approvals(a);
-	const caller = await a.runtime.invoke(ask.name, "Go", { metadata: metadataOf() });
+	const caller = await a.runtime.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
 	await expect.poll(() => !!card.action, poll).toBe(true);
 	await busy.entered;
 	const [tool] = await sql<{ id: string }[]>`
@@ -859,7 +879,7 @@ it("a workflow tool's outcome reaches the Session only once committed: an attemp
 		description: "Runs.",
 		input: z.object({}),
 		retries: { maxAttempts: 2 },
-		run: async () => `attempt ${++attempts}`,
+		run: async () => ({ result: `attempt ${++attempts}` }),
 	});
 	afterAttempt = (workflow) => {
 		if (workflow === flaky.name && attempts === 1) throw new Error("Interrupted after return");
@@ -872,20 +892,23 @@ it("a workflow tool's outcome reaches the Session only once committed: an attemp
 	});
 	const ask = f.defineWorkflow({
 		name: `ask-${short()}`,
-		input: z.string(),
-		run: (input, ctx) => ctx.agent("answer", lead, { input }),
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => ({ answer: await ctx.agent("answer", lead, { input }) }),
 	});
 	script = (request) => {
 		const text = lastText(request.context);
 		return text === "Go" ? use(toolName(flaky.name), {}) : say(`Got ${text}`);
 	};
 	const a = await launch("a", [flaky, ask]);
-	const caller = await a.runtime.invoke(ask.name, "Go", { metadata: metadataOf() });
+	const caller = await a.runtime.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
 	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
 	// The first attempt's return value never reached the Session: only the committed one did.
 	expect(attempts).toBe(2);
-	expect(requests.map((request) => lastText(request.context))).toEqual(["Go", '"attempt 2"']);
-	expect(await output(caller)).toBe('Got "attempt 2"');
+	expect(requests.map((request) => lastText(request.context))).toEqual([
+		"Go",
+		'{"result":"attempt 2"}',
+	]);
+	expect(await output(caller)).toBe('Got {"result":"attempt 2"}');
 	await released(await only());
 });
 
@@ -897,7 +920,7 @@ it("a workflow tool's result sent while its Session restarts on another instance
 	);
 	const a = await launch("a", [runSql, ask]);
 	const card = await approvals(a);
-	const caller = await a.runtime.invoke(ask.name, "Go", { metadata: metadataOf() });
+	const caller = await a.runtime.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
 	await expect.poll(() => !!card.action, poll).toBe(true);
 	await onA.entered;
 	await a.stop();
@@ -910,7 +933,9 @@ it("a workflow tool's result sent while its Session restarts on another instance
 	onB.open();
 	await expect.poll(() => reported("Thought."), poll).toBe(true);
 	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
-	expect(requests.filter((request) => lastText(request.context) === '"ran"')).toHaveLength(1);
+	expect(
+		requests.filter((request) => lastText(request.context) === '{"result":"ran"}'),
+	).toHaveLength(1);
 	expect(requests.filter((request) => lastText(request.context).includes("Fixed."))).toHaveLength(
 		1,
 	);
@@ -944,20 +969,20 @@ it("workflows on another instance read and update a Session's state during a gen
 	});
 	const deliver = f.defineWorkflow({
 		name: `deliver-${short()}`,
-		input: z.string(),
-		run: async (input, ctx) => {
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => {
 			await ctx.send("send", lead, { session: "thread", input });
 		},
 	});
 	const increment = f.defineWorkflow({
 		name: `increment-${short()}`,
-		input: z.number(),
-		run: async (times, ctx) => {
+		input: z.object({ times: z.number() }),
+		run: async ({ times }, ctx) => {
 			for (let n = 0; n < times; n++)
 				await ctx.state(Counter).update(`increment:${n}`, (draft) => {
 					draft.count++;
 				});
-			return (await ctx.state(Counter).get("read")).count;
+			return { count: (await ctx.state(Counter).get("read")).count };
 		},
 	});
 	const busy = gate();
@@ -981,11 +1006,11 @@ it("workflows on another instance read and update a Session's state during a gen
 		replyTo: thread() as InvocationMetadata["replyTo"],
 	};
 	const run = async (times: number) => {
-		const id = await b.runtime.invoke(increment.name, times, { metadata });
+		const id = await b.runtime.invoke(increment.name, { times }, { metadata });
 		await expect.poll(() => execution(id), poll).toMatchObject({ done: true });
-		return output(id);
+		return (await result(id))?.count;
 	};
-	await a.runtime.invoke(deliver.name, "Go", { metadata });
+	await a.runtime.invoke(deliver.name, { text: "Go" }, { metadata });
 	await busy.entered;
 	const session = await only();
 	// During the generation: the host answers between Pi's passes; two workflows race on the revision.

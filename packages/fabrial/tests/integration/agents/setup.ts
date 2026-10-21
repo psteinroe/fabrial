@@ -124,7 +124,7 @@ export function useAgents() {
 	async function routed(queue: string, messageId: string) {
 		return until(`ingress of message ${messageId} to be routed`, async () => {
 			const [row] = await sql()<{ route: string | null }[]>`
-				select result->'output'->>'route' as route from pgconductor._private_executions
+				select result->>'route' as route from pgconductor._private_executions
 				where queue = ${queue} and task_key = 'fabrial.route'
 					and payload->'payload'->'origin'->>'messageId' = ${messageId}
 					and completed_at is not null

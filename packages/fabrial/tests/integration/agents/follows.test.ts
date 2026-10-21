@@ -93,13 +93,12 @@ const deploy = f.defineWorkflow({
 	description: "Deploys the fix once approved.",
 	input: z.object({}),
 	async run(_input, ctx) {
-		return (
-			await ctx.waitForApproval("approval", {
-				title: "Deploy the fix?",
-				details: {},
-				approvers: approver,
-			})
-		).status;
+		const { status } = await ctx.waitForApproval("approval", {
+			title: "Deploy the fix?",
+			details: {},
+			approvers: approver,
+		});
+		return { status };
 	},
 });
 const reviewer = f.defineAgent({

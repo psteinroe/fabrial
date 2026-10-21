@@ -89,7 +89,7 @@ it("rebinds a lazy channel from the durable first-post receipt on replay and chi
 	const runtime = db.runtime();
 	const child = defineWorkflow({
 		name: "child",
-		input: z.null(),
+		input: z.object({}),
 		run: async (_input, ctx) => {
 			expect(metadataOf(ctx).replyTo).toEqual({
 				kind: "thread",
@@ -116,7 +116,7 @@ it("rebinds a lazy channel from the durable first-post receipt on replay and chi
 					// A real second: the handler replays after the sleep.
 					await ctx.sleep("pause", 1000);
 					await ctx.thread!.post("reply", "continued");
-					await ctx.invoke("child", child, null);
+					await ctx.invoke("child", child, {});
 				},
 			}),
 		],

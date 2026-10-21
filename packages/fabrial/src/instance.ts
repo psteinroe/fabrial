@@ -13,7 +13,7 @@ import type { App, CoreConfig, HostedApp, Logger } from "./app.ts";
 import type { ModelCredentials } from "./agents/models.ts";
 import { buildApp } from "./core.ts";
 import { defineGroup, type GroupDefinition, type UserDefinition } from "./identity.ts";
-import type { Json, JsonObject } from "./json.ts";
+import type { JsonObject } from "./json.ts";
 import type { AnyPlugin, PluginClients, ToolkitPlugin } from "./plugin.ts";
 import { production, type ProductionOverrides } from "./production.ts";
 import { defineState, registerState, type StateDefinition, type StateScope } from "./state.ts";
@@ -65,8 +65,8 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 	readonly plugins: Readonly<P>;
 	defineWorkflow<
 		const TName extends string,
-		TInput extends Json = never,
-		TOutput extends Json | void = void,
+		TInput extends JsonObject = never,
+		TOutput extends JsonObject | null | void = void,
 		const TTriggers extends readonly TriggerSpec<any>[] = [],
 	>(
 		this: void,

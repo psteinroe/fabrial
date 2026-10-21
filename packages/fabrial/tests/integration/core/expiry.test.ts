@@ -110,8 +110,7 @@ describe("expiry and timers", () => {
 					approvers: team,
 					timeout: "1h",
 				});
-				return (await ctx.race("r", { approval: approval.decision(), timer: ctx.timer(timeout) }))
-					.key;
+				return (await ctx.waitForAny("r", { approval: approval.branch }, { timeout })).key;
 			}),
 		]);
 		const execution = await enter(test);
@@ -123,7 +122,7 @@ describe("expiry and timers", () => {
 		await execution.suspended();
 		expect((await execution.info())?.status).not.toMatch(/completed|failed|cancelled/);
 		await db.clock.advance(timeout - early);
-		expect(await execution.output()).toBe("timer");
+		expect(await execution.output()).toBe("timeout");
 	});
 
 	it("fires timers at absolute at even when registration is delayed", async () => {
@@ -164,7 +163,7 @@ describe("expiry and timers", () => {
 			input: z.object({}),
 			run: async (_i, ctx) => {
 				await ctx.thread!.post("child", "child");
-				return ctx.thread!.ref.threadId;
+				return { threadId: ctx.thread!.ref.threadId };
 			},
 		});
 		const owner = defineWorkflow({
@@ -181,7 +180,7 @@ describe("expiry and timers", () => {
 				await ctx.sleep("sleep", 10);
 				await ctx.thread!.update("update", first, "updated");
 				await ctx.thread!.post("second", "second");
-				return ctx.invoke("child", child, {});
+				return { child: await ctx.invoke("child", child, {}) };
 			},
 		});
 		const test = setup([owner, child]);

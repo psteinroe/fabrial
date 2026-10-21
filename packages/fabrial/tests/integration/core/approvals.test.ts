@@ -589,10 +589,7 @@ describe("native approval waits", () => {
 					approvers: team,
 					timeout: 60_000,
 				});
-				const first = await ctx.race("r", {
-					approval: approval.decision(),
-					timer: ctx.timer(10_000),
-				});
+				const first = await ctx.waitForAny("r", { approval: approval.branch }, { timeout: 10_000 });
 				return [first.key, (await approval.wait("again")).status];
 			}),
 		]);
@@ -600,9 +597,9 @@ describe("native approval waits", () => {
 		await card(test);
 		await owner.suspended();
 		await db.clock.advance(10_000);
-		await owner.suspended("fabrial:again:wait");
+		await owner.suspended("again");
 		await db.clock.advance(50_000);
-		expect(await owner.output()).toEqual(["timer", "expired"]);
+		expect(await owner.output()).toEqual(["timeout", "expired"]);
 		const [row] = await db.sql<{ count: number }[]>`
 			select count(*)::int as count from pgconductor._private_custom_event_subscriptions
 			where execution_id = ${owner.id}::uuid`;
@@ -630,7 +627,7 @@ describe("native approval waits", () => {
 		const owner = await enter(test);
 		await decision.reached;
 		// The cancel is sent and the caller waits, before the decision execution first runs.
-		await owner.suspended("fabrial:decision:wait");
+		await owner.suspended("decision");
 		decision.release();
 		expect(await owner.output()).toEqual(["cancelled", "Withdrawn"]);
 		const dm = await test.chat.openDM(alice.identities[0]!);

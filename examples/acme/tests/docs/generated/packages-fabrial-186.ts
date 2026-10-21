@@ -12,15 +12,15 @@ const deploy = f.defineWorkflow({
 			destination: slack.channel("C_RELEASES"),
 			card: { fields: [{ label: "Risk", value: "low" }] },
 		});
-		const first = await ctx.race("wait", {
-			decision: approval.decision(),
-			timeout: ctx.timer("1h"),
-		});
+		const first = await ctx.waitForAny("wait", { decision: approval.branch }, { timeout: "1h" });
 		if (first.key === "timeout") {
 			await approval.cancel("cancel", "No answer within an hour");
-			return "timed out";
+			return { status: "timed out" };
 		}
-		return first.value.approved ? "deploying" : `declined: ${first.value.comment ?? "no reason"}`;
+		const decision = await approval.wait("decision");
+		return decision.approved
+			? { status: "deploying" }
+			: { status: `declined: ${decision.comment ?? "no reason"}` };
 	},
 });
 export {};

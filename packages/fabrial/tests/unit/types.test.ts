@@ -67,20 +67,23 @@ it("workflows accept session state and reject agent state", () => {
 
 it("inputless workflows are invoked and started without an argument", () => {
 	const f = createFabrial({ plugins: [] });
-	const hello = f.defineWorkflow({ name: "hello", run: async (): Promise<string> => "hi" });
+	const hello = f.defineWorkflow({
+		name: "hello",
+		run: async (): Promise<{ greeting: string }> => ({ greeting: "hi" }),
+	});
 	const greet = f.defineWorkflow({
 		name: "greet",
 		input: z.object({ name: z.string() }),
-		run: async ({ name }) => name,
+		run: async ({ name }) => ({ name }),
 	});
 	const check = async (ctx: WorkflowContext, tool: ToolContext) => {
-		expectTypeOf(ctx.invokeAndWait("hello", hello)).resolves.toEqualTypeOf<string>();
+		expectTypeOf(ctx.invokeAndWait("hello", hello)).resolves.toEqualTypeOf<{ greeting: string }>();
 		expectTypeOf(
 			ctx.invoke("hello", hello, null, { cancelWithParent: true }),
 		).resolves.toEqualTypeOf<string>();
 		// @ts-expect-error a workflow without input takes none
 		await ctx.invokeAndWait("hello", hello, { name: "x" });
-		expectTypeOf(tool.invoke("hello", hello)).resolves.toEqualTypeOf<string>();
+		expectTypeOf(tool.invoke("hello", hello)).resolves.toEqualTypeOf<{ greeting: string }>();
 		expectTypeOf(tool.start("hello", hello)).resolves.toEqualTypeOf<string>();
 		// @ts-expect-error a workflow without input takes none
 		await ctx.invoke("hello", hello, { name: "x" });

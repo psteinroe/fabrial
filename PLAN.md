@@ -141,21 +141,20 @@ export const repairCustomer = f.defineWorkflow({
 
 Workflow context:
 
-| API                                             | Behavior                                                                                                       |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `ctx.thread`                                    | The trigger event's thread, rebuilt from persisted references. For posting; conversations belong to agents.    |
-| `ctx.clients.*`                                 | Native provider clients from plugins, recreated on resume and never serialized.                                |
-| `ctx.thread.post(id, message)`                  | Durable post into the bound thread. Other thread operations follow the same `(id, …)` shape.                   |
-| `ctx.agent(id, agent, opts)`                    | Calls an agent and returns its answer; nothing is posted.                                                      |
-| `ctx.send(id, agent, { input, home? })`         | Hands an event to an agent's conversation and returns (see [Conversations](#conversations)).                   |
-| `ctx.follow(id, ref)` / `ctx.unfollow(id, ref)` | A conversation starts or stops following a thread or resource.                                                 |
-| `ctx.state(S).get(id)` / `.update(id, fn)`      | Shared state (`defineState`), durable.                                                                         |
-| `ctx.evaluate(id, { model, state, questions })` | Structured judgment (Jev), durably recorded.                                                                   |
-| `ctx.waitForApproval(id, opts)`                 | Complete approval protocol over Conductor `waitForEvent`. Sugar for `requestApproval` + awaiting the decision. |
-| `ctx.requestApproval(id, opts)`                 | Posts the approval request and returns a handle: `decision()`, `cancel(reason)`.                               |
-| `ctx.race(id, { a, b, … })`                     | Durably waits for the first of several awaitables (decision, timer) and returns which one won.                 |
-| `ctx.invoke(id, workflow, input)`               | Calls another workflow as a child and returns its result.                                                      |
-| `ctx.step(name, fn)`                            | Durable, memoized step for arbitrary code.                                                                     |
+| API                                             | Behavior                                                                                                        |
+| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `ctx.thread`                                    | The trigger event's thread, rebuilt from persisted references. For posting; conversations belong to agents.     |
+| `ctx.clients.*`                                 | Native provider clients from plugins, recreated on resume and never serialized.                                 |
+| `ctx.thread.post(id, message)`                  | Durable post into the bound thread. Other thread operations follow the same `(id, …)` shape.                    |
+| `ctx.agent(id, agent, opts)`                    | Calls an agent and returns its answer; nothing is posted.                                                       |
+| `ctx.send(id, agent, { input, home? })`         | Hands an event to an agent's conversation and returns (see [Conversations](#conversations)).                    |
+| `ctx.follow(id, ref)` / `ctx.unfollow(id, ref)` | A conversation starts or stops following a thread or resource.                                                  |
+| `ctx.state(S).get(id)` / `.update(id, fn)`      | Shared state (`defineState`), durable.                                                                          |
+| `ctx.evaluate(id, { model, state, questions })` | Structured judgment (Jev), durably recorded.                                                                    |
+| `ctx.waitForApproval(id, opts)`                 | Complete approval protocol over Conductor `waitForEvent`. Sugar for `requestApproval` + awaiting the decision.  |
+| `ctx.requestApproval(id, opts)`                 | Posts the approval request and returns a handle: `branch` (for `ctx.waitForAny`), `wait(id)`, `cancel(reason)`. |
+| `ctx.invoke(id, workflow, input)`               | Calls another workflow as a child and returns its result.                                                       |
+| `ctx.step(name, fn)`                            | Durable, memoized step for arbitrary code.                                                                      |
 
 ### Automatic durability
 
@@ -324,7 +323,7 @@ Application code only sees the returned decision. Internal events, correlation I
 5. Emits the internal event that satisfies `waitForEvent`.
 6. Updates the card and returns the decision.
 
-`decision.status` is `"approved" | "rejected" | "expired" | "cancelled"`, with `decision.approved` as shorthand. `waitForApproval` is sugar for `ctx.requestApproval(id, opts)`, which returns a handle with `decision()` and `cancel(reason)`, followed by awaiting the decision.
+`decision.status` is `"approved" | "rejected" | "expired" | "cancelled"`, with `decision.approved` as shorthand. `waitForApproval` is sugar for `ctx.requestApproval(id, opts)`, which returns a handle with `branch` (a `ctx.waitForAny` branch), `wait(id)` and `cancel(reason)`, followed by awaiting the decision.
 
 Rules:
 

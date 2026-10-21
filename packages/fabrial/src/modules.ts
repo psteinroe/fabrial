@@ -64,7 +64,6 @@ export {
 } from "./chat/events.ts";
 export type {
 	WorkflowContext,
-	RaceResult,
 	ExecutionInfo,
 	WorkflowMiddleware,
 	WorkflowDefinition,

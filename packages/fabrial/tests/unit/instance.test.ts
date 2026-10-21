@@ -25,7 +25,7 @@ const workflow = f.defineWorkflow({
 		expectTypeOf(ctx.clients.database.query()).toEqualTypeOf<string>();
 		// @ts-expect-error A misspelled client must not compile.
 		void ctx.clients.databse;
-		return ctx.clients.database.query();
+		return { rows: ctx.clients.database.query() };
 	},
 });
 

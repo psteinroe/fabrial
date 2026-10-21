@@ -1,5 +1,5 @@
-import type { ApprovalDecision, ApprovalHandle, ApprovalOptions } from "./approval.ts";
-import type { ContextOptions, InternalAwaitable } from "./context.ts";
+import type { ApprovalHandle, ApprovalOptions } from "./approval.ts";
+import type { ContextOptions, nativeMethods } from "./context.ts";
 import {
 	APPROVAL_CANCEL_SIGNAL,
 	APPROVAL_DECISION_WORKFLOW,
@@ -15,11 +15,11 @@ import type { Json } from "./json.ts";
 import type { Origin } from "./events.ts";
 import { RESERVED_LABELS } from "./approval-card.ts";
 import type { FabrialHost } from "./app.ts";
-import type { Awaitable, Surface } from "./thread.ts";
+import type { Surface } from "./thread.ts";
 
 interface ApprovalContext extends ContextOptions {
 	op(id: string): string;
-	race(id: string, awaitables: Record<string, Awaitable>): Promise<{ key: string; value: Json }>;
+	native: ReturnType<typeof nativeMethods>;
 }
 
 function canonical(value: Json): string {
@@ -185,34 +185,29 @@ export async function createApproval(
 		{ metadata: { ...metadata, ...internal } },
 	);
 
-	const awaitable: InternalAwaitable = {
-		kind: "fabrial.awaitable",
-		// Losing a race leaves the decision running: the approval can be awaited again.
-		branch: { execution: decisionId },
-		accept: (winner) => {
-			if (winner.kind !== "execution") throw new Error("Invalid approval decision");
-			const result = winner.result;
-			if (result.status === "completed") {
-				const output = result.output as unknown as DecisionResult;
+	// A wait that loses `waitForAny` leaves the decision running: the approval can be awaited again.
+	const branch = { execution: decisionId };
+	return {
+		approvalId,
+		approvers,
+		branch,
+		wait: async (waitId) => {
+			const winner = await ctx.native.waitForAny(ctx.op(waitId), { decision: branch });
+			if (!("outcome" in winner)) throw new Error("Invalid approval decision");
+			const outcome = winner.outcome;
+			if (outcome.status === "completed") {
+				const output = outcome.result as unknown as DecisionResult;
 				if ("error" in output) throw new Error(`Approval failed: ${output.error}`);
-				return output.decision as unknown as Json;
+				return output.decision;
 			}
-			if (result.status === "failed") throw new Error(`Approval failed: ${result.error}`);
+			if (outcome.status === "failed") throw new Error(`Approval failed: ${outcome.error}`);
 			return {
 				status: "cancelled",
 				approved: false,
 				decidedBy: null,
 				decidedAt: new Date(now()).toISOString(),
-			} satisfies ApprovalDecision as unknown as Json;
+			};
 		},
-	};
-	return {
-		approvalId,
-		approvers,
-		decision: () => awaitable as Awaitable<ApprovalDecision & Record<string, Json>>,
-		wait: async (waitId) =>
-			(await ctx.race(ctx.op(waitId), { decision: awaitable }))
-				.value as unknown as ApprovalDecision,
 		// Decides the approval unless a decision came first. A signal, not an event: it is kept for the
 		// decision execution even when that has not subscribed yet.
 		cancel: async (cancelId, reason) => {

@@ -5,7 +5,7 @@ import {
 	defineEvent,
 	definePlugin,
 	trigger,
-	type Json,
+	type JsonObject,
 	type WorkflowContext,
 } from "../../internals.ts";
 import { reply, scriptedModels } from "../../../src/testing.ts";
@@ -64,7 +64,7 @@ describe("routing and lifecycle", () => {
 		const b = defineWorkflow({
 			name: "explicit",
 			triggers: [trigger({ event, specificity: 10 })],
-			run: async () => "explicit",
+			run: async () => ({ value: "explicit" }),
 		});
 		const test = setup([a, b]);
 		await test.app.start();
@@ -86,7 +86,7 @@ describe("routing and lifecycle", () => {
 		const pinged = defineWorkflow({
 			name: "pinged",
 			triggers: [trigger<{ value: string }>({ event: "source.ping" })],
-			run: async (input) => input.value,
+			run: async (input) => ({ value: input.value }),
 		});
 		const test = setup([pinged], { plugins: [routes] });
 		test.chat.routes["GET /chat"] = async () => new Response("chat");
@@ -152,7 +152,7 @@ describe("durability and context", () => {
 		expect(posts).toHaveLength(1);
 		expect(posts[0]!.updates).toEqual(["updated"]);
 	});
-	const outputs = (output: z.ZodType<Json>, result: Json) =>
+	const outputs = (output: z.ZodType<JsonObject>, result: JsonObject) =>
 		defineWorkflow({
 			name: "owner",
 			triggers: [trigger({ event })],
@@ -161,24 +161,55 @@ describe("durability and context", () => {
 			run: async () => result,
 		});
 	it("fails a workflow whose result doesn't match its output schema", async () => {
-		const test = setup([outputs(z.number().positive(), -1)]);
+		const test = setup([outputs(z.object({ n: z.number().positive() }), { n: -1 })]);
 		expect(await (await enter(test)).settled()).toMatchObject({
 			status: "failed",
 			error: expect.stringContaining("Invalid workflow owner output"),
 		});
 	});
 	it("records a workflow's result as transformed by its output schema", async () => {
-		const length = z.string().transform((text) => text.length) as unknown as z.ZodType<Json>;
-		const test = setup([outputs(length, "four")]);
-		expect(await (await enter(test)).settled()).toEqual({ status: "completed", output: 4 });
-	});
-	it("invokes an inputless workflow without an argument; it runs with input null", async () => {
-		const child = defineWorkflow({ name: "child", run: async (input) => ({ input }) });
-		const test = setup([workflow(async (_i, ctx) => ctx.invokeAndWait("child", child)), child]);
+		const length = z
+			.object({ text: z.string() })
+			.transform(({ text }) => ({ length: text.length })) as unknown as z.ZodType<JsonObject>;
+		const test = setup([outputs(length, { text: "four" })]);
 		expect(await (await enter(test)).settled()).toEqual({
 			status: "completed",
-			output: { input: null },
+			output: { length: 4 },
 		});
+	});
+	it("fails a workflow whose result is not a JSON object", async () => {
+		const owner = defineWorkflow({
+			name: "owner",
+			triggers: [trigger({ event })],
+			retries: once,
+			run: async () => "text" as never,
+		});
+		const test = setup([owner]);
+		expect(await (await enter(test)).settled()).toMatchObject({
+			status: "failed",
+			error: expect.stringContaining("expected a JSON object"),
+		});
+	});
+	it("rejects input and output schemas that are not object schemas at definition", () => {
+		const run = async () => {};
+		expect(() => defineWorkflow({ name: "x", input: z.string() as never, run })).toThrow(
+			"Workflow x: input must be an object schema (z.object), not string",
+		);
+		expect(() => defineWorkflow({ name: "x", output: z.array(z.string()) as never, run })).toThrow(
+			"Workflow x: output must be an object schema (z.object), not array",
+		);
+		expect(() =>
+			defineWorkflow({ name: "x", input: z.string().pipe(z.any()) as never, run }),
+		).toThrow("Workflow x: input must be an object schema (z.object), not string");
+		// Transforms, unions with an object and untyped schemas are checked on each value instead.
+		const object = z.object({ text: z.string() });
+		for (const schema of [object.transform((v) => v), z.union([object, z.string()]), z.any()])
+			expect(() => defineWorkflow({ name: "x", input: schema as never, run })).not.toThrow();
+	});
+	it("invokes an inputless workflow without an argument; it runs with input {}", async () => {
+		const child = defineWorkflow({ name: "child", run: async (input) => ({ input }) });
+		const test = setup([workflow(async (_i, ctx) => ctx.invokeAndWait("child", child)), child]);
+		expect(await (await enter(test)).output()).toEqual({ input: {} });
 	});
 	it("rejects empty operation ids", async () => {
 		const test = setup([workflow(async (_i, ctx) => ctx.step("", () => 1))]);
@@ -356,7 +387,7 @@ describe("durability and context", () => {
 			run: async (_i, ctx) => {
 				await ctx.step("effect", () => ++effects);
 				if (++attempts === 1) throw new Error("retry");
-				return effects;
+				return { value: effects };
 			},
 		});
 		const test = setup([owner]);
@@ -400,7 +431,7 @@ describe("children", () => {
 			input: z.object({ value: z.number() }),
 			run: async (input, ctx) => {
 				if (ctx.actor?.id !== "alice") throw new Error(`Unexpected actor ${ctx.actor?.id}`);
-				return input.value * 2;
+				return { value: input.value * 2 };
 			},
 		});
 		const test = setup([
@@ -411,9 +442,12 @@ describe("children", () => {
 			}),
 			child,
 		]);
-		const output = (await (await enter(test)).output()) as { result: number; executionId: string };
-		expect(output.result).toBe(6);
-		expect(await db.execution(output.executionId).output()).toBe(8);
+		const output = (await (await enter(test)).output()) as {
+			result: { value: number };
+			executionId: string;
+		};
+		expect(output.result).toEqual({ value: 6 });
+		expect(await db.execution(output.executionId).output()).toEqual({ value: 8 });
 		expect(test.ids("child")).toHaveLength(2);
 	});
 	it.each(["invokeAndWait", "invoke"] as const)(
@@ -441,12 +475,12 @@ describe("children", () => {
 		const registered = defineWorkflow({
 			name: "registered",
 			input: z.object({ count: z.number() }),
-			run: async () => "secret",
+			run: async () => ({ value: "secret" }),
 		});
 		const impostor = defineWorkflow({
 			name: "registered",
 			input: z.object({}),
-			run: async () => "fake",
+			run: async () => ({ value: "fake" }),
 		});
 		const test = setup([
 			workflow(async (_i, ctx) => ctx.invokeAndWait("call", impostor, {})),
@@ -462,10 +496,10 @@ describe("children", () => {
 		const other = defineWorkflow({
 			name: "other",
 			input: z.object({}),
-			run: async () => "secret",
+			run: async () => ({ value: "secret" }),
 		});
 		const test = setup([workflow(async (_i, ctx) => ctx.invokeAndWait("other", other, {})), other]);
-		expect(await (await enter(test)).output()).toBe("secret");
+		expect(await (await enter(test)).output()).toEqual({ value: "secret" });
 		expect(test.ids("other")).toHaveLength(1);
 	});
 	it.each([false, true])("structured cancellation, detached=%s", async (detached) => {
@@ -475,7 +509,7 @@ describe("children", () => {
 			input: z.object({}),
 			run: async (_i, ctx) => {
 				await ctx.sleep("sleep", "1h");
-				return "done";
+				return { value: "done" };
 			},
 		});
 		const test = setup([
@@ -628,7 +662,7 @@ describe("multi-category chat ingress", () => {
 		const owner = defineWorkflow({
 			name: "owner",
 			triggers: [trigger({ event, filter: { toString: [{ exists: false }] } })],
-			run: async () => "matched",
+			run: async () => ({ value: "matched" }),
 		});
 		const test = setup([owner]);
 		await test.app.start();
@@ -790,7 +824,7 @@ describe("provider route response context", () => {
 				const child = defineWorkflow({
 					name: "child",
 					input: z.object({}),
-					run: async (_i, ctx) => (await ctx.state(counter).get("get")).count,
+					run: async (_i, ctx) => ({ count: (await ctx.state(counter).get("get")).count }),
 				});
 				const owner = defineWorkflow({
 					name: "owner",
@@ -813,7 +847,7 @@ describe("provider route response context", () => {
 		);
 		await test.app.start();
 		await test.app.emit(event, {});
-		expect(await (await test.execution()).output()).toBe(1);
+		expect(await (await test.execution()).output()).toEqual({ count: 1 });
 	});
 });
 

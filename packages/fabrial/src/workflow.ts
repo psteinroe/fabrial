@@ -11,7 +11,7 @@ import type { ResourceRef } from "./plugin.ts";
 import type { FollowOptions, FollowReceipt, UnfollowReceipt } from "./follows.ts";
 import type { JsonObject as StateValue } from "./json.ts";
 import type { StateDefinition, WorkflowStateHandle } from "./state.ts";
-import type { Awaitable, Thread } from "./thread.ts";
+import type { Thread } from "./thread.ts";
 import type { TriggerPayload, TriggerSpec } from "./trigger.ts";
 
 /** Conductor's context methods Fabrial wraps (typed for Fabrial workflows below) or keeps to itself. */
@@ -34,7 +34,7 @@ export type ChildMetadata =
 	| Partial<InvocationMetadata>
 	| ((metadata: InvocationMetadata) => Partial<InvocationMetadata>);
 
-export type ResultOutcome<T = Json> =
+export type ResultOutcome<T = JsonObject | null> =
 	| { status: "completed"; result: T }
 	| { status: "failed"; error: string }
 	| { status: "cancelled"; reason: string }
@@ -85,7 +85,7 @@ export interface WorkflowContext<TClients = Record<string, unknown>> extends Omi
 		workflow: W,
 		...args: WorkflowArgs<W, [options?: { timeout?: string | number; metadata?: ChildMetadata }]>
 	): Promise<WorkflowOutput<W>>;
-	/** Wait until an execution settles; its outcome, with the workflow's output as `result`. */
+	/** Wait until an execution settles; its outcome, with the workflow's output object as `result`. */
 	waitForResult(
 		key: string,
 		executionId: string,
@@ -151,10 +151,6 @@ export interface WorkflowContext<TClients = Record<string, unknown>> extends Omi
 	waitForApproval(id: string, options: ApprovalOptions): Promise<ApprovalDecision>;
 	requestApproval(id: string, options: ApprovalOptions): Promise<ApprovalHandle>;
 
-	/** Durably wait for the first awaitable to settle. */
-	race<R extends Record<string, Awaitable>>(id: string, awaitables: R): Promise<RaceResult<R>>;
-	/** Timer awaitable for `race`. */
-	timer(duration: string | number): Awaitable<null>;
 	/** True when `principal` is a member of `group` (resolved now). */
 	isMember(principal: Principal, group: GroupDefinition): Promise<boolean>;
 	/** For Fabrial's own helpers: Conductor's unwrapped methods and this execution's metadata. */
@@ -163,10 +159,6 @@ export interface WorkflowContext<TClients = Record<string, unknown>> extends Omi
 		readonly metadata: InvocationMetadata;
 	};
 }
-
-export type RaceResult<R extends Record<string, Awaitable>> = {
-	[K in keyof R]: { key: K; value: R[K] extends Awaitable<infer T> ? T : never };
-}[keyof R];
 
 /** Information about the current run, passed to middleware. */
 export interface ExecutionInfo {
@@ -191,15 +183,18 @@ export type WorkflowMiddleware = (
 
 export interface WorkflowDefinition<
 	TName extends string,
-	TInput extends Json,
-	TOutput extends Json | void,
+	TInput extends JsonObject,
+	TOutput extends JsonObject | null | void,
 	TTriggers extends readonly TriggerSpec<any>[],
 	TClients = Record<string, unknown>,
 > {
 	name: TName;
 	/** Shown to agents that list this workflow in `tools`. */
 	description?: string;
-	/** Input schema for `invoke`, `invokeAndWait`, and agent tool calls. */
+	/**
+	 * Input schema for `invoke`, `invokeAndWait`, and agent tool calls. Input and output are JSON objects,
+	 * stored by Conductor as they are: both schemas must be object schemas (`z.object`).
+	 */
 	input?: Schema<TInput>;
 	output?: Schema<TOutput>;
 	triggers?: TTriggers;
@@ -215,8 +210,8 @@ export interface WorkflowDefinition<
 
 export interface Workflow<
 	TName extends string = string,
-	TInput extends Json = Json,
-	TOutput extends Json | void = Json | void,
+	TInput extends JsonObject = JsonObject,
+	TOutput extends JsonObject | null | void = JsonObject | void,
 > {
 	readonly kind: "fabrial.workflow";
 	readonly name: TName;
@@ -226,22 +221,83 @@ export interface Workflow<
 export type AnyWorkflow = Workflow<string, any, any>;
 export type WorkflowInput<W> = W extends Workflow<string, infer I, any> ? I : never;
 export type WorkflowOutput<W> = W extends Workflow<string, any, infer O> ? O : never;
-/** The arguments of `invoke` and `invokeAndWait`: a workflow without `input` takes none, and runs with input `null`. */
+/** The arguments of `invoke` and `invokeAndWait`: a workflow without `input` takes none, and runs with `{}`. */
 export type WorkflowArgs<W, Rest extends unknown[] = []> = [WorkflowInput<W>] extends [never]
 	? [input?: null, ...Rest]
 	: [input: WorkflowInput<W>, ...Rest];
 
 export function defineWorkflow<
 	const TName extends string,
-	TInput extends Json = never,
-	TOutput extends Json | void = void,
+	TInput extends JsonObject = never,
+	TOutput extends JsonObject | null | void = void,
 	const TTriggers extends readonly TriggerSpec<any>[] = [],
 >(
 	definition: WorkflowDefinition<TName, TInput, TOutput, TTriggers>,
 ): Workflow<TName, TInput, TOutput> {
+	for (const field of ["input", "output"] as const) {
+		const type = nonObjectType(definition[field] as ZodLike | undefined);
+		if (type !== undefined)
+			throw new Error(
+				`Workflow ${definition.name}: ${field} must be an object schema (z.object), not ${type}`,
+			);
+	}
 	return {
 		kind: "fabrial.workflow",
 		name: definition.name,
 		definition: definition as unknown as Workflow<TName, TInput, TOutput>["definition"],
 	};
+}
+
+type ZodLike = {
+	_zod?: {
+		def?: { type?: string; in?: ZodLike; out?: ZodLike; innerType?: ZodLike; options?: ZodLike[] };
+	};
+};
+/** Zod schema types whose values are never JSON objects. */
+const NON_OBJECT_TYPES = new Set([
+	"string",
+	"number",
+	"bigint",
+	"boolean",
+	"symbol",
+	"null",
+	"undefined",
+	"void",
+	"never",
+	"nan",
+	"literal",
+	"enum",
+	"template_literal",
+	"array",
+	"tuple",
+	"set",
+	"map",
+	"date",
+	"file",
+	"function",
+	"promise",
+]);
+/**
+ * The type of a zod schema whose values are definitely not objects, looking through pipes (both
+ * sides), wrappers and unions. Anything else (objects, records, `any`, transforms, other Standard
+ * Schemas) passes: each value is checked when a run starts and ends.
+ */
+function nonObjectType(schema: ZodLike | undefined): string | undefined {
+	const def = schema?._zod?.def;
+	if (!def?.type) return undefined;
+	if (NON_OBJECT_TYPES.has(def.type)) return def.type;
+	if (def.type === "pipe") return nonObjectType(def.in) ?? nonObjectType(def.out);
+	if (def.innerType) return nonObjectType(def.innerType);
+	if (def.options?.length) {
+		const types = def.options.map(nonObjectType);
+		return types.every((type) => type !== undefined) ? types.join(" | ") : undefined;
+	}
+	return undefined;
+}
+
+/** Workflow input and output are JSON objects (Conductor's payload and result): anything else is rejected. */
+export function workflowObject(value: unknown, label: string): JsonObject {
+	if (value === null || typeof value !== "object" || Array.isArray(value))
+		throw new Error(`Invalid ${label}: expected a JSON object`);
+	return value as JsonObject;
 }

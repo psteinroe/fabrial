@@ -113,7 +113,9 @@ async function setup(
 	const ask = f.defineWorkflow({
 		name: `ask-${channel}`,
 		input: z.object({ question: z.string() }),
-		run: (input, ctx) => ctx.agent("ask", agent, { input: input.question }),
+		run: async (input, ctx) => ({
+			answer: await ctx.agent("ask", agent, { input: input.question }),
+		}),
 	});
 	// Another process on the same database: its driver waits for the Session lease.
 	/** Another instance: by default another deployment (its own queue and chat); `peer` shares both. */
@@ -1141,7 +1143,7 @@ it("ctx.agent returns the answer and posts nothing, without offering no_reply", 
 	);
 	expect(await db.execution(id).settled()).toMatchObject({
 		status: "completed",
-		output: "42",
+		output: { answer: "42" },
 	});
 	// no_reply is not offered: the call failed as an unknown tool and the run went on.
 	expect(t.faux.state.callCount).toBe(2);

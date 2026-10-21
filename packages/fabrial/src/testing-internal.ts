@@ -101,7 +101,7 @@ export type SessionSignal = JsonObject & {
 /** The input signals of the Sessions on `queue`, in the order they were sent (Conductor's tables). */
 export async function sessionSignals(sql: Sql, queue: string): Promise<SessionSignal[]> {
 	const rows = await sql<{ session: string; id: string; payload: JsonObject }[]>`
-		select coalesce(e.payload->'input'->>'session', e.payload->>'session') as session, s.id, s.payload
+		select e.payload->>'session' as session, s.id, s.payload
 		from pgconductor._private_execution_signals s
 		join pgconductor._private_executions e on e.id = s.execution_id and e.queue = s.queue
 		where s.queue = ${queue} and e.task_key = 'fabrial.session' and s.name = 'input'
@@ -275,7 +275,7 @@ export function createTestApp<const P extends readonly AnyPlugin[]>(
 		if (info.status === "completed")
 			return {
 				status: "completed",
-				output: (info.result as { output: Json } | null)?.output ?? null,
+				output: (info.result as Json | undefined) ?? null,
 			};
 		if (info.status === "failed")
 			return { status: "failed", error: info.error ?? "Execution failed" };

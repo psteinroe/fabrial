@@ -153,8 +153,9 @@ test("step and sleep replay from the top, preserving metadata", async () => {
 			return output;
 		}),
 	]);
-	const id = await runtime.invoke("replay", [1, "two"], { metadata });
+	const id = await runtime.invoke("replay", { values: [1, "two"] }, { metadata });
 	await expect.poll(() => completed(id), poll).toBe(true);
+	expect(await output(id)).toEqual({ values: [1, "two"] });
 	expect(attempts).toBe(2);
 	expect(effects).toBe(1);
 	expect(seen).toEqual([metadata, metadata]);
@@ -305,7 +306,8 @@ test("invoke/start/emit inherit metadata; overrides affect only the child; start
 	const [row] = await sql<
 		{ payload: Record<string, unknown> }[]
 	>`select payload from pgconductor._private_executions where task_key = 'resumed'`;
-	expect(row?.payload).toEqual({ input: {} });
+	// The native payload is the input itself: no envelope.
+	expect(row?.payload).toEqual({});
 });
 
 for (const winner of ["first", "second", "child", "timer"] as const) {
@@ -444,9 +446,9 @@ test("cancel via execution, distinguish failed/cancelled child results, timeout,
 	const cancelled = await runtime.invoke("cancel-call", {}, { metadata });
 	await expect.poll(() => completed(cancelled), poll).toBe(true);
 	const [receipt] = await sql<
-		{ result: { output: { result: { status: string; reason: string } } } }[]
+		{ result: { result: { status: string; reason: string } } }[]
 	>`select result from pgconductor._private_executions where id = ${cancelled}::uuid`;
-	expect(receipt?.result.output.result).toEqual({ status: "cancelled", reason: "deliberate" });
+	expect(receipt?.result.result).toEqual({ status: "cancelled", reason: "deliberate" });
 	const failed = await runtime.invoke("failure-call", {}, { metadata });
 	await expect.poll(() => completed(failed), poll).toBe(true);
 	expect(caught).toBeInstanceOf(ExecutionError);
@@ -806,12 +808,12 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 	});
 	const child = defineWorkflow({
 		name: "core-child",
-		input: z.string(),
-		run: async (input, ctx) => {
+		input: z.object({ key: z.string() }),
+		run: async ({ key: input }, ctx) => {
 			await ctx.step("effect", () => {
 				childEffects++;
 			});
-			return `${input}:child`;
+			return { value: `${input}:child` };
 		},
 	});
 	const parent = defineWorkflow({
@@ -823,7 +825,7 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 				effects++;
 			});
 			await ctx.thread!.post("ack", "working");
-			const output = await ctx.invokeAndWait("child", child, input.key);
+			const { value: output } = await ctx.invokeAndWait("child", child, { key: input.key });
 			// Runtime operations are internal; this test captures them from the runtime port.
 			const execution = executions.get(ctx.executionId)!;
 			const event = await waitForEvent(execution, "reply", {
@@ -876,10 +878,10 @@ test("core fabrial composes event routing, steps, child invocation, native wait,
 	expect(childEffects).toBe(1);
 	expect(attempts.get(parent.name)).toBeGreaterThanOrEqual(2);
 	expect(attempts.get(child.name)).toBe(1);
-	const [row] = await sql<{ result: { output: Json } }[]>`
+	const [row] = await sql<{ result: Json }[]>`
 		select result from pgconductor._private_executions where id = ${parentId!}::uuid
 	`;
-	expect(row?.result.output).toEqual({
+	expect(row?.result).toEqual({
 		output: "go:child",
 		event: { name: "test.reply", payload: { key: "reply" } },
 	});
@@ -985,7 +987,7 @@ test("core approval accepts an authenticated click during card delivery, before 
 				})
 			).status;
 			await ctx.sleep("replay", 20);
-			return decision;
+			return { decision };
 		},
 	});
 	const app = testApp(createFabrial({ plugins: [plugin], identity: [alice] }), {
@@ -1098,14 +1100,15 @@ function session(received: Json[]): RuntimeWorkflow {
 				if (payload === "stop") resolve();
 			}),
 		);
-		return received;
+		return { received };
 	});
 }
 const input = (id: string, payload: Json = id) => ({ name: "input", id, payload });
+/** The completed execution's native result: the workflow's output object. */
 async function output(id: string): Promise<Json> {
-	const [row] = await sql<{ result: { output: Json } }[]>`
+	const [row] = await sql<{ result: Json }[]>`
 		select result from pgconductor._private_executions where id = ${id}::uuid`;
-	return row?.result.output ?? null;
+	return row?.result ?? null;
 }
 
 test("a running handler receives signals from outside; stored signals arrive first, in order, deduped by id", async () => {
@@ -1123,7 +1126,7 @@ test("a running handler receives signals from outside; stored signals arrive fir
 	expect(await runtime.signal(id, input("3", "stop"))).toBe(true);
 	await expect.poll(() => completed(id), poll).toBe(true);
 	expect(received).toEqual(["a", "b", "stop"]);
-	expect(await output(id)).toEqual(["a", "b", "stop"]);
+	expect(await output(id)).toEqual({ received: ["a", "b", "stop"] });
 	expect(await runtime.signal(id, input("4"))).toBe(false);
 });
 
@@ -1142,7 +1145,7 @@ test("concurrent signalWithStart calls start exactly one execution per key; ctx.
 			const first = await ctx.signalWithStart("send", { ...options, signal: input("a") });
 			if (++replays === 1) await ctx.sleep("pause", 1);
 			const again = await ctx.signalWithStart("send", { ...options, signal: input("b") });
-			return [first, again];
+			return { first, again };
 		}),
 	]);
 	const send = (id: string) =>
@@ -1161,9 +1164,9 @@ test("concurrent signalWithStart calls start exactly one execution per key; ctx.
 	await send("stop");
 	await expect.poll(() => completed(next), poll).toBe(true);
 
-	const caller = await runtime.invoke("caller", null, { metadata });
+	const caller = await runtime.invoke("caller", {}, { metadata });
 	await expect.poll(() => completed(caller), poll).toBe(true);
-	const [first, again] = (await output(caller)) as string[];
+	const { first, again } = (await output(caller)) as { first: string; again: string };
 	expect(again).toBe(first);
 	await expect.poll(() => completed(first!), poll).toBe(true);
 	expect(seen[0]).toEqual({ ...metadata });

@@ -129,10 +129,13 @@ class ConductorRuntime implements DurableRuntime {
 				execution.queue === this.queue ? this.definitions.get(execution.task_key) : undefined;
 			if (!definition?.attempt) return next({});
 			const durable = this.execution(definition.name, ctx, metadataOf(ctx));
+			// A hook that doesn't call `next` still runs the attempt; the result itself may be null.
+			let ran = false;
 			let result: Awaited<ReturnType<typeof next>> | undefined;
 			await definition.attempt(
 				durable,
 				async (additions) => {
+					ran = true;
 					result = await next({
 						...additions,
 						[ATTEMPT]: { execution: durable } satisfies Attempt,
@@ -140,7 +143,7 @@ class ConductorRuntime implements DurableRuntime {
 				},
 				ctx,
 			);
-			return result ?? next({});
+			return ran ? result! : next({});
 		};
 		const client = Conductor.create({
 			sql: this.sql,
@@ -198,12 +201,9 @@ class ConductorRuntime implements DurableRuntime {
 						const attempt = (ctx as unknown as { [ATTEMPT]?: Attempt })[ATTEMPT];
 						const execution =
 							attempt?.execution ?? this.execution(definition.name, ctx, metadataOf(ctx));
-						const input: Json =
-							event.name === "pgconductor.invoke"
-								? event.payload!.input!
-								: (event.payload ?? { name: event.name });
-						// The native result: getExecution and result waits read `output`.
-						return { output: (await definition.handler(input, execution, ctx)) ?? null };
+						// Input and output are what Conductor sees: the invoke or event payload, the native result.
+						const input: Json = event.payload ?? { name: event.name };
+						return ((await definition.handler(input, execution, ctx)) ?? null) as JsonObject;
 					},
 				),
 			);
@@ -238,7 +238,7 @@ class ConductorRuntime implements DurableRuntime {
 	): Promise<string> {
 		this.assertReady();
 		this.definition(workflow);
-		return this.client!.invoke({ name: workflow, queue: this.queue } as never, { input } as never, {
+		return this.client!.invoke({ name: workflow, queue: this.queue } as never, input as never, {
 			metadata: options.metadata,
 		});
 	}
@@ -272,7 +272,7 @@ class ConductorRuntime implements DurableRuntime {
 		if (!info || info.queue !== this.queue) return null;
 		const result: ExecutionResult | null =
 			info.status === "completed"
-				? { status: "completed", output: (info.result as { output: Json } | null)?.output ?? null }
+				? { status: "completed", output: (info.result as Json | undefined) ?? null }
 				: info.status === "failed"
 					? { status: "failed", error: info.error ?? "Execution failed" }
 					: info.status === "cancelled"
@@ -296,7 +296,7 @@ class ConductorRuntime implements DurableRuntime {
 			queue: this.queue,
 			key: options.key,
 			signal: options.signal,
-			input: { input: options.input ?? null },
+			input: options.input ?? {},
 			metadata: options.metadata,
 		} as unknown as Parameters<Conductor["signalWithStart"]>[0]);
 	}
@@ -331,16 +331,11 @@ class ConductorRuntime implements DurableRuntime {
 		const methods = nativeMethods(raw);
 		const start: DurableExecution["start"] = (id, name, input, options) => {
 			this.definition(name);
-			return methods.invoke(
-				operationId(id),
-				{ name, queue: this.queue },
-				{ input },
-				{
-					metadata: mergeMetadata(metadata, options?.metadata),
-					...(options?.dedupeKey !== undefined ? { dedupe_key: options.dedupeKey } : {}),
-					...(options?.cancelWithParent ? { cancelWithParent: true } : {}),
-				},
-			);
+			return methods.invoke(operationId(id), { name, queue: this.queue }, input as JsonObject, {
+				metadata: mergeMetadata(metadata, options?.metadata),
+				...(options?.dedupeKey !== undefined ? { dedupe_key: options.dedupeKey } : {}),
+				...(options?.cancelWithParent ? { cancelWithParent: true } : {}),
+			});
 		};
 		return {
 			executionId,
@@ -402,7 +397,7 @@ class ConductorRuntime implements DurableRuntime {
 							outcome.status === "completed"
 								? {
 										status: "completed",
-										output: (outcome as { result: { output: Json } | null }).result?.output ?? null,
+										output: ((outcome as { result: Json | undefined }).result ?? null) as Json,
 									}
 								: (outcome as ExecutionResult),
 					};
@@ -411,10 +406,10 @@ class ConductorRuntime implements DurableRuntime {
 				return { key: "timeout", kind: "timeout" };
 			},
 			waitForResult: async (id, executionId) => {
-				const outcome = await methods.waitForResult<{ output: Json }>(operationId(id), executionId);
+				const outcome = await methods.waitForResult<Json>(operationId(id), executionId);
 				if (outcome.status === "timeout") throw new Error("Unexpected result wait timeout");
 				return outcome.status === "completed"
-					? { status: "completed", output: outcome.result.output }
+					? { status: "completed", output: outcome.result ?? null }
 					: outcome;
 			},
 			start,
@@ -426,13 +421,13 @@ class ConductorRuntime implements DurableRuntime {
 				const child = await methods.invoke(
 					`__fabrial:invoke:${id}`,
 					{ name, queue: this.queue },
-					{ input },
+					input as JsonObject,
 					{
 						metadata: mergeMetadata(metadata, options?.metadata),
 						cancelWithParent: !options?.detached,
 					},
 				);
-				const outcome = await methods.waitForResult<{ output: Json }>(
+				const outcome = await methods.waitForResult<Json>(
 					id,
 					child,
 					options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : undefined,
@@ -442,7 +437,7 @@ class ConductorRuntime implements DurableRuntime {
 					if (!options?.detached) await this.cancel(child, "Parent invocation timed out");
 					throw new Error(`Child execution timed out after ${options?.timeoutMs}ms`);
 				}
-				if (outcome.status === "completed") return outcome.result.output;
+				if (outcome.status === "completed") return outcome.result ?? null;
 				throw new ExecutionError(child, outcome);
 			},
 			onSignal: (name, handler) =>
@@ -454,7 +449,7 @@ class ConductorRuntime implements DurableRuntime {
 					queue: this.queue,
 					key: options.key,
 					signal: options.signal,
-					input: { input: options.input ?? null },
+					input: options.input ?? {},
 					metadata: mergeMetadata(metadata, options.metadata),
 				} as never);
 			},

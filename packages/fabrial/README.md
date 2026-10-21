@@ -121,7 +121,7 @@ const triage = f.defineWorkflow({
 			input: text,
 			output: z.object({ urgent: z.boolean(), summary: z.string() }),
 		});
-		return verdict.urgent ? `Urgent: ${verdict.summary}` : verdict.summary;
+		return { summary: verdict.urgent ? `Urgent: ${verdict.summary}` : verdict.summary };
 	},
 });
 ```
@@ -130,7 +130,7 @@ Without `output`, `ctx.agent` returns the answer text. An answer that doesn't ma
 
 ## 3. Workflows
 
-`f.defineWorkflow({ name, description?, input?, output?, triggers?, cron?, concurrency?, retries?, run })`. `run(input, ctx)` receives the trigger's payload, or the typed `input` when the workflow is invoked, started, or called as a tool. A workflow without `input` is invoked and started without one and receives `null`. `output` validates, and may transform, what `run` returns before the execution records it; a result that doesn't match fails the workflow.
+`f.defineWorkflow({ name, description?, input?, output?, triggers?, cron?, concurrency?, retries?, run })`. `run(input, ctx)` receives the trigger's payload, or the typed `input` when the workflow is invoked, started, or called as a tool. Input and output are plain JSON objects that Conductor stores as they are (native `waitForResult` and `waitForAny` see the real output), so `input` and `output` must be object schemas (`z.object`), checked at definition. A workflow without `input` is invoked and started without one and receives `{}`. `output` validates, and may transform, what `run` returns before the execution records it; a result that doesn't match, or isn't an object, fails the workflow.
 
 Workflows replay from the top after a suspension or crash. Every durable operation takes an explicit, nonempty id as its first argument, and a completed operation returns its saved result on replay. Keys follow Conductor: a repeated key addresses the same operation and returns its receipt, so loops pass distinct keys (`processed:${customer.id}`); the `fabrial:` prefix is reserved. A renamed key runs again; there is no call-order determinism or version pinning.
 
@@ -146,7 +146,7 @@ Workflows replay from the top after a suspension or crash. Every durable operati
 | `follow`, `unfollow`                                                                       | Make a conversation follow a resource ([Following](#following-resources)).                                                                                                                                                                                           |
 | `evaluate(id, { model, state, questions })`                                                | A classifier judgment ([`ctx.evaluate`](#ctxevaluate)).                                                                                                                                                                                                              |
 | `state(definition).get(id)`, `.update(id, fn)`                                             | Session state ([State](#state)).                                                                                                                                                                                                                                     |
-| `waitForApproval`, `requestApproval`, `race`, `timer`                                      | [Approvals](#5-workflow-tools-and-approvals).                                                                                                                                                                                                                        |
+| `waitForApproval`, `requestApproval`                                                       | [Approvals](#5-workflow-tools-and-approvals).                                                                                                                                                                                                                        |
 | `invoke(id, workflow, input, { cancelWithParent? })`, `invokeAndWait(id, workflow, input)` | Start a workflow (Conductor `invoke`, independent unless `cancelWithParent`), or start one and wait for its output. A failed `invokeAndWait` child fails the caller; to handle the failure, `invoke` then `waitForResult`, whose failure or cancellation is a value. |
 | `isMember(principal, group)`                                                               | Current group membership.                                                                                                                                                                                                                                            |
 
@@ -165,7 +165,7 @@ Triggers are plugin helpers on workflows and agents: `slack.mentioned({ channel?
 
 A workflow in an agent's `tools` is a tool named after it (`run-sql` → `run_sql`), described by its `description`, with its `input` schema. A call starts the workflow as a child of the agent's run and returns its output; actor, thread, and approvers are those of the request the agent is answering. Approvals are always workflow code, so the check sits next to the effect it guards.
 
-`ctx.waitForApproval(id, options)` requests and waits. `ctx.requestApproval(id, options)` returns a handle: `approvers`, `decision()` (for `ctx.race`), `wait(id)`, and `cancel(id, reason)`.
+`ctx.waitForApproval(id, options)` requests and waits. `ctx.requestApproval(id, options)` returns a handle: `approvers`, `branch` (its decision as a native `ctx.waitForAny` branch; when it wins, `wait` returns the decision at once), `wait(id)`, and `cancel(id, reason)`.
 
 | Option              |                                                                                                                         |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
@@ -195,15 +195,15 @@ const deploy = f.defineWorkflow({
 			destination: slack.channel("C_RELEASES"),
 			card: { fields: [{ label: "Risk", value: "low" }] },
 		});
-		const first = await ctx.race("wait", {
-			decision: approval.decision(),
-			timeout: ctx.timer("1h"),
-		});
+		const first = await ctx.waitForAny("wait", { decision: approval.branch }, { timeout: "1h" });
 		if (first.key === "timeout") {
 			await approval.cancel("cancel", "No answer within an hour");
-			return "timed out";
+			return { status: "timed out" };
 		}
-		return first.value.approved ? "deploying" : `declined: ${first.value.comment ?? "no reason"}`;
+		const decision = await approval.wait("decision");
+		return decision.approved
+			? { status: "deploying" }
+			: { status: `declined: ${decision.comment ?? "no reason"}` };
 	},
 });
 ```
@@ -362,14 +362,14 @@ Tests run on real Conductor and need Postgres; there is no in-memory engine. Sta
 ```ts check
 import { createTestApp } from "fabrial/testing";
 
-const hello = f.defineWorkflow({ name: "hello", run: async () => "hi" });
+const hello = f.defineWorkflow({ name: "hello", run: async () => ({ greeting: "hi" }) });
 const { app, invoke, settled, stop } = createTestApp(f, {
 	database: process.env.DATABASE_URL!,
 	workflows: [hello],
 });
 await app.start();
 const id = await invoke(hello);
-console.log(await settled(id)); // { status: "completed", output: "hi" }
+console.log(await settled(id)); // { status: "completed", output: { greeting: "hi" } }
 await stop();
 ```
 

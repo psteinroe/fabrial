@@ -25,7 +25,7 @@ import type { ExecutionInfo } from "../../../src/workflow.ts";
 import type { Fabrial } from "../../../src/instance.ts";
 import type { ScriptedModels } from "../../../src/testing.ts";
 import { FakeChat, scriptedPi, testApp } from "../../../src/testing-internal.ts";
-import { until, useConductor } from "../../conductor/helper.ts";
+import { until, useConductor, type ExecutionHandle } from "../../conductor/helper.ts";
 
 export const { defineState, defineWorkflow } = createFabrial({ plugins: [] });
 export const identity = (subjectId: string): ExternalIdentity => ({
@@ -94,10 +94,17 @@ export const source = definePlugin({
  * attempts by default), which the test clock reaches only when a test moves it.
  */
 export const once = { maxAttempts: 1 };
+/** A routed test workflow. Outputs are objects: it returns `{ value }`, which `execution().output()` unwraps. */
 export const workflow = (
-	run: (input: Json, ctx: WorkflowContext) => Promise<Json | void>,
+	run: (input: JsonObject, ctx: WorkflowContext) => Promise<Json | void>,
 	name = "owner",
-) => defineWorkflow({ name, triggers: [trigger({ event })], retries: once, run });
+) =>
+	defineWorkflow({
+		name,
+		triggers: [trigger({ event })],
+		retries: once,
+		run: async (input, ctx) => ({ value: (await run(input, ctx)) ?? null }),
+	});
 export const approvalWorkflow = (timeout: string | number = "24h", requesterControls = true) =>
 	workflow(async (_input, ctx) => {
 		const decision = await ctx.waitForApproval("approval", {
@@ -187,8 +194,29 @@ export function useCoreApp() {
 			app,
 			ids,
 			/** The `index`th execution of `name`, once it ran. */
-			execution: async (name = "owner", index = 0) =>
-				db.execution(await until(`${name} #${index} to run`, async () => ids(name)[index])),
+			execution: async (name = "owner", index = 0) => {
+				const handle = db.execution(
+					await until(`${name} #${index} to run`, async () => ids(name)[index]),
+				);
+				// `workflow()` returns `{ value }`: the handle unwraps it, from any of its methods.
+				const unwrap = (output: Json) =>
+					output !== null && typeof output === "object" && "value" in output
+						? (output.value as Json)
+						: output;
+				const unwrapped: ExecutionHandle = {
+					...handle,
+					running: async () => (await handle.running(), unwrapped),
+					suspended: async (step) => (await handle.suspended(step), unwrapped),
+					settled: async () => {
+						const result = await handle.settled();
+						return result.status === "completed"
+							? { ...result, output: unwrap(result.output) }
+							: result;
+					},
+					output: async () => unwrap(await handle.output()),
+				};
+				return unwrapped;
+			},
 			/** Executions of the router, oldest first: it runs without middleware, so it isn't recorded. */
 			routes,
 			/** The `index`th routing decision, once the router finished it. */

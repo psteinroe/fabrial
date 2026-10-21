@@ -103,7 +103,7 @@ function settlement(info: ExecutionInfo): ExecutionResult | undefined {
 	if (info.status === "completed")
 		return {
 			status: "completed",
-			output: (info.result as { output: Json } | null)?.output ?? null,
+			output: (info.result as Json | undefined) ?? null,
 		};
 	if (info.status === "failed")
 		return { status: "failed", error: info.error ?? "Execution failed" };

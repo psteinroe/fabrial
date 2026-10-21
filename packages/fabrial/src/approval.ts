@@ -1,6 +1,6 @@
 import type { GroupDefinition, Principal, UserDefinition } from "./identity.ts";
 import type { Json } from "./json.ts";
-import type { Awaitable, Surface } from "./thread.ts";
+import type { Surface } from "./thread.ts";
 
 /**
  * App content added to an approval card in its own labelled section, after the proposal; it never
@@ -50,8 +50,12 @@ export interface ApprovalHandle {
 	readonly approvalId: string;
 	/** Assigned approvers, resolved when the request was made. */
 	readonly approvers: Principal[];
-	/** Awaitable for `ctx.race`, or `await approval.wait(id)`. */
-	decision(): Awaitable<ApprovalDecision & Record<string, Json>>;
+	/**
+	 * The decision as a `ctx.waitForAny` branch (its decision execution). When it wins, `wait` returns the
+	 * decision at once; losing leaves the approval pending.
+	 */
+	readonly branch: { execution: string };
+	/** Durably wait for the decision. */
 	wait(id: string): Promise<ApprovalDecision>;
 	/** Durable: cancel the pending request; the card shows "Cancelled"/"Superseded". */
 	cancel(id: string, reason: "cancelled" | "superseded" | (string & {})): Promise<void>;

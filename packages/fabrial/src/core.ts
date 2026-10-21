@@ -28,7 +28,7 @@ import {
 	threadOf,
 	threadSession,
 } from "./send.ts";
-import type { AnyWorkflow, WorkflowContext } from "./workflow.ts";
+import { workflowObject, type AnyWorkflow, type WorkflowContext } from "./workflow.ts";
 import type { Json, JsonObject } from "./json.ts";
 import { parseSchema } from "./schema.ts";
 import {
@@ -460,6 +460,8 @@ export function buildApp(config: CoreConfig): HostedApp {
 		.map((hook) => async ({ execution, ctx }, next) => {
 			if (!("fabrial" in ctx)) return next({});
 			const metadata = metadataOf(ctx);
+			// A hook that doesn't call `next` still runs the attempt; the result itself may be null.
+			let ran = false;
 			let result: Awaited<ReturnType<typeof next>> | undefined;
 			await hook(
 				{
@@ -470,10 +472,11 @@ export function buildApp(config: CoreConfig): HostedApp {
 				},
 				ctx as unknown as WorkflowContext,
 				async () => {
+					ran = true;
 					result = await next({});
 				},
 			);
-			return result ?? next({});
+			return ran ? result! : next({});
 		});
 	/** Merges Fabrial's fields onto Conductor's context of every attempt. */
 	const attempt: RuntimeWorkflow["attempt"] = async (execution, next, raw) =>
@@ -500,15 +503,12 @@ export function buildApp(config: CoreConfig): HostedApp {
 		retries: workflow.definition.retries,
 		attempt,
 		handler: async (input, _execution, ctx) => {
-			const output = (await workflow.definition.run(input, ctx as WorkflowContext)) ?? null;
+			const output = await workflow.definition.run(input, ctx as WorkflowContext);
 			// The output schema validates (and transforms) the result before the run records it.
-			return workflow.definition.output
-				? ((await parseSchema(
-						workflow.definition.output,
-						output,
-						`workflow ${workflow.name} output`,
-					)) as Json)
-				: output;
+			const label = `workflow ${workflow.name} output`;
+			if (workflow.definition.output)
+				return workflowObject(await parseSchema(workflow.definition.output, output, label), label);
+			return output === undefined || output === null ? null : workflowObject(output, label);
 		},
 	}));
 	/** Register every workflow with the runtime, once all definitions exist: Pi's only if the instance uses it. */

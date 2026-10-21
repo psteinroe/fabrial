@@ -261,7 +261,7 @@ it("suspends the Session while a workflow tool waits and resumes it with a stabl
 	const child = defineWorkflow({
 		name: randomUUID(),
 		input: z.object({ value: z.string() }),
-		run: async () => "unused",
+		run: async () => ({}),
 	});
 	(f.host.workflows as unknown as (typeof child)[]).push(child);
 	const agent = defineAgent({
