@@ -305,9 +305,13 @@ describe("approval edge cases", () => {
 		]);
 		const owner = await enter(test);
 		expect(await owner.settled()).toMatchObject({ status: "failed" });
-		const c = await card(test);
-		await eventually("the cancelled card", () => cardOf(c.post.content).text === "Cancelled");
-		expect(cardOf(c.post.content).actions).toEqual([]);
+		// The card may already be cancelled, without actions, by the time it is read.
+		const post = () => [...test.chat.threads.values()].flatMap((thread) => thread.posts)[0];
+		await eventually(
+			"the cancelled card",
+			() => post() !== undefined && cardOf(post()!.content).text === "Cancelled",
+		);
+		expect(cardOf(post()!.content).actions).toEqual([]);
 	});
 	it("finishes an in-flight card step then cancels and cleans up its receipt", async () => {
 		const test = setup([approvalWorkflow()]);
