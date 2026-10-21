@@ -5,13 +5,13 @@ import postgres, { type Sql } from "postgres";
 import type { PiOptions } from "./agents/pi.ts";
 import { createModels, type ModelCredentials } from "./agents/models.ts";
 import type { CoreConfig } from "./app.ts";
-import { conductor, type ConductorConfig } from "./runtime/conductor/index.ts";
+import type { ConductorConfig } from "./conductor.ts";
 
 /** Settings only `fabrial/testing` may change. */
 export interface ProductionOverrides {
 	models?: MutableModels;
 	agentSettings?: PiOptions["settings"];
-	conductor?: ConductorConfig;
+	conductor?: Omit<ConductorConfig, "sql">;
 }
 
 /**
@@ -26,7 +26,7 @@ export const MODEL_RETRY: ConversationRetryPolicy = {
 	maxAgentDelayMs: 60_000,
 };
 
-/** One lazily opened pool. Its identity is stable, so runtimes can hold it before app.start(). */
+/** One lazily opened pool. Its identity is stable, so Conductor can hold it before app.start(). */
 function lazyPool(url: string | undefined) {
 	let pool: Sql | undefined;
 	const current = (): Sql => {
@@ -56,12 +56,12 @@ function lazyPool(url: string | undefined) {
 export function production(
 	config: { database: string | undefined; models: ModelCredentials },
 	overrides: ProductionOverrides = {},
-): Pick<CoreConfig, "runtime" | "chat" | "agents" | "resources"> {
+): Pick<CoreConfig, "conductor" | "chat" | "agents" | "resources"> {
 	const pool = lazyPool(config.database);
 	const credentials = createModels(config.models);
 	let state: ReturnType<typeof createPostgresState> | undefined;
 	return {
-		runtime: conductor({ sql: pool.sql }, overrides.conductor),
+		conductor: { ...overrides.conductor, sql: pool.sql },
 		// Opened when the app starts.
 		chat: { state: () => (state = createPostgresState({ url: pool.url! })) },
 		agents: {

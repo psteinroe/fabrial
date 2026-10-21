@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineGroup, definePlugin, defineUser } from "../../internals.ts";
-import type { Json, RuntimeWorkflow, WorkflowContext } from "../../internals.ts";
+import type { Json, WorkflowContext } from "../../internals.ts";
 import { until } from "../../conductor/helper.ts";
 import {
 	alice,
@@ -22,48 +22,44 @@ const { db, setup, enter, card, eventually } = useCoreApp();
 const DAY = 24 * 60 * 60 * 1000;
 
 /**
- * A runtime whose approval decision executions pause on their first attempt until `release`: before their
+ * An app whose approval decision executions pause on their first attempt until `release`: before their
  * handler runs (`start`), or before their decision wait registers (`wait`), as after a crash there.
  */
 function paused(at: "start" | "cards") {
-	const runtime = db.runtime();
 	const open = Promise.withResolvers<void>();
 	const reached = Promise.withResolvers<void>();
 	const pause = async () => {
 		reached.resolve();
 		await open.promise;
 	};
-	const hold = (definition: RuntimeWorkflow): RuntimeWorkflow =>
-		definition.name !== "fabrial.approval.decision"
-			? definition
-			: {
-					...definition,
-					handler: async (input, execution, ctx) => {
-						if (at === "start") {
-							await pause();
-							return definition.handler(input, execution, ctx);
-						}
-						// After the cards started, before the decision's wait computes its timeout. Fabrial starts
-						// children with Conductor's own `invoke`, from the context's prototype.
-						const proto = Object.getPrototypeOf(ctx) as { invoke: (...args: unknown[]) => unknown };
-						const invoke = async (key: string, ...rest: unknown[]) => {
-							if (key === "delivery") await pause();
-							return proto.invoke.call(ctx, key, ...rest);
-						};
-						const held = new Proxy(ctx, {
-							getPrototypeOf: () => Object.assign(Object.create(proto) as object, { invoke }),
-							get: (target, property) => {
-								const value = Reflect.get(target, property) as unknown;
-								return typeof value === "function" ? value.bind(target) : value;
+	const hold = definePlugin({
+		id: "hold",
+		hooks: {
+			workflow: [
+				async (execution, ctx, next) => {
+					if (execution.workflow !== "fabrial.approval.decision") return next();
+					if (at === "start") {
+						await pause();
+						return next();
+					}
+					// After the cards started, before the decision's wait computes its timeout. Fabrial starts
+					// children with Conductor's own `invoke`, from the context's prototype.
+					const proto = Object.getPrototypeOf(ctx) as { invoke: (...args: unknown[]) => unknown };
+					Object.setPrototypeOf(
+						ctx,
+						Object.assign(Object.create(proto) as object, {
+							async invoke(this: unknown, key: string, ...rest: unknown[]) {
+								if (key === "delivery") await pause();
+								return proto.invoke.call(this, key, ...rest);
 							},
-						});
-						return definition.handler(input, execution, held);
-					},
-				};
-	const register = runtime.register.bind(runtime);
-	runtime.register = (definition) =>
-		register({ ...definition, workflows: definition.workflows.map(hold) });
-	return { runtime, reached: reached.promise, release: () => open.resolve() };
+						}),
+					);
+					return next();
+				},
+			],
+		},
+	});
+	return { hold, reached: reached.promise, release: () => open.resolve() };
 }
 const cardOf = (content: unknown) =>
 	(content as { card: { text?: string; actions: { id: string }[] } }).card;
@@ -84,12 +80,13 @@ describe("approvals", () => {
 		const test = setup([approvalWorkflow()]);
 		const owner = await enter(test);
 		const c = await card(test);
-		const emit = test.runtime.emit.bind(test.runtime);
+		const conductor = test.app.host.conductor;
+		const emit = conductor.emit.bind(conductor);
 		let failures = 1;
-		test.runtime.emit = async (...args) => {
+		conductor.emit = (async (...args: Parameters<typeof emit>) => {
 			if (args[0] === "fabrial.ingress" && failures-- > 0) throw new Error("emit failed");
 			return emit(...args);
-		};
+		}) as typeof emit;
 		await expect(
 			test.chat.click(c.post.ref, c.approve, alice.identities[0]!, { dedupeId: "click" }),
 		).rejects.toThrow("emit failed");
@@ -158,7 +155,7 @@ describe("approvals", () => {
 		const owner = await enter(test);
 		const c = await card(test);
 		await owner.suspended();
-		await test.runtime.cancel(owner.id);
+		await test.client.cancel(owner.id);
 		expect(await owner.settled()).toMatchObject({ status: "cancelled" });
 		await eventually("the cancelled card", () => cardOf(c.post.content).text === "Cancelled");
 		expect(cardOf(c.post.content).actions).toEqual([]);
@@ -327,7 +324,7 @@ describe("approval edge cases", () => {
 		const post = dm.post.bind(dm);
 		dm.post = async (content) => {
 			const receipt = await post(content);
-			await test.runtime.cancel((await test.execution()).id);
+			await test.client.cancel((await test.execution()).id);
 			return receipt;
 		};
 		const owner = await enter(test);
@@ -452,7 +449,7 @@ describe("approval edge cases", () => {
 			const cleanup = await until("the card's cleanup", async () => {
 				const [row] = await db.sql<{ id: string }[]>`
 					select id from pgconductor._private_executions
-					where queue = ${test.runtime.queue} and task_key = 'fabrial.cleanup' order by created_at`;
+					where queue = ${test.client.queue} and task_key = 'fabrial.cleanup' order by created_at`;
 				return row;
 			});
 			// Its retries back off on the test clock: the first failed attempt is enough here.
@@ -550,7 +547,7 @@ describe("native approval waits", () => {
 			warnings.includes("Approval card delivery failed"),
 		);
 		// Bob's cleanup is retried, then gives up; the approval keeps waiting on Alice's card.
-		await givenUp(test.runtime.queue, 1);
+		await givenUp(test.client.queue, 1);
 		await owner.suspended();
 		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
 		expect(await owner.output()).toBe("approved");
@@ -558,7 +555,7 @@ describe("native approval waits", () => {
 			"alice's relabelled card",
 			() => cardOf(c.post.content).text === "Approved by Alice",
 		);
-		expect(await cleanups(test.runtime.queue)).toHaveLength(3);
+		expect(await cleanups(test.client.queue)).toHaveLength(3);
 	});
 
 	it("fails at once when no approver can be reached", async () => {
@@ -571,7 +568,7 @@ describe("native approval waits", () => {
 		const thread = await test.chat.thread(surface);
 		await until("the status card", async () => thread.posts[0]);
 		// The requester's status card was delivered, but it is not an approver card.
-		await givenUp(test.runtime.queue, 2);
+		await givenUp(test.client.queue, 2);
 		expect(await owner.settled()).toMatchObject({
 			status: "failed",
 			error: expect.stringContaining("Approval failed: No approver could be reached"),
@@ -627,7 +624,7 @@ describe("native approval waits", () => {
 					return [status, comment ?? null];
 				}),
 			],
-			{ runtime: decision.runtime },
+			{ plugins: [plugin, source, decision.hold] },
 		);
 		const owner = await enter(test);
 		await decision.reached;
@@ -661,7 +658,7 @@ describe("native approval waits", () => {
 		// Conductor's maintenance: removes settled executions older than their task's retention.
 		const removed = await db.sql<{ task_key: string }[]>`
 			delete from pgconductor._private_executions e using pgconductor._private_tasks t
-			where t.key = e.task_key and t.queue = e.queue and e.queue = ${test.runtime.queue}
+			where t.key = e.task_key and t.queue = e.queue and e.queue = ${test.client.queue}
 			and ((e.completed_at is not null and t.remove_on_complete_days > 0
 					and e.completed_at < pgconductor._private_current_time() - t.remove_on_complete_days * interval '1 day')
 				or (e.failed_at is not null and t.remove_on_fail_days > 0
@@ -674,7 +671,7 @@ describe("native approval waits", () => {
 
 	it("denies a click after the deadline while the decision has not registered its timeout", async () => {
 		const decision = paused("cards");
-		const test = setup([approvalWorkflow("1h")], { runtime: decision.runtime });
+		const test = setup([approvalWorkflow("1h")], { plugins: [plugin, source, decision.hold] });
 		const owner = await enter(test);
 		await decision.reached;
 		const dm = await test.chat.openDM(alice.identities[0]!);
@@ -703,7 +700,7 @@ describe("native approval waits", () => {
 		await test.app.start();
 		const rows = await db.sql<{ key: string; complete: number | null; fail: number | null }[]>`
 			select key, remove_on_complete_days as complete, remove_on_fail_days as fail
-			from pgconductor._private_tasks where queue = ${test.runtime.queue}
+			from pgconductor._private_tasks where queue = ${test.client.queue}
 			and key in ('fabrial.approval.decision', 'owner')`;
 		// Callers may first wait on a decision any time later: it is never removed.
 		expect(rows.find((row) => row.key === "fabrial.approval.decision")).toMatchObject({
@@ -774,7 +771,7 @@ describe("approval authorization", () => {
 		await owner.suspended();
 		await first.app.stop();
 		const second = setup([decidedBy()], {
-			runtime: db.runtime({ queue: first.runtime.queue }),
+			queue: first.client.queue,
 			chat: first.chat,
 		});
 		await second.app.start();
@@ -812,23 +809,21 @@ describe("approval authorization", () => {
 		const approvalId = c.approve.slice("fabrial.approval.approve:".length);
 		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
 		expect(await owner.output()).toEqual(["approved", "alice"]);
-		const request = await test.runtime.getExecution(approvalId);
+		const request = await test.app.host.conductor.getExecution(approvalId);
 		expect(request).toMatchObject({
-			workflow: "fabrial.approval.request",
+			taskKey: "fabrial.approval.request",
+			status: "completed",
 			result: {
-				status: "completed",
-				output: {
-					callerId: owner.id,
-					operationId: "approval",
-					assigned: { users: [], groups: ["team"] },
-					requester: { id: "alice" },
-					title: "Proposal",
-				},
+				callerId: owner.id,
+				operationId: "approval",
+				assigned: { users: [], groups: ["team"] },
+				requester: { id: "alice" },
+				title: "Proposal",
 			},
 		});
 		const [retention] = await db.sql<{ complete: number | null; fail: number | null }[]>`
 			select remove_on_complete_days as complete, remove_on_fail_days as fail
-			from pgconductor._private_tasks where key = 'fabrial.approval.request' and queue = ${test.runtime.queue}`;
+			from pgconductor._private_tasks where key = 'fabrial.approval.request' and queue = ${test.client.queue}`;
 		// Approvals last below 30 days; waits and clicks on the request must find it until then.
 		expect(retention!.complete).toBeGreaterThan(30);
 		expect(retention!.fail).toBeGreaterThan(30);

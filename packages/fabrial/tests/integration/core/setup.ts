@@ -25,7 +25,7 @@ import type { ExecutionInfo } from "../../../src/workflow.ts";
 import type { Fabrial } from "../../../src/instance.ts";
 import type { ScriptedModels } from "../../../src/testing.ts";
 import { FakeChat, scriptedPi, testApp } from "../../../src/testing-internal.ts";
-import { until, useConductor, type ExecutionHandle } from "../../conductor/helper.ts";
+import { testClient, until, useConductor, type ExecutionHandle } from "../../conductor/helper.ts";
 
 export const { defineState, defineWorkflow } = createFabrial({ plugins: [] });
 export const identity = (subjectId: string): ExternalIdentity => ({
@@ -137,9 +137,13 @@ export function useCoreApp() {
 	 */
 	function setup(
 		workflows: AnyWorkflow[] | ((f: Fabrial<readonly AnyPlugin[]>) => AnyWorkflow[]),
-		extra: Omit<Partial<CoreConfig>, "agents"> & { models?: ScriptedModels } = {},
+		extra: Omit<Partial<CoreConfig>, "agents" | "conductor"> & {
+			models?: ScriptedModels;
+			/** Another app's queue, to run as its next deploy. */
+			queue?: string;
+		} = {},
 	) {
-		const runtime = db.runtime();
+		const conductor = db.conductor(extra.queue ? { queue: extra.queue } : {});
 		const chat = new FakeChat();
 		const attempts: (ExecutionInfo & { metadata: InvocationMetadata })[] = [];
 		const recorder = definePlugin({
@@ -158,28 +162,32 @@ export function useCoreApp() {
 			identity: identities = [alice, bob, outsider],
 			logger,
 			models,
+			queue: _,
 			...config
 		} = extra;
 		const f = createFabrial({ plugins: [...plugins, recorder], identity: identities });
-		const app = testApp(f, {
-			runtime,
-			chat,
-			...config,
-			workflows: typeof workflows === "function" ? workflows(f) : workflows,
-			logger,
-			...(models && {
-				agents: {
-					models: scriptedPi.get(models)!,
-					sql: (pool ??= postgres(db.url, { max: 4, onnotice: () => {} })),
-					settings: { retry: { enabled: false } },
-				},
+		const app = db.own(
+			testApp(f, {
+				conductor,
+				chat,
+				...config,
+				workflows: typeof workflows === "function" ? workflows(f) : workflows,
+				logger,
+				...(models && {
+					agents: {
+						models: scriptedPi.get(models)!,
+						sql: (pool ??= postgres(db.url, { max: 4, onnotice: () => {} })),
+						settings: { retry: { enabled: false } },
+					},
+				}),
 			}),
-		});
+		);
+		const client = testClient(conductor.queue, () => app.host.conductor);
 		const routes = async () =>
 			(
 				await db.sql<{ id: string }[]>`
 					select id from pgconductor._private_executions
-					where queue = ${runtime.queue} and task_key = 'fabrial.route'
+					where queue = ${conductor.queue} and task_key = 'fabrial.route'
 					order by created_at, id`
 			).map((row) => row.id);
 		/** Executions of `name` in the order they first ran. */
@@ -189,7 +197,8 @@ export function useCoreApp() {
 		return {
 			/** The app's instance: agents and state defined on it before `app.start()` are the app's. */
 			instance: f,
-			runtime,
+			/** Conductor calls on the app's queue, once it started. */
+			client,
 			chat,
 			app,
 			ids,
@@ -249,7 +258,7 @@ export function useCoreApp() {
 				select (completed_at is not null or failed_at is not null
 					or (waiting_step_key = 'decision' and locked_by is null)) as ready
 				from pgconductor._private_executions
-				where queue = ${test.runtime.queue} and task_key = 'fabrial.approval.decision'
+				where queue = ${test.client.queue} and task_key = 'fabrial.approval.decision'
 				order by created_at desc limit 1`;
 			return row?.ready ? true : undefined;
 		});

@@ -408,7 +408,7 @@ This section is for contributors. None of it is API.
 
 ### Durable runtime (Conductor)
 
-`src/runtime/conductor` adapts PG Conductor to Fabrial's internal `DurableRuntime` port. Registration is side-effect free; `start()` migrates Postgres and starts workers. Handlers replay from the top after suspension. Explicit operation keys address saved steps and waits; a repeated key is the same operation. The pool is the instance's; the runtime does not own it. Keep the queue's workflow catalog consistent across instances. Durable wait deadlines use Postgres's clock.
+Core uses PG Conductor directly (`src/conductor.ts`): `app.start()` creates the app's Conductor client, one task per workflow on the app's queue (triggers, cron, retention, concurrency, the attempt middleware), and the Orchestrator, which migrates Postgres and starts workers. Building the app is side-effect free. Handlers replay from the top after suspension. Explicit operation keys address saved steps and waits; a repeated key is the same operation. The pool is the instance's; Conductor does not own it. Keep the queue's workflow catalog consistent across instances. Durable wait deadlines use Postgres's clock.
 
 Event-triggered handlers receive the clean event payload. Cron handlers receive `{ name: scheduleName }`, with a generated request id and no thread or actor. Deadlines are absolute epoch milliseconds, fixed once before replayable waits. A wait that must not miss an event caused by a preceding side effect (an approval card's click) subscribes before the side effect and waits on the subscription.
 

@@ -33,17 +33,17 @@ export function setup(state: StateAdapter = createMemoryState()) {
 	const host: FabrialHost = {
 		plugins: [plugin],
 		workflows: [],
-		runtime: {
-			register: vi.fn(),
+		conductor: {
 			emit: vi.fn(),
 			invoke: vi.fn(),
 			cancel: vi.fn(async () => true),
 			signalWithStart: vi.fn(),
 			signal: vi.fn(),
 			getExecution: vi.fn(async () => null),
-			start: vi.fn(),
-			stop: vi.fn(),
-		},
+		} as never,
+		orchestrator: {} as never,
+		queue: "default",
+		now: () => Date.now(),
 		directory: {
 			resolveIdentity: vi.fn(),
 			identitiesFor: vi.fn(),

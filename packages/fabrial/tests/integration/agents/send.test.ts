@@ -13,7 +13,7 @@ import {
 	type StorageWrite,
 } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { expect, it, vi } from "vitest";
+import { expect, it } from "vitest";
 import { z } from "zod";
 import {
 	createFabrial,
@@ -23,6 +23,7 @@ import {
 	type AgentRef,
 	type ChatMessage,
 	type ExternalIdentity,
+	type Json,
 	type JsonObject,
 } from "../../internals.ts";
 import { PostgresStorage } from "../../../src/agents/index.ts";
@@ -120,7 +121,7 @@ async function setup(
 	// Another process on the same database: its driver waits for the Session lease.
 	/** Another instance: by default another deployment (its own queue and chat); `peer` shares both. */
 	const launch = async (peer?: { queue: string; chat: FakeChat }) => {
-		const { runtime, chat, app } = await start(
+		const { client, chat, app } = await start(
 			f,
 			{
 				...peer,
@@ -142,10 +143,10 @@ async function setup(
 					: {}),
 			},
 		);
-		const settle = (timeoutMs?: number) => idle(runtime.queue, timeoutMs);
-		return { runtime, chat, app, settle };
+		const settle = (timeoutMs?: number) => idle(client.queue, timeoutMs);
+		return { client, chat, app, settle };
 	};
-	const { runtime, chat, app, settle } = await launch();
+	const { client, chat, app, settle } = await launch();
 	const message = (id: string, thread: string, body = id): ChatMessage => ({
 		provider: "chat",
 		threadId: `chat:${channel}:${thread}`,
@@ -181,7 +182,7 @@ async function setup(
 	return {
 		channel,
 		faux,
-		runtime,
+		client,
 		chat,
 		app,
 		message,
@@ -319,7 +320,7 @@ it("maps notification priorities to write, followUp, and steer; written entries 
 		},
 	]);
 	const notify = (input: { text: string; priority: "urgent" | "normal" | "low" }) =>
-		t.runtime.invoke(t.notify.name, input, {
+		t.client.invoke(t.notify.name, input, {
 			metadata: {
 				requestId: randomUUID(),
 				origin: { provider: "github" },
@@ -413,7 +414,7 @@ it.each(["notification", "message"] as const)(
 				if (kind === "message")
 					expect(await other.chat.receive(t.message("m2", "t2", "late steer"))).toBe("accepted");
 				else
-					await other.runtime.invoke(
+					await other.client.invoke(
 						t.notify.name,
 						{ text: "late steer", priority: "urgent" },
 						{
@@ -437,7 +438,7 @@ it.each(["notification", "message"] as const)(
 		]);
 		if (kind === "message") await t.chat.receive(t.message("m1", "t1"));
 		else
-			await t.runtime.invoke(
+			await t.client.invoke(
 				t.notify.name,
 				{ text: "first", priority: "normal" },
 				{
@@ -471,7 +472,7 @@ const queuedBehindFailedRun = async (kind: "notification" | "message") => {
 	const t = await setup();
 	// Another instance of the same app: on another queue, its Session execution would be a second one,
 	// waiting for the lease, and its effects would post through its own chat.
-	const other = await t.launch({ queue: t.runtime.queue, chat: t.chat });
+	const other = await t.launch({ queue: t.client.queue, chat: t.chat });
 	const session = kind === "message" ? `chat:channel:${t.channel}` : `app:ops-${t.channel}`;
 	const seen: string[] = [];
 	// Asserted after settling: a throw inside the response would only fail the generation, which
@@ -483,7 +484,7 @@ const queuedBehindFailedRun = async (kind: "notification" | "message") => {
 			if (kind === "message")
 				expect(await other.chat.receive(t.message("m2", "t2", "queued steer"))).toBe("accepted");
 			else
-				await other.runtime.invoke(
+				await other.client.invoke(
 					t.notify.name,
 					{ text: "queued steer", priority: "urgent" },
 					{
@@ -511,7 +512,7 @@ const queuedBehindFailedRun = async (kind: "notification" | "message") => {
 	]);
 	if (kind === "message") await t.chat.receive(t.message("m1", "t1"));
 	else
-		await t.runtime.invoke(
+		await t.client.invoke(
 			t.notify.name,
 			{ text: "first", priority: "normal" },
 			{
@@ -568,7 +569,7 @@ it("an urgent notification during a tool call steers the running run and is answ
 		},
 	]);
 	const notify = (text: string, priority: "urgent" | "normal") =>
-		t.runtime.invoke(
+		t.client.invoke(
 			t.notify.name,
 			{ text, priority },
 			{
@@ -766,8 +767,8 @@ it("an aborted sent run posts no reply and the conversation stays usable", async
 	]);
 	await t.chat.receive(t.message("m1", "t1"));
 	await blocking;
-	for (const driver of await open(t.runtime.queue, "fabrial.session"))
-		await t.runtime.cancel(driver, "Stopped");
+	for (const driver of await open(t.client.queue, "fabrial.session"))
+		await t.client.cancel(driver, "Stopped");
 	await t.settle();
 	expect(await t.posts("t1")).toEqual([]);
 	await t.chat.receive(t.message("m2", "t1", "again"));
@@ -800,7 +801,7 @@ it(
 		const posts = (await t.posts("t1")).map((post) => post.content as string);
 		expect(posts).toHaveLength(1);
 		expect(posts[0]).toMatch(FAILED);
-		expect(await sessions(t.runtime.queue)).toEqual([{ status: "completed", attempts: 2 }]);
+		expect(await sessions(t.client.queue)).toEqual([{ status: "completed", attempts: 2 }]);
 	},
 	2 * RETRY_MS,
 );
@@ -848,7 +849,7 @@ it(
 		expect(Object.values(obligations!.requests)).toEqual([
 			expect.objectContaining({ owes: "reply", fulfilled: true }),
 		]);
-		expect(await sessions(t.runtime.queue)).toEqual([{ status: "completed", attempts: 2 }]);
+		expect(await sessions(t.client.queue)).toEqual([{ status: "completed", attempts: 2 }]);
 	},
 	2 * RETRY_MS,
 );
@@ -938,7 +939,7 @@ it("a sent run's background child reports as a follow-up; the lead's answer post
 	).catch(async (error: Error) => {
 		const posts = (await t.posts("t1")).map((post) => post.content);
 		throw new Error(
-			`${error.message}; model saw ${JSON.stringify(seen)}; posts ${JSON.stringify(posts)}; sessions ${JSON.stringify(await sessions(t.runtime.queue))}`,
+			`${error.message}; model saw ${JSON.stringify(seen)}; posts ${JSON.stringify(posts)}; sessions ${JSON.stringify(await sessions(t.client.queue))}`,
 		);
 	});
 	await t.settle();
@@ -973,7 +974,7 @@ it("no_reply ends a run without posting and keeps its reason in the transcript",
 	expect((await statuses(t, "t1")).at(-1)).toBeNull();
 	// Nothing to deliver: the Session completed without waiting on a post.
 	expect(await deliveries(t)).toEqual([]);
-	expect(await sessions(t.runtime.queue)).toEqual([{ status: "completed", attempts: 1 }]);
+	expect(await sessions(t.client.queue)).toEqual([{ status: "completed", attempts: 1 }]);
 	await t.chat.receive(t.message("m2", "t1", "a real question"));
 	await t.settle();
 	expect(next).toContain("just chatter");
@@ -1004,7 +1005,6 @@ it(
 			if (++attempts === 1) throw new Error("connection reset after the post");
 			return posted;
 		});
-		const signals = vi.spyOn(t.runtime, "signalWithStart");
 		t.respond([fauxAssistantMessage("The answer"), fauxAssistantMessage("unexpected")]);
 		await t.chat.receive(t.message("m1", "t1"));
 		// The crashed attempt and the failed post are retried after Conductor's backoff.
@@ -1013,9 +1013,11 @@ it(
 		expect(await t.chat.receive(t.message("m1", "t1"))).toBe("accepted");
 		// The same input signalled again, as a redelivered Conductor signal would be.
 		const [request] = await submitted(`chat:channel:${t.channel}`);
-		const input = signals.mock.calls.find(([start]) => start.signal.id === request)![0].signal
-			.payload;
-		await t.runtime.signalWithStart({
+		const [stored] = await sql()<{ payload: Json }[]>`
+			select payload from pgconductor._private_execution_signals
+			where queue = ${t.client.queue} and name = 'input' and id = ${request!}`;
+		const input = stored!.payload;
+		await t.client.signalWithStart({
 			workflow: "fabrial.session",
 			key: `chat:channel:${t.channel}`,
 			signal: { name: "input", id: `${request}:again`, payload: input },
@@ -1033,7 +1035,7 @@ it(
 		expect(attempts).toBe(2);
 		expect(t.faux.state.callCount).toBe(1);
 		expect(await deliveries(t)).toEqual([expect.objectContaining({ status: "posted" })]);
-		expect((await sessions(t.runtime.queue)).at(0)).toEqual({ status: "completed", attempts: 2 });
+		expect((await sessions(t.client.queue)).at(0)).toEqual({ status: "completed", attempts: 2 });
 		// The crashed attempt cleared its progress; the reopened one, with only the post pending, shows none.
 		expect(await statuses(t, "t1")).toEqual(["Thinking…", null]);
 	},
@@ -1055,7 +1057,7 @@ it("a run waits for its final post; input arriving meanwhile is still answered",
 	await until("the held post", async () => (held ? true : undefined));
 	// The answer exists, but the run waits for its post: the Session does not complete.
 	await new Promise((resolve) => setTimeout(resolve, 500));
-	expect((await sessions(t.runtime.queue)).map((session) => session.status)).not.toContain(
+	expect((await sessions(t.client.queue)).map((session) => session.status)).not.toContain(
 		"completed",
 	);
 	expect(await deliveries(t)).toEqual([expect.objectContaining({ status: "pending" })]);
@@ -1064,14 +1066,14 @@ it("a run waits for its final post; input arriving meanwhile is still answered",
 	await until("the second answer", async () => ((await t.posts("t2")).length ? true : undefined));
 	expect((await t.posts("t2")).map((post) => post.content)).toEqual(["Answer two"]);
 	expect(await t.posts("t1")).toEqual([]);
-	expect((await sessions(t.runtime.queue)).map((session) => session.status)).not.toContain(
+	expect((await sessions(t.client.queue)).map((session) => session.status)).not.toContain(
 		"completed",
 	);
 	release();
 	await t.settle();
 	expect((await t.posts("t1")).map((post) => post.content)).toEqual(["Answer one"]);
 	expect((await deliveries(t)).map((delivery) => delivery.status)).toEqual(["posted", "posted"]);
-	expect(await sessions(t.runtime.queue)).toEqual([{ status: "completed", attempts: 1 }]);
+	expect(await sessions(t.client.queue)).toEqual([{ status: "completed", attempts: 1 }]);
 	expect(t.faux.state.callCount).toBe(2);
 });
 
@@ -1105,7 +1107,7 @@ it("a final post that fails for good is logged and recorded, without rerunning t
 			data: expect.objectContaining({ error: "chat is down" }),
 		}),
 	]);
-	expect(await sessions(t.runtime.queue)).toEqual([{ status: "completed", attempts: 1 }]);
+	expect(await sessions(t.client.queue)).toEqual([{ status: "completed", attempts: 1 }]);
 	// The conversation stays usable.
 	const posted: unknown[] = [];
 	await intercept(t, "t2", async (content, actual) => {
@@ -1129,7 +1131,7 @@ it("ctx.agent returns the answer and posts nothing, without offering no_reply", 
 		},
 	]);
 	const thread = { kind: "thread" as const, provider: "chat", threadId: `chat:${t.channel}:t3` };
-	const id = await t.runtime.invoke(
+	const id = await t.client.invoke(
 		t.ask.name,
 		{ question: "What is the answer?" },
 		{

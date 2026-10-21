@@ -36,13 +36,14 @@ import {
 	type JsonObject,
 	type MessageRef,
 	type OutboundMessage,
-	type RuntimeWorkflow,
+	type WorkflowTask,
 	type Schema,
 } from "../modules.ts";
 import type { TaskContext } from "pgconductor-js";
 import {
 	childMetadata,
 	executionResult,
+	settlement,
 	ExecutionError,
 	isCancelled,
 	metadataOf,
@@ -541,13 +542,14 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		payload: SessionInput,
 		metadata: InvocationMetadata,
 	) =>
-		host.runtime.signalWithStart({
-			workflow: SESSION_WORKFLOW,
+		host.conductor.signalWithStart({
+			task: SESSION_WORKFLOW,
+			queue: host.queue,
 			key,
 			signal: { name: "input", id, payload: payload as unknown as Json },
 			input: { session: key },
 			metadata: { ...metadata, ...sessionMetadata(key) } as InvocationMetadata,
-		});
+		} as never);
 
 	/**
 	 * The Session execution: hosts the Pi Session while it has work. Once every live task waits on a workflow, or only
@@ -694,11 +696,12 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 			waitChild: (taskId, executionId, context) =>
 				awaitWithContext(
 					(async () => {
-						const settled = await host.runtime.getExecution(executionId);
-						if (!settled) throw new Error(`Execution ${executionId} not found`);
+						const info = await host.conductor.getExecution(executionId);
+						if (!info) throw new Error(`Execution ${executionId} not found`);
+						const settled = settlement(info);
 						// The reporter signals once the outcome is committed, and settles right after.
-						const result = settled.result
-							? childOutcome(cloneJson(settled.result) as unknown as JsonObject)
+						const result = settled
+							? childOutcome(cloneJson(settled) as unknown as JsonObject)
 							: await reportOf(executionId).promise;
 						return harness.commit(
 							async (tx) => ((await tx.doc(ChildResults)).results[executionId] ??= result),
@@ -932,7 +935,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 			}, context);
 			await cancelChildren(
 				frame,
-				(executionId, why) => host.runtime.cancel(executionId, why),
+				(executionId, why) => host.conductor.cancel(executionId, { reason: why }),
 				stopping,
 				reason,
 				context,
@@ -1111,7 +1114,9 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				if (conversationId !== undefined && post.conversationId !== conversationId) continue;
 				const reported = post.stale
 					? (((await reportedOutcome(executionId)) as ChildSignal["result"] | undefined) ??
-						(await host.runtime.getExecution(executionId))?.result)
+						(await host.conductor
+							.getExecution(executionId)
+							.then((info) => info && settlement(info))))
 					: undefined;
 				const result = reported && (childOutcome(reported as JsonObject) as ExecutionResult);
 				post.stale = false;
@@ -1519,14 +1524,14 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		};
 	}
 
-	const session: RuntimeWorkflow = {
+	const session: WorkflowTask = {
 		name: SESSION_WORKFLOW,
 		triggers: [],
 		// Retries back off 15s, 30s, 1m, …: the first attempts outlast a crashed owner's 30s lease.
 		retries: { maxAttempts: 10 },
 		// No retentionDays, so kept forever: callers wait on a call's result and replay from it, and reclaim reads when
 		// it settled. A finite retention must outlast both, and retainCallSessionsDays.
-		handler: (input, _execution, ctx) => hostSession(input, ctx),
+		handler: (input, ctx) => hostSession(input, ctx),
 	};
 	const retainDays = options.retainCallSessionsDays ?? 7;
 	if (!(retainDays >= 0)) throw new RangeError("retainCallSessionsDays must not be negative");
@@ -1539,7 +1544,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 	 * hosted the Session; a Session leased, never hosted, or whose execution is unknown is kept. One step per batch, in
 	 * key order.
 	 */
-	const reclaim: RuntimeWorkflow = {
+	const reclaim: WorkflowTask = {
 		name: RECLAIM_WORKFLOW,
 		triggers: [],
 		cron:
@@ -1549,12 +1554,9 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		concurrency: 1,
 		// Nothing waits on it.
 		retentionDays: 30,
-		handler: async (_input, _execution, ctx) => {
+		handler: async (_input, ctx) => {
 			const native = nativeMethods(ctx);
-			const cutoff = await native.step(
-				"cutoff",
-				async () => (host.runtime.now?.() ?? Date.now()) - retainDays * 86_400_000,
-			);
+			const cutoff = await native.step("cutoff", async () => host.now() - retainDays * 86_400_000);
 			let after = CALL_SESSION;
 			let reclaimed = 0;
 			let batches = 0;
@@ -1568,9 +1570,10 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 					);
 					let count = 0;
 					for (const { key, executionId } of candidates) {
-						const settled = await host.runtime.getExecution(executionId);
-						if (settled?.workflow !== SESSION_WORKFLOW || !settled.result) continue;
-						if (settled.settledAt === undefined || settled.settledAt > cutoff) continue;
+						const info = await host.conductor.getExecution(executionId);
+						if (info?.queue !== host.queue || info.taskKey !== SESSION_WORKFLOW) continue;
+						const settledAt = settlement(info) && (info.completedAt ?? info.failedAt)?.getTime();
+						if (!settledAt || settledAt > cutoff) continue;
 						if (await PostgresStorage.reclaim(options.sql, key, executionId)) count++;
 					}
 					return {
@@ -1591,10 +1594,10 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 	 * execution once Conductor committed the child's outcome, cancellations included: a retried, failed or interrupted
 	 * attempt never reaches the Session. Returns that outcome. Kept forever, like the executions Sessions wait on.
 	 */
-	const report: RuntimeWorkflow = {
+	const report: WorkflowTask = {
 		name: REPORT_WORKFLOW,
 		triggers: [],
-		handler: async (input, _execution, ctx) => {
+		handler: async (input, ctx) => {
 			const native = nativeMethods(ctx);
 			const {
 				workflow,
@@ -1623,10 +1626,10 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		},
 	};
 	// Effects run in a stable child execution, never in the Session's replaceable execution.
-	const effect: RuntimeWorkflow = {
+	const effect: WorkflowTask = {
 		name: EFFECT_WORKFLOW,
 		triggers: [],
-		handler: async (input, _execution, ctx) => {
+		handler: async (input, ctx) => {
 			const native = nativeMethods(ctx);
 			const metadata = metadataOf(ctx);
 			const { method, args } = input as { method: string; args: Json[] };
@@ -1918,7 +1921,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		state,
 		evaluator,
 		/** Pi's workflows, if the instance defines agents or state (core registers them when the app starts). */
-		get workflows(): RuntimeWorkflow[] {
+		get workflows(): WorkflowTask[] {
 			return used() ? [session, effect, report, reclaim] : [];
 		},
 		get events() {
@@ -1952,7 +1955,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		},
 		async stop() {
 			started = false;
-			// Runtime stop aborts the drivers, but native workers race abort against
+			// Orchestrator stop aborts the drivers, but native workers race abort against
 			// handlers rather than joining their finally blocks. Join the entire
 			// cleanup, not just Harness.close, before core shuts down Chat.
 			await Promise.all(active.values());

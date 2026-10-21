@@ -1,10 +1,9 @@
 import postgres, { type Sql } from "postgres";
 import { afterAll, afterEach, beforeAll } from "vitest";
 import type { HostedApp } from "../../../src/app.ts";
-import type { RuntimeWorkflow } from "../../internals.ts";
 import { PostgresStorage } from "../../../src/agents/index.ts";
 import { FakeChat, testApp } from "../../../src/testing-internal.ts";
-import { until, useConductor } from "../../conductor/helper.ts";
+import { testClient, until, useConductor } from "../../conductor/helper.ts";
 
 type Config = Parameters<typeof testApp>[1];
 
@@ -33,29 +32,24 @@ export function useAgents() {
 	};
 
 	/**
-	 * Start an app on a fresh queue, or on `queue` to restart a stopped app. `retries` overrides the attempts of internal workflows such as
-	 * `fabrial.session`, registered before the runtime starts.
+	 * Start an app on a fresh queue, or on `queue` to restart a stopped app. `retries` overrides the attempts of internal
+	 * workflows such as `fabrial.session`: Conductor reads a task's attempts when an attempt fails.
 	 */
 	async function launch(
 		instance: Parameters<typeof testApp>[0],
-		config: Omit<Config, "runtime" | "chat"> & { chat?: FakeChat; queue?: string },
-		retries: Record<string, RuntimeWorkflow["retries"]> = {},
+		config: Omit<Config, "conductor" | "chat"> & { chat?: FakeChat; queue?: string },
+		retries: Record<string, { maxAttempts: number }> = {},
 	) {
 		const { queue, ...rest } = config;
-		const runtime = db.runtime(queue ? { queue } : {});
-		const register = runtime.register.bind(runtime);
-		runtime.register = (definitions) =>
-			register({
-				...definitions,
-				workflows: definitions.workflows.map((workflow) =>
-					retries[workflow.name] ? { ...workflow, retries: retries[workflow.name] } : workflow,
-				),
-			});
+		const conductor = db.conductor(queue ? { queue } : {});
 		const chat = rest.chat ?? new FakeChat({ installationId: "w" });
-		const app = testApp(instance, { ...rest, runtime, chat });
+		const app = testApp(instance, { ...rest, conductor, chat });
 		await app.start();
 		apps.push(app as HostedApp<never>);
-		return { runtime, chat, app };
+		for (const [task, { maxAttempts }] of Object.entries(retries))
+			await sql()`update pgconductor._private_tasks set max_attempts = ${maxAttempts}
+				where queue = ${conductor.queue} and key = ${task}`;
+		return { client: testClient(conductor.queue, () => app.host.conductor), chat, app };
 	}
 
 	/** Tasks of the executions on `queue` (or of all apps) that have not settled. */

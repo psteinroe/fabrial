@@ -99,8 +99,11 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 
 /** Internal app construction for `fabrial/testing`. Not part of the public API. */
 export const INTERNAL = Symbol.for("fabrial.internal");
-export type InternalOverrides = ProductionOverrides &
-	Partial<Pick<CoreConfig, "runtime" | "chat" | "agents">>;
+export type InternalOverrides = Omit<ProductionOverrides, "conductor"> &
+	Partial<Pick<CoreConfig, "chat" | "agents">> & {
+		/** With `sql`, the app runs on that pool instead of the instance's database. */
+		conductor?: Omit<CoreConfig["conductor"], "sql"> & { sql?: CoreConfig["conductor"]["sql"] };
+	};
 export interface InternalInstance {
 	app(config: AppConfig, overrides: InternalOverrides): HostedApp;
 }
@@ -111,13 +114,17 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 ): Fabrial<P> {
 	const plugins = Object.freeze([...config.plugins]) as unknown as P;
 	const build = (appConfig: AppConfig, overrides: InternalOverrides = {}): HostedApp => {
-		const { runtime, chat, agents, ...settings } = overrides;
-		if (runtime && !agents)
-			throw new Error("An app on an explicit runtime needs agents (Pi options)");
+		const { conductor, chat, agents, ...settings } = overrides;
+		const sql = conductor?.sql;
+		if (sql && !agents)
+			throw new Error("An app on an explicit Conductor pool needs agents (Pi options)");
 		const integrations =
-			runtime && agents
-				? { runtime, chat, agents }
-				: production({ database: config.database, models: config.models ?? {} }, settings);
+			sql && agents
+				? { conductor: { ...conductor, sql }, chat, agents }
+				: production(
+						{ database: config.database, models: config.models ?? {} },
+						{ ...settings, conductor },
+					);
 		return buildApp({
 			...integrations,
 			plugins,

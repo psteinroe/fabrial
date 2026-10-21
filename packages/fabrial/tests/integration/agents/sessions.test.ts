@@ -22,12 +22,12 @@ import {
 } from "../../internals.ts";
 import { toolName } from "../../../src/agent.ts";
 import { callSession, PostgresStorage } from "../../../src/agents/index.ts";
-import { conductor } from "../../../src/runtime/conductor/index.ts";
+import { testClient } from "../../conductor/helper.ts";
 import { FakeChat, testApp } from "../../../src/testing-internal.ts";
 
 /**
- * Sessions hosted in keyed Conductor executions: every case runs the real runtime, and the cross-process cases two
- * app instances (two orchestrators, two pools) on one database, since signals reach only a shared runtime.
+ * Sessions hosted in keyed Conductor executions: every case runs real Conductor, and the cross-process cases two
+ * app instances (two orchestrators, two pools) on one database, since signals reach only a shared database.
  */
 const alice = defineUser({
 	id: "alice",
@@ -134,13 +134,11 @@ function gate() {
 /** One app instance on the test database: its own pool, orchestrator, chat, and model provider. */
 async function launch(name: string, workflows: Parameters<typeof testApp>[1]["workflows"]) {
 	const pool = postgres(url, { max: 10, onnotice: () => {} });
-	const runtime = conductor(
-		{ sql: pool },
-		{
-			logger,
-			worker: { pollIntervalMs: 20, flushIntervalMs: 20, concurrency: 8, fetchBatchSize: 10 },
-		},
-	);
+	const conductor = {
+		sql: pool,
+		logger,
+		worker: { pollIntervalMs: 20, flushIntervalMs: 20, concurrency: 8, fetchBatchSize: 10 },
+	};
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
@@ -161,7 +159,7 @@ async function launch(name: string, workflows: Parameters<typeof testApp>[1]["wo
 	const chat = new FakeChat({ installationId: "w" });
 	const app = testApp(f, {
 		workflows,
-		runtime,
+		conductor,
 		chat,
 		logger,
 		agents: { models, sql: pool, settings: { retry: { enabled: false } } },
@@ -175,7 +173,7 @@ async function launch(name: string, workflows: Parameters<typeof testApp>[1]["wo
 		await pool.end();
 	};
 	stops.push(stop);
-	return { name, runtime, chat, app, stop };
+	return { name, client: testClient("default", () => app.host.conductor), chat, app, stop };
 }
 
 const metadataOf = (): InvocationMetadata => ({
@@ -305,7 +303,7 @@ it("a message ingested on another instance steers the run its host is busy with;
 		return say("done");
 	};
 	const a = await launch("a", [deliver]);
-	await a.runtime.invoke(deliver.name, { text: "first question" }, { metadata: metadataOf() });
+	await a.client.invoke(deliver.name, { text: "first question" }, { metadata: metadataOf() });
 	await busy.entered;
 	// B starts while A hosts the Session, so A's worker holds its execution.
 	const b = await launch("b", [deliver]);
@@ -319,7 +317,7 @@ it("a message ingested on another instance steers the run its host is busy with;
 			() => {},
 		);
 	}, 25);
-	await b.runtime.invoke(deliver.name, { text: "second question" }, { metadata: metadataOf() });
+	await b.client.invoke(deliver.name, { text: "second question" }, { metadata: metadataOf() });
 	await expect.poll(async () => (await submitted(await only())).length, poll).toBe(2);
 	expect(await sessionExecutions()).toEqual([hosting]);
 	expect(requests).toHaveLength(1);
@@ -373,10 +371,10 @@ it("a message is answered while only a background child works; the child's repor
 		(await a.chat.thread(replyTo)).posts.flatMap((post) =>
 			typeof post.content === "string" ? [post.content] : [],
 		);
-	await a.runtime.invoke(deliver.name, { text: "Fix the row" }, { metadata: metadataOf() });
+	await a.client.invoke(deliver.name, { text: "Fix the row" }, { metadata: metadataOf() });
 	await child.entered;
 	await expect.poll(posts, poll).toEqual(["On it."]);
-	await a.runtime.invoke(deliver.name, { text: "Status?" }, { metadata: metadataOf() });
+	await a.client.invoke(deliver.name, { text: "Status?" }, { metadata: metadataOf() });
 	// Answered while the child's model call is still held.
 	await expect.poll(posts, poll).toEqual(["On it.", "Still working."]);
 	expect(requests.filter((request) => lastText(request.context).startsWith("<subagent"))).toEqual(
@@ -402,9 +400,9 @@ for (const from of ["the same", "another"] as const)
 		};
 		const a = await launch("a", [ask]);
 		const metadata = metadataOf();
-		const caller = await a.runtime.invoke(ask.name, { text: "Take your time" }, { metadata });
+		const caller = await a.client.invoke(ask.name, { text: "Take your time" }, { metadata });
 		await held.entered;
-		const canceller = from === "another" ? (await launch("b", [ask])).runtime : a.runtime;
+		const canceller = from === "another" ? (await launch("b", [ask])).client : a.client;
 		await canceller.cancel(caller, "user cancelled");
 		await expect.poll(() => execution(caller), poll).toMatchObject({ cancelled: true });
 		// The call's Session execution is the caller's child: cancelled with it, it aborts the held model call.
@@ -416,7 +414,7 @@ for (const from of ["the same", "another"] as const)
 		expect(requests.map((request) => request.instance)).toEqual(["a"]);
 		// A later call of the same interaction runs in its own Session and answers.
 		script = () => say("fresh");
-		const next = await a.runtime.invoke(ask.name, { text: "Again" }, { metadata });
+		const next = await a.client.invoke(ask.name, { text: "Again" }, { metadata });
 		await expect.poll(() => execution(next), poll).toMatchObject({ done: true, cancelled: false });
 		expect(await output(next)).toBe("fresh");
 	});
@@ -447,7 +445,7 @@ it("a crashed owner's lease delays the Session until it expires; Conductor retri
 	});
 	script = ({ context }) => (lastText(context) === "waited" ? say("all done") : use("wait", {}));
 	const a = await launch("a", [ask]);
-	const caller = await a.runtime.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
+	const caller = await a.client.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
 	await slow.entered;
 	await a.stop();
 	// A crashed owner: it holds the lease and never renews or releases it.
@@ -507,7 +505,7 @@ it("a run resumes on a fresh instance after its host stops mid-run; each model r
 	};
 	const a = await launch("a", [ask]);
 	const metadata = metadataOf();
-	const caller = await a.runtime.invoke(ask.name, { text: "Go" }, { metadata });
+	const caller = await a.client.invoke(ask.name, { text: "Go" }, { metadata });
 	await slow.entered;
 	await a.stop();
 	expect(await lease(metadata.requestId)).toBeNull();
@@ -553,13 +551,13 @@ it("input redelivered with the same request id, also through another instance, i
 		input: { session },
 		metadata,
 	});
-	const first = await a.runtime.signalWithStart(input("r1", "one"));
+	const first = await a.client.signalWithStart(input("r1", "one"));
 	await busy.entered;
 	// The same signal through both instances, and the same request under another signal id.
-	expect(await b.runtime.signalWithStart(input("r1", "one"))).toBe(first);
-	expect(await a.runtime.signalWithStart(input("r1", "one"))).toBe(first);
-	await b.runtime.signalWithStart(input("r2", "two"));
-	await b.runtime.signalWithStart({
+	expect(await b.client.signalWithStart(input("r1", "one"))).toBe(first);
+	expect(await a.client.signalWithStart(input("r1", "one"))).toBe(first);
+	await b.client.signalWithStart(input("r2", "two"));
+	await b.client.signalWithStart({
 		...input("r1", "one"),
 		signal: { ...input("r1", "one").signal, id: "r1:again" },
 	});
@@ -567,7 +565,7 @@ it("input redelivered with the same request id, also through another instance, i
 	busy.open();
 	await released(session);
 	// After the Session closed, a redelivery starts a new execution that admits nothing.
-	await b.runtime.signalWithStart(input("r1", "one"));
+	await b.client.signalWithStart(input("r1", "one"));
 	await expect.poll(async () => (await sessionExecutions()).length, poll).toBe(2);
 	await released(session);
 	expect(await submitted(session)).toEqual(["r1", "r2"]);
@@ -609,7 +607,7 @@ it("a host that loses its Session lease during a model call closes its harness a
 		return use("lookup", {});
 	};
 	const a = await launch("a", [deliver]);
-	await a.runtime.invoke(deliver.name, { text: "Go" }, { metadata: metadataOf() });
+	await a.client.invoke(deliver.name, { text: "Go" }, { metadata: metadataOf() });
 	await held.entered;
 	const owner = await lease(await only());
 	expect(owner).not.toBeNull();
@@ -694,7 +692,7 @@ it("a workflow tool waiting on approval suspends the Session execution; after a 
 	const a = await launch("a", [runSql, ask]);
 	const card = await approvals(a);
 	const metadata = metadataOf();
-	const caller = await a.runtime.invoke(ask.name, { text: "Fix the row" }, { metadata });
+	const caller = await a.client.invoke(ask.name, { text: "Fix the row" }, { metadata });
 	await expect.poll(() => !!card.action, poll).toBe(true);
 	// Waiting on the approval, the Session's execution is suspended (not ended) and the lease is free.
 	const key = await only();
@@ -725,7 +723,7 @@ it("cancelling a run suspended on a workflow tool cancels the tool's execution",
 	const { runSql, ask } = approvalTool();
 	const a = await launch("a", [runSql, ask]);
 	const card = await approvals(a);
-	const caller = await a.runtime.invoke(
+	const caller = await a.client.invoke(
 		ask.name,
 		{ text: "Fix the row" },
 		{ metadata: metadataOf() },
@@ -736,7 +734,7 @@ it("cancelling a run suspended on a workflow tool cancels the tool's execution",
 	const [tool] = await sql<{ id: string }[]>`
 		select id from pgconductor._private_executions where task_key = ${runSql.name}`;
 	const [session] = await sessionExecutions();
-	await a.runtime.cancel(caller, "User stopped");
+	await a.client.cancel(caller, "User stopped");
 	await expect.poll(() => execution(caller), poll).toMatchObject({ cancelled: true });
 	// The suspended Session execution and its tool's are cancelled natively; nothing reopens the Session.
 	await expect.poll(() => execution(session!.id), poll).toMatchObject({ cancelled: true });
@@ -764,7 +762,7 @@ it("a ctx.agent call that times out on a workflow tool fails its caller and canc
 	});
 	const a = await launch("a", [runSql, ask]);
 	const card = await approvals(a);
-	const caller = await a.runtime.invoke(
+	const caller = await a.client.invoke(
 		ask.name,
 		{ text: "Fix the row" },
 		{ metadata: metadataOf() },
@@ -835,7 +833,7 @@ it("a workflow tool's result reaches a Session busy with another subagent's mode
 	const { runSql, ask, reported } = busyAndWaiting((request) => busy.pass(request.signal));
 	const a = await launch("a", [runSql, ask]);
 	const card = await approvals(a);
-	const caller = await a.runtime.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
+	const caller = await a.client.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
 	await expect.poll(() => !!card.action, poll).toBe(true);
 	await busy.entered;
 	await a.chat.click(card.ref!, card.action!, alice.identities[0]!);
@@ -856,12 +854,12 @@ it("a workflow tool whose execution is cancelled while the Session is busy gets 
 	const { runSql, ask, reported } = busyAndWaiting((request) => busy.pass(request.signal));
 	const a = await launch("a", [runSql, ask]);
 	const card = await approvals(a);
-	const caller = await a.runtime.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
+	const caller = await a.client.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
 	await expect.poll(() => !!card.action, poll).toBe(true);
 	await busy.entered;
 	const [tool] = await sql<{ id: string }[]>`
 		select id from pgconductor._private_executions where task_key = ${runSql.name}`;
-	await a.runtime.cancel(tool!.id, "Withdrawn");
+	await a.client.cancel(tool!.id, "Withdrawn");
 	await expect.poll(() => execution(tool!.id), poll).toMatchObject({ cancelled: true });
 	// The tool's reporter reports the cancellation: the fixer answers while the thinker's model call is still held.
 	await expect.poll(() => reported("Not fixed."), poll).toBe(true);
@@ -900,7 +898,7 @@ it("a workflow tool's outcome reaches the Session only once committed: an attemp
 		return text === "Go" ? use(toolName(flaky.name), {}) : say(`Got ${text}`);
 	};
 	const a = await launch("a", [flaky, ask]);
-	const caller = await a.runtime.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
+	const caller = await a.client.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
 	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
 	// The first attempt's return value never reached the Session: only the committed one did.
 	expect(attempts).toBe(2);
@@ -920,7 +918,7 @@ it("a workflow tool's result sent while its Session restarts on another instance
 	);
 	const a = await launch("a", [runSql, ask]);
 	const card = await approvals(a);
-	const caller = await a.runtime.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
+	const caller = await a.client.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
 	await expect.poll(() => !!card.action, poll).toBe(true);
 	await onA.entered;
 	await a.stop();
@@ -1006,11 +1004,11 @@ it("workflows on another instance read and update a Session's state during a gen
 		replyTo: thread() as InvocationMetadata["replyTo"],
 	};
 	const run = async (times: number) => {
-		const id = await b.runtime.invoke(increment.name, { times }, { metadata });
+		const id = await b.client.invoke(increment.name, { times }, { metadata });
 		await expect.poll(() => execution(id), poll).toMatchObject({ done: true });
 		return (await result(id))?.count;
 	};
-	await a.runtime.invoke(deliver.name, { text: "Go" }, { metadata });
+	await a.client.invoke(deliver.name, { text: "Go" }, { metadata });
 	await busy.entered;
 	const session = await only();
 	// During the generation: the host answers between Pi's passes; two workflows race on the revision.

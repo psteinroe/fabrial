@@ -35,11 +35,10 @@ export function createTestApp<const P extends readonly AnyPlugin[]>(
 	config: TestAppConfig & { models?: ScriptedModels },
 ): TestApp<ClientsOf<P>> {
 	const { models, ...rest } = config;
-	const { runtime: _, ...app } = create(instance, {
+	return create(instance, {
 		...rest,
 		...(models ? { models: scripted.get(models) } : {}),
 	});
-	return app;
 }
 
 /** A scripted model reply, built with `reply.text()` or `reply.toolCall()`. */

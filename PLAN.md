@@ -879,7 +879,7 @@ A full review against the goal (Fabrial is glue over Chat SDK, Pi Durable, and C
 - **Call Sessions are reclaimed (2026-10-21).** A daily `fabrial.sessions.reclaim` deletes the storage of `ctx.agent` Sessions whose execution settled at least 7 days ago; thread, channel, and app Sessions are kept.
 - **Tests run on real Conductor** with its test clock; the in-memory runtime engine is removed. Fake chat, scripted models, and pure unit tests stay.
 - **Conductor stays a submodule** pinned to `main` until a version is published.
-- **Explicit public exports (2026-10-21).** `fabrial` for app authors, `fabrial/plugin` for plugin authors, `fabrial/testing` for tests; nothing else is public. Fixtures over internal ports (`StubRuntime`, `testApp`, `fakeAgents`, `createTestClock`) live in the dev-only `fabrial/internal/testing` entry, for Fabrial's and its plugins' tests; it is not in the published exports.
+- **Explicit public exports (2026-10-21).** `fabrial` for app authors, `fabrial/plugin` for plugin authors, `fabrial/testing` for tests; nothing else is public. Fixtures over internal integrations (`testApp`, `fakeAgents`, `createTestClock`) live in the dev-only `fabrial/internal/testing` entry, for Fabrial's and its plugins' tests; it is not in the published exports.
 - **One actor (2026-10-21).** Contexts expose `actor` only (who asked for the work); internal metadata stays off contexts.
 - **Typed `ctx.agent` output (2026-10-21).** With `output`, the result is typed from the schema; there is no caller-chosen result type.
 - **State scope `session` (2026-10-21).** The scope formerly called `thread` is `session`: one value per Session. `agent` state is per conversation and tools-only.

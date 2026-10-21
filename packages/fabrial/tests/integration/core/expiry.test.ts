@@ -1,3 +1,4 @@
+import type { Json } from "../../internals.ts";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { trigger } from "../../internals.ts";
@@ -50,7 +51,7 @@ describe("cleanup workflow", () => {
 		};
 		const owner = await enter(test);
 		const c = await card(test);
-		await test.runtime.cancel(owner.id);
+		await test.client.cancel(owner.id);
 		expect(await owner.settled()).toMatchObject({ status: "cancelled" });
 		await eventually("alice's cancelled card", () => cardOf(c.post.content).text === "Cancelled");
 		release();
@@ -58,7 +59,7 @@ describe("cleanup workflow", () => {
 			"bob's cancelled card",
 			() => !!bobDM.posts[0] && cardOf(bobDM.posts[0].content).text === "Cancelled",
 		);
-		const cleanups = await executions(test.runtime.queue, "fabrial.cleanup");
+		const cleanups = await executions(test.client.queue, "fabrial.cleanup");
 		expect(cleanups).toHaveLength(3);
 		for (const id of cleanups) expect((await db.execution(id).settled()).status).toBe("completed");
 	});
@@ -127,28 +128,28 @@ describe("expiry and timers", () => {
 
 	it("fires timers at absolute at even when registration is delayed", async () => {
 		const at = db.clock.now().getTime() + timeout;
-		const runtime = await db.start(
+		const client = await db.start(
 			[
 				{
 					name: "waiter",
 					triggers: [],
-					handler: async (_i, execution) => {
-						await execution.sleep("delay", early);
+					handler: async (_i, ctx) => {
+						await ctx.sleep("delay", early);
 						// The timeout starts at the first wait: computed from the absolute deadline.
-						const never = await execution.subscribe("never", { event: "test.never" });
+						const never = await ctx.subscribe("never", { event: { name: "test.never" } } as never);
 						return (
-							await execution.waitForAny(
+							await ctx.waitForAny(
 								"timer",
 								{ never },
-								{ timeoutMs: Math.max(0, at - db.clock.now().getTime()) },
+								{ timeout: Math.max(0, at - db.clock.now().getTime()) },
 							)
-						).kind;
+						).key;
 					},
 				},
 			],
 			{ events: [{ name: "test.never", filterable: [] }] },
 		);
-		const execution = db.execution(await runtime.invoke("waiter", {}, { metadata }));
+		const execution = db.execution(await client.invoke("waiter", {}, { metadata }));
 		await execution.suspended("delay");
 		await db.clock.advance(early);
 		await execution.suspended();
@@ -196,22 +197,22 @@ describe("expiry and timers", () => {
 	});
 
 	it("does not lose an event emitted after registration while the attempt is still running", async () => {
-		const runtime = await db.start(
+		const client = await db.start(
 			[
 				{
 					name: "waiter",
 					triggers: [],
-					handler: async (_i, execution) => {
-						const ping = await execution.subscribe("ping", { event: "test.ping" });
-						await execution.step("emit", () => execution.emit("test.ping", { n: 1 }));
-						const winner = await execution.waitForAny("wait", { ping }, { timeoutMs: 60_000 });
-						return winner.kind === "event" ? winner.event.payload : null;
+					handler: async (_i, ctx) => {
+						const ping = await ctx.subscribe("ping", { event: { name: "test.ping" } } as never);
+						await ctx.step("emit", () => ctx.emit("test.ping" as never, { n: 1 } as never));
+						const winner = await ctx.waitForAny("wait", { ping }, { timeout: 60_000 });
+						return "event" in winner ? (winner.event as { payload: Json }).payload : null;
 					},
 				},
 			],
 			{ events: [{ name: "test.ping", filterable: [] }] },
 		);
-		const execution = db.execution(await runtime.invoke("waiter", {}, { metadata }));
+		const execution = db.execution(await client.invoke("waiter", {}, { metadata }));
 		expect(await execution.output()).toEqual({ n: 1 });
 	});
 });

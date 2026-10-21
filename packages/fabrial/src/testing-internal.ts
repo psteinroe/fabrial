@@ -1,7 +1,7 @@
 // Fixtures over Fabrial's internal ports, for Fabrial's own tests and its plugins' tests. Not public:
 // the dev-only `fabrial/internal/testing` entry, omitted from the published exports.
 import { createTestClock, type TestClock } from "pgconductor-js/testing";
-import { Conductor, TaskSchemas } from "pgconductor-js";
+import { Conductor, TaskSchemas, type Orchestrator } from "pgconductor-js";
 import { createModels as createPiModels } from "@earendil-works/pi-ai/models";
 import type { MutableModels } from "@earendil-works/pi-ai";
 import postgres, { type Sql } from "postgres";
@@ -18,64 +18,14 @@ import {
 } from "./instance.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { AnyPlugin } from "./plugin.ts";
-import { conductor } from "./runtime/conductor/index.ts";
-import type {
-	DurableRuntime,
-	ExecutionResult,
-	InvocationMetadata,
-	RuntimeEvent,
-	RuntimeWorkflow,
-} from "./runtime.ts";
+import type { ConductorConfig } from "./conductor.ts";
+import { settlement, type ExecutionResult } from "./execution.ts";
 import type { Surface, ThreadRef } from "./thread.ts";
 import type { AnyWorkflow, WorkflowArgs } from "./workflow.ts";
 
 export { FakeChat } from "./fake-chat.ts";
-/** Conductor's test clock; pass it as `conductor(..., { clock })` over a single-connection pool. */
+/** Conductor's test clock; pass it as the app's `conductor: { sql, clock }` over a single-connection pool. */
 export { createTestClock, type TestClock } from "pgconductor-js/testing";
-
-const clone = <T>(value: T): T => structuredClone(value);
-
-/**
- * A runtime port for unit tests that never run a workflow: it records registrations and emitted events
- * and keeps the time. Starting work (`invoke`, `signal`, …) throws.
- */
-export class StubRuntime implements DurableRuntime {
-	readonly workflows = new Map<string, RuntimeWorkflow>();
-	readonly events: RuntimeEvent[] = [];
-	readonly emitted: { name: string; payload: JsonObject; metadata: InvocationMetadata }[] = [];
-	constructor(public time = Date.now()) {}
-	now(): number {
-		return this.time;
-	}
-	register(definition: { workflows: RuntimeWorkflow[]; events: RuntimeEvent[] }): void {
-		for (const workflow of definition.workflows) this.workflows.set(workflow.name, workflow);
-		this.events.push(...definition.events);
-	}
-	async start(): Promise<void> {}
-	async stop(): Promise<void> {}
-	async emit(
-		name: string,
-		payload: JsonObject,
-		options: Parameters<DurableRuntime["emit"]>[2],
-	): Promise<void> {
-		this.emitted.push(clone({ name, payload, metadata: options.metadata }));
-	}
-	invoke(): never {
-		throw new Error("StubRuntime runs no workflows");
-	}
-	cancel(): never {
-		throw new Error("StubRuntime runs no workflows");
-	}
-	signalWithStart(): never {
-		throw new Error("StubRuntime runs no workflows");
-	}
-	signal(): never {
-		throw new Error("StubRuntime runs no workflows");
-	}
-	async getExecution(): Promise<null> {
-		return null;
-	}
-}
 
 /** The Pi models behind each `scriptedModels()`, for tests building apps below the public API. */
 export const scriptedPi = new WeakMap<object, MutableModels>();
@@ -109,11 +59,11 @@ export async function sessionSignals(sql: Sql, queue: string): Promise<SessionSi
 	return rows.map((row) => ({ ...row.payload, session: row.session, id: row.id }) as SessionSignal);
 }
 
-/** Build an app from an instance with explicit test ports (a runtime, fake or real chat, agents). */
+/** Build an app from an instance with explicit test integrations (a Conductor pool and queue, fake or real chat, agents). */
 export function testApp<const P extends readonly AnyPlugin[]>(
 	instance: Fabrial<P>,
 	config: Omit<AppConfig, "agents"> & {
-		runtime: DurableRuntime;
+		conductor: ConductorConfig;
 		chat?: ChatOptions;
 		/** Pi. Defaults to no models and no database: enough for apps that define no agents or state. */
 		agents?: PiOptions;
@@ -176,14 +126,18 @@ export interface ThreadFollowers {
 export function testingApp<C>(app: HostedApp<C>): TestingApp<C> {
 	return Object.assign(app, {
 		invoke: (workflow: AnyWorkflow, input: Json = null) =>
-			app.host.runtime.invoke(workflow.name, input, {
-				metadata: {
-					requestId: crypto.randomUUID(),
-					origin: null,
-					replyTo: null,
-					requestedBy: null,
+			app.host.conductor.invoke(
+				{ name: workflow.name, queue: app.host.queue } as never,
+				input as never,
+				{
+					metadata: {
+						requestId: crypto.randomUUID(),
+						origin: null,
+						replyTo: null,
+						requestedBy: null,
+					},
 				},
-			}),
+			),
 		async routing(thread: ThreadRef): Promise<ThreadFollowers> {
 			const chat = app.host.chat();
 			if (!chat) throw new Error("The app has no chat integration");
@@ -227,32 +181,35 @@ export interface TestApp<C> {
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
 
 /**
- * `fabrial/testing`'s `createTestApp`, with the app's runtime, for driving it below the public API. Pi
+ * `fabrial/testing`'s `createTestApp`, with the app's Conductor client and Orchestrator (once started), for driving it
+ * below the public API. Pi
  * runs on `models` (none by default) over a pool of its own, opened only if the app defines agents or state.
  */
 export function createTestApp<const P extends readonly AnyPlugin[]>(
 	instance: Fabrial<P>,
 	config: TestAppConfig & { models?: MutableModels },
-): TestApp<ClientsOf<P>> & { readonly runtime: DurableRuntime } {
+): TestApp<ClientsOf<P>> & {
+	readonly conductor: Conductor;
+	readonly orchestrator: Orchestrator;
+	readonly queue: string;
+} {
 	const { database, chat: fake, models, ...appConfig } = config;
 	// The test clock is a session setting: it holds for queries on this one connection.
 	const sql = postgres(database, { max: 1, onnotice: () => {} });
 	const queue = `test_${crypto.randomUUID().replaceAll("-", "")}`;
 	const clock = createTestClock(sql);
-	const runtime = conductor(
-		{ sql },
-		{
-			logger: silent,
-			queue,
-			clock,
-			worker: { concurrency: 8, pollIntervalMs: 20, flushIntervalMs: 20, fetchBatchSize: 10 },
-		},
-	);
+	const conductor: ConductorConfig = {
+		sql,
+		logger: silent,
+		queue,
+		clock,
+		worker: { concurrency: 8, pollIntervalMs: 20, flushIntervalMs: 20, fetchBatchSize: 10 },
+	};
 	const chat = fake ?? new FakeChat();
 	let pi: Sql | undefined;
 	const app = testApp(instance, {
 		...appConfig,
-		runtime,
+		conductor,
 		chat,
 		// Off the clock's connection: Pi's leases run on database time.
 		agents: {
@@ -272,16 +229,7 @@ export function createTestApp<const P extends readonly AnyPlugin[]>(
 	const result = async (id: string): Promise<ExecutionResult | undefined> => {
 		const info = await inspector.getExecution(id);
 		if (!info) throw new Error(`Unknown execution: ${id}`);
-		if (info.status === "completed")
-			return {
-				status: "completed",
-				output: (info.result as Json | undefined) ?? null,
-			};
-		if (info.status === "failed")
-			return { status: "failed", error: info.error ?? "Execution failed" };
-		if (info.status === "cancelled")
-			return { status: "cancelled", reason: info.error ?? "Cancelled" };
-		return undefined;
+		return settlement(info) ?? undefined;
 	};
 	// Conductor's tables: the public API lists no executions.
 	const pending = (queue: string, limit: number) =>
@@ -320,7 +268,13 @@ export function createTestApp<const P extends readonly AnyPlugin[]>(
 		app: testing,
 		chat,
 		invoke: testing.invoke,
-		runtime,
+		get conductor() {
+			return app.host.conductor;
+		},
+		get orchestrator() {
+			return app.host.orchestrator;
+		},
+		queue,
 		clock,
 		result,
 		sessionSignals: () => sessionSignals(sql, queue),

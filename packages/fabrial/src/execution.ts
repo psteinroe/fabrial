@@ -2,7 +2,7 @@
  * What Fabrial's own executions use on top of Conductor's `TaskContext`: the invocation metadata every execution
  * carries, child results as Fabrial reports them, and a child call whose failure the caller can catch.
  */
-import type { ExecutionOutcome, TaskContext } from "pgconductor-js";
+import type { ExecutionInfo, ExecutionOutcome, TaskContext } from "pgconductor-js";
 import type { Origin } from "./events.ts";
 import type { Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
@@ -54,6 +54,17 @@ export function executionResult(
 	return outcome.status === "completed"
 		? { status: "completed", output: (outcome.result ?? null) as Json }
 		: outcome;
+}
+
+/** How an execution ended, from Conductor's view of it; null while it runs or waits. */
+export function settlement(info: ExecutionInfo): ExecutionResult | null {
+	if (info.status === "completed")
+		return { status: "completed", output: (info.result as Json | undefined) ?? null };
+	if (info.status === "failed")
+		return { status: "failed", error: info.error ?? "Execution failed" };
+	if (info.status === "cancelled")
+		return { status: "cancelled", reason: info.error ?? "Cancelled by user" };
+	return null;
 }
 
 type Native = Pick<

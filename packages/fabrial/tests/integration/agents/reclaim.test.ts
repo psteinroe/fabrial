@@ -12,7 +12,7 @@ import {
 	createFabrial,
 	type FabrialHost,
 	type InvocationMetadata,
-	type RuntimeWorkflow,
+	type WorkflowTask,
 } from "../../internals.ts";
 import { FakeChat } from "../../../src/testing.ts";
 import {
@@ -36,7 +36,8 @@ const RECLAIM = "fabrial.sessions.reclaim";
 const GO = "reclaim-test.go";
 
 function fixture(options: Partial<PiOptions> = {}) {
-	const runtime = db.runtime();
+	const tasks = db.tasks();
+	const client = tasks.client;
 	const faux = fauxProvider();
 	const models = createModels();
 	models.setProvider(faux.provider);
@@ -57,7 +58,11 @@ function fixture(options: Partial<PiOptions> = {}) {
 		definitionScope: definitions,
 		plugins: [],
 		workflows: [],
-		runtime,
+		get conductor() {
+			return tasks.conductor;
+		},
+		queue: tasks.queue,
+		now: () => tasks.now(),
 		clients: () => ({}),
 		chat: () => chat.connection(),
 		logger: { warn() {}, error() {}, debug() {}, info() {} },
@@ -65,7 +70,13 @@ function fixture(options: Partial<PiOptions> = {}) {
 		resolvePrincipal: async () => null,
 	} as unknown as FabrialHost;
 	// The fake platform behind `slack-test`, the provider of the tests' threads.
-	connectChat(chat, { ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
+	// Not a spread: the host reads `conductor` lazily, once the tasks started.
+	connectChat(
+		chat,
+		Object.assign(Object.create(host) as FabrialHost, {
+			plugins: [...host.plugins, { id: "slack-test" }],
+		}),
+	);
 	const integration = connectAgents(host, {
 		models,
 		sql: sql(),
@@ -78,8 +89,8 @@ function fixture(options: Partial<PiOptions> = {}) {
 		description: "Answers test questions.",
 		model: `${faux.provider.id}/${faux.getModel().id}`,
 	});
-	async function start(workflows: RuntimeWorkflow[], events: string[] = []) {
-		runtime.register({
+	async function start(workflows: WorkflowTask[], events: string[] = []) {
+		tasks.register({
 			workflows: [...workflows, ...integration.workflows],
 			events: [
 				...[GO, ...events].map((name) => ({ name, filterable: [] })),
@@ -87,16 +98,16 @@ function fixture(options: Partial<PiOptions> = {}) {
 			],
 		});
 		await integration.start();
-		await runtime.start();
+		await tasks.start();
 	}
 	/** Runs the reclaim job once and returns its result. */
 	async function reclaim() {
-		const id = await runtime.invoke(RECLAIM, null, { metadata });
+		const id = await client.invoke(RECLAIM, null, { metadata });
 		const result = await db.execution(id).settled();
 		if (result.status !== "completed") throw new Error(JSON.stringify(result));
 		return result.output as { reclaimed: number; batches: number };
 	}
-	return { runtime, faux, integration, metadata, host, agent, start, reclaim };
+	return { client, tasks, faux, integration, metadata, host, agent, start, reclaim };
 }
 
 const stored = async (key: string) => {
@@ -109,23 +120,22 @@ const stored = async (key: string) => {
 it("reclaims a completed call's Session once its execution settled 7 days ago, never a thread's; a replayed caller returns the stored answer without Pi", async () => {
 	const f = fixture();
 	f.faux.setResponses([fauxAssistantMessage("forty-two")]);
-	const caller: RuntimeWorkflow = {
+	const caller: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (_input, execution, ctx) => {
+		handler: async (_input, ctx) => {
 			const answer = await f.integration.run(ctx, "answer", f.agent, {
 				input: "Question",
 			});
-			const go = await execution.subscribe("go", { event: GO });
-			await execution.waitForAny("later", { go });
+			await ctx.waitForEvent("later", { event: { name: GO } } as never);
 			return answer;
 		},
 	};
 	await f.start([caller]);
-	const id = await f.runtime.invoke(caller.name, null, { metadata: f.metadata });
+	const id = await f.client.invoke(caller.name, null, { metadata: f.metadata });
 	await db.execution(id).suspended("later");
 	const key = callSession(id, "answer");
-	const [call] = await all(f.runtime.queue, "fabrial.session");
+	const [call] = await all(f.client.queue, "fabrial.session");
 	expect((await db.execution(call!).settled()).status).toBe("completed");
 	expect((await stored(key)).commits).toBeGreaterThan(0);
 	// A thread's Session, last hosted by the same settled execution, is never a call's.
@@ -144,7 +154,7 @@ it("reclaims a completed call's Session once its execution settled 7 days ago, n
 	expect((await stored(thread)).session).toBe(true);
 
 	// The caller replays from its stored call result: Pi is neither asked nor reopened.
-	await f.runtime.emit(GO, {}, { metadata: f.metadata });
+	await f.client.emit(GO, {}, { metadata: f.metadata });
 	expect(await db.execution(id).settled()).toEqual({ status: "completed", output: "forty-two" });
 	expect(f.faux.state.callCount).toBe(1);
 	expect((await stored(key)).session).toBe(false);
@@ -167,10 +177,10 @@ it("reclaims a call cancelled while suspended on a workflow tool, but not while 
 			stopReason: "toolUse",
 		}),
 	]);
-	const caller: RuntimeWorkflow = {
+	const caller: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution, ctx) => f.integration.run(ctx, "agent", agent, { input: "Wait" }),
+		handler: (_input, ctx) => f.integration.run(ctx, "agent", agent, { input: "Wait" }),
 	};
 	await f.start(
 		[
@@ -178,26 +188,25 @@ it("reclaims a call cancelled while suspended on a workflow tool, but not while 
 			{
 				name: tool.name,
 				triggers: [],
-				handler: async (_input, execution) => {
-					const never = await execution.subscribe("never", { event: `never-${tool.name}` });
-					await execution.waitForAny("approval", { never });
+				handler: async (_input, ctx) => {
+					await ctx.waitForEvent("approval", { event: { name: `never-${tool.name}` } } as never);
 					return "approved";
 				},
 			},
 		],
 		[`never-${tool.name}`],
 	);
-	const id = await f.runtime.invoke(caller.name, null, { metadata: f.metadata });
+	const id = await f.client.invoke(caller.name, null, { metadata: f.metadata });
 	const child = db.execution(
 		await until(
 			"the workflow tool to start",
-			async () => (await all(f.runtime.queue, tool.name))[0],
+			async () => (await all(f.client.queue, tool.name))[0],
 		),
 	);
 	await child.suspended("approval");
-	const [call] = await all(f.runtime.queue, "fabrial.session");
+	const [call] = await all(f.client.queue, "fabrial.session");
 	await db.execution(call!).suspended();
-	await f.runtime.cancel(id, "user cancelled");
+	await f.client.cancel(id, "user cancelled");
 	expect((await db.execution(call!).settled()).status).toBe("cancelled");
 	const key = callSession(id, "agent");
 	expect((await stored(key)).commits).toBeGreaterThan(0);
@@ -219,16 +228,16 @@ it("examines at most reclaimBatchSize Sessions per step", async () => {
 	const f = fixture({ reclaimBatchSize: 2 });
 	const calls = ["a", "b", "c", "d", "e"];
 	f.faux.setResponses(calls.map((call) => fauxAssistantMessage(call)));
-	const caller: RuntimeWorkflow = {
+	const caller: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (_input, execution, ctx) => {
+		handler: async (_input, ctx) => {
 			for (const call of calls) await f.integration.run(ctx, call, f.agent, { input: call });
 			return null;
 		},
 	};
 	await f.start([caller]);
-	const id = await f.runtime.invoke(caller.name, null, { metadata: f.metadata });
+	const id = await f.client.invoke(caller.name, null, { metadata: f.metadata });
 	expect((await db.execution(id).settled()).status).toBe("completed");
 	await db.clock.advance("8d");
 	const reclaimable = vi.spyOn(PostgresStorage, "reclaimable");

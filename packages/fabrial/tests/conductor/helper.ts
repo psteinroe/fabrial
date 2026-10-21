@@ -1,21 +1,24 @@
 import postgres from "postgres";
-import { Conductor, TaskSchemas, type ExecutionInfo } from "pgconductor-js";
+import { Conductor, TaskSchemas, type ExecutionInfo, type Orchestrator } from "pgconductor-js";
 import { afterAll, afterEach, beforeAll, beforeEach, inject } from "vitest";
-import type {
-	DurableRuntime,
-	ExecutionResult,
-	Json,
-	RuntimeEvent,
-	RuntimeWorkflow,
+import {
+	createConductor,
+	settlement,
+	type ConductorConfig,
+	type ExecutionResult,
+	type InvocationMetadata,
+	type Json,
+	type JsonObject,
+	type TaskEvent,
+	type WorkflowTask,
 } from "../internals.ts";
-import { conductor, type ConductorConfig } from "../../src/runtime/conductor/index.ts";
 import { createTestClock, type TestClock } from "../../src/testing-internal.ts";
 // Declares the `fabrialDatabaseUrl` the global setup provides, also for other packages' tests.
 import type {} from "./global-setup.ts";
 
 /**
  * Real Conductor for Fabrial's tests: one Postgres per Vitest run (`global-setup.ts`), one database per
- * test file, a fresh queue per runtime, and Conductor's test clock. Tests observe executions through
+ * test file, a fresh queue per app or task set, and Conductor's test clock. Tests observe executions through
  * handles; nothing here schedules work. Advance the clock only after the wait it should end is
  * registered: `await handle.suspended("pause"); await db.clock.advance(10)`.
  */
@@ -23,31 +26,103 @@ export interface ConductorFixture {
 	/** The test file's database. */
 	readonly url: string;
 	/**
-	 * Single-connection pool (`max: 1`) shared with every runtime, so all of them see the clock. Replaced
-	 * after a test whose runtimes don't stop in time, so the next test doesn't queue behind them.
+	 * Single-connection pool (`max: 1`) shared with every app and task set, so all of them see the clock.
+	 * Replaced after a test whose apps don't stop in time, so the next test doesn't queue behind them.
 	 */
 	readonly sql: postgres.Sql;
 	/** Database time for `sql`; reset to real time after each test. */
 	readonly clock: TestClock;
-	/** Register and start a runtime on a fresh queue. Runtimes stop after each test. */
-	start(workflows: RuntimeWorkflow[], options?: StartOptions): Promise<TestRuntime>;
-	/** A runtime on a fresh queue for an app to register and start; it stops after each test. */
-	runtime(options?: Omit<StartOptions, "events">): DurableRuntime & { readonly queue: string };
-	/** A handle on an execution of any runtime on this database. */
+	/** Create `workflows` as Conductor tasks on a fresh queue and start them. They stop after each test. */
+	start(workflows: WorkflowTask[], options?: StartOptions): Promise<TestTasks>;
+	/** Conductor settings for an app on a fresh queue (`testApp(f, { conductor })`). */
+	conductor(options?: Omit<StartOptions, "events">): ConductorConfig & { readonly queue: string };
+	/**
+	 * Tasks started later on a fresh queue: the queue, client and clock exist now, for a host built before its
+	 * workflows are. `start` creates and starts them; they stop after each test.
+	 */
+	tasks(options?: Omit<StartOptions, "events">): DeferredTasks;
+	/** Stop `app` after the test unless it stopped; returns it. */
+	own<A extends { start(): Promise<void>; stop(): Promise<void> }>(app: A): A;
+	/** A handle on an execution of any app on this database. */
 	execution(id: string): ExecutionHandle;
 }
 
 export interface StartOptions {
-	events?: RuntimeEvent[];
-	/** Defaults to a queue no other runtime in this file uses. */
+	events?: TaskEvent[];
+	/** Defaults to a queue no other app or task set in this file uses. */
 	queue?: string;
 	config?: Omit<ConductorConfig, "queue" | "clock">;
 }
 
-export interface TestRuntime extends DurableRuntime {
+/** Conductor calls from outside any execution, with Fabrial's metadata, on one queue. */
+export interface TestClient {
 	readonly queue: string;
-	/** Stop this runtime and start a new one with the same definitions and queue, as after a deploy. */
-	restart(): Promise<TestRuntime>;
+	invoke(workflow: string, input: Json, options: { metadata: InvocationMetadata }): Promise<string>;
+	emit(
+		event: string,
+		payload: JsonObject,
+		options: { id?: string; metadata: InvocationMetadata },
+	): Promise<void>;
+	cancel(executionId: string, reason?: string): Promise<boolean>;
+	signal(
+		executionId: string,
+		signal: { name: string; id: string; payload: Json },
+	): Promise<boolean>;
+	signalWithStart(options: {
+		workflow: string;
+		key: string;
+		signal: { name: string; id: string; payload: Json };
+		input?: Json;
+		metadata: InvocationMetadata;
+	}): Promise<string>;
+}
+
+/** `TestClient` over `conductor()`, the client of an app (`app.host.conductor`) or a task set. */
+export function testClient(queue: string, conductor: () => Conductor): TestClient {
+	return {
+		queue,
+		invoke: (workflow, input, { metadata }) =>
+			conductor().invoke({ name: workflow, queue } as never, input as never, { metadata }),
+		emit: async (event, payload, { id, metadata }) => {
+			await conductor().emit(event as never, payload as never, {
+				metadata,
+				...(id !== undefined ? { dedupe_key: id } : {}),
+			});
+		},
+		cancel: (executionId, reason = "Cancelled by user") =>
+			conductor().cancel(executionId, { reason }),
+		signal: (executionId, signal) => conductor().signal(executionId, signal),
+		signalWithStart: (options) =>
+			conductor().signalWithStart({
+				task: options.workflow,
+				queue,
+				key: options.key,
+				signal: options.signal,
+				input: options.input ?? {},
+				metadata: options.metadata,
+			} as never),
+	};
+}
+
+export interface DeferredTasks {
+	readonly queue: string;
+	readonly client: TestClient;
+	/** The started tasks' client and Orchestrator; they throw before `start`. */
+	readonly conductor: Conductor;
+	readonly orchestrator: Orchestrator;
+	/** Conductor's clock: the file's test clock. */
+	now(): number;
+	/** The tasks `start` creates: the last definition registered. */
+	register(definition: { workflows: WorkflowTask[]; events?: TaskEvent[] }): void;
+	start(): Promise<TestTasks>;
+}
+
+export interface TestTasks extends TestClient {
+	readonly conductor: Conductor;
+	readonly orchestrator: Orchestrator;
+	stop(): Promise<void>;
+	/** Stop these tasks and start new ones with the same definitions and queue, as after a deploy. */
+	restart(): Promise<TestTasks>;
 }
 
 export interface ExecutionHandle {
@@ -70,7 +145,7 @@ export interface ExecutionHandle {
 /** Below the integration `testTimeout`, so a stuck wait reports what it waited for. */
 const WAIT_MS = 40_000;
 const POLL_MS = 20;
-/** How long the runtimes of a finished test may take to stop before the fixture abandons them. */
+/** How long the apps and tasks of a finished test may take to stop before the fixture abandons them. */
 const STOP_MS = 20_000;
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
 const testWorker = { pollIntervalMs: POLL_MS, flushIntervalMs: POLL_MS, fetchBatchSize: 10 };
@@ -97,19 +172,6 @@ export async function until<T>(
 		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${description}`);
 		await new Promise((resolve) => setTimeout(resolve, POLL_MS));
 	}
-}
-
-function settlement(info: ExecutionInfo): ExecutionResult | undefined {
-	if (info.status === "completed")
-		return {
-			status: "completed",
-			output: (info.result as Json | undefined) ?? null,
-		};
-	if (info.status === "failed")
-		return { status: "failed", error: info.error ?? "Execution failed" };
-	if (info.status === "cancelled")
-		return { status: "cancelled", reason: info.error ?? "Cancelled by user" };
-	return undefined;
 }
 
 /**
@@ -157,7 +219,7 @@ export function useConductor(): ConductorFixture {
 	let queues = 0;
 	const database = `fabrial_${crypto.randomUUID().replaceAll("-", "")}`;
 	const server = () => postgres(inject("fabrialDatabaseUrl"), { max: 1, onnotice: () => {} });
-	const runtimes: DurableRuntime[] = [];
+	const stops: (() => Promise<void>)[] = [];
 	const ready = <T>(value: T | undefined): T => {
 		if (value === undefined) throw new Error("useConductor() is only usable inside tests");
 		return value;
@@ -179,12 +241,12 @@ export function useConductor(): ConductorFixture {
 		current = signal;
 	});
 	afterEach(async ({ signal }) => {
-		const stopping = runtimes.splice(0).reverse();
-		// A timed-out test body keeps running, and so do its runtimes' workers: cut them off the
+		const stopping = stops.splice(0).reverse();
+		// A timed-out test body keeps running, and so do its workers: cut them off the
 		// connection first, or their queries queue the next tests behind them.
 		if (signal.aborted) await reconnect();
 		const stopped = (async () => {
-			for (const runtime of stopping) await runtime.stop();
+			for (const stop of stopping) await stop();
 			return true;
 		})();
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -237,41 +299,83 @@ export function useConductor(): ConductorFixture {
 		await old.end({ timeout: 0 });
 	}
 
-	function runtime(options: Omit<StartOptions, "events"> = {}) {
+	function conductor(options: Omit<StartOptions, "events"> = {}) {
 		const queue = options.queue ?? `test_${++queues}`;
-		const created = conductor(
-			{ sql: ready(sql) },
-			{
-				logger: silent,
-				...options.config,
-				worker: { concurrency: 8, ...testWorker, ...options.config?.worker },
-				queue,
-				clock: ready(clock),
-			},
-		);
-		// Apps stop their runtime too; the fixture's stop after the test must not stop it twice.
-		const stop = created.stop.bind(created);
-		let stopped: Promise<void> | undefined;
-		created.stop = () => (stopped ??= stop());
-		runtimes.push(created);
-		return Object.assign(created, { queue });
+		return {
+			sql: ready(sql),
+			logger: silent,
+			...options.config,
+			worker: { concurrency: 8, ...testWorker, ...options.config?.worker },
+			queue,
+			clock: ready(clock),
+		};
 	}
 
-	async function start(
-		workflows: RuntimeWorkflow[],
-		options: StartOptions = {},
-	): Promise<TestRuntime> {
-		const created = runtime(options);
-		const { queue } = created;
-		created.register({ workflows, events: options.events ?? [] });
-		await created.start();
-		return Object.assign(created, {
-			restart: async () => {
-				await created.stop();
-				runtimes.splice(runtimes.indexOf(created), 1);
-				return start(workflows, { ...options, queue });
+	function own<A extends { start(): Promise<void>; stop(): Promise<void> }>(app: A): A {
+		const start = app.start.bind(app);
+		const stop = app.stop.bind(app);
+		// Tests stop their apps too; the fixture's stop after the test must not stop one twice.
+		let stopped: Promise<void> | undefined = Promise.resolve();
+		app.start = async () => {
+			stopped = undefined;
+			await start();
+		};
+		app.stop = () => (stopped ??= stop());
+		stops.push(() => app.stop());
+		return app;
+	}
+
+	function tasks(options: Omit<StartOptions, "events"> = {}): DeferredTasks {
+		const { queue } = conductor(options);
+		let started: TestTasks | undefined;
+		let definition: { workflows: WorkflowTask[]; events?: TaskEvent[] } = { workflows: [] };
+		const current = () => {
+			if (!started) throw new Error("The test's tasks are not started");
+			return started;
+		};
+		return {
+			queue,
+			client: testClient(queue, () => current().conductor),
+			get conductor() {
+				return current().conductor;
 			},
-		});
+			get orchestrator() {
+				return current().orchestrator;
+			},
+			now: () => ready(clock).now().getTime(),
+			register: (registered) => {
+				definition = registered;
+			},
+			start: async () =>
+				(started = await start(definition.workflows, {
+					...options,
+					queue,
+					events: definition.events ?? [],
+				})),
+		};
+	}
+
+	async function start(workflows: WorkflowTask[], options: StartOptions = {}): Promise<TestTasks> {
+		const config = conductor(options);
+		const created = createConductor(config, { workflows, events: options.events ?? [] });
+		let stopped: Promise<void> | undefined;
+		const stop = () =>
+			(stopped ??= (async () => {
+				await created.orchestrator.stop();
+				await created.orchestrator.stopped;
+			})());
+		stops.push(stop);
+		await created.orchestrator.start();
+		return {
+			...testClient(config.queue, () => created.conductor),
+			conductor: created.conductor,
+			orchestrator: created.orchestrator,
+			stop,
+			restart: async () => {
+				await stop();
+				return start(workflows, { ...options, queue: config.queue });
+			},
+		};
 	}
 
 	/** Engine state the public API does not expose: whether a released execution waits, and where. */
@@ -318,7 +422,7 @@ export function useConductor(): ConductorFixture {
 					return await until(`${id} to settle`, async () => {
 						last = (await info()) ?? undefined;
 						if (!last) throw new Error(`Unknown execution: ${id}`);
-						return settlement(last);
+						return settlement(last) ?? undefined;
 					});
 				} catch (error) {
 					// Say where it is stuck: a pending retry, a wait nobody ends, or a worker that never ran it.
@@ -351,7 +455,9 @@ export function useConductor(): ConductorFixture {
 			return ready(clock);
 		},
 		start,
-		runtime,
+		conductor,
+		tasks,
+		own,
 		execution,
 	};
 }

@@ -522,7 +522,7 @@ describe("children", () => {
 		const owner = await enter(test);
 		const execution = await (await test.execution("child")).suspended("sleep");
 		await owner.suspended();
-		await test.runtime.cancel(owner.id);
+		await test.client.cancel(owner.id);
 		expect(await owner.settled()).toMatchObject({ status: "cancelled" });
 		if (detached) {
 			expect(await execution.info()).toMatchObject({ status: "pending" });
@@ -571,7 +571,7 @@ describe("children", () => {
 		const detached = await (await test.execution("background")).suspended("sleep");
 		await (await test.execution("child")).suspended();
 		await owner.suspended();
-		await test.runtime.cancel(owner.id);
+		await test.client.cancel(owner.id);
 		expect(await (await test.execution("child")).settled()).toMatchObject({ status: "cancelled" });
 		expect(await leaf.settled()).toMatchObject({ status: "cancelled" });
 		expect(await detached.info()).toMatchObject({ status: "pending" });
@@ -807,7 +807,7 @@ describe("provider route response context", () => {
 		});
 		const test = setup([workflow(async () => null), child]);
 		await test.app.start();
-		const id = await test.runtime.invoke(child.name, null, {
+		const id = await test.client.invoke(child.name, null, {
 			metadata: { ...metadata, replyTo: surface, triggerEvent: null, ownerWorkflow: null },
 		});
 		expect(await db.execution(id).output()).toEqual({ thread: surface.threadId, owner: null });
@@ -874,7 +874,7 @@ describe("Pi workflows", () => {
 			{ models: scriptedModels(), plugins: [hook(seen)] },
 		);
 		await test.app.start();
-		const id = await test.runtime.invoke("fabrial.sessions.reclaim", null, { metadata });
+		const id = await test.client.invoke("fabrial.sessions.reclaim", null, { metadata });
 		expect(await db.execution(id).output()).toMatchObject({ reclaimed: 0 });
 		expect(seen).toEqual(["fabrial.sessions.reclaim"]);
 	});

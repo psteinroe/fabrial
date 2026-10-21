@@ -1,5 +1,6 @@
+import { childMetadata, metadataOf } from "../../../src/execution.ts";
 import { expect, test } from "vitest";
-import type { InvocationMetadata, Json, RuntimeWorkflow } from "../../internals.ts";
+import type { InvocationMetadata, Json, WorkflowTask } from "../../internals.ts";
 import { until, useConductor } from "../../conductor/helper.ts";
 
 const db = useConductor();
@@ -13,7 +14,7 @@ const HOUR = 60 * 60 * 1000;
 const signal = (id: string, payload: Json = id) => ({ name: "input", id, payload });
 
 /** Collects "input" signals until one carries "stop"; returns what this attempt received. */
-function session(received: Json[], extra: Partial<RuntimeWorkflow> = {}): RuntimeWorkflow {
+function session(received: Json[], extra: Partial<WorkflowTask> = {}): WorkflowTask {
 	return {
 		name: "session",
 		triggers: [],
@@ -37,37 +38,37 @@ function session(received: Json[], extra: Partial<RuntimeWorkflow> = {}): Runtim
 test("a running handler receives signals from outside; stored signals arrive first, in order, deduped by id", async () => {
 	const received: Json[] = [];
 	// One slot, held by another key, keeps the first execution pending while its signals are stored.
-	const runtime = await db.start([session(received, { concurrency: 1 })]);
+	const client = await db.start([session(received, { concurrency: 1 })]);
 	const start = { workflow: "session", metadata };
 	const blocker = db.execution(
-		await runtime.signalWithStart({ ...start, key: "blocker", signal: signal("0", "held") }),
+		await client.signalWithStart({ ...start, key: "blocker", signal: signal("0", "held") }),
 	);
 	await blocker.running();
-	const id = await runtime.signalWithStart({ ...start, key: "thread-1", signal: signal("1", "a") });
-	expect(await runtime.signal(id, signal("2", "b"))).toBe(true);
+	const id = await client.signalWithStart({ ...start, key: "thread-1", signal: signal("1", "a") });
+	expect(await client.signal(id, signal("2", "b"))).toBe(true);
 	expect(
-		await runtime.signalWithStart({ ...start, key: "thread-1", signal: signal("1", "dup") }),
+		await client.signalWithStart({ ...start, key: "thread-1", signal: signal("1", "dup") }),
 	).toBe(id);
 	const execution = db.execution(id);
 	expect(await execution.info()).toMatchObject({ status: "pending", attempts: 0 });
 
-	expect(await runtime.signal(blocker.id, signal("stop"))).toBe(true);
+	expect(await client.signal(blocker.id, signal("stop"))).toBe(true);
 	expect(await blocker.output()).toEqual(["held", "stop"]);
 	await execution.running();
 	await until("stored signals", async () => (received.length === 4 ? true : undefined));
 	expect(received).toEqual(["held", "stop", "a", "b"]);
-	expect(await runtime.signal(id, signal("2", "dup"))).toBe(true);
-	expect(await runtime.signal(id, signal("3", "stop"))).toBe(true);
+	expect(await client.signal(id, signal("2", "dup"))).toBe(true);
+	expect(await client.signal(id, signal("3", "stop"))).toBe(true);
 	expect(await execution.output()).toEqual(["a", "b", "stop"]);
 	expect(received).toEqual(["held", "stop", "a", "b", "stop"]);
-	expect(await runtime.signal(id, signal("4"))).toBe(false);
-	expect(await runtime.signal(crypto.randomUUID(), signal("4"))).toBe(false);
+	expect(await client.signal(id, signal("4"))).toBe(false);
+	expect(await client.signal(crypto.randomUUID(), signal("4"))).toBe(false);
 });
 
 test("concurrent signalWithStart calls start exactly one execution per key; settlement releases the key", async () => {
-	const runtime = await db.start([session([])]);
+	const client = await db.start([session([])]);
 	const send = (id: string, key = "thread-1") =>
-		runtime.signalWithStart({ workflow: "session", key, signal: signal(id), metadata });
+		client.signalWithStart({ workflow: "session", key, signal: signal(id), metadata });
 	const ids = await Promise.all(Array.from({ length: 10 }, (_, i) => send(`s${i}`)));
 	expect(new Set(ids).size).toBe(1);
 	const other = await send("o1", "thread-2");
@@ -82,22 +83,19 @@ test("concurrent signalWithStart calls start exactly one execution per key; sett
 	expect(next).not.toBe(ids[0]);
 	await send("stop");
 	expect(await db.execution(next).output()).toEqual(["n1", "stop"]);
-	await expect(
-		runtime.signalWithStart({ workflow: "missing", key: "k", signal: signal("x"), metadata }),
-	).rejects.toThrow("Unknown workflow");
 });
 
 test("ctx.signalWithStart is memoized per id and passes merged metadata to the execution it starts", async () => {
 	const received: Json[] = [];
 	const seen: InvocationMetadata[] = [];
 	const recorders: string[] = [];
-	const runtime = await db.start([
+	const client = await db.start([
 		{
 			name: "recorder",
 			triggers: [],
 			handler: async (_input, ctx) => {
 				recorders.push(ctx.executionId);
-				seen.push(ctx.metadata);
+				seen.push(metadataOf(ctx));
 				ctx.onSignal("input", (payload) => void received.push(payload));
 			},
 		},
@@ -105,16 +103,24 @@ test("ctx.signalWithStart is memoized per id and passes merged metadata to the e
 			name: "caller",
 			triggers: [],
 			handler: async (_input, ctx) => {
-				const options = { workflow: "recorder", key: "k", metadata: { ownerWorkflow: "recorder" } };
-				const first = await ctx.signalWithStart("send", { ...options, signal: signal("a") });
+				const options = {
+					task: "recorder",
+					queue: ctx.queue,
+					key: "k",
+					input: {},
+					metadata: childMetadata(ctx, { ownerWorkflow: "recorder" }),
+				};
+				const send = (id: string, value: string) =>
+					ctx.signalWithStart(id, { ...options, signal: signal(value) } as never);
+				const first = await send("send", "a");
 				await ctx.sleep("pause", HOUR);
-				const again = await ctx.signalWithStart("send", { ...options, signal: signal("b") });
-				const stop = await ctx.signalWithStart("stop", { ...options, signal: signal("stop") });
+				const again = await send("send", "b");
+				const stop = await send("stop", "stop");
 				return [first, again, stop];
 			},
 		},
 	]);
-	const caller = db.execution(await runtime.invoke("caller", null, { metadata }));
+	const caller = db.execution(await client.invoke("caller", null, { metadata }));
 	await caller.suspended("pause");
 	const first = await until("the first recorder", async () => recorders[0]);
 	await db.execution(first).output();
@@ -132,7 +138,7 @@ test("ctx.signalWithStart is memoized per id and passes merged metadata to the e
 test("signals arriving while the handler returns re-queue the execution without counting an attempt", async () => {
 	let attempts = 0;
 	const received: Json[] = [];
-	const runtime = await db.start([
+	const client = await db.start([
 		{
 			name: "returning",
 			triggers: [],
@@ -143,14 +149,14 @@ test("signals arriving while the handler returns re-queue the execution without 
 					received.push(payload);
 					if (payload !== "first") return;
 					// By now the workflow handler has returned and this attempt reads no more signals.
-					await runtime.signal(ctx.executionId, signal("second"));
+					await client.signal(ctx.executionId, signal("second"));
 				});
 				ctx.onSignal("other", () => {});
 				return attempts;
 			},
 		},
 	]);
-	const id = await runtime.signalWithStart({
+	const id = await client.signalWithStart({
 		workflow: "returning",
 		key: "k",
 		signal: signal("first"),
@@ -160,12 +166,12 @@ test("signals arriving while the handler returns re-queue the execution without 
 	expect(await execution.settled()).toEqual({ status: "completed", output: 2 });
 	expect(received).toEqual(["first", "second"]);
 	expect(await execution.info()).toMatchObject({ attempts: 1 });
-	expect(await runtime.signal(id, signal("x"))).toBe(false);
+	expect(await client.signal(id, signal("x"))).toBe(false);
 });
 
 test("a throwing signal handler fails the attempt; the retry receives the signal again", async () => {
 	let attempts = 0;
-	const runtime = await db.start([
+	const client = await db.start([
 		{
 			name: "failing",
 			triggers: [],
@@ -195,7 +201,7 @@ test("a throwing signal handler fails the attempt; the retry receives the signal
 		},
 	]);
 	const execution = db.execution(
-		await runtime.signalWithStart({
+		await client.signalWithStart({
 			workflow: "failing",
 			key: "k",
 			signal: { name: "late", id: "1", payload: "ok" },
@@ -211,7 +217,7 @@ test("a throwing signal handler fails the attempt; the retry receives the signal
 	expect(await execution.settled()).toEqual({ status: "completed", output: "ok" });
 	expect(attempts).toBe(2);
 
-	const fatal = await runtime.signalWithStart({
+	const fatal = await client.signalWithStart({
 		workflow: "fatal",
 		key: "k",
 		signal: signal("1"),
@@ -223,10 +229,10 @@ test("a throwing signal handler fails the attempt; the retry receives the signal
 	});
 });
 
-test("a restarted runtime delivers the signals the stopped one had not, and none twice", async () => {
+test("restarted tasks deliver the signals the stopped one had not, and none twice", async () => {
 	const received: Json[] = [];
-	const runtime = await db.start([session(received)]);
-	const send = (id: string, payload: Json, to = runtime) =>
+	const client = await db.start([session(received)]);
+	const send = (id: string, payload: Json, to = client) =>
 		to.signalWithStart({
 			workflow: "session",
 			key: "thread-1",
@@ -238,7 +244,7 @@ test("a restarted runtime delivers the signals the stopped one had not, and none
 	await until("the first signal", async () => (received.length === 1 ? true : undefined));
 	await execution.running();
 
-	const restarted = await runtime.restart();
+	const restarted = await client.restart();
 	expect(await send("2", "b", restarted)).toBe(id);
 	expect(await send("1", "dup", restarted)).toBe(id);
 	expect(await send("3", "stop", restarted)).toBe(id);
@@ -248,16 +254,16 @@ test("a restarted runtime delivers the signals the stopped one had not, and none
 
 test("cancelling a session drops its signals and releases its key", async () => {
 	const received: Json[] = [];
-	const runtime = await db.start([session(received)]);
+	const client = await db.start([session(received)]);
 	const send = (id: string) =>
-		runtime.signalWithStart({ workflow: "session", key: "thread-1", signal: signal(id), metadata });
+		client.signalWithStart({ workflow: "session", key: "thread-1", signal: signal(id), metadata });
 	const execution = db.execution(await send("1"));
 	await until("the first signal", async () => (received.length === 1 ? true : undefined));
 
-	expect(await runtime.cancel(execution.id, "closed")).toBe(true);
+	expect(await client.cancel(execution.id, "closed")).toBe(true);
 	expect(await execution.settled()).toEqual({ status: "cancelled", reason: "closed" });
-	expect(await runtime.signal(execution.id, signal("2"))).toBe(false);
-	expect(await runtime.cancel(execution.id)).toBe(false);
+	expect(await client.signal(execution.id, signal("2"))).toBe(false);
+	expect(await client.cancel(execution.id)).toBe(false);
 
 	const next = await send("3");
 	expect(next).not.toBe(execution.id);

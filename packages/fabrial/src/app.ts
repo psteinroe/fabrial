@@ -4,7 +4,8 @@ import type { JsonObject } from "./json.ts";
 import type { AnyPlugin } from "./plugin.ts";
 import type { ChatConnection, ChatOptions } from "./chat/index.ts";
 import type { PiOptions } from "./agents/pi.ts";
-import type { DurableRuntime } from "./runtime.ts";
+import type { Conductor, Orchestrator } from "pgconductor-js";
+import type { ConductorConfig } from "./conductor.ts";
 import type { ChatMessage, Surface, ThreadRef } from "./thread.ts";
 import type { AnyWorkflow } from "./workflow.ts";
 
@@ -21,7 +22,14 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 	readonly definitionScope?: object;
 	readonly plugins: readonly AnyPlugin[];
 	readonly workflows: readonly AnyWorkflow[];
-	readonly runtime: DurableRuntime;
+	/** The app's Conductor client, once app.start() created its tasks. */
+	readonly conductor: Conductor;
+	/** Runs the app's tasks; started and stopped with the app. */
+	readonly orchestrator: Orchestrator;
+	/** The Conductor queue of the app's tasks. */
+	readonly queue: string;
+	/** Conductor's clock (epoch ms): the test clock in tests. */
+	now(): number;
 	readonly directory: IdentityDirectory;
 	readonly logger: Logger;
 	/** Live clients of all plugins (built once per app; plugin `clients()` must be cheap and stateless). */
@@ -81,8 +89,8 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 
 export interface CoreConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[]> {
 	definitionScope?: object;
-	/** Durable workflow runtime (Conductor, or in memory for tests). */
-	runtime: DurableRuntime;
+	/** Conductor: core creates its client, tasks and Orchestrator when the app starts. */
+	conductor: ConductorConfig;
 	/** Chat SDK options. Required when any plugin has a `chat` capability. */
 	chat?: ChatOptions;
 	/** Pi: agents, state, and evaluation (`ctx.agent`, `ctx.send`, `ctx.state`, `ctx.evaluate`). */
@@ -101,7 +109,7 @@ export interface CoreConfig<P extends readonly AnyPlugin[] = readonly AnyPlugin[
 export interface App<TClients = Record<string, unknown>> {
 	/** One fetch handler for all plugin routes and chat webhooks. */
 	fetch(request: Request): Promise<Response>;
-	/** Validates (trigger ties, …), aborts orphaned agent work, runs plugin `init`, starts the runtime. */
+	/** Validates (trigger ties, …), aborts orphaned agent work, runs plugin `init`, starts Conductor. */
 	start(): Promise<void>;
 	stop(): Promise<void>;
 	/** Emit an event from application code. */

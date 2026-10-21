@@ -32,11 +32,11 @@ import { workflowObject, type AnyWorkflow, type WorkflowContext } from "./workfl
 import type { Json, JsonObject } from "./json.ts";
 import { parseSchema } from "./schema.ts";
 import type { AgentRef } from "./agent.ts";
-import type { RuntimeWorkflow } from "./runtime.ts";
+import { createConductor, type WorkflowTask } from "./conductor.ts";
 import { childMetadata, nativeMethods, type InvocationMetadata } from "./execution.ts";
 import type { ChatMessage, ThreadRef } from "./thread.ts";
 import { createContext, metadataOf } from "./context.ts";
-import type { Middleware, TaskContext } from "pgconductor-js";
+import type { Conductor, Middleware, Orchestrator, TaskContext } from "pgconductor-js";
 import { CLEANUP_ATTEMPTS, CLEANUP_WORKFLOW, cleanup } from "./cleanup.ts";
 import type { TriggerSpec } from "./trigger.ts";
 import { notifyFollowers } from "./follows.ts";
@@ -58,10 +58,18 @@ const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 /** Longest rejection reason kept (characters). */
 const MAX_REASON = 3000;
 
-/** Compose integrations and register the core workflow/context protocol with the durable runtime. */
+/** Compose integrations and register the core workflows as Conductor tasks on the app's queue. */
 export function buildApp(config: CoreConfig): HostedApp {
-	const runtime = config.runtime;
-	const now = () => runtime.now?.() ?? Date.now();
+	const queue = config.conductor.queue ?? "default";
+	const now = () => config.conductor.clock?.now().getTime() ?? Date.now();
+	/** The app's Conductor client and Orchestrator, once `start` registered its tasks. */
+	let tasks: { conductor: Conductor; orchestrator: Orchestrator } | undefined;
+	let running = false;
+	const started = () => {
+		if (!tasks) throw new Error("The app is not started");
+		return tasks;
+	};
+	const conductor = () => started().conductor;
 	let chat: ChatConnection | undefined;
 	// Connected once the host exists, before any workflow runs.
 	let agents!: Agents;
@@ -162,8 +170,8 @@ export function buildApp(config: CoreConfig): HostedApp {
 	};
 	/** Store the request: one `fabrial.ingress` event, deduped by its provider id. `fabrial.route` routes it. */
 	const accept = async (ingress: IngressEvent, requestId: string) => {
-		await runtime.emit(INGRESS_EVENT, ingress, {
-			id: ingressKey(ingress),
+		await conductor().emit(INGRESS_EVENT as never, ingress as never, {
+			dedupe_key: ingressKey(ingress),
 			metadata: { requestId, origin: ingress.origin, replyTo: null, requestedBy: null },
 		});
 		return "accepted" as const;
@@ -214,8 +222,8 @@ export function buildApp(config: CoreConfig): HostedApp {
 			// and a retry reuses the authorization above.
 			const decided = await native.step("decide", async () => {
 				if (now() >= request!.deadline) return false;
-				await runtime.emit(
-					APPROVAL_DECIDED_EVENT,
+				await conductor().emit(
+					APPROVAL_DECIDED_EVENT as never,
 					{
 						approvalId: approvalId!,
 						status: verb === "approve" ? "approved" : verb === "reject" ? "rejected" : "cancelled",
@@ -225,9 +233,9 @@ export function buildApp(config: CoreConfig): HostedApp {
 						...(verb === "reject" && action.value?.trim()
 							? { comment: action.value.trim().slice(0, MAX_REASON) }
 							: {}),
-					},
+					} as never,
 					{
-						id: ingress.id,
+						dedupe_key: ingress.id,
 						metadata: {
 							requestId: approvalId!,
 							origin: { provider: ingress.actor!.provider },
@@ -391,7 +399,14 @@ export function buildApp(config: CoreConfig): HostedApp {
 		definitionScope: config.definitionScope,
 		plugins: config.plugins,
 		workflows: config.workflows,
-		runtime,
+		get conductor() {
+			return conductor();
+		},
+		get orchestrator() {
+			return started().orchestrator;
+		},
+		queue,
+		now,
 		directory,
 		logger: config.logger ?? silentLogger,
 		clients,
@@ -494,11 +509,11 @@ export function buildApp(config: CoreConfig): HostedApp {
 			return ran ? result! : next({});
 		});
 	/** Merges Fabrial's fields onto Conductor's context of every attempt. */
-	const attempt: RuntimeWorkflow["attempt"] = async (_execution, next, raw) =>
+	const attempt: WorkflowTask["attempt"] = async (raw, next) =>
 		next(await createContext({ host, raw, metadata: metadataOf(raw), agents, now }));
-	const workflows: RuntimeWorkflow[] = config.workflows.map((workflow) => ({
+	const workflows: WorkflowTask[] = config.workflows.map((workflow) => ({
 		name: workflow.name,
-		// The routing workflow starts app workflows; they have no runtime triggers.
+		// The routing workflow starts app workflows; they have no event triggers.
 		triggers: [],
 		cron: workflow.definition.cron?.map((c) => ({
 			schedule: c.schedule,
@@ -508,7 +523,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 		concurrency: workflow.definition.concurrency,
 		retries: workflow.definition.retries,
 		attempt,
-		handler: async (input, _execution, ctx) => {
+		handler: async (input, ctx) => {
 			const output = await workflow.definition.run(input, ctx as unknown as WorkflowContext);
 			// The output schema validates (and transforms) the result before the run records it.
 			const label = `workflow ${workflow.name} output`;
@@ -517,7 +532,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			return output === undefined || output === null ? null : workflowObject(output, label);
 		},
 	}));
-	/** Register every workflow with the runtime, once all definitions exist: Pi's only if the instance uses it. */
+	/** Create every workflow's task, once all definitions exist: Pi's only if the instance uses it. */
 	let registered = false;
 	const register = () => {
 		if (registered) return;
@@ -530,7 +545,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 			name: CLEANUP_WORKFLOW,
 			triggers: [],
 			retries: { maxAttempts: CLEANUP_ATTEMPTS },
-			handler: (input, _execution, ctx) => cleanup(input, ctx, host),
+			handler: (input, ctx) => cleanup(input, ctx, host),
 		});
 		for (const workflow of extraWorkflows.values()) workflows.push({ ...workflow, attempt });
 		// Routing is plumbing: no workflow context or plugin middleware.
@@ -538,9 +553,9 @@ export function buildApp(config: CoreConfig): HostedApp {
 			name: ROUTE_WORKFLOW,
 			triggers: [{ event: INGRESS_EVENT }],
 			retries: { maxAttempts: 5 },
-			handler: (input, _execution, ctx) => route(input as IngressEvent, ctx),
+			handler: (input, ctx) => route(input as IngressEvent, ctx),
 		});
-		runtime.register({
+		tasks = createConductor(config.conductor, {
 			workflows,
 			middleware,
 			events: [
@@ -607,10 +622,23 @@ export function buildApp(config: CoreConfig): HostedApp {
 			chat = config.chat && connectChat(config.chat, host);
 			await chat?.start();
 			await agents.start();
-			await runtime.start();
+			if (!running) {
+				// Resumed handlers may emit while worker startup is still completing.
+				running = true;
+				try {
+					await tasks!.orchestrator.start();
+				} catch (error) {
+					running = false;
+					throw error;
+				}
+			}
 		},
 		async stop() {
-			await runtime.stop();
+			if (running && tasks) {
+				running = false;
+				await tasks.orchestrator.stop();
+				await tasks.orchestrator.stopped;
+			}
 			await agents.stop();
 			await chat?.stop();
 			for (const plugin of [...config.plugins].reverse()) await plugin.shutdown?.();

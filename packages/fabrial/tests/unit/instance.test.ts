@@ -2,7 +2,7 @@ import { createMemoryState } from "@chat-adapter/state-memory";
 import { expect, expectTypeOf, it, vi } from "vitest";
 import { createFabrial, definePlugin, defineUser } from "../internals.ts";
 import { testApp } from "../../src/testing-internal.ts";
-import { StubRuntime } from "../../src/testing-internal.ts";
+import postgres from "postgres";
 
 const database = definePlugin((value: string) => ({
 	id: "database",
@@ -31,9 +31,8 @@ const workflow = f.defineWorkflow({
 
 // Compiled only: plugins have one configuration point, at definition.
 function invalidConfig() {
-	const runtime = new StubRuntime();
 	// @ts-expect-error Plugins cannot be passed to f.app().
-	f.app({ runtime, workflows: [], plugins: { database: database("fake") } });
+	f.app({ workflows: [], plugins: { database: database("fake") } });
 	// @ts-expect-error Groups are referenced by workflows, not registered as users.
 	createFabrial({ plugins: [], identity: [group] });
 	// @ts-expect-error The introspection catalog cannot be mutated.
@@ -75,12 +74,14 @@ it("does not connect chat adapters until startup", async () => {
 		plugins: [{ id: "chat", chat: { installationId: "", adapter: vi.fn() } }],
 	});
 	const app = testApp(instance, {
-		runtime: new StubRuntime(),
+		// Reaches no database: the start fails when Conductor connects, after chat connected. A missing
+		// socket is not an error Conductor retries.
+		conductor: { sql: postgres({ host: "/nonexistent-fabrial", max: 1 }) },
 		workflows: [],
 		chat: { state: createMemoryState(), capability: connect },
 	});
 	expect(connect).not.toHaveBeenCalled();
-	await app.start();
+	await expect(app.start()).rejects.toThrow(/ENOENT/);
 	expect(connect).toHaveBeenCalledOnce();
 	await app.stop();
 });

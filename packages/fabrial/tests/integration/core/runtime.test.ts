@@ -1,5 +1,5 @@
 import { beforeEach, expect, it } from "vitest";
-import type { InvocationMetadata, RuntimeWorkflow } from "../../internals.ts";
+import type { InvocationMetadata, WorkflowTask } from "../../internals.ts";
 import { useConductor } from "../../conductor/helper.ts";
 
 // Runtime-port contracts the core relies on, on real Conductor.
@@ -11,7 +11,7 @@ const metadata: InvocationMetadata = {
 	replyTo: null,
 	requestedBy: null,
 };
-const waiter = (handler: RuntimeWorkflow["handler"]): RuntimeWorkflow => ({
+const waiter = (handler: WorkflowTask["handler"]): WorkflowTask => ({
 	name: "waiter",
 	triggers: [],
 	// One attempt: the test clock reaches Conductor's retry backoff only when a test moves it.
@@ -28,7 +28,7 @@ it("enforces workflow concurrency", async () => {
 		await new Promise((resolve) => setTimeout(resolve, 20));
 		active--;
 	};
-	const runtime = await db.start([
+	const client = await db.start([
 		{
 			name: "limited",
 			triggers: [],
@@ -37,21 +37,21 @@ it("enforces workflow concurrency", async () => {
 		},
 	]);
 	const ids = await Promise.all(
-		Array.from({ length: 3 }, () => runtime.invoke("limited", {}, { metadata })),
+		Array.from({ length: 3 }, () => client.invoke("limited", {}, { metadata })),
 	);
 	for (const id of ids) await db.execution(id).output();
 	expect(max).toBe(1);
 });
 
 it("rejects unknown child waits", async () => {
-	const runtime = await db.start([
+	const client = await db.start([
 		waiter(async (_i, execution) => {
 			await execution.waitForAny("wait", {
 				child: { execution: crypto.randomUUID() },
 			});
 		}),
 	]);
-	const id = await runtime.invoke("waiter", {}, { metadata });
+	const id = await client.invoke("waiter", {}, { metadata });
 	expect(await db.execution(id).settled()).toMatchObject({
 		status: "failed",
 		error: expect.stringContaining("not found"),

@@ -10,6 +10,10 @@ export {
 export type {
 	Agent,
 	AgentDefinition,
+	AgentRef,
+	AgentResult,
+	AgentRunOptions,
+	DurationInput,
 	AgentObservers,
 	AgentTool,
 	InstructionContext,
@@ -33,7 +37,14 @@ export * from "./events.ts";
 export * from "./identity.ts";
 export type * from "./json.ts";
 export * from "./plugin.ts";
-export * from "./runtime.ts";
+export * from "./conductor.ts";
+export {
+	ExecutionError,
+	isCancelled,
+	settlement,
+	type ExecutionResult,
+	type InvocationMetadata,
+} from "./execution.ts";
 export type { Follow, ResourceFollow, ThreadRoutingState } from "./routing.ts";
 export * from "./schema.ts";
 export {

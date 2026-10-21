@@ -21,8 +21,8 @@ import {
 	type Agent,
 	type FabrialHost,
 	type InvocationMetadata,
-	type RuntimeEvent,
-	type RuntimeWorkflow,
+	type TaskEvent,
+	type WorkflowTask,
 } from "../../internals.ts";
 import { toolName } from "../../../src/agent.ts";
 import { callSession, connectAgents, PostgresStorage } from "../../../src/agents/index.ts";
@@ -44,7 +44,8 @@ const { defineAgent, defineTool, defineWorkflow } = definitions;
 const { db, sql, launch, idle, open, all } = useAgents();
 
 function fixture() {
-	const runtime = db.runtime();
+	const tasks = db.tasks();
+	const client = tasks.client;
 	const chat = new FakeChat({ installationId: "w" });
 	const faux = fauxProvider();
 	const models = createModels();
@@ -71,7 +72,11 @@ function fixture() {
 		definitionScope: definitions,
 		plugins: [],
 		workflows: [],
-		runtime,
+		get conductor() {
+			return tasks.conductor;
+		},
+		queue: tasks.queue,
+		now: () => tasks.now(),
 		clients: () => ({}),
 		chat: () => chat.connection(),
 		logger,
@@ -79,7 +84,13 @@ function fixture() {
 		resolvePrincipal: async () => null,
 	} as unknown as FabrialHost;
 	// The fake platform behind `slack-test`, the provider of the tests' threads.
-	connectChat(chat, { ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
+	// Not a spread: the host reads `conductor` lazily, once the tasks started.
+	connectChat(
+		chat,
+		Object.assign(Object.create(host) as FabrialHost, {
+			plugins: [...host.plugins, { id: "slack-test" }],
+		}),
+	);
 	const integration = connectAgents(host, {
 		models,
 		sql: sql(),
@@ -105,25 +116,25 @@ function fixture() {
 	const call = async (
 		agent: Agent,
 		input: string,
-		others: RuntimeWorkflow[] = [],
-		events: RuntimeEvent[] = [],
+		others: WorkflowTask[] = [],
+		events: TaskEvent[] = [],
 	) => {
-		const workflow: RuntimeWorkflow = {
+		const workflow: WorkflowTask = {
 			name: randomUUID(),
 			triggers: [],
-			handler: (_input, execution, ctx) => integration.run(ctx, "agent", agent, { input }),
+			handler: (_input, ctx) => integration.run(ctx, "agent", agent, { input }),
 		};
-		runtime.register({
+		tasks.register({
 			workflows: [workflow, ...integration.workflows, ...others],
 			events,
 		});
 		await integration.start();
-		await runtime.start();
-		const id = await runtime.invoke(workflow.name, null, { metadata });
+		await tasks.start();
+		const id = await client.invoke(workflow.name, null, { metadata });
 		calling = id;
 		const settled = async () => {
 			const result = await db.execution(id).settled();
-			await idle(runtime.queue);
+			await idle(client.queue);
 			return result;
 		};
 		return { id, settled };
@@ -133,7 +144,8 @@ function fixture() {
 			await sql()`SELECT writes FROM fabrial_pi.commits WHERE session_key = ${key()} ORDER BY seq`
 		).flatMap((row) => JSON.parse(String(row.writes)) as StorageWrite[]);
 	return {
-		runtime,
+		client,
+		tasks,
 		chat,
 		faux,
 		integration,
@@ -468,7 +480,7 @@ it("cancelling the lead's caller aborts the child's tool; no further model calls
 	]);
 	const { id, settled } = await f.call(lead, "Go");
 	await blocking;
-	await f.runtime.cancel(id, "Stopped");
+	await f.client.cancel(id, "Stopped");
 	expect(await settled()).toMatchObject({ status: "cancelled" });
 	// The call's Session execution is cancelled with its caller; the child's running tool is aborted in process.
 	await cancelledCall(f);
@@ -507,8 +519,8 @@ it("a child's workflow tool acts for the lead's request; the Session is released
 		{
 			name: approve.name,
 			triggers: [],
-			handler: async (_input, execution) => {
-				seen.push(execution.metadata);
+			handler: async (_input, ctx) => {
+				seen.push(metadataOf(ctx));
 				// The driver released the Session while the child waits on this workflow.
 				await leaseFreed(f.key());
 				return "approved and ran";
@@ -940,7 +952,7 @@ it("cancelling the interaction aborts its background children", async () => {
 	});
 	const { id, settled } = await f.call(lead, "Go");
 	await started.opened;
-	await f.runtime.cancel(id, "Stopped");
+	await f.client.cancel(id, "Stopped");
 	expect(await settled()).toMatchObject({ status: "cancelled" });
 	// The background child dies with the call's Session execution: its tool is aborted, and it never reports.
 	await cancelledCall(f);
@@ -1001,13 +1013,13 @@ it("a child's workflow tool waits for approval: the approver's click resumes it 
 		}),
 	);
 	const chat = new FakeChat({ installationId: "w" });
-	const { runtime } = await launch(g, {
+	const { client } = await launch(g, {
 		workflows: [runSql, entry],
 		chat,
 		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
 	{
-		const id = await runtime.invoke(entry.name, null, {
+		const id = await client.invoke(entry.name, null, {
 			metadata: {
 				requestId: randomUUID(),
 				origin: null,
@@ -1044,20 +1056,19 @@ it.each([
 				run: async () => ({}),
 			});
 			(f.host.workflows as unknown as (typeof workflow)[]).push(workflow);
-			const runtime: RuntimeWorkflow = {
+			const task: WorkflowTask = {
 				name: workflow.name,
 				triggers: [],
-				handler: async (_input, execution) => {
-					const go = await execution.subscribe("go", { event: `go-${workflow.name}` });
-					await execution.waitForAny("wait", { go });
+				handler: async (_input, ctx) => {
+					await ctx.waitForEvent("wait", { event: { name: `go-${workflow.name}` } } as never);
 					return `${who} went`;
 				},
 			};
 			return {
 				workflow,
-				runtime,
+				task,
 				event: { name: `go-${workflow.name}`, filterable: [] },
-				go: () => f.runtime.emit(`go-${workflow.name}`, {}, { metadata: f.metadata }),
+				go: () => f.client.emit(`go-${workflow.name}`, {}, { metadata: f.metadata }),
 			};
 		};
 		const lead = waiter("lead");
@@ -1090,7 +1101,7 @@ it.each([
 		const { id, settled } = await f.call(
 			agent,
 			"Go",
-			[lead.runtime, child.runtime],
+			[lead.task, child.task],
 			[lead.event, child.event],
 		);
 		await Promise.all([parked.lead.opened, parked.child.opened]);
@@ -1099,7 +1110,7 @@ it.each([
 				.execution(
 					await until(
 						`${waiter.workflow.name} to start`,
-						async () => (await open(f.runtime.queue, waiter.workflow.name))[0],
+						async () => (await open(f.client.queue, waiter.workflow.name))[0],
 					),
 				)
 				.suspended("wait");
@@ -1181,13 +1192,13 @@ it("a stop after the lead answered cancels a background child's approval workflo
 		}),
 	);
 	const chat = new FakeChat({ installationId: "w" });
-	const { runtime } = await launch(g, {
+	const { client } = await launch(g, {
 		workflows: [runSql, ask],
 		chat,
 		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
 	const send = (text: string) =>
-		runtime.invoke(
+		client.invoke(
 			ask.name,
 			{ text },
 			{
@@ -1223,7 +1234,7 @@ it("a stop after the lead answered cancels a background child's approval workflo
 		.poll(approvalWorkflow, { timeout: 30_000 })
 		.toMatchObject({ cancelled: true, done: false });
 	await approve();
-	await idle(runtime.queue);
+	await idle(client.queue);
 	expect(await approvalWorkflow()).toMatchObject({ cancelled: true, done: false });
 	expect(await posts()).toEqual(["On it."]);
 });
@@ -1291,13 +1302,13 @@ it("a background child waiting for approval suspends the Session: a new message 
 		}),
 	);
 	const chat = new FakeChat({ installationId: "w" });
-	const { runtime } = await launch(g, {
+	const { client } = await launch(g, {
 		workflows: [runSql, ask],
 		chat,
 		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
 	const send = (text: string) =>
-		runtime.invoke(
+		client.invoke(
 			ask.name,
 			{ text },
 			{
@@ -1325,7 +1336,7 @@ it("a background child waiting for approval suspends the Session: a new message 
 		await expect
 			.poll(
 				async () => {
-					if ((await open(runtime.queue, "fabrial.session")).length !== 1) return false;
+					if ((await open(client.queue, "fabrial.session")).length !== 1) return false;
 					const storage = await PostgresStorage.open(sql(), session).catch(() => undefined);
 					await storage?.close(BACKGROUND_CONTEXT);
 					return !!storage;
@@ -1347,7 +1358,7 @@ it("a background child waiting for approval suspends the Session: a new message 
 				"Still waiting for approval.",
 				`Done: <subagent name="${tool}-1" status="done">Fixed after approval.</subagent>`,
 			]);
-		await idle(runtime.queue);
+		await idle(client.queue);
 	}
 });
 
@@ -1399,7 +1410,7 @@ it("a child's answer frees its concurrency slot as it settles, and its status li
  * follows (the count stays put for a while).
  */
 async function cancelledCall(f: Fixture) {
-	const [call] = await all(f.runtime.queue, "fabrial.session");
+	const [call] = await all(f.client.queue, "fabrial.session");
 	expect((await db.execution(call!).settled()).status).toBe("cancelled");
 	await leaseFreed(f.key());
 	const requests = f.contexts.length;
@@ -1472,13 +1483,13 @@ it("continuing a background child from another actor and thread runs its tools f
 			return say("ok");
 		}),
 	);
-	const { runtime } = await launch(g, {
+	const { client } = await launch(g, {
 		workflows: [ask],
 		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
 	const threads = [`slack-test:general:${randomUUID()}`, `slack-test:general:${randomUUID()}`];
 	const send = (text: string, index: number) =>
-		runtime.invoke(
+		client.invoke(
 			ask.name,
 			{ text },
 			{
@@ -1497,7 +1508,7 @@ it("continuing a background child from another actor and thread runs its tools f
 	await send("Again", 1);
 	await expect.poll(() => seen.length, { timeout: 30_000 }).toBe(2);
 	expect(seen).toEqual([`${users[0]!.id}@${threads[0]}`, `${users[1]!.id}@${threads[1]}`]);
-	await idle(runtime.queue);
+	await idle(client.queue);
 });
 
 it("channel-session agents share session state across threads with their workflow tools; a ctx.agent call's tools see their own", async () => {
@@ -1571,7 +1582,7 @@ it("channel-session agents share session state across threads with their workflo
 			return say("ok");
 		}),
 	);
-	const { runtime } = await launch(g, {
+	const { client } = await launch(g, {
 		workflows: [deliver, call, flow, read],
 		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
@@ -1589,26 +1600,26 @@ it("channel-session agents share session state across threads with their workflo
 		ownerWorkflow: null,
 		triggerEvent: null,
 	});
-	await runtime.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("a") });
+	await client.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("a") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1]);
-	await runtime.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("b") });
+	await client.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("b") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2]);
-	const id = await runtime.invoke(call.name, { text: "Bump" }, { metadata: metadata("a") });
+	const id = await client.invoke(call.name, { text: "Bump" }, { metadata: metadata("a") });
 	expect(await db.execution(id).settled()).toEqual({
 		status: "completed",
 		output: { answer: "Done count=1." },
 	});
 	expect(seen).toEqual([1, 2, 1]);
-	await runtime.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("a") });
+	await client.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("a") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2, 1, 3]);
-	await runtime.invoke(deliver.name, { text: "Flow" }, { metadata: metadata("b") });
+	await client.invoke(deliver.name, { text: "Flow" }, { metadata: metadata("b") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2, 1, 3, 4]);
-	await runtime.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("a") });
+	await client.invoke(deliver.name, { text: "Bump" }, { metadata: metadata("a") });
 	await expect.poll(() => seen, { timeout: 30_000 }).toEqual([1, 2, 1, 3, 4, 5]);
-	const own = await runtime.invoke(read.name, null, { metadata: metadata("a") });
+	const own = await client.invoke(read.name, null, { metadata: metadata("a") });
 	expect(await db.execution(own).settled()).toEqual({
 		status: "completed",
 		output: { count: 0 },
 	});
-	await idle(runtime.queue);
+	await idle(client.queue);
 });

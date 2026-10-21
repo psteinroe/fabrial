@@ -1,12 +1,6 @@
 import { createFabrial, type JsonObject } from "fabrial";
 import { definePlugin, trigger, type ResourceKind } from "fabrial/plugin";
-import {
-	createTestApp,
-	scriptedPi,
-	StubRuntime,
-	testApp,
-	FakeChat,
-} from "fabrial/internal/testing";
+import { createTestApp, scriptedPi, testApp, FakeChat } from "fabrial/internal/testing";
 import { reply, scriptedModels } from "fabrial/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { github, parsePullRequest, pullRequest } from "../../src/index.ts";
@@ -28,19 +22,17 @@ const prThread = { kind: "thread", provider: "github", threadId: "github:acme/ap
 
 /** The plugin event a webhook's ingress event carries. */
 async function emitted(hook: { event: string; payload: unknown }) {
-	const runtime = new StubRuntime();
+	// Never started: the webhook route only ingests.
 	const app = testApp(createFabrial({ plugins: [plugin()] }), {
-		runtime,
+		conductor: { sql: {} as never },
 		chat: new FakeChat(),
 		workflows: [],
 	});
-	await app.start();
+	const ingest = vi.spyOn(app.host, "ingest").mockResolvedValue("accepted");
 	expect((await app.fetch(deliver(hook, "d"))).status).toBe(200);
-	await app.stop();
-	const ingress = runtime.emitted.find((e) => e.name === "fabrial.ingress")?.payload as
-		| { events: string[]; payload: JsonObject }
-		| undefined;
-	const name = ingress?.events.find((event) => event.startsWith("github."));
+	const call = ingest.mock.calls.find(([event]) => event.startsWith("github."));
+	const ingress = call && { events: [call[0]], payload: call[1] };
+	const name = ingress?.events[0];
 	return name === undefined
 		? undefined
 		: { name: name.slice("github.".length), payload: ingress!.payload };
@@ -196,7 +188,7 @@ describe("follows in an app", () => {
 		await app.start();
 		const start = async (workflow: string, input: JsonObject | null = null) =>
 			t.settled(
-				await t.runtime.invoke(workflow, input, {
+				await t.conductor.invoke({ name: workflow, queue: t.queue } as never, input as never, {
 					metadata: { requestId: workflow, origin: null, replyTo: null, requestedBy: null },
 				}),
 			);

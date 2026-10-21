@@ -7,7 +7,7 @@ import { definedGroup, type Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { TaskContext } from "pgconductor-js";
 import { childMetadata, executionResult, nativeMethods } from "./execution.ts";
-import type { RuntimeWorkflow } from "./runtime.ts";
+import type { WorkflowTask } from "./conductor.ts";
 import type { CardAction, Surface } from "./thread.ts";
 
 /** One execution per approval request; its result is the request the routing workflow authorizes clicks against. */
@@ -57,7 +57,7 @@ export type ApprovalAction = "approve" | "reject" | "cancel";
  */
 const REQUEST_RETENTION_DAYS = 60;
 
-export function approvalRequestWorkflow(): RuntimeWorkflow {
+export function approvalRequestWorkflow(): WorkflowTask {
 	return {
 		name: APPROVAL_REQUEST_WORKFLOW,
 		triggers: [],
@@ -101,12 +101,12 @@ export const UNREACHABLE = "No approver could be reached";
  * its card was posted and the approval decided. It settles before the decision only when every approver
  * card failed for good.
  */
-export function approvalDeliveryWorkflow(): RuntimeWorkflow {
+export function approvalDeliveryWorkflow(): WorkflowTask {
 	return {
 		name: APPROVAL_DELIVERY_WORKFLOW,
 		triggers: [],
 		retentionDays: REQUEST_RETENTION_DAYS,
-		handler: async (input, _execution, ctx) => {
+		handler: async (input, ctx) => {
 			const { cleanups } = input as { cleanups: string[] };
 			const native = nativeMethods(ctx);
 			for (const [index, id] of cleanups.entries())
@@ -122,12 +122,12 @@ export function approvalDeliveryWorkflow(): RuntimeWorkflow {
  * just posted is never missed. The first decision wins; the caller settling first cancels the approval,
  * and every approver card failing for good fails it.
  */
-export function approvalDecisionWorkflow(now: () => number): RuntimeWorkflow {
+export function approvalDecisionWorkflow(now: () => number): WorkflowTask {
 	return {
 		name: APPROVAL_DECISION_WORKFLOW,
 		triggers: [],
 		// No retention: a caller may first wait on its decision any time later.
-		handler: async (input, _execution, ctx) => {
+		handler: async (input, ctx) => {
 			const data = input as unknown as DecisionInput;
 			// Registered before any wait. The handler returns only once the reason is kept, so a crash in
 			// between redelivers it.
@@ -257,8 +257,11 @@ export async function loadRequest(
 ): Promise<ApprovalRequest | null> {
 	const native = nativeMethods(ctx);
 	const found = await native.step("approval", async () => {
-		const info = await host.runtime.getExecution(approvalId);
-		return info?.workflow === APPROVAL_REQUEST_WORKFLOW;
+		// Ids come from clicks and other untrusted input: anything but a UUID of this app's requests is unknown.
+		if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(approvalId))
+			return false;
+		const info = await host.conductor.getExecution(approvalId);
+		return info?.queue === host.queue && info.taskKey === APPROVAL_REQUEST_WORKFLOW;
 	});
 	if (!found) return null;
 	// Started before any card was posted, so it settles right after a fast click at the latest.

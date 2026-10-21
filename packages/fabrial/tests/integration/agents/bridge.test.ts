@@ -1,3 +1,4 @@
+import { metadataOf } from "../../../src/execution.ts";
 import { connectChat } from "../../../src/chat/index.ts";
 import { randomUUID } from "node:crypto";
 import type { Message, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
@@ -11,8 +12,8 @@ import {
 	createFabrial,
 	type FabrialHost,
 	type InvocationMetadata,
-	type RuntimeEvent,
-	type RuntimeWorkflow,
+	type TaskEvent,
+	type WorkflowTask,
 	type ToolCall,
 } from "../../internals.ts";
 import { FakeChat } from "../../../src/testing.ts";
@@ -34,7 +35,7 @@ const { defineAgent, defineTool, defineToolkit, defineState } = definitions;
 
 /**
  * The Pi integration connected to a bare host on real Conductor, in real time: tests register workflows
- * with the runtime directly and wait for executions through `db.execution`.
+ * with Conductor directly and wait for executions through `db.execution`.
  */
 const { db, sql, idle, open, all } = useAgents();
 
@@ -44,7 +45,8 @@ function fixture(
 	stateTimeoutMs?: number,
 	stateConflicts?: number,
 ) {
-	const runtime = db.runtime();
+	const tasks = db.tasks();
+	const client = tasks.client;
 	const chat = new FakeChat({ installationId: "w" });
 	const faux = fauxProvider();
 	const models = createModels();
@@ -65,7 +67,11 @@ function fixture(
 		definitionScope,
 		plugins,
 		workflows: [],
-		runtime,
+		get conductor() {
+			return tasks.conductor;
+		},
+		queue: tasks.queue,
+		now: () => tasks.now(),
 		clients: () => ({ example: "client" }),
 		chat: () => chat.connection(),
 		logger: { warn() {}, error() {}, debug() {}, info() {} },
@@ -78,7 +84,13 @@ function fixture(
 		}),
 	} as unknown as FabrialHost;
 	// The fake platform behind `slack-test`, the provider of the tests' threads.
-	connectChat(chat, { ...host, plugins: [...host.plugins, { id: "slack-test" }] } as FabrialHost);
+	// Not a spread: the host reads `conductor` lazily, once the tasks started.
+	connectChat(
+		chat,
+		Object.assign(Object.create(host) as FabrialHost, {
+			plugins: [...host.plugins, { id: "slack-test" }],
+		}),
+	);
 	const integration = connectAgents(host, {
 		models,
 		sql: sql(),
@@ -86,22 +98,22 @@ function fixture(
 		...(stateTimeoutMs ? { stateTimeoutMs } : {}),
 		...(stateConflicts ? { stateConflicts } : {}),
 	});
-	return { runtime, chat, faux, integration, metadata, host };
+	return { client, tasks, chat, faux, integration, metadata, host };
 }
-async function execute(f: ReturnType<typeof fixture>, workflow: RuntimeWorkflow) {
+async function execute(f: ReturnType<typeof fixture>, workflow: WorkflowTask) {
 	runtimeRegister(f, workflow);
 	await f.integration.start();
-	await f.runtime.start();
-	const id = await f.runtime.invoke(workflow.name, null, { metadata: f.metadata });
+	await f.tasks.start();
+	const id = await f.client.invoke(workflow.name, null, { metadata: f.metadata });
 	return { id, result: await db.execution(id).settled() };
 }
 function runtimeRegister(
 	f: ReturnType<typeof fixture>,
-	workflow: RuntimeWorkflow,
-	others: RuntimeWorkflow[] = [],
-	events: RuntimeEvent[] = [],
+	workflow: WorkflowTask,
+	others: WorkflowTask[] = [],
+	events: TaskEvent[] = [],
 ) {
-	f.runtime.register({
+	f.tasks.register({
 		workflows: [workflow, ...f.integration.workflows, ...others],
 		events: [...events, ...(f.integration.events ?? [])],
 	});
@@ -128,11 +140,11 @@ it("runs durable structured answers and memoizes submissions; each call has a Se
 		},
 		fauxAssistantMessage("continued"),
 	]);
-	const workflow: RuntimeWorkflow = {
+	const workflow: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (_input, execution, ctx) => {
-			await execution.step("answer:output", () => "user receipt");
+		handler: async (_input, ctx) => {
+			await ctx.step("answer:output", () => "user receipt");
 			const first = await f.integration.run(ctx, "answer", agent, {
 				input: "Question",
 				output: z.object({ answer: z.number() }),
@@ -214,10 +226,10 @@ it("binds adapter identity, clients, sections and durable posts; commits tool st
 		fauxAssistantMessage(fauxToolCall("record_note", { text: "hello" }), { stopReason: "toolUse" }),
 		fauxAssistantMessage("finished"),
 	]);
-	const workflow: RuntimeWorkflow = {
+	const workflow: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (_input, execution, ctx) => {
+		handler: async (_input, ctx) => {
 			await f.integration.state.update(ctx, "seed", state, (draft) => {
 				draft.notes.push("seed");
 			});
@@ -279,36 +291,35 @@ it("suspends the Session while a workflow tool waits and resumes it with a stabl
 		),
 		fauxAssistantMessage("child finished"),
 	]);
-	const workflow: RuntimeWorkflow = {
+	const workflow: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution, ctx) =>
-			f.integration.run(ctx, "agent", agent, { input: "Run child" }),
+		handler: (_input, ctx) => f.integration.run(ctx, "agent", agent, { input: "Run child" }),
 	};
 	runtimeRegister(f, workflow, [
 		{
 			name: child.name,
 			triggers: [],
-			handler: async (_input, execution) => {
-				expect(execution.metadata).toMatchObject({
+			handler: async (_input, ctx) => {
+				expect(metadataOf(ctx)).toMatchObject({
 					...f.metadata,
 					triggerEvent: null,
 					ownerWorkflow: null,
 				});
-				const storage = await PostgresStorage.open(sql(), execution.metadata.piSession as string);
+				const storage = await PostgresStorage.open(sql(), metadataOf(ctx).piSession as string);
 				await storage.close(BACKGROUND_CONTEXT);
 				return "ok";
 			},
 		},
 	]);
 	await f.integration.start();
-	await f.runtime.start();
-	const id = await f.runtime.invoke(workflow.name, null, { metadata: f.metadata });
+	await f.tasks.start();
+	const id = await f.client.invoke(workflow.name, null, { metadata: f.metadata });
 	expect(await db.execution(id).settled()).toEqual({
 		status: "completed",
 		output: "child finished",
 	});
-	expect(await all(f.runtime.queue, child.name)).toHaveLength(1);
+	expect(await all(f.client.queue, child.name)).toHaveLength(1);
 	await f.integration.stop();
 });
 
@@ -320,11 +331,11 @@ it("rejects invalid structured answers", async () => {
 		model: `${f.faux.provider.id}/${f.faux.getModel().id}`,
 	});
 	f.faux.setResponses([fauxAssistantMessage('{"answer":"not a number"}')]);
-	const workflow: RuntimeWorkflow = {
+	const workflow: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
 		retries: { maxAttempts: 1 },
-		handler: (_input, execution, ctx) =>
+		handler: (_input, ctx) =>
 			f.integration.run(ctx, "agent", agent, {
 				input: "Answer",
 				output: z.object({ answer: z.number() }),
@@ -448,11 +459,10 @@ it.each([[false], [true]])(
 			}),
 			fauxAssistantMessage("approved"),
 		]);
-		const workflow: RuntimeWorkflow = {
+		const workflow: WorkflowTask = {
 			name: randomUUID(),
 			triggers: [],
-			handler: (_input, execution, ctx) =>
-				f.integration.run(ctx, "agent", agent, { input: "Wait", detached }),
+			handler: (_input, ctx) => f.integration.run(ctx, "agent", agent, { input: "Wait", detached }),
 		};
 		runtimeRegister(
 			f,
@@ -461,9 +471,8 @@ it.each([[false], [true]])(
 				{
 					name: child.name,
 					triggers: [],
-					handler: async (_input, execution) => {
-						const decision = await execution.subscribe("decision", { event: approved.name });
-						await execution.waitForAny("approval", { decision });
+					handler: async (_input, ctx) => {
+						await ctx.waitForEvent("approval", { event: { name: approved.name } } as never);
 						return "approved";
 					},
 				},
@@ -471,16 +480,16 @@ it.each([[false], [true]])(
 			[approved],
 		);
 		await f.integration.start();
-		await f.runtime.start();
-		const id = await f.runtime.invoke(workflow.name, null, { metadata: f.metadata });
+		await f.tasks.start();
+		const id = await f.client.invoke(workflow.name, null, { metadata: f.metadata });
 		const tool = db.execution(
 			await until(
 				"the workflow tool to start",
-				async () => (await all(f.runtime.queue, child.name))[0],
+				async () => (await all(f.client.queue, child.name))[0],
 			),
 		);
 		await tool.suspended("approval");
-		await f.runtime.cancel(id, "User stopped");
+		await f.client.cancel(id, "User stopped");
 		// The call's Session execution is the caller's child: cancelled with it unless detached.
 		expect((await db.execution(id).settled()).status).toBe("cancelled");
 		if (detached) {
@@ -491,14 +500,14 @@ it.each([[false], [true]])(
 					await sql()`SELECT owner FROM fabrial_pi.sessions WHERE key = ${callSession(id, "agent")}`;
 				return lease && lease.owner === null ? true : undefined;
 			});
-			expect(await open(f.runtime.queue, "fabrial.session")).toHaveLength(1);
+			expect(await open(f.client.queue, "fabrial.session")).toHaveLength(1);
 			expect(["pending", "running"]).toContain((await tool.info())?.status);
-			await f.runtime.emit(approved.name, {}, { metadata: f.metadata });
+			await f.client.emit(approved.name, {}, { metadata: f.metadata });
 			await until("the agent to answer", async () =>
 				f.faux.state.callCount === 2 ? true : undefined,
 			);
 			// The detached call's Session execution still settles with the answer.
-			const [call] = await all(f.runtime.queue, "fabrial.session");
+			const [call] = await all(f.client.queue, "fabrial.session");
 			expect(await db.execution(call!).settled()).toEqual({
 				status: "completed",
 				output: { status: "completed", output: "approved" },
@@ -506,7 +515,7 @@ it.each([[false], [true]])(
 		} else {
 			expect((await tool.settled()).status).toBe("cancelled");
 		}
-		await idle(f.runtime.queue);
+		await idle(f.client.queue);
 		if (!detached) expect(f.faux.state.callCount).toBe(1);
 		const [lease] =
 			await sql()`SELECT owner FROM fabrial_pi.sessions WHERE key = ${callSession(id, "agent")}`;
@@ -532,11 +541,11 @@ it("a timed-out agent call cancels its attached Session execution and the call's
 		}),
 		fauxAssistantMessage("never"),
 	]);
-	const workflow: RuntimeWorkflow = {
+	const workflow: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
 		retries: { maxAttempts: 1 },
-		handler: (_input, execution, ctx) =>
+		handler: (_input, ctx) =>
 			f.integration.run(ctx, "agent", agent, { input: "Wait", timeout: "3s" }),
 	};
 	runtimeRegister(
@@ -546,9 +555,8 @@ it("a timed-out agent call cancels its attached Session execution and the call's
 			{
 				name: child.name,
 				triggers: [],
-				handler: async (_input, execution) => {
-					const never = await execution.subscribe("never", { event: `never-${child.name}` });
-					await execution.waitForAny("approval", { never });
+				handler: async (_input, ctx) => {
+					await ctx.waitForEvent("approval", { event: { name: `never-${child.name}` } } as never);
 					return "approved";
 				},
 			},
@@ -556,12 +564,12 @@ it("a timed-out agent call cancels its attached Session execution and the call's
 		[{ name: `never-${child.name}`, filterable: [] }],
 	);
 	await f.integration.start();
-	await f.runtime.start();
-	const id = await f.runtime.invoke(workflow.name, null, { metadata: f.metadata });
+	await f.tasks.start();
+	const id = await f.client.invoke(workflow.name, null, { metadata: f.metadata });
 	const tool = db.execution(
 		await until(
 			"the workflow tool to start",
-			async () => (await all(f.runtime.queue, child.name))[0],
+			async () => (await all(f.client.queue, child.name))[0],
 		),
 	);
 	await tool.suspended("approval");
@@ -570,10 +578,10 @@ it("a timed-out agent call cancels its attached Session execution and the call's
 		error: expect.stringMatching(/timed out/),
 	});
 	// The call's Session execution and its tool's are cancelled with the caller; the agent never resumes.
-	const [call] = await all(f.runtime.queue, "fabrial.session");
+	const [call] = await all(f.client.queue, "fabrial.session");
 	expect((await db.execution(call!).settled()).status).toBe("cancelled");
 	expect((await tool.settled()).status).toBe("cancelled");
-	await idle(f.runtime.queue);
+	await idle(f.client.queue);
 	expect(f.faux.state.callCount).toBe(1);
 	const [lease] =
 		await sql()`SELECT owner FROM fabrial_pi.sessions WHERE key = ${callSession(id, "agent")}`;
@@ -610,7 +618,7 @@ it("installs plugin observers globally but does not select unrequested plugin to
 	const { result } = await execute(f, {
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution, ctx) => f.integration.run(ctx, "agent", agent, { input: "Hello" }),
+		handler: (_input, ctx) => f.integration.run(ctx, "agent", agent, { input: "Hello" }),
 	});
 	expect(result).toEqual({ status: "completed", output: "ok" });
 	expect(requests).toBe(1);
@@ -637,10 +645,10 @@ it("observes each Session's agent on its own: two Sessions at once", async () =>
 		);
 	};
 	f.faux.setResponses([echo, echo]);
-	const workflow: RuntimeWorkflow = {
+	const workflow: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (input, execution, ctx) => {
+		handler: async (input, ctx) => {
 			const agent = input === "a" ? a! : b!;
 			return f.integration.run(ctx, "agent", agent, {
 				input: `from ${String(input as string)}`,
@@ -649,9 +657,9 @@ it("observes each Session's agent on its own: two Sessions at once", async () =>
 	};
 	runtimeRegister(f, workflow);
 	await f.integration.start();
-	await f.runtime.start();
+	await f.tasks.start();
 	const ids = await Promise.all(
-		["a", "b"].map((input) => f.runtime.invoke(workflow.name, input, { metadata: f.metadata })),
+		["a", "b"].map((input) => f.client.invoke(workflow.name, input, { metadata: f.metadata })),
 	);
 	const results = await Promise.all(ids.map((id) => db.execution(id).settled()));
 	expect(results).toEqual([
@@ -698,8 +706,7 @@ it("notifies onToolCall after a tool settles and logs observers that throw", asy
 	const { result } = await execute(f, {
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution, ctx) =>
-			f.integration.run(ctx, "agent", agent, { input: "Look up a" }),
+		handler: (_input, ctx) => f.integration.run(ctx, "agent", agent, { input: "Look up a" }),
 	});
 	expect(result).toEqual({ status: "completed", output: "done" });
 	expect(calls).toEqual([
@@ -762,19 +769,19 @@ it("attributes observer calls to each Session's own agent while two Sessions int
 		fauxAssistantMessage("b done"),
 		fauxAssistantMessage("a done"),
 	]);
-	const run = (agent: typeof waiting, input: string): RuntimeWorkflow => ({
+	const run = (agent: typeof waiting, input: string): WorkflowTask => ({
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution, ctx) => f.integration.run(ctx, "agent", agent, { input }),
+		handler: (_input, ctx) => f.integration.run(ctx, "agent", agent, { input }),
 	});
 	const [a, b] = [run(waiting, "Wait"), run(other, "Look up b")];
 	runtimeRegister(f, a, [b]);
 	await f.integration.start();
-	await f.runtime.start();
-	const first = await f.runtime.invoke(a.name, null, { metadata: f.metadata });
+	await f.tasks.start();
+	const first = await f.client.invoke(a.name, null, { metadata: f.metadata });
 	await inside;
 	// Each Session numbers its conversations from the start, so both leads share a conversation id.
-	const second = await f.runtime.invoke(b.name, null, { metadata: f.metadata });
+	const second = await f.client.invoke(b.name, null, { metadata: f.metadata });
 	expect(await db.execution(second).settled()).toEqual({ status: "completed", output: "b done" });
 	release();
 	expect(await db.execution(first).settled()).toEqual({ status: "completed", output: "a done" });
@@ -818,8 +825,7 @@ it("returns input that fails the tool schema to the model without running the to
 	const { result } = await execute(f, {
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution, ctx) =>
-			f.integration.run(ctx, "agent", agent, { input: "Deploy" }),
+		handler: (_input, ctx) => f.integration.run(ctx, "agent", agent, { input: "Deploy" }),
 	});
 	expect(result).toEqual({ status: "completed", output: "fixed nothing" });
 	expect(runs).toBe(0);
@@ -859,7 +865,7 @@ it("sends a non-string tool result to the model as serialized JSON", async () =>
 	const { result } = await execute(f, {
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution, ctx) => f.integration.run(ctx, "agent", agent, { input: "Query" }),
+		handler: (_input, ctx) => f.integration.run(ctx, "agent", agent, { input: "Query" }),
 	});
 	expect(result).toEqual({ status: "completed", output: "one row" });
 	expect(seen).toMatchObject([
@@ -884,13 +890,13 @@ it("workflow state needs a posted thread; an unposted channel locator is not a S
 	const { result } = await execute(f, {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (_input, execution, ctx) => {
+		handler: async (_input, ctx) => {
 			await expect(f.integration.state.get(ctx, "state", state)).rejects.toThrow("ctx.thread.post");
 			return "ok";
 		},
 	});
 	expect(result).toEqual({ status: "completed", output: "ok" });
-	expect(await all(f.runtime.queue, "fabrial.session")).toHaveLength(0);
+	expect(await all(f.client.queue, "fabrial.session")).toHaveLength(0);
 	expect(f.chat.threads.size).toBe(0);
 	await f.integration.stop();
 });
@@ -914,7 +920,7 @@ it("workflow state resolves by name on this instance: an unknown definition fail
 	const { result } = await execute(f, {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (_input, execution, ctx) => {
+		handler: async (_input, ctx) => {
 			await expect(f.integration.state.get(ctx, "read", stranger)).rejects.toThrow(
 				"is not defined on this Fabrial instance",
 			);
@@ -922,18 +928,18 @@ it("workflow state resolves by name on this instance: an unknown definition fail
 		},
 	});
 	expect(result).toEqual({ status: "completed", output: "ok" });
-	expect(await all(f.runtime.queue, "fabrial.session")).toHaveLength(0);
+	expect(await all(f.client.queue, "fabrial.session")).toHaveLength(0);
 	await f.integration.stop();
 });
 
 it("a workflow update that fails its schema fails the workflow and changes nothing", async () => {
 	const f = fixture();
 	const state = counter();
-	const invalid: RuntimeWorkflow = {
+	const invalid: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
 		retries: { maxAttempts: 1 },
-		handler: async (_input, execution, ctx) => {
+		handler: async (_input, ctx) => {
 			await f.integration.state.update(ctx, "seed", state, (draft) => {
 				draft.count = 5;
 			});
@@ -942,20 +948,20 @@ it("a workflow update that fails its schema fails the workflow and changes nothi
 			});
 		},
 	};
-	const reader: RuntimeWorkflow = {
+	const reader: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution, ctx) => f.integration.state.get(ctx, "read", state),
+		handler: (_input, ctx) => f.integration.state.get(ctx, "read", state),
 	};
 	runtimeRegister(f, invalid, [reader]);
 	await f.integration.start();
-	await f.runtime.start();
-	const failed = await f.runtime.invoke(invalid.name, null, { metadata: f.metadata });
+	await f.tasks.start();
+	const failed = await f.client.invoke(invalid.name, null, { metadata: f.metadata });
 	expect(await db.execution(failed).settled()).toMatchObject({
 		status: "failed",
 		error: expect.stringContaining(`state ${state.name}`),
 	});
-	const read = await f.runtime.invoke(reader.name, null, { metadata: f.metadata });
+	const read = await f.client.invoke(reader.name, null, { metadata: f.metadata });
 	expect(await db.execution(read).settled()).toEqual({ status: "completed", output: { count: 5 } });
 	await f.integration.stop();
 });
@@ -970,10 +976,9 @@ it("a lost state response is asked for again with the same operation: the update
 	const session = f.integration.workflows.find((workflow) => workflow.name === "fabrial.session")!;
 	const handler = session.handler;
 	let dropped = 0;
-	session.handler = (input, execution, ctx) =>
+	session.handler = (input, ctx) =>
 		handler(
 			input,
-			execution,
 			intercept(ctx, {
 				emit: async (emit, event: string, payload: { operation?: string }, options: unknown) => {
 					if (payload.operation?.includes(":write") && !dropped++) return;
@@ -984,7 +989,7 @@ it("a lost state response is asked for again with the same operation: the update
 	const { result } = await execute(f, {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (_input, execution, ctx) => {
+		handler: async (_input, ctx) => {
 			const updated = await f.integration.state.update(ctx, "increment", state, change);
 			return { updated, read: await f.integration.state.get(ctx, "read", state) };
 		},
@@ -1005,11 +1010,11 @@ it("a workflow restarted after sending its update waits for the same answer; not
 		draft.count++;
 	});
 	let crashed = false;
-	const workflow: RuntimeWorkflow = {
+	const workflow: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
 		retries: { maxAttempts: 3 },
-		handler: async (_input, _execution, ctx) => {
+		handler: async (_input, ctx) => {
 			const crashing = intercept(ctx, {
 				signalWithStart: async (signalWithStart, id: string, options: unknown) => {
 					const sent = await signalWithStart(id, options);
@@ -1099,7 +1104,7 @@ it("a tool that changes the state between a workflow's read and write makes the 
 	const { result } = await execute(f, {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (_input, execution, ctx) => {
+		handler: async (_input, ctx) => {
 			// The first write waits until the agent's tool changed the state it read.
 			const forced = beforeWrites(ctx, async (n) => {
 				if (n) return;
@@ -1138,7 +1143,7 @@ it("an update that keeps conflicting fails clearly after its conflicts run out",
 		name: randomUUID(),
 		triggers: [],
 		retries: { maxAttempts: 1 },
-		handler: async (_input, execution, ctx) => {
+		handler: async (_input, ctx) => {
 			// Another update lands between every read and write.
 			const contended = beforeWrites(ctx, async (n) => {
 				await f.integration.state.update(ctx, `other:${n}`, state, (draft) => {
@@ -1163,10 +1168,9 @@ it("a duplicated state write gets the same answer again and applies once", async
 	const answers: unknown[] = [];
 	const session = f.integration.workflows.find((workflow) => workflow.name === "fabrial.session")!;
 	const handler = session.handler;
-	session.handler = (input, execution, ctx) =>
+	session.handler = (input, ctx) =>
 		handler(
 			input,
-			execution,
 			intercept(ctx, {
 				emit: async (emit, event: string, payload: { operation?: string }, options: unknown) => {
 					if (payload.operation?.includes(":write")) answers.push(payload);
@@ -1177,7 +1181,7 @@ it("a duplicated state write gets the same answer again and applies once", async
 	const { result } = await execute(f, {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (_input, execution, ctx) => {
+		handler: async (_input, ctx) => {
 			// Every write request is delivered twice, under two signal ids: the second arrives once the first applied.
 			const duplicating = intercept(ctx, {
 				signalWithStart: async (
@@ -1214,10 +1218,10 @@ it("a duplicated state write gets the same answer again and applies once", async
 it("concurrent workflow updates of one Session's state lose nothing: a stale write reads again", async () => {
 	const f = fixture();
 	const state = counter();
-	const workflow: RuntimeWorkflow = {
+	const workflow: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
-		handler: async (_input, execution, ctx) => {
+		handler: async (_input, ctx) => {
 			for (let n = 0; n < 4; n++)
 				await f.integration.state.update(ctx, `increment:${n}`, state, (draft) => {
 					draft.count++;
@@ -1225,20 +1229,20 @@ it("concurrent workflow updates of one Session's state lose nothing: a stale wri
 			return null;
 		},
 	};
-	const reader: RuntimeWorkflow = {
+	const reader: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution, ctx) => f.integration.state.get(ctx, "read", state),
+		handler: (_input, ctx) => f.integration.state.get(ctx, "read", state),
 	};
 	runtimeRegister(f, workflow, [reader]);
 	await f.integration.start();
-	await f.runtime.start();
+	await f.tasks.start();
 	const ids = await Promise.all(
-		[0, 1, 2].map(() => f.runtime.invoke(workflow.name, null, { metadata: f.metadata })),
+		[0, 1, 2].map(() => f.client.invoke(workflow.name, null, { metadata: f.metadata })),
 	);
 	for (const id of ids)
 		expect(await db.execution(id).settled()).toEqual({ status: "completed", output: null });
-	const read = await f.runtime.invoke(reader.name, null, { metadata: f.metadata });
+	const read = await f.client.invoke(reader.name, null, { metadata: f.metadata });
 	expect(await db.execution(read).settled()).toEqual({
 		status: "completed",
 		output: { count: 12 },
@@ -1271,16 +1275,15 @@ it("stop joins driver routing cleanup after the harness has closed", async () =>
 		}
 		return setStatus(thread, status);
 	});
-	const workflow: RuntimeWorkflow = {
+	const workflow: WorkflowTask = {
 		name: randomUUID(),
 		triggers: [],
-		handler: (_input, execution, ctx) =>
-			f.integration.run(ctx, "agent", agent, { input: "Answer" }),
+		handler: (_input, ctx) => f.integration.run(ctx, "agent", agent, { input: "Answer" }),
 	};
 	runtimeRegister(f, workflow);
 	await f.integration.start();
-	await f.runtime.start();
-	await f.runtime.invoke(workflow.name, null, { metadata: f.metadata });
+	await f.tasks.start();
+	await f.client.invoke(workflow.name, null, { metadata: f.metadata });
 	let stopped = false;
 	try {
 		await cleaning;

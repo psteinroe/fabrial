@@ -10,7 +10,8 @@ import {
 	weeklyRotation,
 } from "../internals.ts";
 import type { AnyWorkflow, EventFilter, ExternalIdentity } from "../internals.ts";
-import { FakeChat, StubRuntime, testApp } from "../../src/testing-internal.ts";
+import postgres from "postgres";
+import { FakeChat, testApp } from "../../src/testing-internal.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
 const identity = (subjectId: string): ExternalIdentity => ({
@@ -22,7 +23,6 @@ const alice = defineUser({ id: "alice", name: "Alice", identities: [identity("A"
 const bob = defineUser({ id: "bob", name: "Bob", identities: [identity("B")] });
 const outsider = defineUser({ id: "outsider", identities: [identity("O")] });
 const team = defineGroup({ id: "team", members: [alice, bob] });
-const surface = { kind: "thread", provider: "chat", threadId: "channel:general:thread" } as const;
 const event = "chat.message";
 const plugin = definePlugin({
 	id: "chat",
@@ -31,15 +31,18 @@ const plugin = definePlugin({
 	},
 });
 // Definition, routing-table and identity checks that run no workflow; executions are covered on real
-// Conductor in tests/integration/core.
+// Conductor in tests/integration/core. Conductor's pool reaches no database: a start that passes the checks
+// fails when Conductor connects, at once (a missing socket is not an error Conductor retries).
+const unreachable = postgres({ host: "/nonexistent-fabrial", max: 1 });
+const unreachableError = /ENOENT/;
 function setup(
 	workflows: AnyWorkflow[],
 	extra: Partial<import("../../src/app.ts").CoreConfig> = {},
-	runtime: StubRuntime = new StubRuntime(),
+	clock = { time: Date.now() },
 ) {
 	const chat = new FakeChat();
 	const config = {
-		runtime,
+		conductor: { sql: unreachable, clock: { now: () => new Date(clock.time) } },
 		chat,
 		plugins: [plugin],
 		workflows,
@@ -48,7 +51,7 @@ function setup(
 	};
 	const { plugins, identity: identities, logger, ...appConfig } = config;
 	const app = testApp(createFabrial({ plugins, identity: identities }), { ...appConfig, logger });
-	return { runtime, chat, app };
+	return { clock, chat, app };
 }
 describe("routing table", () => {
 	it.each([
@@ -77,19 +80,9 @@ describe("routing table", () => {
 				],
 				run: async () => {},
 			});
-		await expect(setup([make("a", "a"), make("b", "b")]).app.start()).resolves.toBeUndefined();
-	});
-	it("preserves cron replyTo in the registered runtime contract", async () => {
-		const cron = defineWorkflow({
-			name: "cron",
-			cron: [{ schedule: "0 * * * *", replyTo: surface }],
-			run: async () => {},
-		});
-		const test = setup([cron]);
-		await test.app.start();
-		expect((test.runtime as StubRuntime).workflows.get("cron")!.cron).toEqual([
-			{ schedule: "0 * * * *", name: "cron", replyTo: surface },
-		]);
+		await expect(setup([make("a", "a"), make("b", "b")]).app.start()).rejects.toThrow(
+			unreachableError,
+		);
 	});
 });
 
@@ -99,8 +92,8 @@ describe("identity", () => {
 			id: "chat",
 			identity: { lookup: async () => ({ name: "Provider name" }) },
 		});
-		const runtime = new StubRuntime(Date.parse("2026-01-05T00:00:00Z"));
-		const test = setup([], { plugins: [lookup] }, runtime);
+		const clock = { time: Date.parse("2026-01-05T00:00:00Z") };
+		const test = setup([], { plugins: [lookup] }, clock);
 		expect(await test.app.host.resolvePrincipal(identity("A"))).toMatchObject({
 			id: "alice",
 			known: true,
@@ -121,7 +114,7 @@ describe("identity", () => {
 			resolve: ({ now }) => [weeklyRotation([alice, bob], { start: "2026-01-05", now })],
 		});
 		expect((await test.app.host.directory.members(rotation))[0]!.id).toBe("alice");
-		runtime.time += 7 * 86400000;
+		clock.time += 7 * 86400000;
 		expect((await test.app.host.directory.members(rotation))[0]!.id).toBe("bob");
 		expect(weeklyRotation([alice, bob], { start: "2026-01-05", now: new Date("2025-12-29") })).toBe(
 			bob,

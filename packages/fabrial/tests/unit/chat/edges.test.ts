@@ -123,7 +123,7 @@ it("maps the native platform stop control to actor-aware cancellation ingress", 
 		thread: ref,
 		dedupeId: JSON.stringify(["slack", "agent-session-stopped", ref.threadId, "U2", []]),
 	});
-	expect(env.host.runtime.cancel).not.toHaveBeenCalled();
+	expect(env.host.conductor.cancel).not.toHaveBeenCalled();
 });
 
 it("creates one fallback status message and edits it", async () => {

@@ -56,7 +56,7 @@ async function setup(
 	const model = `${faux.provider.id}/${faux.getModel().id}`;
 	const { agents, workflows = [] } = build({ channel, model });
 	const {
-		runtime,
+		client,
 		chat: fake,
 		app,
 	} = await launch(f, {
@@ -64,7 +64,7 @@ async function setup(
 		routedAgents: agents,
 		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
-	const settle = () => idle(runtime.queue);
+	const settle = () => idle(client.queue);
 	const threadId = (thread: string, provider = "chat") => `${provider}:${channel}:${thread}`;
 	const message = (
 		id: string,
@@ -97,7 +97,7 @@ async function setup(
 	 * for the router's decision.
 	 */
 	const receive = async (m: ChatMessage) =>
-		(await fake.receive(m)) === "ignored" ? "ignored" : routed(runtime.queue, m.messageId);
+		(await fake.receive(m)) === "ignored" ? "ignored" : routed(client.queue, m.messageId);
 	const posts = async (thread: string, provider = "chat") =>
 		(
 			await fake.thread({ kind: "thread", provider, threadId: threadId(thread, provider) })
@@ -107,7 +107,7 @@ async function setup(
 		channel,
 		model,
 		faux,
-		runtime,
+		client,
 		chat: fake,
 		app,
 		settle,

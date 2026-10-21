@@ -1,3 +1,4 @@
+import { testClient } from "../../conductor/helper.ts";
 import { updateRoutingState } from "../../../src/chat/index.ts";
 import type { AnyWorkflow } from "../../../src/workflow.ts";
 import { until } from "../../conductor/helper.ts";
@@ -61,8 +62,9 @@ describe("instances", () => {
 
 	it("reuses definitions across isolated apps with definition-time plugins and spied clients", async () => {
 		const fixture = () => {
-			const runtime = db.runtime();
-			return { runtime, app: testApp(f, { workflows: [workflow], runtime, chat: new FakeChat() }) };
+			const conductor = db.conductor();
+			const app = db.own(testApp(f, { workflows: [workflow], conductor, chat: new FakeChat() }));
+			return { client: testClient(conductor.queue, () => app.host.conductor), app };
 		};
 		const production = fixture();
 		const test = fixture();
@@ -75,7 +77,7 @@ describe("instances", () => {
 		] as const) {
 			await fixture.app.start();
 			try {
-				const id = await fixture.runtime.invoke(workflow.name, null, {
+				const id = await fixture.client.invoke(workflow.name, null, {
 					metadata: {
 						requestId: "query",
 						origin: null,
@@ -120,17 +122,17 @@ describe("follow records", () => {
 	const ref = { kind: "thread", provider: "chat", threadId: "chat:general:t1" } as const;
 	/** Pi on a scripted model that answers every request; the tests observe the signals its Sessions receive. */
 	const start = (workflows: AnyWorkflow[] = []) => {
-		const runtime = db.runtime();
+		const conductor = db.conductor();
 		const faux = fauxProvider({ provider: "test", models: [{ id: "model" }] });
 		faux.setResponses(Array.from({ length: 20 }, () => fauxAssistantMessage("ok")));
 		const models = createModels();
 		models.setProvider(faux.provider);
 		const chat = new FakeChat({ installationId: "w" });
 		const agents = { models, sql: pool, settings: { retry: { enabled: false } } };
-		const app = testApp(f, { workflows, routedAgents: [agent], agents, runtime, chat });
-		const signals = () => sessionSignals(db.sql, runtime.queue);
+		const app = db.own(testApp(f, { workflows, routedAgents: [agent], agents, conductor, chat }));
+		const signals = () => sessionSignals(db.sql, conductor.queue);
 		const sent = async () => (await signals()).filter((signal) => signal.kind === "input");
-		return { app, chat, runtime, signals, sent };
+		return { app, chat, signals, sent };
 	};
 
 	it("writes a follow record for a thread session and routes the next message by it", async () => {
@@ -188,16 +190,17 @@ describe("follow records", () => {
 	});
 
 	it("retries a partial delivery: the router resumes after the signals it sent", async () => {
-		const { app, chat, runtime, sent } = start();
+		const { app, chat, sent } = start();
 		const attempts: string[] = [];
-		const signalWithStart = runtime.signalWithStart.bind(runtime);
-		runtime.signalWithStart = async (options) => {
-			attempts.push(options.key!);
+		await app.start();
+		const conductor = app.host.conductor;
+		const signalWithStart = conductor.signalWithStart.bind(conductor);
+		conductor.signalWithStart = async (options) => {
+			attempts.push(options.key);
 			// The second conversation's first delivery fails, after the first one was signalled.
 			if (attempts.length === 2) throw new Error("agents unavailable");
 			return signalWithStart(options);
 		};
-		await app.start();
 		const connection = app.host.chat()!;
 		await updateRoutingState(connection, await connection.thread(ref), () => ({
 			follows: [

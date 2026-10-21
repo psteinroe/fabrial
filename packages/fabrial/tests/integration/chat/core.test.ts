@@ -40,11 +40,11 @@ const settled = (queue: string) =>
 
 it("dispatches a mention to its owner and all matching observers without duplicate runs", async () => {
 	const env = setup();
-	const runtime = db.runtime();
+	const conductor = db.conductor();
 	const owner = vi.fn(async () => {});
 	const observer = vi.fn(async () => {});
 	const app = testApp(createFabrial({ plugins: env.host.plugins }), {
-		runtime,
+		conductor,
 		chat: { state: createMemoryState() },
 		workflows: [
 			defineWorkflow({ name: "owner", triggers: [chatTrigger("slack", "mentioned")], run: owner }),
@@ -71,7 +71,7 @@ it("dispatches a mention to its owner and all matching observers without duplica
 		await until("the owner and the observer to run", async () =>
 			owner.mock.calls.length && observer.mock.calls.length ? true : undefined,
 		);
-		await settled(runtime.queue);
+		await settled(conductor.queue);
 		expect(owner).toHaveBeenCalledOnce();
 		expect(observer).toHaveBeenCalledOnce();
 		expect(
@@ -86,7 +86,7 @@ it("dispatches a mention to its owner and all matching observers without duplica
 
 it("rebinds a lazy channel from the durable first-post receipt on replay and child invocation", async () => {
 	const env = setup();
-	const runtime = db.runtime();
+	const conductor = db.conductor();
 	const child = defineWorkflow({
 		name: "child",
 		input: z.object({}),
@@ -101,7 +101,7 @@ it("rebinds a lazy channel from the durable first-post receipt on replay and chi
 	});
 	const refs: string[] = [];
 	const app = testApp(createFabrial({ plugins: [...env.host.plugins, demo] }), {
-		runtime,
+		conductor,
 		chat: { state: createMemoryState() },
 		workflows: [
 			child,
@@ -134,7 +134,7 @@ it("rebinds a lazy channel from the durable first-post receipt on replay and chi
 				(
 					await db.sql<{ id: string }[]>`
 					select id from pgconductor._private_executions
-					where queue = ${runtime.queue} and task_key = 'owner'`
+					where queue = ${conductor.queue} and task_key = 'owner'`
 				)[0]?.id,
 		);
 		expect(await db.execution(owner).settled()).toEqual({ status: "completed", output: null });

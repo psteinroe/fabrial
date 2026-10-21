@@ -115,19 +115,19 @@ const chat = new FakeChat({ installationId: "w" });
 
 /** Start the app, or restart it on the queue of a stopped one. */
 async function launch(routedAgents = [developer], queue?: string) {
-	const { app, runtime } = await start(f, {
+	const { app, client } = await start(f, {
 		workflows: [deploy],
 		routedAgents,
 		chat,
 		queue,
 		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
-	const settle = () => idle(runtime.queue);
+	const settle = () => idle(client.queue);
 	const webhook = async (hook: { event: string; payload: unknown }, delivery: string) => {
 		expect((await app.fetch(deliver(hook, delivery))).status).toBe(200);
 		await settle();
 	};
-	return { app, runtime, settle, webhook };
+	return { app, client, settle, webhook };
 }
 /** Request ids Pi accepted in a Session, read from its commit log without taking the lease. */
 async function submitted(session: string): Promise<string[]> {
@@ -183,7 +183,7 @@ it("a chat conversation follows its PR: tool follow, restart, review wakes the a
 	]);
 	let t = await launch();
 	await chat.receive(message(threadId, "m1", "Fix the flaky test and open a PR"));
-	expect(await routed(t.runtime.queue, "m1")).toBe("new");
+	expect(await routed(t.client.queue, "m1")).toBe("new");
 	await t.settle();
 	expect(faux.state.callCount).toBe(2);
 	// The tool wrote a follow record in the PR thread's state for the calling conversation, replying home.
@@ -198,7 +198,7 @@ it("a chat conversation follows its PR: tool follow, restart, review wakes the a
 
 	// Restart between the follow and the first event: the record is in thread state.
 	await t.app.stop();
-	t = await launch([developer], t.runtime.queue);
+	t = await launch([developer], t.client.queue);
 	await t.webhook(webhooks.review("changes_requested"), "review-1");
 	expect(faux.state.callCount).toBe(3);
 	expect(contexts[0]).toContain("requested changes on acme/app#5");
@@ -217,7 +217,7 @@ it("a chat conversation follows its PR: tool follow, restart, review wakes the a
 	// An urgent review steers the busy run: it joins the run's next model call, with no run of its own.
 	const waiting = new Promise<void>((resolve) => (started = resolve));
 	await chat.receive(message(threadId, "m2", "Wait for CI"));
-	expect(await routed(t.runtime.queue, "m2")).toBe("follow");
+	expect(await routed(t.client.queue, "m2")).toBe("follow");
 	// The run blocks in its tool until the release below.
 	await waiting;
 	expect(faux.state.callCount).toBe(4);
