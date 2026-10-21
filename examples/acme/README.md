@@ -1,17 +1,21 @@
-# Acme — Fabrial v1 reference app
+# Acme: a Fabrial reference app
 
-A private workspace example, not a hosted service. The app has one Slack entry
-workflow, a support agent, a SQL repair workflow with triage approval, inline bug investigation (the router calls the support agent with `ctx.agent`),
-a GitHub PR review owner/changelog observer, and Linear issue triage.
+A private workspace example, not a hosted service. It shows every part of the model on one app: Slack, GitHub, and Linear plugins, two agents with triggers, a router workflow, a SQL repair workflow with an approval, PR follows, a subagent, and observers.
 
-`src/fabrial.ts` creates the instance with `createFabrial({ database, models,
-plugins, identity })`, reading values from `process.env` at definition. It imports
-only plugins and `src/users.ts`, never workflows or groups. Agents, tools, and state
-are defined with `f.defineAgent`, `f.defineTool`, and `f.defineState`. `src/groups.ts` uses `f.defineGroup` for typed clients and is imported
-by workflows; groups are referenced directly, not registered in `identity`.
-Factories are side-effect free: importing the app with unset env is safe, but
-`app.start()` requires valid configuration. Set env **before importing** the app;
-changing env after import does not reconfigure plugins.
+## Layout
+
+- `src/fabrial.ts`: the instance (`createFabrial({ database, models, plugins, identity })`). It reads `process.env` at definition and imports only plugins and `src/users.ts`, never workflows, so every definition can import `f`. Factories are side-effect free: importing the app with unset environment is safe, `app.start()` checks it. Set the environment **before importing** the app.
+- `src/users.ts`: Alice and Bob with their Slack, GitHub, and Linear identities. `src/groups.ts`: `engineeringTriage`, a weekly rotation of Bob and Alice from 2026-01-05 (`f.defineGroup`), and `slackEngineeringTriage`, the live members of Slack's `@triage`.
+- `src/database.ts`: an app-local plugin with a least-privilege business database client (`ctx.clients.database`).
+- `src/app.ts`: `f.app({ workflows, agents })`, with the two agents that have triggers.
+
+## Use cases
+
+1. **Support in #help** (`src/agents/support.ts`). `acme-support` has a trigger on every message in `C_HELP` and `session: "channel"`: one conversation for the whole channel. Each answer posts in the asker's thread, and the conversation follows every thread it answered. Its `read_only_query` tool runs SQL in a read-only transaction and records findings in session state (`Findings`), which the agent sees in its prompt.
+2. **Repairs with approval** (`src/workflows/run-sql.ts`). `run-sql` is a tool of the support agent. It previews the statement with `EXPLAIN`, then waits for `engineeringTriage` to approve the exact proposal (organisation, SQL, reason, preview) in a DM card. Rejection, expiry, and cancellation return a declined result, with the rejection reason when the approver gave one, and the agent reports it. Anyone in the thread may ask; the approval is the permission check.
+3. **Mentions elsewhere** (`src/workflows/general-assistant.ts`). The router classifies the message with `ctx.evaluate` (`typesafe/jev-latest`). Bug reports (and everything in `#bugs`) are investigated inline: `ctx.agent` calls the support agent and the workflow posts the analysis. Everything else goes to `acme-support` with `ctx.send` and `session: "thread"`, overriding the agent's channel session, so each thread outside #help is a conversation of its own and later replies go straight to the agent. A missing or failing classifier falls back to support.
+4. **Development in #dev** (`src/agents/developer.ts`). `acme-developer` gets every `C_DEV` message, one conversation per thread, with the `github` toolkit. `open_pull_request` opens a PR and `ctx.follow`s it: reviews and comments arrive as notifications (changes requested is `urgent`), the agent answers on GitHub with `github_reply_to_review` and in the Slack thread with its final answer, and it unfollows after the merge. Its subagent `acme-researcher` (tool `acme_researcher`) has only read-only code search, in the foreground or in the background.
+5. **GitHub and Linear lifecycle** (`src/workflows/pr-review.ts`, `changelog.ts`, `linear-triage.ts`). `pr-review` owns `pullRequestOpened` on acme/app and comments on the PR; `changelog` observes the same event (`observe: true`) and records it without a thread. `linear-triage` comments on new ENG issues.
 
 ## Run / embed
 
@@ -36,33 +40,11 @@ Configure these environment variables:
 | `LINEAR_WEBHOOK_SECRET`  | Linear webhook signing secret.                                                                                   |
 | `LINEAR_ORGANIZATION_ID` | Linear organization ID, shared with users and signed payloads.                                                   |
 
-`src/app.ts` is the whole wiring:
+Load `schema.sql` into `APP_DATABASE_URL`, replace the sample user, channel, and team ids with your own, and serve `app.fetch`:
 
-```ts
-export const app = f.app({ workflows, agents });
-await app.start(); // migrates Postgres, validates credentials, starts workers
-// Mount app.fetch in your Node HTTP server; call app.stop() on shutdown.
-```
-
-Load `schema.sql` in `APP_DATABASE_URL`. Replace the sample external user IDs,
-channel IDs, team keys, and model references in source with your own.
-`supportAgent` uses `"anthropic/claude-sonnet-4-5"`; routing calls
-`ctx.evaluate` with the classifier `"typesafe/jev-latest"`. A missing or erroring
-classifier explicitly falls back to support; `#bugs` is always investigated inline. Define
-agents before `app.start()`.
-
-Endpoints:
-
-- `/slack/events`: mentions and signed interactive approval actions.
-- `/github/events`: comments; `/github/webhook`: PR/issue lifecycle events.
+- `/slack/events`: messages, mentions, approval clicks, and the rejection modal.
+- `/github/events`: PR and issue comments; `/github/webhook`: PR, review, comment, and check lifecycle events.
 - `/linear/events`: comments; `/linear/webhook`: issue lifecycle events.
-
-The SQL tool's schema includes organisation, exact SQL and reason. Its preview is
-an `EXPLAIN` in a read-only transaction. Approval binds to that proposal, and the
-approval is the only permission check: anyone in the thread can ask for it. Bob and Alice rotate weekly from 2026-01-05. Alternatively,
-replace `engineeringTriage` with `slackEngineeringTriage` for live `@triage`
-membership. Rejection/cancellation return a declined tool result without executing
-SQL. The support agent records read-only query findings in rendered session state.
 
 **Security:** these are illustrative business queries, not a SQL sandbox. Use
 least-privilege database roles, enforce tenant authorization/RLS, and restrict
@@ -74,55 +56,14 @@ should not be exposed to application SQL in production (`APP_DATABASE_URL`).
 ## Tests
 
 ```sh
-pnpm vitest run examples/acme
+pnpm vitest run --project examples
 pnpm --filter @fabrial/example-acme typecheck
-pnpm oxlint --type-aware --deny-warnings examples/acme
-pnpm oxfmt examples/acme
 ```
 
-Docker is required. Integration tests build the app with
-`createIntegrationApp(f, { workflows, models: scriptedModels() })` from
-`fabrial/testing`: **real PostgreSQL 17 (testcontainers), the real durable runtime
-and agent sessions, and scripted models**, including a scripted classifier. They use the **real Chat SDK, Slack plugin/adapter and
-Postgres Chat state**, not `FakeChat`. Signed Slack mentions/actions and signed
-GitHub/Linear lifecycle webhooks go through `app.fetch`. Outbound Slack Web API,
-Octokit and Linear API responses are mocked; Linear's startup profile lookup is
-seeded. `@chat-adapter/tests` supplies the inspectable logger. No live tokens or
-model network calls are needed. Global setup starts Postgres and sets both database URLs and provider test values
-before importing the app. Each scenario resets durable/Chat state and business
-tables on those same databases; the
-restart test stops the app and starts a new one on the same database.
+Docker is required. `tests/global-setup.ts` starts PostgreSQL 17 with testcontainers and sets both database URLs and provider test values before the app is imported. Integration tests build the app with `createIntegrationApp(f, { workflows, agents, models: scriptedModels() })`: the real durable runtime, agent sessions, Chat SDK with the Slack adapter and Postgres chat state, and scripted models and classifier. Signed Slack messages and clicks and signed GitHub and Linear webhooks go through `app.fetch`; outbound Slack, GitHub, and Linear API calls are mocked. Each scenario resets durable, chat, and business state; the restart scenarios stop the app and start a new one on the same database.
 
-Coverage: approval + duplicate click, rejection, requester cancellation,
-non-approver notice then approval, restart during approval, PR owner + observer,
-inline bug investigation, independent per-thread support conversations, Linear triage, and database-enforced read-only/multiple-statement
-rejection. Assertions poll durable state, never sleep arbitrary durations. Tests
-pin the on-call week so Bob is the approver regardless of the calendar.
+Covered: approval, duplicate click, rejection with a reason, requester cancellation, a non-approver's click, a restart during an approval, the #help channel conversation across threads and a restart, independent per-thread conversations from the router, inline bug investigation, the PR owner and observer, Linear triage, the #dev follow lifecycle with a restart and a redelivered webhook, foreground and background subagents, and read-only and multiple-statement SQL rejection. Tests pin the on-call week so Bob is the approver.
 
-## Explicit limits
+`tests/unit/readme.test.ts` checks that the READMEs' `ts check` snippets in `tests/docs/generated` are current (regenerate with `node examples/acme/tests/docs/snippets.ts`); `pnpm typecheck` compiles them against `tests/docs/prelude.ts`.
 
-Workflow-tool children retain the originating thread without inheriting
-trigger ownership; no example-local runtime workaround is needed. The passing
-unit regression checks the child metadata contract, and the real cancellation
-scenario checks the emitted child metadata and requester card in the origin thread.
-Approval tests click on card delivery without waiting for a
-native subscription: durable event cursors retain pre-registration decisions.
-
-- **Conductor boundaries still apply:** strict mutexes are soft across
-  workers. See the shim table in `packages/fabrial/README.md`. The restart test waits for suspended
-  approval work before stopping, and proves one write in that scenario, **not exactly-once SQL across a crash during a database effect**.
-  Conductor step memoization cannot atomically commit an external DB write and
-  its runtime receipt. A production repair needs business-level idempotency or
-  reconciliation. No extra execution/approval tables are introduced here.
-
-## Support channel
-
-`acme-support` has a trigger on every message in `#help` (`C_HELP`) with `session: "channel"`: one conversation for the whole channel, listed in `f.app({ workflows, agents })`. Each asker's final reply posts automatically in the asker's thread, and the conversation follows each thread. The integration test covers two threads sharing that conversation, each answer going to its asker's thread, and a restart after ingress.
-
-`general-assistant` is the router for mentions elsewhere: the router investigates bug reports inline with `ctx.agent` and posts the analysis; everything else goes to `acme-support` with `ctx.send` and `session: "thread"`, overriding the agent's `"channel"`, so each thread outside `#help` is a conversation of its own. Its final reply posts in the thread, and later replies there go straight to the agent. The integration test covers two such threads getting independent conversations.
-
-## Developer agent
-
-`src/agents/developer.ts` defines `acme-developer`. Its trigger sends every `#dev` (`C_DEV`) message to it, one conversation per thread, and it has the `github` toolkit. Its `open_pull_request` tool opens a PR with `ctx.clients.github` and calls `ctx.follow`. The e2e test runs use case 4: Slack message, PR opened and followed (a record in the PR thread's state), a restart, a signed changes-requested review webhook (delivered twice, notified once, `urgent`), the agent's answer on GitHub with `github_reply_to_review`, its final reply in the original Slack thread, and the merge webhook, after which the agent calls `github_unfollow_pull_request`.
-
-`acme-developer` also has a subagent, `acme-researcher`, offered as the `acme_researcher` tool. The researcher has only the read-only `search_code` tool, so delegated investigation cannot change anything. The developer calls it in the foreground for a quick lookup and waits for its answer, or with `background: true` for longer digging: the tool returns at once and the answer arrives later as a `<subagent>` input whose answer the developer posts in the thread. The e2e test makes one call of each in a `#dev` thread.
+A restart test proves one write in its scenario, not exactly-once SQL across a crash during the write: a step cannot commit an external write and its receipt atomically. A production repair needs business-level idempotency or reconciliation.

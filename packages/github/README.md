@@ -1,6 +1,6 @@
 # @fabrial/github
 
-```ts
+```ts check
 import { github } from "@fabrial/github";
 import { createFabrial } from "fabrial";
 
@@ -13,17 +13,17 @@ const plugin = github({
 	botUserId: 12345,
 });
 const f = createFabrial({ plugins: [plugin] });
-// Define workflows with f.defineWorkflow; wire runtime/chat with f.app({ runtime, chat, workflows }).
+// Define workflows and agents on f; build the app with f.app({ workflows, agents }).
 ```
 
 Supports PAT credentials or a single GitHub App installation (`appId`, `privateKey`, numeric `installationId`). Credentials and adapter options are passed through to Chat SDK. The app's own bot is `botUserId` when set, else the account Chat SDK detects from the credentials; set it explicitly where detection can't run (e.g. installation-token providers). Verification requires an explicit `webhookSecret` or `webhookVerifier`; it does not silently use environment credentials.
 
 Configure two GitHub webhook subscriptions:
 
-- `POST /github/events`: issue comments (both issues and PR conversations), plus PR review comments; standard `mentioned`, `message`, `dm` events supplied by `chatEvents()` from `fabrial`.
+- `POST /github/events`: issue comments (both issues and PR conversations), plus PR review comments; standard `mentioned`, `message`, `dm` events supplied by `chatEvents()` from `fabrial/plugin`.
 - `POST /github/webhook`: `pull_request` (opened, closed, reopened, labeled, unlabeled, synchronize), `issues` opened, `pull_request_review` (submitted), `issue_comment` and `pull_request_review_comment` (created, on PRs), `check_suite` and `check_run` (completed). Unsupported actions are acknowledged without emitting. Invalid signatures/payloads fail closed, and `x-github-delivery` supplies durable dedupe.
 
-Use with `chat({ state })`. `ctx.clients.github` is the adapter's authenticated Octokit. Lifecycle events provide `repo`, `id`, `number`, `title`, `body`, `url`, `authorId`, `authorLogin`, `threadId`, installation-scoped origin/actor metadata, and a reply destination on the conversation. PR threads are `github:owner/repo:number`; issue threads are `github:owner/repo:issue:number`; reviews retain their own SDK review-thread codec. History is bounded to 50 messages; status uses edited messages.
+`ctx.clients.github` is the adapter's authenticated Octokit. Lifecycle events provide `repo`, `id`, `number`, `title`, `body`, `url`, `authorId`, `authorLogin`, `threadId`, installation-scoped origin/actor metadata, and a reply destination on the conversation. PR threads are `github:owner/repo:number`; issue threads are `github:owner/repo:issue:number`; reviews retain their own SDK review-thread codec. History is bounded to 50 messages; status uses edited messages.
 
 Helpers are named exports and properties on `github`:
 
@@ -35,7 +35,7 @@ Helpers are named exports and properties on `github`:
 
 Identities are numeric GitHub account ids, the same ids webhooks and comments carry, so a `defineUser` identity matches inbound principals and approvals. Logins are not identities: they can be renamed and never match an inbound id.
 
-Lifecycle routes use core's `EmitOptions.replyTo` for the PR/issue thread and `requestedBy` for its author (not the webhook sender). Multiple plugin aliases and request-scoped multi-tenant clients are not supported by the current Chat provider-id contract.
+Lifecycle routes use core's `EmitOptions.replyTo` for the PR/issue thread and `requestedBy` for its author (not the webhook sender). One installation per app in this preview: the plugin id is the Chat SDK adapter's name, so a second GitHub plugin can't be added, and clients are not request-scoped.
 
 Both ingress paths reject payloads outside the configured App installation. PATs restrict repository owners to `owner`, or default to the token's authenticated user (resolved via GitHub API and cached; failures remain retryable). An explicit `owner` additionally restricts App repositories. The owner in `repository.full_name` and, when present, `repository.owner.login` must agree with that scope. A numeric PAT `installationId` also rejects conflicting payload installation IDs when present; string installation IDs remain identity namespaces.
 

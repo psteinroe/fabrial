@@ -1,198 +1,383 @@
 # fabrial
 
-Durable workflows, AI agents, and human approvals in TypeScript. You install one package, give it a Postgres database and model credentials, and define workflows, agents, and tools on an instance. The durable runtime ([PG Conductor](https://github.com/psteinroe/postgres-conductor)), the agent runtime ([Pi Durable](https://earendil.com/posts/pi-durable/)), and chat ([Chat SDK](https://chat-sdk.dev)) are internal modules, not part of the API.
+Durable workflows, AI agents, and human approvals in TypeScript, on one Postgres database. Fabrial is one API over three runtimes that stay internal: [PG Conductor](https://github.com/psteinroe/postgres-conductor) runs workflows, [Pi Durable](https://earendil.com/posts/pi-durable/) runs agents, and [Chat SDK](https://chat-sdk.dev) talks to Slack, GitHub, and Linear. Apps never import or configure them.
 
-```ts
-// fabrial.ts: imports plugins and users only, never workflows, to avoid import cycles.
+Status: preview. The package has three entry points:
+
+| Import            | For                                                                                                     |
+| ----------------- | ------------------------------------------------------------------------------------------------------- |
+| `fabrial`         | App authors: `createFabrial`, `defineUser`, `defineGroup`, `weeklyRotation`, and the public types.      |
+| `fabrial/plugin`  | Plugin authors: `definePlugin`, `defineEvent`, `trigger`, `resource`, the chat helpers, and hook types. |
+| `fabrial/testing` | Tests: `createTestApp`, `createIntegrationApp`, `scriptedModels`, `FakeChat`.                           |
+
+The model, in the order this README teaches it: an **instance** holds configuration; on it you define **agents** and **workflows**; **triggers** start them from events. Workflows are also tools for agents, and a workflow can wait for a human **approval**. Sessions, follows, subagents, state, plugins, and testing come after.
+
+Code blocks marked `ts check` in the READMEs are compiled by `examples/acme/tests/unit/readme.test.ts`. Names they use without defining (`f`, `support`, `billing`, `lookupOrder`, `z`, …) come from [`examples/acme/tests/docs/prelude.ts`](../../examples/acme/tests/docs/prelude.ts).
+
+## Hello world
+
+One agent that answers Slack mentions:
+
+```ts check
 import { createFabrial } from "fabrial";
 import { slack } from "@fabrial/slack";
-export const f = createFabrial({
-	database: process.env.DATABASE_URL,
+
+const f = createFabrial({
+	database: process.env.DATABASE_URL, // Postgres: workflows, agent sessions, and chat state
 	models: { anthropic: { apiKey: process.env.ANTHROPIC_API_KEY } },
-	plugins: [slack({ botToken, signingSecret, workspace })],
-	identity: users,
+	plugins: [
+		slack({
+			botToken: process.env.SLACK_BOT_TOKEN!,
+			signingSecret: process.env.SLACK_SIGNING_SECRET!,
+			workspace: "acme", // identity namespace for Slack users
+		}),
+	],
 });
 
-// agents.ts
-import { z } from "zod";
-export const lookup = f.defineTool({
-	name: "lookup_order",
-	description: "Look up an order",
-	input: z.object({ orderId: z.string() }),
-	idempotent: true,
-	run: async ({ orderId }, ctx) => ctx.clients.shop.order(orderId), // a string or any JSON value
-});
-export const support = f.defineAgent({
-	name: "support",
-	description: "Answers support questions.",
+const hello = f.defineAgent({
+	name: "hello",
+	description: "Answers questions in Slack.",
 	model: "anthropic/claude-sonnet-5",
-	instructions: "Answer support questions. Return your answer without posting it.",
-	tools: [lookup, refundWorkflow], // workflows are tools too
-	toolkits: ["slack"],
+	instructions: "Answer briefly and kindly.",
+	triggers: [slack.mentioned()],
 });
 
-// workflows.ts
-export const assistant = f.defineWorkflow({
-	name: "assistant",
-	triggers: [slack.mentioned()],
-	async run(message, ctx) {
-		const answer = await ctx.agent("answer", support, { input: message.text });
-		await ctx.thread!.post("reply", answer);
+export const app = f.app({ workflows: [], agents: [hello] });
+await app.start(); // migrates Postgres, validates credentials, starts workers
+// Serve app.fetch (Slack posts to /slack/events); call app.stop() on shutdown.
+```
+
+Each mention starts or continues the conversation of its thread, and the agent's final answer posts in the thread on its own. Later messages in that thread reach the same conversation, mention or not.
+
+## A workflow with an approval
+
+A refund needs someone from billing. The workflow is a tool of the agent: the agent proposes, a person decides.
+
+```ts check
+const refund = f.defineWorkflow({
+	name: "refund",
+	description: "Refund an order after billing approves it.",
+	input: z.object({ orderId: z.string(), amount: z.number().positive(), reason: z.string() }),
+	async run(input, ctx) {
+		const order = await ctx.step("order", () => ctx.clients.shop.order(input.orderId));
+		const decision = await ctx.waitForApproval("approve", {
+			title: `Refund ${input.amount} € on ${input.orderId}?`,
+			details: { ...input, customer: order.customer }, // shown verbatim; the approval binds to it
+			approvers: billing, // users and groups: static, a rotation, or a Slack user group
+			timeout: "24h",
+		});
+		if (!decision.approved) return { status: decision.status, reason: decision.comment ?? null };
+		return ctx.step("refund", () => ctx.clients.shop.refund(input.orderId, input.amount));
 	},
 });
 
-// app.ts
-export const app = f.app({ workflows: [assistant] });
-await app.start(); // migrates Postgres, validates credentials, starts workers
-// Mount app.fetch in your HTTP server; call app.stop() on shutdown.
+const desk = f.defineAgent({
+	name: "desk",
+	description: "Handles order questions and refunds in #support.",
+	model: "anthropic/claude-sonnet-5",
+	tools: [lookupOrder, refund], // a workflow is a tool named after it
+	triggers: [slack.message({ channel: "C_SUPPORT" })],
+});
+
+export const app = f.app({ workflows: [refund], agents: [desk] });
 ```
 
-## The instance and the app
+When the agent calls `refund`, each billing member gets a card in their DMs with the proposal and Approve/Reject, and the thread shows a status card with [Cancel request]. The tool call waits durably, across restarts and deploys, and the agent gets the workflow's output.
 
-`createFabrial({ database, models, plugins, identity })` creates an explicit, typed instance. There is no global `Register` augmentation. `database` is one Postgres connection string shared by workflows, agent sessions, and chat state. `models` holds credentials per model provider (`{ anthropic: { apiKey } }`); agents and `ctx.evaluate` name models as `"provider/model"` strings.
+## 1. The instance
 
-`f.defineWorkflow`, `f.defineAgent`, `f.defineTool`, `f.defineToolkit`, `f.defineState`, and `f.defineGroup({ id, resolve(ctx) { … } })` infer precise `ctx.clients` and plugin toolkit ids from the instance. Definitions are plain data and can be reused by any app made from `f`; groups can be referenced directly as approvers. `f.plugins` is a readonly catalog for introspection.
+`createFabrial({ database, models, plugins, identity })`:
 
-`f.app({ workflows, agents?, logger? })` builds the app and exposes `app.fetch`, `app.start`, `app.stop`, `app.emit`, and `app.clients()`. Plugins carry their values at definition and factories must stay side-effect free: importing the app with unset environment is safe. The database pool opens, credentials are validated, and connections start at `app.start()`, not at import or `f.app()`. Chat-capable plugins are served at `POST /<pluginId>/events`; routes await ingress before responding.
+- `database`: one Postgres connection string. Conductor, Pi, and Chat SDK keep their state there, each in its own schema. **One Fabrial app per database**: ingress events and their dedupe are database-wide, so two different apps on one database route each other's events. Instances of the same app (and versions during a rollout) may share it.
+- `models`: credentials per provider (`{ anthropic: { apiKey } }`). Agents and `ctx.evaluate` name models `"provider/model"`.
+- `plugins`: `slack(…)`, `github(…)`, `linear(…)`, or your own. **One installation per provider** in this preview: one Slack workspace, one GitHub installation, one Linear organization.
+- `identity`: users (`defineUser({ id, name, identities })`), which map chat identities to people. Groups are not listed here: define them with `f.defineGroup({ id, members })` or `f.defineGroup({ id, resolve })` and reference them where they are used.
 
-Durable operations require explicit, nonempty IDs. Repeated IDs are suffixed deterministically on replay. `fabrial:` is reserved for helper receipts. Completed receipts prevent repeated effects on replay; a crash during an external effect can still repeat it. Providers must supply idempotency or reconciliation when exactly-once effects matter.
+Keep the instance in a module that imports plugins and users only, never workflows, so every definition file can import `f` without cycles. Plugin factories are side-effect free: nothing connects or validates credentials until `app.start()`, so importing the app with unset environment is safe.
 
-## Agents and tools
+`f.defineAgent`, `f.defineTool`, `f.defineToolkit`, `f.defineWorkflow`, `f.defineState`, and `f.defineGroup` type `ctx.clients` and plugin toolkit ids from the instance's plugins. Definitions are plain data.
 
-- `f.defineAgent({ name, description, model, thinking?, instructions?, tools?, toolkits?, state?, subagents?, limits? })`. `name` is stable: it is the conversation's continuation key. `description` is required: it says what the agent does and when to use it, and is the tool description when the agent is a subagent. `instructions` are strings or functions rendered per run with a read-only context (`actor`, `clients`, `state(definition).get()`). Define agents before `app.start()`.
-- `tools` lists tools and workflows. A workflow tool starts the workflow as a child of the agent run and returns its output; approvals are always workflow-backed.
-- `f.defineTool({ name, description, input, idempotent?, run })`. `input` is a Standard Schema with Standard JSON Schema support (e.g. zod ≥ 4.2); the model sees its JSON Schema, and the app fails to start if a schema cannot be converted. Input is validated before `run`: invalid input never reaches `run` and goes back to the model as an error result. `run` returns a string (sent as is) or any JSON value (serialized). Tool `ctx` has `actor`, `clients`, `thread` (durable `post`/`update`/`history`, each with an id), `state`, `invoke`, `start`, `evaluate`, and `signal`.
-- `idempotent: true` tools run again after a crash interrupts them; other tools give the model an interrupted result instead.
-- `f.defineToolkit({ name, tools, instructions })` groups tools and instructions. Agents list app toolkits and plugin ids in `toolkits`.
-- `f.defineState({ name, scope, schema, initial, render? })` is state agents see and change, scoped to the Session (`"session"`) or to one conversation (`"agent"`, tools only; see [Agent sessions](#agent-sessions-pi)). Tools change it with `ctx.state(def).update(fn)`; the changes commit atomically with the tool result. Workflows use `ctx.state(def).get(id)` / `.update(id, fn)`. Agents listing a state in `state` see its `render` output in the prompt.
-- `ctx.agent(id, agent, { input, output?, detached?, timeout? })` runs the agent durably and returns its final answer text (`Promise<string>`); it never posts automatically. With `output`, the agent is asked for a single JSON value, which is parsed and validated against the schema in a durable step, and the result is typed from the schema (`Schema<T>` → `Promise<T>`). There is no caller-chosen result type. Invalid answers fail explicitly; there is no silent coercion or repair loop. The call is a child execution of its caller: cancelling the caller (or the caller failing permanently) cancels it and the workflows its tools started. `detached: true` keeps the agent run alive when the caller is cancelled. After `timeout` the caller fails; an attached call is cancelled, a detached one keeps running.
+`f.app({ workflows, agents?, logger? })` builds the app. `workflows` lists every workflow that runs, including those agents call as tools; `agents` lists the agents with `triggers` (agents only reached by `ctx.agent` or `ctx.send` need no entry). The app has `fetch` (one handler for every plugin route; chat plugins are served at `POST /<pluginId>/events`, and routes respond once the event is stored durably), `start()`, `stop()`, `emit(event, payload, options?)`, and `clients()`.
+
+## 2. Agents and tools
+
+`f.defineAgent({ name, description, model, thinking?, instructions?, tools?, toolkits?, state?, subagents?, limits?, triggers?, session?, home? })`:
+
+- `name` is stable: it keys the agent's conversations. `description` is required: what the agent does and when to use it (the tool description when it is a subagent).
+- `instructions`: strings, or functions rendered per run with a read-only context (`actor`, `clients`, `state(definition).get()`).
+- `tools`: tools and workflows. `toolkits`: plugin ids (`"slack"`, `"github"`) and app toolkits (`f.defineToolkit({ name, tools, instructions })`). Listing a plugin without a toolkit fails at `app.start()`.
+- `triggers`, `session`, `home`: see [Triggers](#4-triggers) and [Sessions and conversations](#sessions-and-conversations).
+
+`f.defineTool({ name, description, input, idempotent?, run })`: `input` is a Standard Schema with JSON Schema support (zod ≥ 4.2). The model sees its JSON Schema; invalid input goes back to the model as an error and never reaches `run`. `run` returns a string (sent as is) or any JSON value. `idempotent: true` tools run again after a crash interrupted them; other tools give the model an interrupted result. The tool `ctx` has `actor`, `clients`, `thread` (durable `post`/`update`/`history`, each with an id), `state`, `invoke`, `start`, `evaluate`, `send`, `follow`, `unfollow`, and `signal`.
+
+A workflow **calls** an agent with `ctx.agent`: it waits for the answer and posts nothing. With `output`, the answer is a JSON value validated against the schema and typed from it:
+
+```ts check
+const triage = f.defineWorkflow({
+	name: "triage",
+	input: z.object({ text: z.string() }),
+	async run({ text }, ctx) {
+		const verdict = await ctx.agent("classify", support, {
+			input: text,
+			output: z.object({ urgent: z.boolean(), summary: z.string() }),
+		});
+		return verdict.urgent ? `Urgent: ${verdict.summary}` : verdict.summary;
+	},
+});
+```
+
+Without `output`, `ctx.agent` returns the answer text. An answer that doesn't match the schema fails the call; there is no repair loop. The call is a child of the workflow: cancelling the workflow cancels it, unless `detached: true`. After `timeout` the call fails (an attached call is cancelled, a detached one keeps running). Each call runs in a Session of its own, never in a thread's conversation.
+
+## 3. Workflows
+
+`f.defineWorkflow({ name, description?, input?, output?, triggers?, cron?, concurrency?, retries?, run })`. `run(input, ctx)` receives the trigger's payload, or the typed `input` when the workflow is invoked, started, or called as a tool.
+
+Workflows replay from the top after a suspension or crash. Every durable operation takes an explicit, nonempty id as its first argument, and a completed operation returns its saved result on replay. Repeated ids in one execution are suffixed (`a`, `a#1`, …); the `fabrial:` prefix is reserved. A renamed id runs again; there is no call-order determinism or version pinning.
+
+| `ctx`                                                                      |                                                                                                                  |
+| -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `thread`                                                                   | Where the execution replies (`post`, `update`, `history`); `undefined` for observers and runs without a surface. |
+| `clients`, `actor`, `executionId`, `signal`                                | Plugin clients, who asked for the work, diagnostics, cancellation.                                               |
+| `step(id, fn)`, `sleep(id, duration)`                                      | A memoized step; a durable timer.                                                                                |
+| `agent(id, agent, { input, output?, detached?, timeout? })`                | Call an agent and wait for its answer.                                                                           |
+| `send(id, agent, { input, home?, session?, priority? })`                   | Hand input to a conversation and return ([Sessions](#sessions-and-conversations)).                               |
+| `follow`, `unfollow`                                                       | Make a conversation follow a resource ([Following](#following-resources)).                                       |
+| `evaluate(id, { model, state, questions })`                                | A classifier judgment ([`ctx.evaluate`](#ctxevaluate)).                                                          |
+| `state(definition).get(id)`, `.update(id, fn)`                             | Session state ([State](#state)).                                                                                 |
+| `waitForApproval`, `requestApproval`, `race`, `timer`                      | [Approvals](#5-workflow-tools-and-approvals).                                                                    |
+| `invoke(id, workflow, input, { detached? })`, `start(id, workflow, input)` | Call a child workflow and wait for it, or start an independent one.                                              |
+| `isMember(principal, group)`                                               | Current group membership.                                                                                        |
+
+A completed step is not an exactly-once effect: a crash during an external call can repeat it. Use provider idempotency or reconciliation where that matters.
+
+## 4. Triggers
+
+Triggers are plugin helpers on workflows and agents: `slack.mentioned({ channel? })`, `slack.message({ channel })`, `github.pullRequestOpened({ repo })`, `linear.issueCreated({ team })`, …. `cron: [{ schedule, replyTo? }]` schedules a workflow.
+
+- **One owner.** When several triggers match an event, the most specific one receives it, an agent's or a workflow's. Specificity is the trigger's `specificity`, by default the number of filtered fields. Two owners with equal specificity whose filters may overlap make `app.start()` fail; ties startup cannot see (a message in two chat event categories) fail that event's routing instead.
+- **Observers.** `observe: true` on a workflow trigger runs it as well, independently and without `ctx.thread`.
+- **Chat messages** go first to the conversations following their thread (a message naming one `@agent` goes only to that agent), then to the most specific trigger; otherwise they are ignored. Workflows don't receive replies: replies belong to the conversations following the thread.
+- **Events without a thread** (a cron run, a custom event): a workflow trigger's `replyTo` and an agent's `home` say where `ctx.thread` points or where the conversation lives; the thread is created by the first post.
+
+## 5. Workflow tools and approvals
+
+A workflow in an agent's `tools` is a tool named after it (`run-sql` → `run_sql`), described by its `description`, with its `input` schema. A call starts the workflow as a child of the agent's run and returns its output; actor, thread, and approvers are those of the request the agent is answering. Approvals are always workflow code, so the check sits next to the effect it guards.
+
+`ctx.waitForApproval(id, options)` requests and waits. `ctx.requestApproval(id, options)` returns a handle: `approvers`, `decision()` (for `ctx.race`), `wait(id)`, and `cancel(id, reason)`.
+
+| Option              |                                                                                                                         |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `title`, `details`  | The proposal. `details` (any JSON) is shown verbatim in a code block; the approval binds to it.                         |
+| `approvers`         | Users and groups. Group members are resolved when a click arrives.                                                      |
+| `timeout`           | A duration (`"24h"`) or ms, below 30 days. At the deadline the approval expires.                                        |
+| `card`              | `{ text?, fields? }`, shown after the standard content; it never replaces it.                                           |
+| `destination`       | A surface (`slack.channel("C_OPS")`) that gets one approver card instead of each approver's DM. It grants no authority. |
+| `requesterControls` | Show [Cancel request] on the requester's status card (default `true`).                                                  |
+
+The decision is `{ status: "approved" | "rejected" | "expired" | "cancelled", approved, decidedBy, comment?, decidedAt }`; `comment` is the approver's rejection reason or the reason given to `cancel`.
+
+- **What a card shows.** Title, details, the verified requester (the authenticated actor, never model text), the source thread (a link where the plugin provides one, as Slack does), and the deadline. A closed card keeps them and adds the outcome, when it closed, and a rejection's reason.
+- **Who decides.** Only assigned users and current members of assigned groups. Anyone else who clicks gets an ephemeral notice, and the click never reaches the workflow. The first eligible decision wins: no quorum, no editing (cancel and request again). Free text in the thread never changes an approval.
+- **Reject** opens a modal for an optional reason where the provider has modals (Slack); elsewhere it decides at once. Approve carries no text.
+- **Failure.** If no approver card can be posted, the approval fails at once (`wait` throws `Approval failed: No approver could be reached`). Cancelling the waiting workflow cancels the approval.
+
+```ts check
+const deploy = f.defineWorkflow({
+	name: "deploy",
+	input: z.object({ service: z.string(), version: z.string() }),
+	async run(input, ctx) {
+		const approval = await ctx.requestApproval("approve", {
+			title: `Deploy ${input.service} ${input.version}?`,
+			details: input,
+			approvers: billing,
+			destination: slack.channel("C_RELEASES"),
+			card: { fields: [{ label: "Risk", value: "low" }] },
+		});
+		const first = await ctx.race("wait", {
+			decision: approval.decision(),
+			timeout: ctx.timer("1h"),
+		});
+		if (first.key === "timeout") {
+			await approval.cancel("cancel", "No answer within an hour");
+			return "timed out";
+		}
+		return first.value.approved ? "deploying" : `declined: ${first.value.comment ?? "no reason"}`;
+	},
+});
+```
+
+## Advanced
+
+### Sessions and conversations
+
+| Term             | Meaning                                                                                                                                                                                                                                       |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Session          | A Pi Session: a durable log with a key. Agents hold their conversations in Sessions.                                                                                                                                                          |
+| `session` option | How an agent picks the Session for an event: `"thread"` (default) is one per chat thread (`<provider>:<threadId>`), `"channel"` one per channel (`<provider>:channel:<channelId>`), and a function `(event) => key` an app key (`app:<key>`). |
+| Conversation     | One agent's transcript in a Session, keyed `[session, agent name]`. Several agents can have conversations in one Session.                                                                                                                     |
+| Call Session     | Each `ctx.agent` call runs in a Session of its own (`run:<executionId>:<operationId>`), reclaimed 7 days after the call settled.                                                                                                              |
+| State scope      | `"session"` state has one value per Session; `"agent"` state one value per conversation ([State](#state)).                                                                                                                                    |
+
+`ctx.send(id, agent, { input, home?, session?, priority? })` delivers input to a conversation as if the agent's trigger had matched it and returns `{ requestId, conversation }`. A chat message is rendered with attribution and steers a busy run or starts one. Any other JSON is a notification: `urgent` steers, `normal` (default) runs next, `low` is written for the next run without waking the agent. `session` overrides the agent's option, so a router can give each thread its own conversation of a channel-session agent. The thread is followed afterwards, so later replies go straight to the agent.
+
+- **Replies.** The final answer posts to the input's thread (or the conversation's home) on its own. Inputs that steer one run share its answer, which posts once, to the newest one's thread. Answers are posted **at least once**: Chat SDK posts carry no idempotency key, so a crash after the provider accepted a post and before its receipt repeats it. A run ends only once its posts settled; a post that fails for good is logged.
+- **`no_reply({ reason? })`**: a built-in tool that ends the run without posting (chatter, a notification that needs nothing).
+- **Progress** ("Thinking…", tool descriptions, "Waiting for the model provider…") shows on the reply thread.
+- **Errors.** Transient model errors are retried durably for about 5 minutes. If the input still fails, one error reply with an error id posts where the answer would have.
+- **Stop.** A stop in a thread (Slack's native stop button) aborts the current run of every conversation following it; the conversation stays usable. Anyone in a followed thread may stop or steer it: permissions live on tools.
+
+### Following resources
+
+`ctx.follow(id, resource, options?)` makes a conversation follow something besides its threads; the resource's events arrive as notifications until `ctx.unfollow`. GitHub provides `github.pullRequest("acme/app#42")`:
+
+```ts check
+const watch = f.defineTool({
+	name: "watch_pr",
+	description: "Follow a pull request's reviews in this conversation.",
+	input: z.object({ pr: z.string() }),
+	async run({ pr }, ctx) {
+		await ctx.follow("follow", github.pullRequest(pr), { priority: { comment: "urgent" } });
+		return `Following ${pr}.`;
+	},
+});
+```
+
+From a tool (or a workflow an agent's tool started) the calling conversation follows, and answers to notifications post where the current request replies. Other workflows pass `to: { agent, session?, home? }` or the `conversation` of a `ctx.send` receipt. `events: "all"` adds the kinds a plugin leaves out by default (GitHub: labels and CI). A follow is a record in the resource thread's Chat SDK state, which expires 30 days after its last write. Merge and close are delivered like other events; the agent decides when to unfollow.
 
 ### Subagents
 
-```ts
-export const researcher = f.defineAgent({
+```ts check
+const researcher = f.defineAgent({
 	name: "researcher",
-	description: "Investigates a question and returns findings with sources.",
+	description: "Investigates a question and returns findings.",
 	model: "anthropic/claude-haiku-4-5",
-	tools: [search, readDocs],
+	tools: [lookupOrder],
 });
-
-export const lead = f.defineAgent({
+const lead = f.defineAgent({
 	name: "lead",
-	description: "Answers support questions in #help.",
+	description: "Answers hard order questions.",
 	model: "anthropic/claude-sonnet-5",
 	subagents: [researcher, { agent: "self", context: "fork" }],
-	limits: { depth: 1, concurrent: 5 }, // defaults
+	limits: { depth: 1, concurrent: 5 }, // the defaults
 });
 ```
 
-- Entries are an agent, `"self"` (a copy of the lead), or `{ agent, context?: "fresh" | "fork", background?: "allow" | "always" | "never" }`. Names that collide with another subagent, a tool, a workflow, or `no_reply` are rejected at definition (plugin toolkit tools when the app starts).
-- The model gets one tool per subagent, named after the agent like workflow tools (`researcher`, `bug-researcher` → `bug_researcher`) and described by its `description`: `researcher({ task, name?, background? })`. A call runs a child conversation in the lead's Session, configured from the subagent's definition (model, instructions, tools, toolkits, state); unset `model` and `thinking` follow the lead. Fresh children see only their task; `context: "fork"` children see the lead's transcript up to the delegating response.
-- The call waits and returns the answer as data: `<subagent name="researcher-1" status="done">…escaped…</subagent>`. Pass `name: "researcher-1"` to continue that child with its history. A child that ends without an answer returns `status="failed"` with a generic message and an error id; the provider's error is logged with that id.
-- The child is owned by the lead's tool call (Pi ownership): cancelling the lead aborts it, and a restart resumes it without submitting the task twice. Children have no chat binding, post no final replies, and get no `no_reply` tool; their tools and workflows (approvals included) act for the lead's current request: the same actor, thread, and approvers. Their activity shows on the lead's status (`researcher: Thinking…`).
-- With `depth: 1` children get no subagent tools; a deeper `depth` passes the remaining levels down. More than `concurrent` children running at once in one conversation is a tool error the model can act on. Running children are counted from durable state (slots held by the call or the reporter task), so the limit holds across restarts and Session reopenings. A slot frees in the commit that settles the child's answer, not when its holder task ends. A background child waiting on a workflow (e.g. an approval for days) does not hold the Session: when every live task waits on a workflow, the Session's execution closes Pi and suspends until any of those workflows completes, and new messages and `ctx.agent` calls to the Session are processed meanwhile. A child's line on the lead's status clears as soon as it answers.
-- Background: `background: true` (or an `"always"` entry) returns the name at once (`Started researcher-1 in the background…`). The child is owned by a background anchor task, and a reporter task submits the task and later reports `<subagent name="researcher-1" status="done|failed">…</subagent>` to the lead as a `followUp`, once, across restarts. Calling with the name of a background child steers it while it works and gives it new input when idle; each answer is reported once. Background children stay in the background when continued.
-- `subagent_stop({ name })` aborts a child's current work (Pi `conversation.abort`); it reports nothing and stays usable. A prompt section lists the lead's children and whether each is working.
-- When the run ends: under `ctx.agent` the call settles only after the lead has answered its children's reports, and returns that last answer. Under `ctx.send` and followed resources the Session's execution stays open while children work; reports arrive as follow-ups, and the lead's answer to each posts to the reply thread of the request that started the child. The run ends only once those answers posted. Child activity shows on the lead's status meanwhile.
-- Aborts: aborting the lead's Pi run stops at the background boundary. Cancelling the run (its calling workflow, or a stop in the thread) aborts the background children that run started or continued.
+- Each entry is an agent, `"self"`, or `{ agent, context?: "fresh" | "fork", background?: "allow" | "always" | "never" }`, and becomes one tool named after the agent: `researcher({ task, name?, background? })`. Name collisions with tools fail at definition.
+- A call runs a child conversation in the lead's Session and returns `<subagent name="researcher-1" status="done">…</subagent>`; pass `name` to continue that child. `"fresh"` children see only their task, `"fork"` children the lead's transcript so far. Unset `model` and `thinking` follow the lead.
+- `background: true` returns at once; the answer reaches the lead later as input, once. `subagent_stop({ name })` aborts a child's current work.
+- Children post nothing themselves; their tools act for the lead's current request (same actor, thread, approvers). Cancelling the lead aborts them. More than `concurrent` running children is a tool error the model can act on.
+
+### State
+
+```ts check
+const Notes = f.defineState({
+	name: "notes",
+	scope: "session",
+	schema: z.object({ notes: z.array(z.string()) }),
+	initial: () => ({ notes: [] }),
+	render: (s) => (s.notes.length ? `Known so far:\n- ${s.notes.join("\n- ")}` : undefined),
+});
+const note = f.defineTool({
+	name: "note",
+	description: "Remember a finding.",
+	input: z.object({ text: z.string() }),
+	async run({ text }, ctx) {
+		await ctx.state(Notes).update((s) => {
+			s.notes.push(text);
+		}); // committed with the tool result
+		return "noted";
+	},
+});
+const seed = f.defineWorkflow({
+	name: "seed",
+	async run(_input, ctx) {
+		await ctx.state(Notes).update("seed", (s) => ({ notes: [...s.notes, "Seeded."] }));
+	},
+});
+```
+
+- `scope: "session"`: one value per Session, shared by the workflows on that Session's thread and every conversation in it. A `ctx.agent` call's tools see their call Session's value, not the thread's: pass what the agent needs in `input`. Workflows can use state once their thread exists (posted).
+- `scope: "agent"`: one value per conversation, for tools only (a type error in workflows).
+- Agents listing a state in `state` see its `render` output in their prompt. Tool updates commit with the tool result; workflow updates are optimistic and retry on conflict. Updaters must be pure. Bump `version` and add `migrate` when the shape changes.
 
 ### `ctx.evaluate`
 
-```ts
-const route = await ctx.evaluate("route", {
-	model: "typesafe/jev-latest",
-	state: { message: message.text },
-	questions: { bug: { type: "boolean", instructions: "Is this a bug report?" } },
+```ts check
+const route = f.defineWorkflow({
+	name: "route",
+	triggers: [slack.mentioned({ channel: "C_BUGS" })],
+	async run(message, ctx) {
+		const result = await ctx.evaluate("route", {
+			model: "typesafe/jev-latest",
+			state: { message: message.text },
+			questions: { bug: { type: "boolean", instructions: "Is this a bug report?" } },
+		});
+		const bug = result.stopReason === "stop" && result.answers.bug?.value;
+		await ctx.send("deliver", support, { input: message, priority: bug ? "urgent" : "normal" });
+	},
 });
-if (route.stopReason === "stop" && route.answers.bug?.value) …
 ```
 
-Question types are `choice`, `score`, and `boolean`, on Pi AI's `models.classify()`. Choice distributions and confidence, boolean probability, and usage are kept. Score rubrics map to ordered criteria, and the classifier's score is a zero-based rubric index; out-of-range or non-integer scores are errors. Pi exposes no score distribution, so `probabilities` is `{}` for scores rather than invented. Unknown classifiers, provider errors, and aborts return `stopReason: "error"`; workflows fall back explicitly. The result is a memoized step in workflows and a memo in tools.
+Questions are `choice`, `score`, or `boolean`, on Pi AI's `models.classify()`; distributions, confidence, and usage are kept. Unknown classifiers and provider errors return `stopReason: "error"`, so workflows fall back explicitly. The result is a memoized step in workflows and a memo in tools.
 
-## Plugins
+### Plugins
 
-Plugin authors import `definePlugin`, `defineEvent`, `trigger`, `resource`, the chat helpers, and hook types from `fabrial/plugin`; shared types (`ExternalIdentity`, `ThreadRef`, `ToolDefinition`, …) come from `fabrial`. Test helpers live in `fabrial/testing`.
+A plugin (`definePlugin` from `fabrial/plugin`) has an `id` and optionally `events` (`defineEvent`), `routes` (`"METHOD /path"`, served by `app.fetch`), `clients` (built once per app; `ctx.clients`), `toolkit: (clients) => ({ tools, instructions })`, `context`, `identity.lookup`, `resources` (what `ctx.follow` accepts), `hooks.workflow` middleware, `hooks.agent` observers (`onModelResponse`, `onToolCall`; best effort), and `init`/`shutdown` for resources it owns. Factories must be side-effect free.
 
-A plugin carries an `id` and optionally `events`, `routes` (`"METHOD /path"`, served by `app.fetch`), `clients`, `context`, `identity`, `hooks.workflow` middleware, and `init`/`shutdown` for resources it owns, acquired at `app.start()` and never in the factory. For agents it adds:
+```ts check
+import { defineEvent, definePlugin, trigger } from "fabrial/plugin";
 
-- `toolkit: (clients) => ({ tools, instructions })` for agents that list the plugin id in `toolkits`. Listing a plugin without a toolkit fails at `app.start()`.
-- `hooks.agent` observers for every agent: `onModelResponse({ agent, model, text, toolCalls, stopReason, error?, usage? })` and `onToolCall({ agent, callId, name, arguments, result, isError })` after a tool settles. Observers are best effort: they may repeat on recovery, and a throwing observer is logged without failing the run.
-- `chat: chatCapability({ … })` to connect a Chat SDK adapter, the one runtime type plugin authors see:
-
-```ts
-import { chatCapability, chatEvents, chatTrigger } from "fabrial/plugin";
-
-const plugin = {
-	id: "github",
-	events: { ...chatEvents() /* provider-specific defineEvent entries */ },
-	chat: chatCapability({
-		adapter: () => createGitHubAdapter(credentials),
-		installationId: configuredInstallation,
-		history: { mode: "thread", limit: 50 },
-		status: "message", // for platforms without meaningful typing/status
-		isNewThread: (thread, message) => isRootComment(thread, message),
-	}),
-};
-const mentioned = (filters = {}) => chatTrigger("github", "mentioned", filters);
+const issue = z.object({ id: z.string(), title: z.string(), level: z.string() });
+export const sentry = definePlugin((options: { secret: string }) => ({
+	id: "sentry",
+	events: { issueCreated: defineEvent({ payload: issue, filterable: ["level"] }) },
+	routes: {
+		"POST /sentry/webhook": async (request, ctx) => {
+			if (request.headers.get("x-secret") !== options.secret)
+				return new Response(null, { status: 401 });
+			const body = issue.parse(await request.json());
+			await ctx.emit("issueCreated", body, { id: `sentry:${body.id}` }); // the dedupe key
+			return new Response(null, { status: 200 });
+		},
+	},
+}));
+export const issueCreated = (level?: string) =>
+	trigger<z.infer<typeof issue>>({
+		event: "sentry.issueCreated",
+		filter: level ? { level: [level] } : {},
+		replyTo: slack.channel("C_BUGS"),
+	});
 ```
 
-Adapters must use their plugin id as the thread/channel id prefix. Installation ids are configured, trusted identity namespaces, not display names inferred from messages. Standard payloads include `channelId` (without adapter prefix), `threadId` (full SDK id), `isDM`, `isMention`, and `isNewThread`. Nonstandard root codecs should provide `isNewThread`.
+Chat providers pass a Chat SDK adapter in `chat: chatCapability({ adapter, installationId, history?, status?, isNewThread?, permalink? })`, add `events: chatEvents()`, and build triggers with `chatTrigger(id, "mentioned" | "message" | "dm", filters)`. The adapter's name must be the plugin id, which prefixes its thread ids; `installationId` is a configured, trusted identity namespace. Each inbound message carries every matching category (`message` or `dm`, plus `mentioned`). Plugin tools that write elsewhere (`slack_post`, `github_comment`, …) are how agents post outside their conversation.
 
-Each inbound message carries all matching categories: channel messages emit `message`, plus `mentioned` when applicable; DMs emit `dm`, plus `mentioned` when applicable (not `message`). Channel `message`/`newThread` observers therefore also see mentions. Core selects one owner across the categories and dedupes each observing workflow across them.
+### Testing
 
-## Routing and identity
+Tests run on real Conductor and need Postgres; there is no in-memory engine. Start one per run in Vitest's `globalSetup` (e.g. `new PostgreSqlContainer("postgres:17").start()`, passed on with `project.provide`), and give each test file its own database: ingress is database-wide, so apps of other files running at once would route its events.
 
-`identity` accepts `readonly UserDefinition[]` only. Define groups in a separate module with `f.defineGroup` for typed `ctx.clients`. Approvers resolve group references directly; groups do not require registration, including dynamically resolved groups.
+`createTestApp(f, { database, workflows, agents?, routedAgents?, chat? })` runs workflows on Conductor with a `FakeChat` and fake agents, without models:
 
-Owner specificity is `trigger.specificity ?? Object.keys(trigger.filter ?? {}).length`. Fields are ANDed, alternatives ORed, with Conductor's scalar, prefix, numeric, exists, and anything-but semantics. Observers run without the owner's thread. Triggers on the same workflow are merged.
-
-Startup rejects equal-specificity owners on the same event whenever their filters may overlap. Literal, prefix, numeric-range, and existence disjointness is checked statically; uncertain combinations are conservatively rejected. Startup cannot know which **different event categories** a future chat message will carry. Such ties fail the routing workflow (`fabrial.route`) for that input, which starts nothing.
-
-Chat integrations must provide trusted installation IDs and authenticated actors. The host ignores messages marked `author.isBot`. A stop in a thread (Slack's native stop button) cancels the current run of every conversation following the thread (`AgentPort.stop`: a Pi abort; the Session stays usable). Anyone in a followed thread may stop it, as anyone there may steer it; permissions stay on tools. Runtime cancellation itself must also be idempotent.
-
-Thread state holds Fabrial's routing index: the conversations following the thread (`follows`, `[session, agent]` records, for every session kind). It keeps no ingress receipts: redeliveries are deduped by the `fabrial.ingress` emit's key (about one to two days, see below), and a retried `fabrial.route` resumes from its persisted decision and completed steps. Follows are subject to the 30-day thread-state TTL; a follow idle for longer lapses. There is no thread ownership, interaction, or reply buffer.
-
-An unbound reservation (`handlerExecutionId: null`) expires at ingress after `reservationTimeout` (default `"10m"`, configurable as a duration string or milliseconds, below 30 days). Fresh messages replace expired reservations; replies do not extend the grace. Legacy unbound states without `reservedAt` are immediately considered stale. Bound handlers are not expired by this check. This also limits the impact of a redelivery older than the ingress dedupe window or a lost dispatch.
-
-Channel surfaces remain unresolved until a post. The first durable post receipt supplies the real thread reference; every replay rebinds from that receipt. Handoffs and child invocations inherit this real reference, never a provisional channel locator.
-
-## Approvals and terminal cleanup
-
-Each request is its own execution (`fabrial.approval.request`), whose result stores the proposal, the assigned users and group ids, the requester, controls, and absolute expiry. The routing workflow checks every click against it before the waiting approval sees it: assigned users, and the current members of assigned groups (resolved when the click arrives, by the group defined once with `defineGroup`; an unknown or duplicate group id grants nothing). Unauthorized clicks get an ephemeral notice and never reach the approval. Requester cancellation is separate from approval authority; free text never changes an approval. Reply and approval timeouts must be below the 30-day routing-state TTL.
-
-Every card shows what is authorized, from the persisted request: the title, the details verbatim (in a code block, so markdown cannot change them), the verified requester (the router's resolved actor, never model text), the source thread (a link where the chat plugin provides `permalink`, as Slack does), and the deadline. `card: { text, fields }` adds content after these and never replaces them. A closed card keeps all of it and adds the outcome (`Approved by Bob`, `Rejected by Bob`, `Expired`, `Cancelled`, or why the approval failed), when it closed, and a rejection's reason. Reject opens a modal for an optional reason where the provider has modals (Slack); its submit is a click like any other and is authorized the same way. Without modals Reject decides at once, without a reason. The reason is the decision's `comment`. Approve carries no text. Cards go to each approver's DM unless `destination` names a surface (e.g. `slack.channel("C0123")`), which gets one approver card instead. A destination never grants authority: anyone there sees the card, but only assigned approvers may decide. The first eligible decision wins. There is no quorum and no editing a proposal: cancel and request again.
-
-Each approval also starts a decision execution (`fabrial.approval.decision`). It subscribes to authorized clicks once, then starts one independent `fabrial.cleanup` execution per card: each approver's card (or the destination's), plus the requester's status card. Each cleanup posts its card, waits for the decision's result, and closes the card: no actions, with the outcome. That includes a card posted after the decision. The first authorized click decides. If the caller settles first, the approval is cancelled. At the absolute deadline it expires, and a resume never extends that deadline. A cleanup retries a failed post or update up to three times, then gives up on that card. Undelivered approver cards do not fail the request while another approver's card was delivered. If every approver card fails for good, the approval ends at once instead of at its deadline: the waiting workflow's `wait` throws `Approval failed: No approver could be reached`, and the status card shows that reason. The decision learns this through a `fabrial.approval.delivery` execution, which waits on the approver cleanups' results and settles before the decision only when none of them was delivered. The requester's status card does not count as an approver card. These workflows are framework internals, not application APIs.
-
-Authorized decisions are emitted with a dedupe key. The decision execution subscribes to them (`ctx.subscribe`) before any card is posted, so a click that arrives during delivery is not lost.
-
-## Testing
-
-`fabrial/testing` runs apps on real Conductor; there is no in-memory engine. Tests need a Postgres: start one per test run in Vitest's `globalSetup` (e.g. `new PostgreSqlContainer("postgres:17").start()` from `@testcontainers/postgresql`, passed on with `project.provide`) or point at an existing database URL. Each test app runs on a queue of its own, but ingress is database-wide: give each test file its own database (e.g. `create database` in `beforeAll`), or apps running at once in other files route its events. `createTestApp` runs workflows with fake chat and agents, without models:
-
-```ts
+```ts check
 import { createTestApp } from "fabrial/testing";
 
-const { app, chat, runtime, clock, settled, idle, stop } = createTestApp(f, {
+const hello = f.defineWorkflow({ name: "hello", run: async () => "hi" });
+const { app, runtime, settled, stop } = createTestApp(f, {
 	database: process.env.DATABASE_URL!,
 	workflows: [hello],
 });
 await app.start();
-const id = await runtime.invoke("hello", {}, { metadata });
-console.log(await settled(id)); // { status: "completed", output: … }
+const id = await runtime.invoke("hello", null, {
+	metadata: { requestId: "r1", origin: null, replyTo: null, requestedBy: null },
+});
+console.log(await settled(id)); // { status: "completed", output: "hi" }
 await stop();
 ```
 
-- `createTestApp(f, { database, workflows, agents?, routedAgents?, chat? })`: an app on Conductor with a `FakeChat` and `fakeAgents()`, fast polling, and one connection. `settled(id)` waits for an execution's outcome and `result(id)` reads it; `idle()` waits until every emitted event was dispatched and every execution of the app settled, for asserting that something did not happen. `clock` is Conductor's test clock: `clock.set(date)` freezes the app's time and `clock.advance(ms)` moves it; advance only after the wait it should end is registered. `stop()` stops the app and closes its connection. Spy on `app.host.clients()` or its client methods for fakes.
-- `FakeChat`: inspectable threads, posts, DMs, and ephemeral notices, with `receive`, `click`, and `cancel` for ingress.
-- `StubRuntime`: a runtime port for unit tests that run no workflow; it records registrations and emitted events.
-- `testApp(f, { runtime, chat?, agents?, workflows })`: an app on explicit ports.
+It also returns `chat` (a `FakeChat` with inspectable posts, DMs, and ephemeral notices, and `receive`, `click`, `cancel` for ingress), `clock` (Conductor's test clock: `set`, `advance`; advance only after the wait it should end is registered), `result(id)`, and `idle()`. `idle()` waits for every event of the database and every execution of the app: use it only to assert that something did not happen, and wait on concrete effects otherwise.
 
-**Test reliability.** Ingress events, their dedupe, and routing span the database: an app's router also receives the events of other apps on it, fails on plugin events it doesn't know, and retries with backoff, so a shared database stalls `idle()` and routes events twice. Wait on the concrete effect a test asserts (`settled(id)`, a post, `expect.poll`); `idle()` waits for every event of the database and every execution of the app, so any unrelated retry delays it. Use `idle()` only to assert that something did not happen.
+`createIntegrationApp(f, { workflows, agents?, models })` runs the real runtime, agents, and chat on the instance's `database`, with `scriptedModels()` instead of credentials, model retries off, and fast polling:
 
-`createIntegrationApp(f, { workflows, models, logger? })` runs the real runtime, agents, and chat against the instance's `database` (e.g. Postgres from testcontainers) with scripted models instead of credentials:
-
-```ts
+```ts check
 import { createIntegrationApp, reply, scriptedModels } from "fabrial/testing";
 
 const models = scriptedModels();
@@ -203,10 +388,19 @@ models
 		({ messages }) => reply.text(`Seen ${messages.length} messages`),
 	]);
 models.classifier("typesafe/jev-latest", () => ({ bug: { probability: 0.01 } }));
-const app = createIntegrationApp(f, { workflows, models });
+const app = createIntegrationApp(f, { workflows: [], agents: [support], models });
+await app.start();
 ```
 
-Each model request consumes the next scripted step; `model.calls` counts requests. Model retries are off by default (`modelRetries`), and worker polling is fast (`pollIntervalMs`, `concurrency`).
+Each model request consumes the next step; `model.calls` counts requests. Spy on `app.host.clients()` (or its client methods) to fake plugin clients. [examples/acme](../../examples/acme) drives signed Slack, GitHub, and Linear webhooks through `app.fetch` this way.
+
+## Guarantees and limits
+
+- **External effects are at-least-once.** Steps, posts, and final replies are memoized, but a crash after an effect and before its receipt repeats it. Approval decisions, sent input, and routing are deduplicated.
+- **One app per database; one installation per provider.**
+- **Webhook dedupe** lasts as long as Conductor's dispatch retention (about one to two days); an older redelivery routes again.
+- **Thread state expires 30 days after its last write**: idle follows lapse, and approval timeouts must stay below 30 days.
+- **Permissions live on tools.** Anyone in a thread a conversation follows can steer or stop it; tools that need authority ask approvers.
 
 ## Internals
 
@@ -234,6 +428,14 @@ Fabrial uses only public APIs of the libraries below: no private access, no poll
 
 **One Fabrial app per database.** Ingress events and their dedupe are database-wide: every app on the database routes every `fabrial.ingress` event, and a delivery id dedupes across all of them. Several instances, and versions during a rollout, of the same app may share a database; different apps need their own. Emit dedupe is bounded by Conductor's dispatch retention (about one to two days).
 
+### Approvals
+
+Each request is its own execution (`fabrial.approval.request`), whose result stores the proposal, the assigned users and group ids, the requester, controls, and absolute expiry. The routing workflow checks every click against it before the waiting approval sees it: assigned users, and the current members of assigned groups (resolved when the click arrives, by the group defined once with `defineGroup`; an unknown or duplicate group id grants nothing). Unauthorized clicks get an ephemeral notice and never reach the approval. Requester cancellation is separate from approval authority; free text never changes an approval. Reply and approval timeouts must be below the 30-day routing-state TTL.
+
+Each approval also starts a decision execution (`fabrial.approval.decision`). It subscribes to authorized clicks once, then starts one independent `fabrial.cleanup` execution per card: each approver's card (or the destination's), plus the requester's status card. Each cleanup posts its card, waits for the decision's result, and closes the card: no actions, with the outcome. That includes a card posted after the decision. The first authorized click decides. If the caller settles first, the approval is cancelled. At the absolute deadline it expires, and a resume never extends that deadline. A cleanup retries a failed post or update up to three times, then gives up on that card. Undelivered approver cards do not fail the request while another approver's card was delivered. If every approver card fails for good, the approval ends at once instead of at its deadline: the waiting workflow's `wait` throws `Approval failed: No approver could be reached`, and the status card shows that reason. The decision learns this through a `fabrial.approval.delivery` execution, which waits on the approver cleanups' results and settles before the decision only when none of them was delivered. The requester's status card does not count as an approver card. These workflows are framework internals, not application APIs.
+
+Authorized decisions are emitted with a dedupe key. The decision execution subscribes to them (`ctx.subscribe`) before any card is posted, so a click that arrives during delivery is not lost.
+
 ### Agent sessions (Pi)
 
 `src/agents` runs agents on Pi Durable. `app.start()` migrates the `fabrial_pi` schema under a transactional advisory lock, builds the registry, and rejects missing live task kinds before admitting work.
@@ -242,11 +444,11 @@ Fabrial uses only public APIs of the libraries below: no private access, no poll
 
 Each acquisition atomically increments a per-Session epoch and assigns an owner UUID. Leases last 30 seconds and renew every 10 seconds on the database clock. Acquisition never steals an unexpired lease. Every commit locks and updates the Session row with matching owner, epoch, and unexpired lease in the same transaction as the write batch, so expired or stale owners cannot write or release a successor's lease. Renewal failures abort the run's Chord Context; uncertain commit outcomes poison the owner and require reopening. Conductor's claim is not the Pi epoch: different executions share a Session, so the Pi lease is independently authoritative. The keyed Session execution still avoids paid or externally visible work during stale-worker overlap. Fencing is not an exactly-once guarantee for external effects.
 
-Session keys are computed from the event (see [Conversations](#conversations)): `<provider>:<threadId>` for `session: "thread"`, `<provider>:channel:<channelId>` for `"channel"`, `app:<key>` for an app's key, and `<event>:<id>` for thread sessions of input without a thread. A `ctx.agent` call runs in a Session of its own, `run:<executionId>:<operationId>`: it never shares a transcript with a thread's conversation and never follows a thread. Conversations continue by agent name inside the Session. `InvocationMetadata.interactionId` remains the request correlation id (it keys request ids); renaming it is a follow-up.
+Session keys are computed from the event (see [Conversations](#conversations)): `<provider>:<threadId>` for `session: "thread"`, `<provider>:channel:<channelId>` for `"channel"`, `app:<key>` for an app's key, and `<event>:<id>` for thread sessions of input without a thread. A `ctx.agent` call runs in a Session of its own, `run:<executionId>:<operationId>`: it never shares a transcript with a thread's conversation and never follows a thread. Conversations continue by agent name inside the Session. `InvocationMetadata.requestId` correlates one request and keys its request ids.
 
 **Bridge.** One keyed `fabrial.session` execution per Session key hosts the Pi harness while the Session has work. Every input reaches it as an `input` signal through `signalWithStart` (sent input, stops, workflows' state requests); signal ids dedupe redeliveries. The host commits the request's invocation and its obligation (what Fabrial owes for it: a reply, or a call's outcome), then submits to Pi with the request id; Pi owns admission, ordering, steering, settlement, and recovery, and Fabrial keeps no run records. When every live task waits on a workflow or only reply posts are pending, the host closes Pi and the execution suspends on its input signal, `child` signals, and the execution of each waited-on workflow and pending post; the winner reopens Pi. A `ctx.agent` call is instead the input of its own Session's execution, a child of the caller (`ctx.invoke`, attached unless detached); that execution returns the call's outcome. Request ids derive from the caller's execution and operation id. Per-request identity is a request-keyed `fabrial.invocation` document committed right before submitting, so tools and instructions resolve the active request's actor rather than a conversation-wide current user. Forks have no Fabrial binding and cannot use managed outbound operations.
 
-Workflow tools start children keyed by Pi task id and operation id. An execution a Session waits on sends it a `child` signal with its outcome, which resumes the waiting tool in process; a suspended Session also wakes on the child execution itself. Idle is `harness.inspect()` plus that suspension rule, re-checked after every storage commit. Interrupted tools reconnect to the same child. Permissions and input validation use the registered workflow. Unauthorized workflow tools are removed from model discovery. Children inherit the originating request's actor, interaction, origin, and thread, with the Session's trigger and owner markers cleared so core does not treat them as observers.
+Workflow tools start children keyed by Pi task id and operation id. An execution a Session waits on sends it a `child` signal with its outcome, which resumes the waiting tool in process; a suspended Session also wakes on the child execution itself. Idle is `harness.inspect()` plus that suspension rule, re-checked after every storage commit. Interrupted tools reconnect to the same child. Permissions and input validation use the registered workflow. Unauthorized workflow tools are removed from model discovery. Children inherit the originating request's actor, request id, origin, and thread, with the Session's trigger and owner markers cleared so core does not treat them as observers.
 
 Cancellation aborts the recorded request and task tree, not a newer run in the conversation. Child start intents and cancellation relationships commit before starting, and lost start receipts reconcile through a Session/task/operation dedupe key. Conductor cancellation is the source of truth for a call: when its Session execution is cancelled while running, the Session aborts the call's Pi run in process (best effort) before closing Pi, so no further model calls happen. Cancelled while suspended, nothing runs: its workflow tools are cancelled natively with it, and the call's Pi Session is left as it is, never reopened; reclaim deletes its storage later (see below). Progress is best-effort, throttled, and limited to thinking and tool descriptions, never reasoning or raw stream output. Final and error replies post through stable child executions; a request's obligation is fulfilled only once its post settled, and a post that fails for good is logged, never answered with another error reply. Posts are at-least-once: a crash after the provider accepted one and before its receipt repeats it.
 
@@ -286,72 +488,6 @@ Limitations:
 - SDK native stop events have no unique webhook event ID; dedupe uses thread, stopper, and stopped streaming message IDs.
 - The SDK Slack adapter swallows assistant status API errors, so missing assistant scopes cannot trigger the edited-message fallback automatically. Providers can opt into `status: "message"`. There is no attachment field in core's normalized message yet.
 
-## Current boundaries
+### Current boundaries
 
-Live plugin clients are built once per app, as specified by `FabrialHost.clients`; they must not capture invocation identity. Core does not add a reaction acknowledgement to buffered replies because `ChatPort` has no reaction operation. Thread routing state is a read/write port, not a transaction or CAS: ingress for a given thread must be serialized by the state adapter, including across webhook replicas. The test runtime does not emulate missing Conductor capabilities or schedule cron timers.
-
-## Conversations: triggers, following, and send
-
-Agents receive events, like workflows. A trigger on an agent delivers the event to one of its conversations, keyed by `[session, agent]`; list such agents in `f.app({ workflows, agents })`.
-
-```ts
-export const support = f.defineAgent({
-	name: "support",
-	description: "Answers customer questions in #help.",
-	triggers: [slack.mentioned({ channel: "C_HELP" })],
-	session: "thread", // default; "channel", or (event) => key (namespaced as `app:<key>`)
-	home: slack.channel("C_BUGS"), // for triggers whose events have no thread
-});
-export const app = f.app({ workflows, agents: [support] });
-```
-
-Session keys come from the event: `<provider>:<threadId>` for `"thread"`, `<provider>:channel:<channelId>` for `"channel"`, the app's key otherwise. An event without a thread (a Sentry issue) starts a `"thread"` conversation keyed by the event; its first final reply creates a thread in the `home` channel, which the conversation follows.
-
-An incoming chat message is routed in this order:
-
-1. **Followers.** An agent follows every thread it receives a message from, so every later message there reaches the same conversation, mention or not: it steers a running run or starts the next one. Every followed thread, whatever the session kind, holds a follow record `{ session, agent }` in its Chat SDK state; ingress reads it with the redelivery check, so routing needs no table. A message naming one agent (`@agent-name`) goes only to that agent, which then follows the thread too.
-2. **Triggers.** Otherwise the most specific matching trigger wins, an agent's or a workflow's. Equal specificity on overlapping filters fails `app.start()`; `observe: true` workflow triggers run alongside.
-3. Otherwise the message is ignored.
-
-An incoming message goes first to the conversations following its thread (a message mentioning one `@agent-name` goes only to that agent, which then follows the thread too), otherwise to the most specific matching trigger, an agent's or a workflow's. Workflows don't receive chat replies: `ctx.thread.waitForReply`, `ask`, `nextReply`, `ctx.handoff`, and the `fabrial.reply` event are removed.
-
-`ctx.agent` **calls** an agent: it submits and waits for the answer. `ctx.send` **sends**: it submits and returns. An idle conversation starts a run. A busy one gets the input by kind and priority. The conversation is found as if the agent's trigger had matched the input: by the input's thread, or `home`; for other input, relative to the sender's thread. The thread is followed afterwards, so a routing workflow picks an agent once and later replies go straight to it.
-
-```ts
-await ctx.send("deliver", supportAgent, {
-	input: message, // a ChatMessage, a string, or JSON
-	home: slack.channel("C_BUGS"), // where the conversation lives when the input has no thread
-	// Options: input, home? (where input without a thread lives), session? (the agent's by default), priority? (notifications).
-});
-```
-
-| Input                 | Rendered as                                            | Delivery                                     |
-| --------------------- | ------------------------------------------------------ | -------------------------------------------- |
-| `message`             | `<message from="Alice" thread="…">text</message>`      | steers a busy run, or starts one             |
-| `notification` urgent | `<notification source="…" kind="…" priority="urgent">` | steer                                        |
-| `notification` normal | same                                                   | follow-up (next run)                         |
-| `notification` low    | same                                                   | written; seen on the next run, does not wake |
-
-Tools have the same `ctx.send`. A tool's send runs in a managed child execution through the same path, and the reply goes where the tool call's request replies.
-
-The agent's final answer to sent input posts automatically to the input's `replyTo`. When several inputs steer one run, they share its answer, which posts once, to the newest one's thread. The post is a managed effect keyed by the answer, attached to the Session's execution: a restart or redelivery reconnects to the same post instead of starting another. Posts are at-least-once, since Chat SDK posts carry no idempotency key: a crash after the provider accepted a post and before its receipt repeats it. A run is not done until its posts settled: the Session keeps waiting on them (suspended, still handling new input), so a `ctx.agent` call or a Session never completes before its answers posted. A post that fails for good (after the effect's retries) is logged as `Reply post failed` with its error and recorded as `failed` in the run's `deliveries`; the run then settles without it, the model is not run again, and no error reply is posted for it. Runs that answer input with a reply thread also get a built-in `no_reply({ reason? })` tool: called alone, it ends the run without posting, e.g. for chatter or a notification that needs no answer. The reason stays in the transcript. Input with `replyTo: null` posts nothing. A sent run shows progress ("Thinking…", tool descriptions, or "Waiting for the model provider…" while a model call waits to retry) on the reply thread of its latest request. Each input's request ID comes from the send's operation ID, so retries and redeliveries are submitted once. Sent input is a signal to the Session's execution, which admits it to Pi; a redelivery is deduplicated by the signal id and by Pi's request ID.
-
-**Errors.** Transient model errors are retried durably for about 5 minutes in production (`MODEL_RETRY`: up to 9 retries, 2 s doubling to a 60 s cap). If sent input still ends with a model error, or no model is configured, the driver posts one error reply where its final reply would have gone ("I couldn't reach the model provider…" when the retries ran out, otherwise "I hit an error…"), with an error id that is also logged next to the provider's error text. Redeliveries and restarts reuse the same post (at-least-once, like final replies), and the run waits for it. Aborted, reset, or stale input gets no reply. `createIntegrationApp({ modelRetries })` turns retries on: `true` for the production policy, or a policy such as `{ baseDelayMs: 5, maxRetries: 1 }` for fast tests.
-
-### Following other things
-
-`ctx.follow` makes a conversation follow a resource besides its threads, from a workflow or a tool; `ctx.unfollow` stops it. A follow lasts until `unfollow`: merge and close events are delivered like any other, and the agent decides. GitHub provides `github.pullRequest("acme/app#42")` (or `{ repo, number }`):
-
-```ts
-await ctx.follow("follow-pr", github.pullRequest("acme/app#42"), {
-	priority: { comment: "urgent" }, // per notification kind, over the plugin's default
-	events: "all", // also the kinds the plugin leaves out by default (GitHub: labels and CI)
-});
-await ctx.unfollow("unfollow-pr", github.pullRequest("acme/app#42"));
-```
-
-- **Target.** From a tool, or a workflow an agent tool started, the calling agent's conversation follows, and final replies to its notifications go where the current request replies (the conversation's home, e.g. the Slack thread). From other workflows, pass `to: { agent, session, home? }`, or the `conversation` reference a `ctx.send` receipt returns (`to: receipt.conversation`, optionally with `home`); `home` defaults to the workflow's thread. Following again replaces the record's options.
-- **Storage.** The follow is a record `{ session, agent, resource, replyTo, priority?, events? }` in `resourceFollows` of the resource thread's Chat SDK state (for GitHub, the PR's thread). There is no Fabrial table; the 30-day state TTL applies, refreshed on every write.
-- **Delivery.** When a plugin emits an event, ingress asks the plugin's resource kinds which threads it belongs to, reads their follow records, and delivers a `notification` to each follower with `signalWithStart`: the plugin renders it (and drops untrusted authors), the record's `events` selects kinds, and the priority is the record's override, then the plugin's default, then `normal`. Request ids are `${event id}:${session}:${agent}`, so a redelivered webhook is delivered once. Follows never own threads: triggers on the same events still run.
-- **Plugin SPI.** A plugin adds `resources: { [kind]: { key(ref), thread(ref), events, threads(event), notify(event), defaults } }` and a helper built on `resource(pluginId, kind, ref)`.
-- **Writing elsewhere** is a plugin tool: `github_comment`, `github_reply_to_review`, `slack_post`. Rendered notifications carry the ids those tools take (`pr="acme/app#42" review="991"`).
+Live plugin clients are built once per app; they must not capture invocation identity. Core adds no reaction acknowledgement to replies because `ChatPort` has no reaction operation.

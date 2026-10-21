@@ -8,25 +8,41 @@ A minimal SDK subclass disables Slack's independent pre-dispatch `markEventDeliv
 
 ## Instance wiring
 
-```ts
+```ts check
 import { createFabrial } from "fabrial";
 import { slack } from "@fabrial/slack";
 
-const triage = slack.userGroup({ id: "triage", handle: "triage" });
 const f = createFabrial({
-	plugins: [slack({ botToken, signingSecret, workspace })],
-	identity: [triage],
+	plugins: [
+		slack({
+			botToken: process.env.SLACK_BOT_TOKEN!,
+			signingSecret: process.env.SLACK_SIGNING_SECRET!,
+			workspace: "acme",
+		}),
+	],
 });
-const workflow = f.defineWorkflow({
-	name: "slack-auth",
-	async run(_input, ctx) {
-		await ctx.step("auth", () => ctx.clients.slack.auth.test());
+// Whoever is in @triage when an approver clicks; rotate in Slack, no deploy.
+const triage = slack.userGroup({ id: "triage", handle: "triage" });
+export const announce = f.defineWorkflow({
+	name: "announce",
+	triggers: [slack.mentioned({ channel: "C_OPS" })],
+	async run(message, ctx) {
+		const decision = await ctx.waitForApproval("approve", {
+			title: "Announce this?",
+			details: message.text,
+			approvers: triage,
+		});
+		if (decision.approved)
+			await ctx.step("post", async () => {
+				await ctx.clients.slack.chat.postMessage({ channel: "C_ALL", text: message.text });
+			});
 	},
 });
-const app = f.app({ runtime, chat, workflows: [workflow] });
 ```
 
-`userGroup` resolves through a structurally typed group context containing a Slack WebClient. It works with any catalog that includes Slack and fails explicitly if the live client is missing. Configure plugin values once in `createFabrial`; tests spy on `app.host.clients().slack`. The factory is side-effect free; credentials are checked at `app.start()`.
+Helpers: `slack.mentioned({ channel?, thread?, observe? })`, `slack.message({ channel, … })`, `slack.newThread({ channel, … })`, `slack.dm()`, `slack.channel(id)` (a surface for `replyTo`, `home`, and approval `destination`), `slack.identity({ workspace, userId })`, and `slack.userGroup({ id, handle })`. `userGroup` resolves live membership through `ctx.clients.slack` and never caches it. `ctx.clients.slack` is a `WebClient`; tests spy on `app.host.clients().slack`. The factory is side-effect free; credentials are checked at `app.start()`.
+
+One Slack workspace per app in this preview. Approval cards link their source thread with `chat.getPermalink`, and Reject opens a modal for an optional reason.
 
 ## Toolkit
 

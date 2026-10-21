@@ -6,6 +6,18 @@ Fabrial is an open-source framework for making a company AI-native. Events from 
 
 The name comes from Brandon Sanderson's _Stormlight Archive_: a fabrial is a device that turns extraordinary capabilities into practical tools. (In the books, fabrials trap spren, so avoid branding around captured spirits.)
 
+## Current design
+
+This file is a design log. The current design is described in [packages/fabrial/README.md](./packages/fabrial/README.md): the API in teaching order (instance → agents and workflows → triggers → workflow tools and approvals, then sessions, follows, subagents, state, plugins, testing) and, under Internals, how it runs on Conductor, Pi Durable, and Chat SDK. In short:
+
+- `createFabrial({ database, models, plugins, identity })` is the instance; `f.define*` defines agents, tools, toolkits, workflows, state, and groups; `f.app({ workflows, agents })` is the app. Public exports are `fabrial`, `fabrial/plugin`, and `fabrial/testing`.
+- Triggers (on workflows and agents) start work; the most specific owner wins and ties fail at startup. Chat messages go to the conversations following the thread first.
+- Agents hold conversations `[session, agent]` in Pi Sessions keyed by their `session` option; final answers post on their own, at least once. `ctx.agent` calls an agent in a Session of its own (typed with `output`); `ctx.send` hands it input.
+- Workflows are tools; approvals are workflow code (`ctx.waitForApproval`), authorized at ingress, with cards that show what is authorized.
+- One app per database, one installation per provider, tests on real Conductor.
+
+Sections from [Public API](#public-api) to [Coding agents](#coding-agents-after-v1) are the original proposal, kept for history: their code is not the current API. Where they disagree with the README, the [Decisions](#decisions) and [Review decisions](#review-decisions-2026-10-20), the README wins.
+
 ## Goals
 
 - Wire up integrations (Slack, GitHub, Linear, Sentry, …) and trigger workflows on their events quickly.
@@ -55,7 +67,7 @@ Everything lives in the one configured Postgres database, in the runtimes' schem
 
 ## Public API
 
-All code below is the proposed Fabrial API.
+> Historical: the original proposal. The current API is in [packages/fabrial/README.md](./packages/fabrial/README.md); for example, state scopes are `session` and `agent`, tools have no `requestedBy`, GitHub identities are numeric account ids, and plugins have no `clients({ chat })`.
 
 ### The instance: `createFabrial`
 
@@ -812,7 +824,7 @@ Recorded as open questions are resolved.
 - **Plugins: `definePlugin(factory | object)`** with the capability set in [Plugins](#plugins). Chat SDK is just the optional `chat` capability, so non-chat sources like Sentry or internal webhooks are first-class (`events` + `routes`). The shape follows Better Auth and Executor: an option factory, a declarative object, and inferred types. Global hooks are `hooks: { workflow, agent }` in Fabrial shapes: workflow middleware and agent observers. Plugin tools live in `toolkit`. Trigger helpers are static exports.
 - **Typed clients come from an instance, not global type augmentation.** `createFabrial({ database, models, plugins, identity })` returns `f`; every `f.define*` gets `ctx.clients` and plugin toolkit ids typed from `f`'s plugins, and a misspelled client is a type error. The instance holds no workflows (no import cycles); `f.app({ workflows, agents })` lists what runs. `identity` lists users only; groups are referenced where they're used. There are no free `defineWorkflow`/`fabrial()` functions and no `declare module` registration. Most backend frameworks do it this way (Conductor, Inngest, tRPC, Hono); global `Register` augmentation is a frontend-library pattern and felt like magic.
 - **Plugin values at definition, from env (the Better Auth / Inngest style).** Plugins get their options when passed to `createFabrial`, typically read from env when the module loads. Factories are side-effect free and nothing connects until `app.start()`. Tests set env in a `globalSetup` (e.g. testcontainers URLs, test secrets) before importing the app, and use spies on `app.host.clients()` for fake clients. There is one way to configure plugins: no `f.app()` overrides and no type/value split (the NestJS / Effect style was considered and rejected as heavier).
-- **Credentials are plugin options.** Executor's provider/account split (an accounts table, secret storage, slots) is deferred until several accounts per provider or per-person credentials are needed. A second installation is a second plugin instance with its own `id`.
+- **Credentials are plugin options.** Executor's provider/account split (an accounts table, secret storage, slots) is deferred until several accounts per provider or per-person credentials are needed. This preview supports one installation per provider: a chat plugin's id is its Chat SDK adapter's name.
 - **`f.defineAgent` with Fabrial fields only.** `name`, `description` (required), `model` (a `"provider/model"` string), `thinking`, `instructions` (strings and per-run functions), `tools` (tools and workflows), `toolkits` (plugin ids and app toolkits), `state`, `subagents`, and `limits`. There is no pass-through to the runtime's agent config and no `configure` escape hatch: a missing capability becomes a field. `ctx.agent` options are `input`, `output` (typed structured result, validated from a JSON answer), and `detached`. No Fabrial-owned agent features such as memory or per-agent permissions.
 - **v1 scope: Slack + the SQL approval flow + GitHub and Linear.**
   - Packages: `fabrial`, `@fabrial/slack`, `@fabrial/github`, `@fabrial/linear`.
@@ -828,7 +840,7 @@ Recorded as open questions are resolved.
 - **Conversations answer where they live; threads route by session key.** Agents have triggers; an event goes to a conversation keyed by `[session, agent]`, computed from the event (`"thread"` by default, `"channel"`, or a function). Final replies post automatically to the input's thread when it is followed, otherwise to the conversation's home; `no_reply` stays silent; posting anywhere else is a plugin tool. An agent follows every thread it receives a message from, and `ctx.follow` / `ctx.unfollow` add other threads and resources; follows are records in Chat SDK thread state. There is no thread ownership, interaction, reply buffer, or `reply` tool, and workflows don't wait for chat replies (`waitForReply`, `ask`, `nextReply`, and `ctx.handoff` are removed). Modeled on Eve (automatic final reply, `no_reply`) and OpenClaw (session keys computed from the source).
   - Chat SDK thread state has a 30-day TTL refreshed on every write; a follow idle for longer lapses.
   - A stop in a thread (Slack's native agent stop button) cancels the current run of every conversation following the thread; anyone in the thread may stop it. Calls (`ctx.agent`) are cancelled with their workflow instead.
-  - `InvocationMetadata.interactionId` stays as the request correlation id; renaming it is a follow-up.
+  - `InvocationMetadata.requestId` is the request correlation id (formerly `interactionId`); request ids derive from it.
 - **Sessions are hosted by keyed Conductor executions; inputs are signals.** One execution per Session key hosts the Pi Session while Pi has work, and every input reaches it with `signalWithStart` (Conductor item 12), so steering and cancelling are native Pi calls in process. This replaced an inbox table, then hand-overs at Pi's `afterTools` boundary (verified in a spike, but every edge case around closing a Session mid-run had to be handled), and boundary event reads. It follows the hosts other harnesses use: an addressable owner per conversation (Cloudflare Durable Objects, Temporal signals, Eve's run inbox, Mastra's lease-owner routing).
 - **Trigger overlap: the most specific trigger receives the event, `observe: true` adds side work, and ties fail at startup.** Agent and workflow triggers compete together for messages that no conversation follows, so exactly one handles an interactive message. The most specific matching trigger wins. Specificity is defined per plugin (Slack: channel+thread > channel > workspace). Two owners with equal specificity on the same event make `app.start()` throw. Triggers marked `observe: true` always run as well, independently and without `ctx.thread`. They can't post into or receive replies from that thread, but can still use clients or a `replyTo` elsewhere.
   ```ts
@@ -868,6 +880,13 @@ A full review against the goal (Fabrial is glue over Chat SDK, Pi Durable, and C
 - **Call Sessions are reclaimed (2026-10-21).** A daily `fabrial.sessions.reclaim` deletes the storage of `ctx.agent` Sessions whose execution settled at least 7 days ago; thread, channel, and app Sessions are kept.
 - **Tests run on real Conductor** with its test clock; the in-memory runtime engine is removed. Fake chat, scripted models, and pure unit tests stay.
 - **Conductor stays a submodule** pinned to `main` until a version is published.
+- **Explicit public exports (2026-10-21).** `fabrial` for app authors, `fabrial/plugin` for plugin authors, `fabrial/testing` for tests; nothing else is public.
+- **One actor (2026-10-21).** Contexts expose `actor` only (who asked for the work); internal metadata stays off contexts.
+- **Typed `ctx.agent` output (2026-10-21).** With `output`, the result is typed from the schema; there is no caller-chosen result type.
+- **State scope `session` (2026-10-21).** The scope formerly called `thread` is `session`: one value per Session. `agent` state is per conversation and tools-only.
+- **One app per database; one installation per provider (2026-10-21).** Ingress events and their dedupe are database-wide; chat plugin ids are adapter names. Both are preview limits, documented, not enforced beyond duplicate-id checks.
+- **Final replies and approval cards are at-least-once (2026-10-21).** Restated for docs: decisions and inputs are deduped, posts are not.
+- **README snippets compile (2026-10-21).** `ts check` blocks are generated into `examples/acme/tests/docs/generated` and typechecked; a unit test fails when they are stale.
 
 ## Upstream suggestions
 
