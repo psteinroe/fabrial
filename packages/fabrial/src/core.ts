@@ -348,10 +348,6 @@ export function buildApp(config: CoreConfig): HostedApp {
 			await execution.start(`observer:${observer.workflow}`, observer.workflow, ingress.payload, {
 				metadata: { ...metadata, replyTo: null, triggerEvent: observer.event },
 			});
-		// Each category is also emitted once for `ctx.waitForEvent`; no workflow triggers on it.
-		if (ingress.kind === "event" || decision.route === "new")
-			for (const event of ingress.events)
-				await execution.emit(event, ingress.payload, { id: ingress.id, metadata });
 		// Conversations following the event's resource threads get a notification; triggers still run.
 		if (ingress.kind === "event")
 			await execution.step("notify", async () => {
@@ -535,12 +531,6 @@ export function buildApp(config: CoreConfig): HostedApp {
 	runtime.register({
 		workflows,
 		events: [
-			...config.plugins.flatMap((p) =>
-				Object.entries(p.events ?? {}).map(([key, event]) => ({
-					name: `${p.id}.${key}`,
-					filterable: (event as { filterable: string[] }).filterable,
-				})),
-			),
 			{ name: INGRESS_EVENT, filterable: [] },
 			{ name: APPROVAL_DECIDED_EVENT, filterable: ["approvalId"] },
 			...(agents?.events ?? []),
