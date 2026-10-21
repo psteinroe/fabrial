@@ -12,6 +12,7 @@ import {
 	createFabrial,
 	defineEvent,
 	definePlugin,
+	defineUser,
 	trigger,
 	type ChatMessage,
 	type ExternalIdentity,
@@ -41,7 +42,11 @@ const githubPlugin = github({
 	botUserId: 99,
 });
 vi.spyOn(githubPlugin.identity!, "lookup").mockResolvedValue(undefined);
-const f = createFabrial({ plugins: [chatPlugin, githubPlugin] });
+const approver = defineUser({
+	id: "approver",
+	identities: [{ provider: "chat", installationId: "w", subjectId: "approver" }],
+});
+const f = createFabrial({ plugins: [chatPlugin, githubPlugin], identity: [approver] });
 const faux = fauxProvider();
 const models = createModels();
 models.setProvider(faux.provider);
@@ -83,13 +88,37 @@ const lead = f.defineAgent({
 	triggers: [trigger({ event: "chat.message", filter: { channelId: [orchestrated] } })],
 });
 
+const reviewed = `r${randomUUID().slice(0, 8)}`;
+const deploy = f.defineWorkflow({
+	name: "deploy_fix",
+	description: "Deploys the fix once approved.",
+	input: z.object({}),
+	async run(_input, ctx) {
+		return (
+			await ctx.waitForApproval("approval", {
+				title: "Deploy the fix?",
+				details: {},
+				approvers: approver,
+			})
+		).status;
+	},
+});
+const reviewer = f.defineAgent({
+	name: "reviewer",
+	description: "Follows its PR and deploys fixes for reviews.",
+	model: `${faux.provider.id}/${faux.getModel().id}`,
+	tools: [deploy],
+	toolkits: ["github"],
+	triggers: [trigger({ event: "chat.message", filter: { channelId: [reviewed] } })],
+});
+
 /** Chat SDK state outlives app restarts (Postgres in production); one fake chat stands in for it. */
 const chat = new FakeChat();
 
 /** Start the app, or restart it on the queue of a stopped one. */
 async function launch(routedAgents = [developer], queue?: string) {
 	const { app, runtime } = await start(f, {
-		workflows: [],
+		workflows: [deploy],
 		routedAgents,
 		chat,
 		queue,
@@ -381,5 +410,44 @@ it("orchestrator: a channel lead starts a background worker per message; reports
 	expect(followed).toHaveLength(3);
 	for (const result of followed)
 		expect(result).toMatch(/^\["Following github:acme\/app#[56]\."\]$/);
+	await t.app.stop();
+});
+
+it("a followed review's approval names the review as its source and the chat thread as its reply thread", async () => {
+	const threadId = `chat:${reviewed}:t1`;
+	faux.setResponses([
+		fauxAssistantMessage(fauxToolCall("github_follow_pull_request", { pr: "acme/app#7" }), {
+			stopReason: "toolUse",
+		}),
+		fauxAssistantMessage("Following acme/app#7."),
+		fauxAssistantMessage(fauxToolCall("deploy_fix", {}), { stopReason: "toolUse" }),
+	]);
+	const t = await launch([reviewer]);
+	await chat.receive({
+		...message(threadId, "r1", "Open a PR and follow it"),
+		channelId: reviewed,
+	});
+	await t.settle();
+	// A review of the followed PR (#7, so no follower from the tests above) wakes the agent, which asks.
+	const hook = webhooks.review("changes_requested");
+	const payload = hook.payload as { pull_request: JsonObject };
+	const review = {
+		...hook,
+		payload: { ...hook.payload, pull_request: { ...payload.pull_request, number: 7 } },
+	};
+	expect((await t.app.fetch(deliver(review, `${reviewed}:review`))).status).toBe(200);
+	type Shown = { title: string; fields: { label: string; value: string }[] };
+	const card = await until("the approval card", async () =>
+		[...chat.threads.values()]
+			.flatMap((thread) => thread.posts)
+			.map((post) => (post.content as { card?: Shown }).card)
+			.find((card) => card?.title === "Deploy the fix?"),
+	);
+	const field = (label: string) => card.fields.find((each) => each.label === label)?.value;
+	// The authenticated input that prompted the request is the review on GitHub; replies go to the chat.
+	expect(field("Source")).toBe(
+		"https://chat.test/github/github:acme/app:7 (github repo acme/app number 7)",
+	);
+	expect(field("Reply thread")).toBe(`https://chat.test/chat/${threadId}`);
 	await t.app.stop();
 });
