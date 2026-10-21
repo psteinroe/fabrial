@@ -4,7 +4,7 @@
  * GitHub/Linear may add provider events/routes alongside these standard events;
  * their adapters must encode thread/channel ids with the plugin id as prefix.
  */
-import type { Adapter, Message, Thread } from "chat";
+import type { Message, Thread } from "chat";
 import { defineEvent, type EventFilter } from "../events.ts";
 import type { ExternalIdentity } from "../identity.ts";
 import type { ChatCapability } from "../plugin.ts";
@@ -12,7 +12,6 @@ import type { ChatMessage, ThreadRef } from "../thread.ts";
 import { trigger } from "../trigger.ts";
 
 export interface ChatPluginCapability extends ChatCapability {
-	adapter: () => Adapter;
 	/** Override root detection for adapters whose thread ids do not end in the root message id. */
 	isNewThread?: (thread: Thread, message: Message) => boolean;
 	/** Use an edited status post when the platform has no meaningful typing/status API. */

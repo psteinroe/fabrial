@@ -46,7 +46,10 @@ export interface PluginDefinition<
 	TEvents extends Record<string, EventDefinition<any>> = Record<string, EventDefinition<any>>,
 	TClients extends Record<string, unknown> = Record<string, unknown>,
 > {
-	/** Unique name; prefixes events (`sentry.issueCreated`). A second installation is a second instance with its own id. */
+	/**
+	 * Unique name; prefixes events (`sentry.issueCreated`). One installation per provider in this preview: a chat
+	 * plugin's id is its adapter's name, so a second instance of the same provider is not supported.
+	 */
 	id: TId;
 	/** Typed events, registered with the workflow runtime as `${id}.${key}`. */
 	events?: TEvents;
@@ -54,7 +57,7 @@ export interface PluginDefinition<
 	routes?: Record<string, RouteHandler<TEvents, TClients>>;
 	/** Chat SDK adapter: routes, typed message events, `ctx.thread`, cards, status rendering, history. */
 	chat?: ChatCapability;
-	/** Canonical live clients, exposed as `ctx.clients.*` and rebuilt on every run/resume. */
+	/** Canonical live clients, exposed as `ctx.clients.*`; built once per app, so they must not capture a request. */
 	clients?: () => TClients;
 	/** Tools and instructions for agents that list this plugin's id in `toolkits`. */
 	toolkit?: PluginToolkitFactory<TClients>;
