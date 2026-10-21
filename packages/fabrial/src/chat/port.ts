@@ -38,6 +38,7 @@ export function renderMessage(message: OutboundMessage): AdapterPostableMessage 
 		);
 		children.push(CardText(`${fence}${card.code.language ?? ""}\n${card.code.content}\n${fence}`));
 	}
+	if (card.footer) children.push(CardText(card.footer));
 	if (card.actions?.length) children.push(Actions(card.actions.map((action) => Button(action))));
 	const rendered = toCardElement(SDKCard({ title: card.title, children }));
 	if (!rendered) throw new Error("Invalid card");
@@ -322,6 +323,9 @@ export function createChatPort(
 			if (!adapter.openDM) throw new Error(`Provider "${identity.provider}" does not support DMs`);
 			const threadId = await adapter.openDM(identity.subjectId);
 			return port.thread({ kind: "thread", provider: identity.provider, threadId });
+		},
+		async permalink(ref) {
+			return (await capability(ref.provider).permalink?.(ref)) ?? null;
 		},
 		async postEphemeral(ref, identity, text) {
 			checkIdentity(identity);

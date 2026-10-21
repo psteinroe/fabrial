@@ -1,5 +1,7 @@
 import {
 	Chat,
+	Modal,
+	TextInput,
 	type ActionEvent,
 	type Adapter,
 	type StateAdapter,
@@ -42,6 +44,15 @@ export function actionDedupeId(
 		action.user.userId,
 		receipt ?? action.value ?? "",
 	]);
+}
+
+/** The modal Reject opens for an optional reason. */
+export const REJECT_MODAL = "fabrial.approval.reject";
+
+interface RejectContext {
+	actionId: string;
+	threadId: string;
+	messageId: string;
 }
 
 export function chat(options: ChatOptions): ChatIntegration {
@@ -121,6 +132,38 @@ export function chat(options: ChatOptions): ChatIntegration {
 			bot.onAction(async (action) => {
 				if (!action.thread || action.user.isMe) return;
 				const provider = providerFor(action.adapter);
+				// Reject asks for a reason first where the provider has modals; its submit is the decision,
+				// authorized like any click. Without modals, Reject decides at once, without a reason.
+				if (action.actionId.startsWith("fabrial.approval.reject:")) {
+					const context: RejectContext = {
+						actionId: action.actionId,
+						threadId: action.threadId,
+						messageId: action.messageId,
+					};
+					const opened = await action
+						.openModal(
+							Modal({
+								callbackId: REJECT_MODAL,
+								title: "Reject request",
+								submitLabel: "Reject",
+								privateMetadata: JSON.stringify(context),
+								children: [
+									TextInput({
+										id: "reason",
+										label: "Reason",
+										optional: true,
+										multiline: true,
+										maxLength: 3000,
+									}),
+								],
+							}),
+						)
+						.catch((error: unknown) => {
+							host.logger.warn("Reject modal failed to open", { error });
+							return undefined;
+						});
+					if (opened) return;
+				}
 				await host.receiveAction({
 					actionId: action.actionId,
 					value: action.value,
@@ -133,6 +176,30 @@ export function chat(options: ChatOptions): ChatIntegration {
 					messageId: action.messageId,
 					dedupeId: actionDedupeId(provider, action),
 				});
+			});
+			bot.onModalSubmit(REJECT_MODAL, async (event) => {
+				const provider = providerFor(event.adapter);
+				const context = JSON.parse(event.privateMetadata ?? "null") as RejectContext | null;
+				if (!context?.actionId.startsWith("fabrial.approval.reject:")) return undefined;
+				try {
+					await host.receiveAction({
+						actionId: context.actionId,
+						value: event.values.reason || undefined,
+						actor: chatIdentity(
+							provider,
+							capabilities.get(provider)!.installationId,
+							event.user.userId,
+						),
+						thread: { kind: "thread", provider, threadId: context.threadId },
+						messageId: context.messageId,
+						dedupeId: JSON.stringify([provider, "modal", event.viewId, event.user.userId]),
+					});
+					return undefined;
+				} catch (error) {
+					// The SDK swallows handler errors: keep the modal open so the approver can retry.
+					host.logger.warn("Reject submit failed", { error });
+					return { action: "errors", errors: { reason: "Could not reject. Try again." } };
+				}
 			});
 			bot.onAgentSessionStopped(async (event) => {
 				const provider = providerFor(event.adapter);

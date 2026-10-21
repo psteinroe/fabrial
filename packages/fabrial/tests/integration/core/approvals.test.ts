@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineGroup, defineUser } from "../../internals.ts";
+import type { Json, WorkflowContext } from "../../internals.ts";
 import { until } from "../../conductor/helper.ts";
 import {
 	alice,
@@ -687,5 +688,161 @@ describe("approval authorization", () => {
 		await expect(
 			test.app.emit("fabrial.approval.decided", { approvalId: "x", status: "approved" }),
 		).rejects.toThrow("Reserved event name");
+	});
+});
+
+describe("approval cards", () => {
+	type Shown = {
+		title: string;
+		text?: string;
+		fields: { label: string; value: string }[];
+		code?: { language?: string; content: string };
+		footer?: string;
+		actions: { id: string }[];
+	};
+	const shown = (content: unknown) => (content as { card: Shown }).card;
+	const field = (content: unknown, label: string) =>
+		shown(content).fields.find((each) => each.label === label)?.value;
+	const decisionWorkflow = (
+		options: Partial<Parameters<WorkflowContext["waitForApproval"]>[1]> = {},
+	) =>
+		workflow(async (_input, ctx) => {
+			const decision = await ctx.waitForApproval("approval", {
+				title: "Run SQL?",
+				details: { sql: "delete from users where id = 1" },
+				approvers: team,
+				timeout: "24h",
+				...options,
+			});
+			return decision as unknown as Json;
+		});
+
+	it("shows the exact proposal, the verified requester, the source thread and the deadline", async () => {
+		const test = setup([decisionWorkflow()]);
+		await enter(test);
+		const c = await card(test);
+		const thread = await test.chat.thread(surface);
+		const status = await until("the status card", async () => thread.posts[0]);
+		for (const content of [c.post.content, status.content]) {
+			expect(shown(content)).toMatchObject({
+				title: "Run SQL?",
+				code: {
+					language: "json",
+					content: JSON.stringify({ sql: "delete from users where id = 1" }, null, 2),
+				},
+			});
+			expect(field(content, "Requested by")).toBe("Alice");
+			expect(field(content, "Source")).toBe(`https://chat.test/chat/${surface.threadId}`);
+			expect(field(content, "Expires")).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
+		}
+		expect(shown(c.post.content).text).toBe("Approval requested");
+		expect(shown(status.content).text).toBe("Waiting for approval");
+	});
+	it("adds custom content after the proposal, never replacing it", async () => {
+		const test = setup([
+			decisionWorkflow({
+				card: {
+					text: "Nothing to see here",
+					fields: [{ label: "Requested by", value: "Mallory" }],
+				},
+			}),
+		]);
+		await enter(test);
+		const c = await card(test);
+		const content = shown(c.post.content);
+		expect(content.title).toBe("Run SQL?");
+		expect(content.code?.content).toContain("delete from users where id = 1");
+		expect(content.fields.slice(0, 3).map((each) => each.label)).toEqual([
+			"Requested by",
+			"Source",
+			"Expires",
+		]);
+		expect(content.fields[0]!.value).toBe("Alice");
+		expect(content.fields.at(-1)).toEqual({ label: "Requested by", value: "Mallory" });
+		expect(content.footer).toBe("Nothing to see here");
+	});
+	it("keeps the proposal and adds the decision, its time and reason on final cards", async () => {
+		const test = setup([decisionWorkflow()]);
+		const owner = await enter(test);
+		const c = await card(test);
+		// A reason comes from the reject modal's submit, which is authorized like any click.
+		await test.chat.click(c.post.ref, c.reject, outsider.identities[0]!, { value: "No" });
+		await eventually("the ephemeral rejection", () => test.chat.ephemeral.length === 1);
+		await owner.suspended();
+		await test.chat.click(c.post.ref, c.reject, bob.identities[0]!, { value: " Too risky " });
+		expect(await owner.output()).toMatchObject({
+			status: "rejected",
+			comment: "Too risky",
+			decidedBy: { id: "bob" },
+		});
+		await eventually("the final card", () => c.post.updates.length > 0);
+		const content = c.post.content;
+		expect(shown(content)).toMatchObject({
+			title: "Run SQL?",
+			text: "Rejected by Bob",
+			actions: [],
+		});
+		expect(shown(content).code?.content).toContain("delete from users where id = 1");
+		expect(field(content, "Requested by")).toBe("Alice");
+		expect(field(content, "Reason")).toBe("Too risky");
+		expect(field(content, "Closed")).toMatch(/Z$/);
+		expect(field(content, "Expires")).toBeUndefined();
+	});
+	it("rejects without a reason where the provider has no modal", async () => {
+		const test = setup([decisionWorkflow()]);
+		const owner = await enter(test);
+		const c = await card(test);
+		await test.chat.click(c.post.ref, c.reject, alice.identities[0]!);
+		const decision = (await owner.output()) as { status: string; comment?: string };
+		expect(decision.status).toBe("rejected");
+		expect(decision.comment).toBeUndefined();
+		await eventually("the final card", () => c.post.updates.length > 0);
+		expect(field(c.post.content, "Reason")).toBeUndefined();
+	});
+	it("ignores a value on approve", async () => {
+		const test = setup([decisionWorkflow()]);
+		const owner = await enter(test);
+		const c = await card(test);
+		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!, { value: "spoofed" });
+		const decision = (await owner.output()) as { status: string; comment?: string };
+		expect(decision).toMatchObject({ status: "approved" });
+		expect(decision.comment).toBeUndefined();
+		await eventually("the final card", () => c.post.updates.length > 0);
+		expect(shown(c.post.content)).toMatchObject({ text: "Approved by Alice", actions: [] });
+		expect(field(c.post.content, "Requested by")).toBe("Alice");
+	});
+	it("keeps the proposal on expired cards", async () => {
+		const test = setup([decisionWorkflow({ timeout: "1h" })]);
+		const owner = await enter(test);
+		const c = await card(test);
+		await owner.suspended();
+		await db.clock.advance("1h");
+		expect(await owner.output()).toMatchObject({ status: "expired" });
+		await eventually("the expired card", () => shown(c.post.content).text === "Expired");
+		expect(shown(c.post.content).code?.content).toContain("delete from users");
+		expect(field(c.post.content, "Requested by")).toBe("Alice");
+	});
+	it("posts to a destination, where only assigned approvers may decide", async () => {
+		const destination = { kind: "channel", provider: "chat", channelId: "approvals" } as const;
+		const test = setup([decisionWorkflow({ approvers: alice, destination })]);
+		const owner = await enter(test);
+		const post = await until("the channel card", async () =>
+			[...test.chat.threads.values()]
+				.find((thread) => thread.channelId === "approvals")
+				?.posts.at(0),
+		);
+		const [approve] = shown(post.content).actions;
+		expect(shown(post.content).text).toBe("Approval requested");
+		expect(field(post.content, "Requested by")).toBe("Alice");
+		// No DMs: the destination replaces them.
+		expect((await test.chat.openDM(alice.identities[0]!)).posts).toHaveLength(0);
+		await owner.suspended();
+		await test.chat.click(post.ref, approve!.id, bob.identities[0]!);
+		await eventually("the ephemeral rejection", () => test.chat.ephemeral.length === 1);
+		await owner.suspended();
+		await test.chat.click(post.ref, approve!.id, alice.identities[0]!);
+		expect(await owner.output()).toMatchObject({ status: "approved", decidedBy: { id: "alice" } });
+		await eventually("the final card", () => post.updates.length > 0);
+		expect(shown(post.content)).toMatchObject({ text: "Approved by Alice", actions: [] });
 	});
 });

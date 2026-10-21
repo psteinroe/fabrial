@@ -7,6 +7,7 @@ import {
 	chat,
 	chatEvents,
 	chatTrigger,
+	REJECT_MODAL,
 	renderMessage,
 } from "../../../src/chat/index.ts";
 import { routingState, setup } from "../../chat/helper.ts";
@@ -143,6 +144,81 @@ describe("inbound Chat SDK dispatch", () => {
 		expect(
 			actionDedupeId("slack", { ...action, raw: { actions: [{ action_ts: "123.457" }] } }),
 		).not.toBe(actionDedupeId("slack", action));
+	});
+
+	it("asks for a rejection reason in a modal and forwards its submit as the reject action", async () => {
+		const env = setup();
+		await env.connection.port.thread(ref);
+		const openModal = vi.fn(async () => ({ viewId: "V1" }));
+		env.adapter.openModal = openModal;
+		const actionId = "fabrial.approval.reject:approval-1";
+		await env.sdk().processAction(
+			{
+				adapter: env.adapter,
+				actionId,
+				user: author,
+				threadId: ref.threadId,
+				messageId: "card-1",
+				triggerId: "trigger-1",
+				raw: {},
+			},
+			undefined,
+		);
+		expect(env.host.receiveAction).not.toHaveBeenCalled();
+		expect(openModal).toHaveBeenCalledOnce();
+		const [triggerId, modal] = openModal.mock.calls[0] as unknown as [
+			string,
+			{ callbackId: string; privateMetadata: string; children: { id: string }[] },
+		];
+		expect(triggerId).toBe("trigger-1");
+		expect(modal).toMatchObject({ callbackId: REJECT_MODAL, children: [{ id: "reason" }] });
+		const submit = {
+			adapter: env.adapter,
+			callbackId: REJECT_MODAL,
+			privateMetadata: modal.privateMetadata,
+			user: author,
+			values: { reason: "Too risky" },
+			viewId: "V1",
+			raw: {},
+		};
+		await env.sdk().processModalSubmit(submit);
+		expect(env.host.receiveAction).toHaveBeenCalledExactlyOnceWith({
+			actionId,
+			value: "Too risky",
+			actor,
+			thread: ref,
+			messageId: "card-1",
+			dedupeId: JSON.stringify(["slack", "modal", "V1", "U1"]),
+		});
+		// A failed ingress keeps the modal open with an error, so the approver can retry.
+		vi.mocked(env.host.receiveAction).mockRejectedValueOnce(new Error("offline"));
+		expect(await env.sdk().processModalSubmit({ ...submit, viewId: "V2" })).toMatchObject({
+			action: "errors",
+		});
+	});
+
+	it("rejects without a reason where the provider has no modals", async () => {
+		const env = setup();
+		await env.connection.port.thread(ref);
+		env.adapter.openModal = undefined;
+		const action = {
+			adapter: env.adapter,
+			actionId: "fabrial.approval.reject:approval-1",
+			user: author,
+			threadId: ref.threadId,
+			messageId: "card-1",
+			triggerId: "trigger-1",
+			raw: {},
+		};
+		await env.sdk().processAction(action, undefined);
+		expect(env.host.receiveAction).toHaveBeenCalledExactlyOnceWith({
+			actionId: action.actionId,
+			value: undefined,
+			actor,
+			thread: ref,
+			messageId: "card-1",
+			dedupeId: actionDedupeId("slack", action),
+		});
 	});
 
 	it("mounts one webhook route per chat plugin and waits for local ingress", async () => {

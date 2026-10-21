@@ -324,6 +324,8 @@ export interface ChatPort {
 	/** Resolve a surface to a thread, creating a new thread in a channel lazily. */
 	resolve(surface: Surface): Promise<ThreadIO>;
 	openDM(identity: ExternalIdentity): Promise<ThreadIO>;
+	/** A link to the thread, when its provider has one. */
+	permalink?(thread: ThreadRef): Promise<string | null>;
 	/** Short-lived message visible only to one user (e.g. "you are not an approver"). */
 	postEphemeral(thread: ThreadRef, identity: ExternalIdentity, text: string): Promise<void>;
 }

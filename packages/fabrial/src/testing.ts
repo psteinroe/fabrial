@@ -261,6 +261,9 @@ export class FakeChat implements ChatPort, ChatIntegration {
 			threadId: `dm:${identityKey(identity)}`,
 		});
 	}
+	async permalink(thread: ThreadRef): Promise<string | null> {
+		return `https://chat.test/${thread.provider}/${thread.threadId}`;
+	}
 	async postEphemeral(thread: ThreadRef, identity: ExternalIdentity, text: string): Promise<void> {
 		this.ephemeral.push(clone({ thread, identity, text }));
 	}

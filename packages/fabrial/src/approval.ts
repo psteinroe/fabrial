@@ -1,17 +1,33 @@
 import type { GroupDefinition, Principal, UserDefinition } from "./identity.ts";
 import type { Json } from "./json.ts";
-import type { Card } from "./thread.ts";
-import type { Awaitable } from "./thread.ts";
+import type { Awaitable, Surface } from "./thread.ts";
+
+/** App content added to an approval card, after the proposal; it never replaces it. */
+export interface ApprovalCardContent {
+	text?: string;
+	fields?: { label: string; value: string }[];
+}
 
 export interface ApprovalOptions {
 	title: string;
-	/** Shown on the card; also what the approval binds to (a changed proposal needs a new approval). */
+	/**
+	 * Shown verbatim on every card; also what the approval binds to (a changed proposal needs a new
+	 * approval).
+	 */
 	details: Json;
 	approvers: GroupDefinition | UserDefinition | readonly (GroupDefinition | UserDefinition)[];
 	/** Duration string ("24h") or ms. Must stay below 30 days (Chat SDK thread-state TTL). */
 	timeout?: string | number;
-	/** Custom card body; defaults to a rendering of title + details. */
-	card?: Omit<Card, "actions">;
+	/**
+	 * Extra card content, shown after the proposal, the verified requester, the source thread, and the
+	 * deadline, which every card shows.
+	 */
+	card?: ApprovalCardContent;
+	/**
+	 * Where the approver card is posted (e.g. a channel) instead of each approver's DM. It grants no
+	 * authority: only assigned approvers may decide, whoever sees the card.
+	 */
+	destination?: Surface;
 	/** Show [Cancel request] on the requester's status message. Default true. */
 	requesterControls?: boolean;
 }
@@ -22,6 +38,7 @@ export interface ApprovalDecision {
 	status: DecisionStatus;
 	approved: boolean;
 	decidedBy: Principal | null;
+	/** The rejection reason an approver gave, or the reason passed to `cancel`. */
 	comment?: string;
 	decidedAt: string;
 }

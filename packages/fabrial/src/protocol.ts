@@ -4,14 +4,15 @@ import {
 	APPROVAL_DECIDED_EVENT,
 	APPROVAL_DECISION_WORKFLOW,
 	APPROVAL_REQUEST_WORKFLOW,
+	type ApprovalCard,
 	type ApprovalRequest,
 	type DecisionInput,
 	type DecisionResult,
 } from "./approval-workflows.ts";
 import { definedGroup, type Principal } from "./identity.ts";
-import type { CardDestination } from "./cleanup.ts";
 import { boundedTimeout } from "./internal.ts";
 import type { Json } from "./json.ts";
+import type { FabrialHost } from "./app.ts";
 import type { Awaitable, Surface } from "./thread.ts";
 
 interface ApprovalContext extends ContextOptions {
@@ -27,6 +28,17 @@ function canonical(value: Json): string {
 			.map((key) => `${JSON.stringify(key)}:${canonical(value[key]!)}`)
 			.join(",")}}`;
 	return JSON.stringify(value);
+}
+
+/** A link to the source surface, else a description of it. */
+async function describe(host: FabrialHost, surface: Surface | null): Promise<string | null> {
+	if (!surface) return null;
+	if (surface.kind === "channel") return `${surface.provider} channel ${surface.channelId}`;
+	const link = await host
+		.chat()
+		?.permalink?.(surface)
+		.catch(() => null);
+	return link ?? `${surface.provider} thread ${surface.threadId}`;
 }
 
 export async function createApproval(
@@ -70,11 +82,13 @@ export async function createApproval(
 			},
 			approvers,
 			requester: metadata.requestedBy,
+			source: await describe(host, (metadata.replyTo as Surface | null) ?? null),
+			destination: options.destination ?? null,
 			deadline: now() + boundedTimeout(options.timeout),
 			title: options.title,
 			details: options.details,
 			requesterControls: options.requesterControls ?? true,
-			card: options.card ? (options.card as unknown as Json) : null,
+			content: options.card ?? null,
 		} satisfies ApprovalRequest as unknown as Json;
 	})) as unknown as ApprovalRequest;
 	if (request.title !== options.title || canonical(request.details) !== canonical(options.details))
@@ -90,35 +104,35 @@ export async function createApproval(
 		{ metadata: { ...metadata, ...internal } },
 	);
 	const approvers = request.approvers;
-	const cards: DecisionInput["cards"] = approvers.map((approver) => ({
-		destination: {
-			kind: "dm",
-			approver,
-			provider: originatingProvider ?? null,
-		} satisfies CardDestination,
-		card: {
-			...((request.card as unknown as ApprovalOptions["card"]) ?? {
-				title: request.title,
-				text:
-					typeof request.details === "string" ? request.details : JSON.stringify(request.details),
-			}),
-			actions: [
-				{ id: `fabrial.approval.approve:${approvalId}`, label: "Approve", style: "primary" },
-				{ id: `fabrial.approval.reject:${approvalId}`, label: "Reject", style: "danger" },
-			],
-		} as unknown as Json,
-	}));
+	const decide = [
+		{ id: `fabrial.approval.approve:${approvalId}`, label: "Approve", style: "primary" as const },
+		{ id: `fabrial.approval.reject:${approvalId}`, label: "Reject", style: "danger" as const },
+	];
+	// One card in the destination, else one per approver's DM: either way, only the assigned may decide.
+	const cards: ApprovalCard[] = request.destination
+		? [
+				{
+					destination: { kind: "surface", surface: request.destination },
+					approver: true,
+					status: "Approval requested",
+					actions: decide,
+				},
+			]
+		: approvers.map((approver) => ({
+				destination: { kind: "dm", approver, provider: originatingProvider ?? null },
+				approver: true,
+				status: "Approval requested",
+				actions: decide,
+			}));
 	if (metadata.replyTo)
 		cards.push({
 			destination: { kind: "surface", surface: metadata.replyTo as Surface },
-			card: {
-				title: request.title,
-				text: "Waiting for approval",
-				actions:
-					request.requesterControls === false
-						? []
-						: [{ id: `fabrial.approval.cancel:${approvalId}`, label: "Cancel request" }],
-			},
+			approver: false,
+			status: "Waiting for approval",
+			actions:
+				request.requesterControls === false
+					? []
+					: [{ id: `fabrial.approval.cancel:${approvalId}`, label: "Cancel request" }],
 		});
 	// Subscribes to decisions before its cleanups post the cards; independent of this execution.
 	const decisionId = await execution.start(
@@ -128,7 +142,14 @@ export async function createApproval(
 			approvalId,
 			callerId: execution.executionId,
 			deadline: request.deadline,
-			title: request.title,
+			proposal: {
+				title: request.title,
+				details: request.details,
+				requester: request.requester,
+				source: request.source,
+				deadline: request.deadline,
+				content: request.content,
+			},
 			cards,
 		} satisfies DecisionInput as unknown as Json,
 		{ metadata: { ...metadata, ...internal } },

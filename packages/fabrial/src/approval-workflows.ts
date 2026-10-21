@@ -1,10 +1,12 @@
 import type { FabrialHost } from "./app.ts";
-import type { ApprovalDecision } from "./approval.ts";
+import type { ApprovalCardContent, ApprovalDecision } from "./approval.ts";
+import type { Proposal } from "./approval-card.ts";
 import { CLEANUP_WORKFLOW, type CardDestination, type CleanupInput } from "./cleanup.ts";
 import { samePrincipal } from "./directory.ts";
 import { definedGroup, type Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { DurableExecution, RuntimeWorkflow } from "./runtime.ts";
+import type { CardAction, Surface } from "./thread.ts";
 
 /** One execution per approval request; its result is the request the routing workflow authorizes clicks against. */
 export const APPROVAL_REQUEST_WORKFLOW = "fabrial.approval.request";
@@ -26,14 +28,18 @@ export interface ApprovalRequest {
 	assigned: { users: Principal[]; groups: string[] };
 	/** Who received a card: the assigned users and the groups' members when it was requested. */
 	approvers: Principal[];
-	/** May cancel the request from its status card, unless `requesterControls` is false. */
+	/** The verified requester: may cancel the request from its status card, unless `requesterControls` is false. */
 	requester: Principal | null;
+	/** A link to the thread the request came from, or a description of it. */
+	source: string | null;
+	/** Where the approver card goes instead of the approvers' DMs; grants no authority. */
+	destination: Surface | null;
 	/** Epoch ms. */
 	deadline: number;
 	title: string;
 	details: Json;
 	requesterControls: boolean;
-	card: Json | null;
+	content: ApprovalCardContent | null;
 }
 
 export type ApprovalAction = "approve" | "reject" | "cancel";
@@ -59,8 +65,17 @@ export interface DecisionInput {
 	callerId: string;
 	/** Epoch ms, persisted with the request: resumes never extend it. */
 	deadline: number;
-	title: string;
-	cards: { destination: CardDestination; card: Json }[];
+	proposal: Proposal;
+	cards: ApprovalCard[];
+}
+
+/** One card of an approval: an approver card, or the requester's status card. */
+export interface ApprovalCard {
+	destination: CardDestination;
+	/** Whether approvers decide on it: an approval fails when none of these could be posted. */
+	approver: boolean;
+	status: string;
+	actions: CardAction[];
 }
 
 /**
@@ -69,7 +84,7 @@ export interface DecisionInput {
  */
 export type DecisionResult =
 	| { decision: ApprovalDecision; label: string }
-	| { error: string; label: string };
+	| { error: string; label: string; at: string };
 
 /** Why an approval fails when every approver card failed permanently. */
 export const UNREACHABLE = "No approver could be reached";
@@ -118,7 +133,7 @@ export function approvalDecisionWorkflow(now: () => number): RuntimeWorkflow {
 						{
 							requestExecutionId: data.approvalId,
 							decisionId: execution.executionId,
-							title: data.title,
+							proposal: data.proposal,
 							...card,
 						} satisfies CleanupInput as unknown as Json,
 						{ metadata: { replyTo: null, ownerWorkflow: null, triggerEvent: null } },
@@ -129,7 +144,7 @@ export function approvalDecisionWorkflow(now: () => number): RuntimeWorkflow {
 			const delivery = await execution.start(
 				"delivery",
 				APPROVAL_DELIVERY_WORKFLOW,
-				{ cleanups: cleanups.filter((_id, index) => data.cards[index]!.destination.kind === "dm") },
+				{ cleanups: cleanups.filter((_id, index) => data.cards[index]!.approver) },
 				{ metadata: { replyTo: null, ownerWorkflow: null, triggerEvent: null } },
 			);
 			const winner = await execution.waitForAny(
@@ -142,7 +157,11 @@ export function approvalDecisionWorkflow(now: () => number): RuntimeWorkflow {
 					winner.result.status === "completed"
 						? UNREACHABLE
 						: `Approval delivery ${winner.result.status}`;
-				return { error, label: error } satisfies DecisionResult;
+				return {
+					error,
+					label: error,
+					at: new Date(now()).toISOString(),
+				} satisfies DecisionResult;
 			}
 			const decidedAt = new Date(now()).toISOString();
 			let result: DecisionResult;

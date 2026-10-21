@@ -21,7 +21,13 @@ export const runSql = f.defineWorkflow({
 			timeout: "24h",
 		});
 		if (!decision.approved)
-			return { status: "declined", decision: decision.status, rowsChanged: 0 };
+			return {
+				status: "declined",
+				decision: decision.status,
+				// The approver's rejection reason, if they gave one: the agent reports it.
+				...(decision.comment ? { rejectionReason: decision.comment } : {}),
+				rowsChanged: 0,
+			};
 		const result = await ctx.step("execute", () =>
 			ctx.clients.database.execute(input.organisationId, input.sql),
 		);

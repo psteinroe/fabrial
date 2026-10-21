@@ -50,6 +50,9 @@ import {
 
 const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
+/** Longest rejection reason kept (characters). */
+const MAX_REASON = 3000;
+
 /** Compose integrations and register the core workflow/context protocol with the durable runtime. */
 export function buildApp(config: CoreConfig): HostedApp {
 	const runtime = config.runtime;
@@ -209,7 +212,10 @@ export function buildApp(config: CoreConfig): HostedApp {
 					status: verb === "approve" ? "approved" : verb === "reject" ? "rejected" : "cancelled",
 					actor: actor as unknown as Json,
 					messageId: action.messageId,
-					comment: action.value,
+					// A rejection's reason, from the reject modal; approve and cancel buttons carry none.
+					...(verb === "reject" && action.value?.trim()
+						? { comment: action.value.trim().slice(0, MAX_REASON) }
+						: {}),
 				},
 				{
 					id: ingress.id,

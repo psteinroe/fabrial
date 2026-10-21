@@ -8,7 +8,7 @@ import type { Adapter, Message, Thread } from "chat";
 import { defineEvent, type EventFilter } from "../events.ts";
 import type { ExternalIdentity } from "../identity.ts";
 import type { ChatCapability } from "../plugin.ts";
-import type { ChatMessage } from "../thread.ts";
+import type { ChatMessage, ThreadRef } from "../thread.ts";
 import { trigger } from "../trigger.ts";
 
 export interface ChatPluginCapability extends ChatCapability {
@@ -17,6 +17,8 @@ export interface ChatPluginCapability extends ChatCapability {
 	isNewThread?: (thread: Thread, message: Message) => boolean;
 	/** Use an edited status post when the platform has no meaningful typing/status API. */
 	status?: "typing" | "message";
+	/** A link to a thread, shown on approval cards as their source. */
+	permalink?: (thread: ThreadRef) => Promise<string | null>;
 }
 
 export function chatCapability(options: ChatPluginCapability): ChatPluginCapability {

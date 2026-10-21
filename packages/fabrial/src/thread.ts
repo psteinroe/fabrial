@@ -40,6 +40,8 @@ export interface Card {
 	fields?: { label: string; value: string }[];
 	/** Pre-formatted block (e.g. SQL). */
 	code?: { language?: string; content: string };
+	/** Text after the other content, before the actions. */
+	footer?: string;
 	actions?: CardAction[];
 }
 

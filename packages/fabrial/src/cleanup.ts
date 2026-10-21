@@ -1,25 +1,23 @@
 import type { FabrialHost } from "./app.ts";
-import type { DecisionResult } from "./approval-workflows.ts";
+import { finalCard, pendingCard, type Outcome, type Proposal } from "./approval-card.ts";
+import type { ApprovalCard, DecisionResult } from "./approval-workflows.ts";
 import type { Principal } from "./identity.ts";
 import type { Json, JsonObject } from "./json.ts";
 import type { DurableExecution, ThreadIO } from "./runtime.ts";
-import type { MessageRef, OutboundMessage, Surface } from "./thread.ts";
+import type { MessageRef, Surface } from "./thread.ts";
 
 export const CLEANUP_WORKFLOW = "fabrial.cleanup";
 
-/** Where an approval card goes: an approver's DM (origin provider first) or the requester's surface. */
+/** Where an approval card goes: an approver's DM (origin provider first), or a surface. */
 export type CardDestination =
 	| { kind: "dm"; approver: Principal; provider: string | null }
 	| { kind: "surface"; surface: Surface };
 
-export interface CleanupInput {
+export interface CleanupInput extends ApprovalCard {
 	requestExecutionId: string;
-	/** The decision execution: its result labels the card. It settles when the caller does at the latest. */
+	/** The decision execution: its result closes the card. It settles when the caller does at the latest. */
 	decisionId: string;
-	destination: CardDestination;
-	/** Card content, with its actions. */
-	card: Json;
-	title: string;
+	proposal: Proposal;
 }
 
 /** Retried attempts repeat only the card's failed post or update; a card still failing is given up. */
@@ -46,8 +44,8 @@ export async function cleanup(
 		.step("post", async () => {
 			const io = await open(host, data.destination);
 			return (await io.post({
-				card: data.card,
-			} as unknown as OutboundMessage)) as unknown as JsonObject;
+				card: pendingCard(data.proposal, data.status, data.actions),
+			})) as unknown as JsonObject;
 		})
 		.catch((error: unknown) => {
 			warn("Approval card delivery failed", error);
@@ -55,23 +53,35 @@ export async function cleanup(
 		})) as unknown as MessageRef;
 	// Only the decision: a card posted after both it and the caller settled must show the decision.
 	const result = await execution.waitForResult("closed", data.decisionId);
-	const label =
-		result.status === "completed"
-			? (result.output as unknown as DecisionResult).label
-			: "Cancelled";
 	await execution
 		.step("update", async () => {
+			const outcome: Outcome =
+				result.status === "completed"
+					? closed(result.output as unknown as DecisionResult)
+					: { label: "Cancelled", at: new Date().toISOString() };
 			const io = await chat.thread({
 				kind: "thread",
 				provider: ref.provider,
 				threadId: ref.threadId,
 			});
-			await io.update(ref, { card: { title: data.title, text: label, actions: [] } });
+			await io.update(ref, { card: finalCard(data.proposal, outcome) });
 		})
 		.catch((error: unknown) => {
 			warn("Approval card update failed", error);
 			throw error;
 		});
+}
+
+function closed(result: DecisionResult): Outcome {
+	if ("error" in result) return { label: result.label, at: result.at };
+	const { status, comment, decidedAt } = result.decision;
+	// A cancel's own reason shows; the labelled ones ("cancelled", "superseded") already do.
+	const reason =
+		status === "rejected" ||
+		(status === "cancelled" && comment !== "cancelled" && comment !== "superseded")
+			? comment
+			: undefined;
+	return { label: result.label, at: decidedAt, ...(reason ? { reason } : {}) };
 }
 
 async function open(host: FabrialHost, destination: CardDestination): Promise<ThreadIO> {

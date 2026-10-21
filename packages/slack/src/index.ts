@@ -93,37 +93,49 @@ const createPlugin = definePlugin<
 	"slack",
 	ReturnType<typeof chatEvents>,
 	{ slack: WebClient }
->((options) => ({
-	id: "slack",
-	init() {
-		if (!options.workspace) throw new Error("Slack requires workspace");
-		if (!options.botToken) throw new Error("Slack requires botToken");
-		if (!options.signingSecret) throw new Error("Slack requires signingSecret");
-	},
-	events: chatEvents(),
-	chat: chatCapability({
-		adapter: () => new ScopedSlackAdapter(options),
-		installationId: options.workspace,
-		history: { mode: "since-last-reply", limit: 50 },
-	}),
-	toolkit: () => ({ tools: [postTool] }),
-	clients: () => {
-		const client = new WebClient(options.botToken);
-		workspaces.set(client, options.workspace);
-		return { slack: client };
-	},
-	identity: {
-		async lookup(identity: ExternalIdentity, clients: { slack: WebClient }) {
-			if (identity.provider !== "slack" || identity.installationId !== options.workspace)
-				return undefined;
-			const { user } = await clients.slack.users.info({ user: identity.subjectId });
-			if (!user) return undefined;
-			return {
-				name: user.profile?.display_name || user.profile?.real_name || user.real_name || user.name,
-			};
+>((options) => {
+	let permalinks: WebClient | undefined;
+	return {
+		id: "slack",
+		init() {
+			if (!options.workspace) throw new Error("Slack requires workspace");
+			if (!options.botToken) throw new Error("Slack requires botToken");
+			if (!options.signingSecret) throw new Error("Slack requires signingSecret");
 		},
-	},
-}));
+		events: chatEvents(),
+		chat: chatCapability({
+			adapter: () => new ScopedSlackAdapter(options),
+			installationId: options.workspace,
+			history: { mode: "since-last-reply", limit: 50 },
+			permalink: async (thread) => {
+				// Thread ids are `slack:<channel>:<root ts>`.
+				const [, channel, ts] = thread.threadId.split(":");
+				if (!channel || !ts) return null;
+				permalinks ??= new WebClient(options.botToken);
+				const { permalink } = await permalinks.chat.getPermalink({ channel, message_ts: ts });
+				return permalink ?? null;
+			},
+		}),
+		toolkit: () => ({ tools: [postTool] }),
+		clients: () => {
+			const client = new WebClient(options.botToken);
+			workspaces.set(client, options.workspace);
+			return { slack: client };
+		},
+		identity: {
+			async lookup(identity: ExternalIdentity, clients: { slack: WebClient }) {
+				if (identity.provider !== "slack" || identity.installationId !== options.workspace)
+					return undefined;
+				const { user } = await clients.slack.users.info({ user: identity.subjectId });
+				if (!user) return undefined;
+				return {
+					name:
+						user.profile?.display_name || user.profile?.real_name || user.real_name || user.name,
+				};
+			},
+		},
+	};
+});
 
 export interface SlackFilter {
 	channel?: string;
