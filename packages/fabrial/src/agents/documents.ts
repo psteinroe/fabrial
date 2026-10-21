@@ -207,7 +207,7 @@ export async function stateDraft<T extends JsonObject>(
 		scope: "session",
 		initial: (_seed: string) => definition.initial(),
 	});
-	return tx.doc(token, "thread", "");
+	return tx.doc(token, "session", "");
 }
 
 export async function applyState<T extends JsonObject>(
@@ -222,7 +222,7 @@ export async function applyState<T extends JsonObject>(
 	value = await parseSchema(definition.schema, value, `state ${definition.name}`);
 	for (const key of Object.keys(draft)) if (!(key in value)) delete draft[key];
 	Object.assign(draft, value);
-	if (definition.scope === "thread") {
+	if (definition.scope === "session") {
 		const { revisions } = await tx.doc(StateRevisions);
 		revisions[definition.name] = (revisions[definition.name] ?? 0) + 1;
 	}

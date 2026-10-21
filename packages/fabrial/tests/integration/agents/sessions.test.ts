@@ -862,7 +862,7 @@ it("a workflow tool's result sent while its Session restarts on another instance
 it("workflows on another instance read and update a Session's state during a generation and while it waits on an approval; with its tool, nothing is lost", async () => {
 	const Counter = f.defineState({
 		name: `counter-${short()}`,
-		scope: "thread",
+		scope: "session",
 		schema: z.object({ count: z.number() }),
 		initial: () => ({ count: 0 }),
 	});

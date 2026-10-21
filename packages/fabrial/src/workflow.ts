@@ -53,7 +53,8 @@ export interface WorkflowContext<TClients = Record<string, unknown>> {
 		id: string,
 		request: EvaluateRequest<Q>,
 	): Promise<EvaluateResult<Q>>;
-	state<T extends StateValue>(state: StateDefinition<T>): WorkflowStateHandle<T>;
+	/** Session-scoped state only: agent-scoped state belongs to a conversation, which a workflow does not select. */
+	state<T extends StateValue>(state: StateDefinition<T, "session">): WorkflowStateHandle<T>;
 
 	waitForApproval(id: string, options: ApprovalOptions): Promise<ApprovalDecision>;
 	requestApproval(id: string, options: ApprovalOptions): Promise<ApprovalHandle>;

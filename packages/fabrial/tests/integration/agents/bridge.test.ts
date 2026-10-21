@@ -143,7 +143,7 @@ it("binds adapter identity, clients, sections and durable posts; commits tool st
 	const f = fixture();
 	const state = defineState({
 		name: randomUUID(),
-		scope: "thread",
+		scope: "session",
 		schema: z.object({ notes: z.array(z.string()) }),
 		initial: () => ({ notes: [] as string[] }),
 		render: (value) => value.notes.join(","),
@@ -797,7 +797,7 @@ it("workflow state needs a posted thread; an unposted channel locator is not a S
 	f.metadata.replyTo = { kind: "channel", provider: "slack-test", channelId: "C1" };
 	const state = defineState({
 		name: randomUUID(),
-		scope: "thread",
+		scope: "session",
 		schema: z.object({ value: z.string() }),
 		initial: () => ({ value: "initial" }),
 	});
@@ -820,7 +820,7 @@ it("workflow state needs a posted thread; an unposted channel locator is not a S
 const counter = () =>
 	defineState({
 		name: randomUUID(),
-		scope: "thread",
+		scope: "session",
 		schema: z.object({ count: z.number().max(100) }),
 		initial: () => ({ count: 0 }),
 	});
@@ -829,7 +829,7 @@ it("workflow state resolves by name on this instance: an unknown definition fail
 	const f = fixture();
 	const stranger = createFabrial({ plugins: [] }).defineState({
 		name: randomUUID(),
-		scope: "thread",
+		scope: "session",
 		schema: z.object({ count: z.number() }),
 		initial: () => ({ count: 0 }),
 	});

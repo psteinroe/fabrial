@@ -1,16 +1,21 @@
 import type { JsonObject } from "./json.ts";
 import type { Schema } from "./schema.ts";
 
-export type StateScope = "thread" | "agent";
+/**
+ * `"session"`: one value per Session, shared by the workflows on that Session's thread and the conversations
+ * following it; a `ctx.agent` call's tools see their own call Session's value. `"agent"`: one value per
+ * conversation, for agent tools only.
+ */
+export type StateScope = "session" | "agent";
 
 /**
  * State that agents see and change and that outlives a single step. Backed by Pi documents in the
- * thread's Pi Session (implemented in `src/agents`).
+ * Pi Session (implemented in `src/agents`).
  */
-export interface StateDefinition<T extends JsonObject = JsonObject> {
+export interface StateDefinition<T extends JsonObject = JsonObject, S extends StateScope = StateScope> {
 	readonly kind: "fabrial.state";
 	readonly name: string;
-	readonly scope: StateScope;
+	readonly scope: S;
 	readonly schema: Schema<T>;
 	readonly initial: () => T;
 	/** How agents listing this state see it in their system prompt. `undefined` omits it. */
@@ -20,15 +25,15 @@ export interface StateDefinition<T extends JsonObject = JsonObject> {
 	readonly migrate?: (old: unknown, fromVersion: number) => T;
 }
 
-export function defineState<T extends JsonObject>(definition: {
+export function defineState<T extends JsonObject, S extends StateScope>(definition: {
 	name: string;
-	scope: StateScope;
+	scope: S;
 	schema: Schema<T>;
 	initial: () => T;
 	render?: (state: T) => string | undefined;
 	version?: number;
 	migrate?: (old: unknown, fromVersion: number) => T;
-}): StateDefinition<T> {
+}): StateDefinition<T, S> {
 	return { kind: "fabrial.state", version: 1, ...definition };
 }
 
@@ -38,10 +43,10 @@ export function defineState<T extends JsonObject>(definition: {
  */
 export const definedStates = new WeakMap<object, Map<string, StateDefinition>>();
 
-export function registerState<T extends JsonObject>(
-	definition: StateDefinition<T>,
+export function registerState<T extends JsonObject, S extends StateScope>(
+	definition: StateDefinition<T, S>,
 	scope: object,
-): StateDefinition<T> {
+): StateDefinition<T, S> {
 	let states = definedStates.get(scope);
 	if (!states) definedStates.set(scope, (states = new Map()));
 	if (states.has(definition.name)) throw new Error(`State ${definition.name} is already defined`);

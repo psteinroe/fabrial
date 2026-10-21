@@ -220,7 +220,7 @@ describe("durability and context", () => {
 		});
 		const counter = defineState({
 			name: "count",
-			scope: "thread",
+			scope: "session",
 			schema: z.object({ count: z.number() }),
 			initial: () => ({ count: 0 }),
 		});
@@ -289,7 +289,7 @@ describe("durability and context", () => {
 		let initializations = 0;
 		const state = defineState({
 			name: "state",
-			scope: "thread",
+			scope: "session",
 			schema: z.object({ count: z.number() }),
 			initial: () => ({ count: ++initializations }),
 		});
@@ -682,7 +682,7 @@ describe("provider route response context", () => {
 	it("uses receipt-derived metadata for state and agents after lazy channel posts", async () => {
 		const counter = defineState({
 			name: "counter",
-			scope: "thread",
+			scope: "session",
 			schema: z.object({ count: z.number() }),
 			initial: () => ({ count: 0 }),
 		});

@@ -286,7 +286,7 @@ function connect(options: PiOptions, host: FabrialHost): ReturnType<AgentIntegra
 			throw new Error(
 				`State ${name} is not defined on this Fabrial instance; define it with defineState`,
 			);
-		if (definition.scope !== "thread")
+		if (definition.scope !== "session")
 			throw new Error(
 				`Agent state ${name} requires a Pi conversation; use it inside an agent tool`,
 			);

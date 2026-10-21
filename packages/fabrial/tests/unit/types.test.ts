@@ -1,6 +1,7 @@
 import { expectTypeOf, it } from "vitest";
 import { z } from "zod";
-import type { AgentRef, WorkflowContext } from "../../src/index.ts";
+import type { AgentRef, ToolContext, WorkflowContext } from "../../src/index.ts";
+import { defineState } from "../../src/state.ts";
 
 // Compile-only: `pnpm typecheck` checks these; the functions never run.
 
@@ -40,6 +41,25 @@ it("ctx.agent rejects mismatched usage", () => {
 		// @ts-expect-error `output` must be a Standard Schema.
 		await ctx.agent("answer", agent, { input: "x", output: "number" });
 		return [answer, text];
+	};
+	expectTypeOf(check).toBeFunction();
+});
+
+it("workflows accept session state and reject agent state", () => {
+	const schema = z.object({ count: z.number() });
+	const session = defineState({
+		name: "s",
+		scope: "session",
+		schema,
+		initial: () => ({ count: 0 }),
+	});
+	const agent = defineState({ name: "a", scope: "agent", schema, initial: () => ({ count: 0 }) });
+	const check = async (ctx: WorkflowContext, tool: ToolContext) => {
+		expectTypeOf(await ctx.state(session).get("get")).toEqualTypeOf<{ count: number }>();
+		// @ts-expect-error Agent-scoped state belongs to a conversation, which a workflow does not select.
+		ctx.state(agent);
+		expectTypeOf(await tool.state(session).get()).toEqualTypeOf<{ count: number }>();
+		expectTypeOf(await tool.state(agent).get()).toEqualTypeOf<{ count: number }>();
 	};
 	expectTypeOf(check).toBeFunction();
 });

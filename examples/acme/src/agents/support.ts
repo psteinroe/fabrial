@@ -5,7 +5,7 @@ import { runSql } from "../workflows/run-sql.ts";
 
 export const Findings = f.defineState({
 	name: "acme-findings",
-	scope: "thread",
+	scope: "session",
 	schema: z.object({ notes: z.array(z.string()) }),
 	initial: () => ({ notes: [] as string[] }),
 	render: (s) => (s.notes.length ? `Known so far:\n- ${s.notes.join("\n- ")}` : undefined),

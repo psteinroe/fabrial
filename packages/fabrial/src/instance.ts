@@ -78,18 +78,18 @@ export interface Fabrial<P extends readonly AnyPlugin[]> {
 	): Agent;
 	defineTool<TInput>(this: void, definition: ToolDefinition<TInput, ClientsOf<P>>): Tool<TInput>;
 	defineToolkit(this: void, definition: ToolkitDefinition<ClientsOf<P>>): Toolkit;
-	defineState<T extends JsonObject>(
+	defineState<T extends JsonObject, S extends StateScope>(
 		this: void,
 		definition: {
 			name: string;
-			scope: StateScope;
+			scope: S;
 			schema: Schema<T>;
 			initial: () => T;
 			render?: (state: T) => string | undefined;
 			version?: number;
 			migrate?: (old: unknown, fromVersion: number) => T;
 		},
-	): StateDefinition<T>;
+	): StateDefinition<T, S>;
 	defineGroup(
 		this: void,
 		definition: Parameters<typeof defineGroup<ClientsOf<P>>>[0],
