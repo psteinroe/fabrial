@@ -1,7 +1,8 @@
 import { expectTypeOf, it } from "vitest";
 import { z } from "zod";
-import type { AgentRef, ToolContext, WorkflowContext } from "../../src/index.ts";
-import { createFabrial } from "../../src/index.ts";
+import type { AgentRef, ToolContext } from "../../src/agents/definition.ts";
+import type { WorkflowContext } from "../../src/workflows/definition.ts";
+import { createFabrial } from "../../src/instance.ts";
 import { defineState } from "../../src/state.ts";
 
 // Compile-only: `pnpm typecheck` checks these; the functions never run.

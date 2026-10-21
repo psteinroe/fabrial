@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { createMockLogger } from "@chat-adapter/tests";
-import { connectChat, type ChatConnection } from "../../fabrial/src/chat/index.ts";
+import { connectChat, type ChatConnection } from "../../fabrial/src/chat/connection.ts";
 import type { FabrialHost } from "../../fabrial/src/app.ts";
 import type { AnyPlugin } from "../../fabrial/src/plugin.ts";
 import { vi } from "vitest";

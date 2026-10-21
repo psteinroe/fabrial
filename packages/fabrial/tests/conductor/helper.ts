@@ -12,7 +12,7 @@ import {
 	type TaskEvent,
 	type WorkflowTask,
 } from "../internals.ts";
-import { createTestClock, type TestClock } from "../../src/testing-internal.ts";
+import { createTestClock, type TestClock } from "pgconductor-js/testing";
 // Declares the `fabrialDatabaseUrl` the global setup provides, also for other packages' tests.
 import type {} from "./global-setup.ts";
 

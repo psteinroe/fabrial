@@ -1,23 +1,32 @@
-import type { Context } from "@earendil-works/chord";
-import type { TSchema } from "@earendil-works/pi-ai";
 import {
+	type AgentChange,
 	configure,
+	type ConversationId,
 	defineDoc,
 	defineTask,
-	defineTool as piTool,
-	type AgentChange,
-	type ConversationId,
 	type EntryRecord,
 	type Harness,
+	defineTool as piTool,
 	type TaskId,
 	type ToolExecutionResult,
 	type ToolRegistration,
 	type Tx,
 } from "@earendil-works/pi-durable";
-import { SUBAGENT_DEFAULTS, type Agent, type ResolvedSubagent } from "../agent.ts";
-import { BridgeKey, currentRequest, frame, type BridgeFrame } from "./context.ts";
-import { Binding, Obligations, Subagent } from "./documents.ts";
-import { newErrorId } from "./errors.ts";
+import type { Context } from "@earendil-works/chord";
+import type { TSchema } from "@earendil-works/pi-ai";
+import { type Agent, type ResolvedSubagent, SUBAGENT_DEFAULTS } from "./definition.ts";
+import { type BridgeFrame, BridgeKey, currentRequest, frame } from "./tool-context.ts";
+import { Binding, newErrorId, Obligations } from "../sessions/obligations.ts";
+
+/** A subagent's agent and the subagent levels left below it; initial on a lead conversation. */
+export const Subagent = defineDoc({
+	kind: "fabrial.subagent",
+	scope: "conversation",
+	history: "latest",
+	fork: "initial",
+	version: 1,
+	initial: (): { agent: string | null; depth: number | null } => ({ agent: null, depth: null }),
+});
 
 export interface SubagentDeps {
 	/** The Pi agent of a child running `agent` with `depth` subagent levels left below it. */

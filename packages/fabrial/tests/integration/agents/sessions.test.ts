@@ -20,11 +20,12 @@ import {
 	type Json,
 	type ThreadRef,
 } from "../../internals.ts";
-import { toolName } from "../../../src/agent.ts";
-import { callSession } from "../../../src/agents/pi.ts";
-import { PostgresStorage } from "../../../src/agents/storage.ts";
+import { toolName } from "../../../src/agents/definition.ts";
+import { callSession } from "../../../src/sessions/delivery.ts";
+import { PostgresStorage } from "../../../src/sessions/storage.ts";
 import { testClient } from "../../conductor/helper.ts";
-import { FakeChat, testApp } from "../../../src/testing-internal.ts";
+import { FakeChat } from "../../../src/testing/chat.ts";
+import { testApp } from "../../../src/testing/app.ts";
 
 /**
  * Sessions hosted in keyed Conductor executions: every case runs real Conductor, and the cross-process cases two

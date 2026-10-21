@@ -11,7 +11,8 @@ import {
 } from "../internals.ts";
 import type { AnyWorkflow, EventFilter, ExternalIdentity } from "../internals.ts";
 import postgres from "postgres";
-import { FakeChat, testApp } from "../../src/testing-internal.ts";
+import { FakeChat } from "../../src/testing/chat.ts";
+import { testApp } from "../../src/testing/app.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
 const identity = (subjectId: string): ExternalIdentity => ({

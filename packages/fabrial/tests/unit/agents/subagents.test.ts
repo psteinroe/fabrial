@@ -1,8 +1,8 @@
 import { expect, it } from "vitest";
 import { z } from "zod";
 import { createFabrial } from "../../internals.ts";
-import { resolveSubagents } from "../../../src/agent.ts";
-import { activityOf } from "../../../src/agents/pi.ts";
+import { resolveSubagents } from "../../../src/agents/definition.ts";
+import { activityOf } from "../../../src/chat/status.ts";
 import { subagentResult, subagentTool, type SubagentDeps } from "../../../src/agents/subagents.ts";
 
 const f = createFabrial({ plugins: [] });

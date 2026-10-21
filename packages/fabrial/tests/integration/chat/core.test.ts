@@ -1,4 +1,4 @@
-import { metadataOf } from "../../../src/context.ts";
+import { metadataOf } from "../../../src/workflows/metadata.ts";
 // oxlint-disable typescript/unbound-method -- Referenced adapter methods are Vitest mocks.
 import { createTestMessage } from "@chat-adapter/tests";
 import { createMemoryState } from "@chat-adapter/state-memory";
@@ -10,9 +10,9 @@ import {
 	type WorkflowContext,
 } from "../../internals.ts";
 import { z } from "zod";
-import { testApp } from "../../../src/testing-internal.ts";
+import { testApp } from "../../../src/testing/app.ts";
 import { expect, it, vi } from "vitest";
-import { chatTrigger } from "../../../src/chat/index.ts";
+import { chatTrigger } from "../../../src/routing/events.ts";
 import { setup } from "../../chat/helper.ts";
 import { until, useConductor } from "../../conductor/helper.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });

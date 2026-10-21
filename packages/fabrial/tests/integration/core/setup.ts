@@ -1,4 +1,4 @@
-import { metadataOf } from "../../../src/context.ts";
+import { metadataOf } from "../../../src/workflows/metadata.ts";
 import { afterAll, beforeEach } from "vitest";
 import postgres, { type Sql } from "postgres";
 import { z } from "zod";
@@ -21,10 +21,12 @@ import type {
 } from "../../internals.ts";
 import type { CoreConfig } from "../../../src/app.ts";
 import type { AnyPlugin } from "../../../src/plugin.ts";
-import type { ExecutionInfo } from "../../../src/workflow.ts";
+import type { ExecutionInfo } from "../../../src/workflows/definition.ts";
 import type { Fabrial } from "../../../src/instance.ts";
-import type { ScriptedModels } from "../../../src/testing.ts";
-import { FakeChat, scriptedPi, testApp } from "../../../src/testing-internal.ts";
+import type { ScriptedModels } from "../../../src/testing/models.ts";
+import { FakeChat } from "../../../src/testing/chat.ts";
+import { scriptedPi } from "../../../src/testing/models.ts";
+import { testApp } from "../../../src/testing/app.ts";
 import { testClient, until, useConductor, type ExecutionHandle } from "../../conductor/helper.ts";
 
 export const { defineState, defineWorkflow } = createFabrial({ plugins: [] });

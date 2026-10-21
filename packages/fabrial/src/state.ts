@@ -1,5 +1,83 @@
-import type { JsonObject } from "./json.ts";
-import type { Schema } from "./schema.ts";
+import {
+	type ConversationId,
+	defineDoc,
+	defineDocFamily,
+	type ToolExecutionApi,
+	type Tx,
+} from "@earendil-works/pi-durable";
+import type { Context } from "@earendil-works/chord";
+import { type JsonObject, parseSchema, type Schema } from "./schema.ts";
+
+export const ToolReceipt = defineDoc({
+	kind: "fabrial.tool-result",
+	scope: "task",
+	version: 1,
+	initial: (): { result: JsonObject | null } => ({ result: null }),
+});
+
+export async function stateDraft<T extends JsonObject>(
+	tx: Tx,
+	definition: StateDefinition<T>,
+	conversationId?: ConversationId,
+) {
+	const common = {
+		kind: `fabrial.state.${definition.name}`,
+		version: definition.version,
+		initial: definition.initial,
+		...(definition.migrate ? { migrate: definition.migrate } : {}),
+	};
+	if (definition.scope === "agent") {
+		if (!conversationId)
+			throw new Error(
+				`Agent state ${definition.name} requires a Pi conversation; use it inside an agent tool`,
+			);
+		return tx.doc(
+			defineDoc({ ...common, scope: "conversation", history: "rewindable", fork: "asOf" }),
+			conversationId,
+		);
+	}
+	const token = defineDocFamily({
+		family: true,
+		...common,
+		scope: "session",
+		initial: (_seed: string) => definition.initial(),
+	});
+	return tx.doc(token, "session", "");
+}
+
+export async function applyState<T extends JsonObject>(
+	tx: Tx,
+	definition: StateDefinition<T>,
+	conversationId: ConversationId | undefined,
+	changes: readonly ((draft: T) => void | T)[],
+): Promise<T> {
+	const draft = await stateDraft(tx, definition, conversationId);
+	let value = JSON.parse(JSON.stringify(draft)) as T;
+	for (const change of changes) value = change(value) ?? value;
+	value = await parseSchema(definition.schema, value, `state ${definition.name}`);
+	for (const key of Object.keys(draft)) if (!(key in value)) delete draft[key];
+	Object.assign(draft, value);
+	return value;
+}
+export type StagedState = {
+	definition: StateDefinition;
+	changes: ((draft: JsonObject) => void | JsonObject)[];
+	value: JsonObject;
+};
+
+export async function commitStaged(
+	api: ToolExecutionApi,
+	context: Context,
+	staged: Map<string, StagedState>,
+	change: (tx: import("@earendil-works/pi-durable").Tx) => Promise<void>,
+): Promise<void> {
+	await api.commit(async (tx) => {
+		for (const entry of staged.values())
+			if (entry.changes.length)
+				await applyState(tx, entry.definition, api.conversationId, entry.changes);
+		await change(tx);
+	}, context);
+}
 
 /**
  * `"session"`: one value per Session, shared by the tools of its conversations; a `ctx.agent` call's tools see their
@@ -9,7 +87,7 @@ export type StateScope = "session" | "agent";
 
 /**
  * State that agents see and change and that outlives a single step. Backed by Pi documents in the
- * Pi Session (implemented in `src/agents`).
+ * Pi Session (`stateDraft` below).
  */
 export interface StateDefinition<
 	T extends JsonObject = JsonObject,

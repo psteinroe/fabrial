@@ -1,4 +1,4 @@
-import { metadataOf } from "../../../src/context.ts";
+import { metadataOf } from "../../../src/workflows/metadata.ts";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
@@ -8,7 +8,7 @@ import {
 	type JsonObject,
 	type WorkflowContext,
 } from "../../internals.ts";
-import { reply, scriptedModels } from "../../../src/testing.ts";
+import { reply, scriptedModels } from "../../../src/testing/models.ts";
 import { until } from "../../conductor/helper.ts";
 import {
 	alice,

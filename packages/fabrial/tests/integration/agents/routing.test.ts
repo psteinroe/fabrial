@@ -21,7 +21,7 @@ import {
 	type ExternalIdentity,
 	type JsonObject,
 } from "../../internals.ts";
-import { FakeChat } from "../../../src/testing.ts";
+import { FakeChat } from "../../../src/testing/chat.ts";
 import { useAgents } from "./setup.ts";
 
 const { sql, launch, idle, routed } = useAgents();

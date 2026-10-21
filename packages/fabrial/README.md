@@ -406,6 +406,20 @@ Each model request consumes the next step; `model.calls` counts requests. Spy on
 
 This section is for contributors. None of it is API.
 
+### Source layout
+
+`src` is organized by capability. Modules import the concrete files they use; there are no internal barrels.
+
+- **Entry points:** `index.ts` (`fabrial`), `plugin.ts` (`fabrial/plugin`: the plugin definition and its exports), `testing.ts` (`fabrial/testing`), and `testing/internal.ts` (the dev-only `fabrial/internal/testing`).
+- **Composition:** `instance.ts` (typed definition factories), `app.ts` (configuration, the host, task registration, HTTP dispatch, start and stop), `conductor.ts` (the client, tasks and Orchestrator), `execution.ts` (results, child calls, durations), `schema.ts` (Standard Schema, JSON Schema conversion, JSON types), `models.ts` (credential-backed models, model names, `ctx.evaluate`), `identity.ts` (users, groups, the directory), and `state.ts` (state definitions, their Pi documents, staged tool state).
+- **`workflows/`:** `definition.ts` (definitions and their Conductor tasks), `context.ts` (the attempt middleware adding Fabrial's fields and policy, plugin middleware), `metadata.ts` (invocation metadata).
+- **`routing/`:** `events.ts` (events, triggers, filter matching, chat events), `route.ts` (ingress and the `fabrial.route` workflow), `follows.ts` (follow records and the locked routing-state update).
+- **`agents/`:** `definition.ts`, `registry.ts` (compiles agents, toolkits, tools and instructions into one Pi registry), `tools.ts`, `tool-context.ts`, `subagents.ts`.
+- **`sessions/`:** `host.ts` (the keyed `fabrial.session` host loop), `delivery.ts` (Session keys, input rendering, `ctx.send`, `ctx.agent`), `obligations.ts` (request bindings, replies, call outcomes, stops, error replies), `workflows.ts` (workflow and effect children, the reporter), `storage.ts` (Pi's Postgres storage), `reclaim.ts`.
+- **`approvals/`:** `request.ts`, `decision.ts`, `authorization.ts` (click and reject-modal handling), `delivery.ts` (one execution per card, and the all-unreachable monitor), `cards.ts`.
+- **`chat/`:** `connection.ts`, `ingress.ts`, `messages.ts` (surfaces, posting, history, literal cards), `status.ts` (throttled status and progress).
+- **`testing/`:** `app.ts`, `chat.ts` (`FakeChat`), `models.ts` (scripted models).
+
 ### Durable runtime (Conductor)
 
 Core uses PG Conductor directly (`src/conductor.ts`): `app.start()` creates the app's Conductor client, one task per workflow on the app's queue (triggers, cron, retention, concurrency, the attempt middleware), and the Orchestrator, which migrates Postgres and starts workers. Building the app is side-effect free. Handlers replay from the top after suspension. Explicit operation keys address saved steps and waits; a repeated key is the same operation. The pool is the instance's; Conductor does not own it. Keep the queue's workflow catalog consistent across instances. Durable wait deadlines use Postgres's clock.
@@ -438,7 +452,7 @@ Authorized decisions are emitted with a dedupe key. The decision execution subsc
 
 ### Agent sessions (Pi)
 
-`src/agents` runs agents on Pi Durable. `app.start()` migrates the `fabrial_pi` schema under a transactional advisory lock, builds the registry, and rejects missing live task kinds before admitting work.
+`src/agents` and `src/sessions` run agents on Pi Durable. `app.start()` migrates the `fabrial_pi` schema under a transactional advisory lock, builds the registry, and rejects missing live task kinds before admitting work.
 
 **Storage and leases.** A Session is a Postgres commit log plus Pi's native `MemoryStorage` materializer. Pi validates transactions, documents, forks, copies, ancestry, and rewind reads; Postgres atomically persists the detached, validated write batch before adoption. The log stores JSON text, not jsonb, because Pi permits lone-surrogate strings that jsonb cannot represent. Reopening replays the log. There is no log compaction or indexed read path yet; memory and startup cost grow with Session history.
 
@@ -475,7 +489,7 @@ State uses Pi documents: a thread family per Session and rewindable, forkable co
 
 ### Chat (Chat SDK)
 
-`src/chat` connects one Chat SDK bot to all chat-capable plugins, with Postgres state on the instance's database. It supports reconstructed threads, lazy channel roots, DMs, ephemeral messages, text/Markdown/cards, edited messages, best-effort throttled progress, attributed bounded history, and routing state under `thread.state.fabrial`. Consumers hold the SDK's own `Chat` and `Thread`; `src/chat/threads.ts` adds Fabrial's semantics on them. `updateRoutingState(chat, thread, fn)` is an atomic read-modify-write (the SDK's `setState` is read/merge/write) under the state adapter's token-owned per-thread lock; all routing-state writers use it. Lock contention retries for at most 10 seconds; leases last 60 seconds and are checked and renewed before writing, with release in `finally`. Keep callbacks pure, since a lost lease can retry them. State writes refresh a 30-day TTL. Card action ids and values are forwarded unchanged to core.
+`src/chat` connects one Chat SDK bot to all chat-capable plugins, with Postgres state on the instance's database. It supports reconstructed threads, lazy channel roots, DMs, ephemeral messages, text/Markdown/cards, edited messages, best-effort throttled progress, attributed bounded history, and routing state under `thread.state.fabrial`. Consumers hold the SDK's own `Chat` and `Thread`; `src/chat/messages.ts` and `src/chat/status.ts` add Fabrial's posting and status semantics on them, and `src/routing/follows.ts` the routing state. `updateRoutingState(chat, thread, fn)` is an atomic read-modify-write (the SDK's `setState` is read/merge/write) under the state adapter's token-owned per-thread lock; all routing-state writers use it. Lock contention retries for at most 10 seconds; leases last 60 seconds and are checked and renewed before writing, with release in `finally`. Keep callbacks pure, since a lost lease can retry them. State writes refresh a 30-day TTL. Card action ids and values are forwarded unchanged to core.
 
 Start and stop map to SDK initialize and shutdown. Local SDK concurrency slots serialize arrivals without coalescing. Webhook ingress disables the SDK's pre-dispatch dedupe so failed durable ingress can be retried; core receives a stable platform message or action dedupe id. Channel surfaces stay provisional until the first post and cannot store routing state until then.
 

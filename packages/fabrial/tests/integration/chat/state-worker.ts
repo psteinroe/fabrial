@@ -1,8 +1,9 @@
 // Each child owns an independent Chat instance and Postgres pool (no shared JS mutex).
 import { createPostgresState } from "@chat-adapter/state-pg";
 import { Chat, type Adapter } from "chat";
-import { ChatConnection, updateRoutingState, type SDKState } from "../../../src/chat/threads.ts";
-import { chatCapability } from "../../../src/chat/events.ts";
+import { ChatConnection, type SDKState } from "../../../src/chat/connection.ts";
+import { updateRoutingState } from "../../../src/routing/follows.ts";
+import { chatCapability } from "../../../src/plugin.ts";
 
 const state = createPostgresState({ url: process.env.STATE_URL! });
 const adapter = {

@@ -1,6 +1,6 @@
 import { testClient } from "../../conductor/helper.ts";
-import { updateRoutingState } from "../../../src/chat/index.ts";
-import type { AnyWorkflow } from "../../../src/workflow.ts";
+import { updateRoutingState } from "../../../src/routing/follows.ts";
+import type { AnyWorkflow } from "../../../src/workflows/definition.ts";
 import { until } from "../../conductor/helper.ts";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
@@ -17,8 +17,9 @@ import {
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { createModels } from "@earendil-works/pi-ai/models";
 import postgres, { type Sql } from "postgres";
-import { PostgresStorage } from "../../../src/agents/storage.ts";
-import { FakeChat, sessionSignals, testApp } from "../../../src/testing-internal.ts";
+import { PostgresStorage } from "../../../src/sessions/storage.ts";
+import { FakeChat } from "../../../src/testing/chat.ts";
+import { sessionSignals, testApp } from "../../../src/testing/app.ts";
 import { useConductor } from "../../conductor/helper.ts";
 
 // App-level runs on real Conductor and real time: instances, follow records.

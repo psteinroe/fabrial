@@ -1,5 +1,5 @@
-import { metadataOf } from "../../../src/execution.ts";
-import { connectChat } from "../../../src/chat/index.ts";
+import { metadataOf } from "../../../src/workflows/metadata.ts";
+import { connectChat } from "../../../src/chat/connection.ts";
 import { randomUUID } from "node:crypto";
 import type { Message, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -16,11 +16,12 @@ import {
 	type WorkflowTask,
 	type ToolCall,
 } from "../../internals.ts";
-import { FakeChat } from "../../../src/testing.ts";
+import { FakeChat } from "../../../src/testing/chat.ts";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
-import { callSession, connectAgents } from "../../../src/agents/pi.ts";
-import { PostgresStorage } from "../../../src/agents/storage.ts";
+import { callSession } from "../../../src/sessions/delivery.ts";
+import { connectAgents } from "../../../src/sessions/host.ts";
+import { PostgresStorage } from "../../../src/sessions/storage.ts";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { until } from "../../conductor/helper.ts";
 import { useAgents } from "./setup.ts";

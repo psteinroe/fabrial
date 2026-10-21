@@ -1,4 +1,4 @@
-import { childMetadata, metadataOf } from "../../../src/execution.ts";
+import { childMetadata, metadataOf } from "../../../src/workflows/metadata.ts";
 import { expect, test } from "vitest";
 import type { InvocationMetadata, Json, WorkflowTask } from "../../internals.ts";
 import { until, useConductor } from "../../conductor/helper.ts";

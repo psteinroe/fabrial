@@ -3,7 +3,9 @@ import { createMemoryState } from "@chat-adapter/state-memory";
 import type { ChatInstance, StateAdapter } from "chat";
 import type { FabrialHost, ThreadRoutingState } from "../internals.ts";
 import { vi } from "vitest";
-import { chatCapability, chatEvents, connectChat } from "../../src/chat/index.ts";
+import { chatCapability } from "../../src/plugin.ts";
+import { chatEvents } from "../../src/routing/events.ts";
+import { connectChat } from "../../src/chat/connection.ts";
 
 export const routingFixture: ThreadRoutingState = {
 	ingestedDedupeIds: [{ kind: "message", id: "message-1", at: 1 }],

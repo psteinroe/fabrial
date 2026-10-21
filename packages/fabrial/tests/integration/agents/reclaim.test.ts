@@ -1,4 +1,4 @@
-import { connectChat } from "../../../src/chat/index.ts";
+import { connectChat } from "../../../src/chat/connection.ts";
 import { randomUUID } from "node:crypto";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
@@ -14,9 +14,10 @@ import {
 	type InvocationMetadata,
 	type WorkflowTask,
 } from "../../internals.ts";
-import { FakeChat } from "../../../src/testing.ts";
-import { callSession, connectAgents, type PiOptions } from "../../../src/agents/pi.ts";
-import { PostgresStorage } from "../../../src/agents/storage.ts";
+import { FakeChat } from "../../../src/testing/chat.ts";
+import { callSession } from "../../../src/sessions/delivery.ts";
+import { connectAgents, type PiOptions } from "../../../src/sessions/host.ts";
+import { PostgresStorage } from "../../../src/sessions/storage.ts";
 import { until } from "../../conductor/helper.ts";
 import { useAgents } from "./setup.ts";
 

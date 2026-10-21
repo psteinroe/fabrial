@@ -1,30 +1,35 @@
+import type { AnyPlugin, PluginClients, ToolkitPlugin } from "./plugin.ts";
+import type { ModelCredentials } from "./models.ts";
+import { defineGroup, type GroupDefinition, type UserDefinition } from "./identity.ts";
 import {
+	type AnyWorkflow,
+	defineWorkflow,
+	type Workflow,
+	type WorkflowDefinition,
+} from "./workflows/definition.ts";
+import {
+	type Agent,
+	type AgentDefinition,
 	defineAgent,
 	defineTool,
 	defineToolkit,
-	type Agent,
-	type AgentDefinition,
 	type Tool,
 	type ToolDefinition,
 	type Toolkit,
 	type ToolkitDefinition,
-} from "./agent.ts";
-import type { App, CoreConfig, HostedApp, Logger } from "./app.ts";
-import type { ModelCredentials } from "./models.ts";
-import { buildApp } from "./core.ts";
-import { defineGroup, type GroupDefinition, type UserDefinition } from "./identity.ts";
-import type { JsonObject } from "./json.ts";
-import type { AnyPlugin, PluginClients, ToolkitPlugin } from "./plugin.ts";
-import { production, type ProductionOverrides } from "./production.ts";
-import { defineState, registerState, type StateDefinition, type StateScope } from "./state.ts";
-import type { Schema } from "./schema.ts";
-import type { TriggerSpec } from "./trigger.ts";
+} from "./agents/definition.ts";
 import {
-	defineWorkflow,
-	type AnyWorkflow,
-	type Workflow,
-	type WorkflowDefinition,
-} from "./workflow.ts";
+	type App,
+	buildApp,
+	type CoreConfig,
+	type HostedApp,
+	type Logger,
+	production,
+	type ProductionOverrides,
+} from "./app.ts";
+import type { JsonObject, Schema } from "./schema.ts";
+import type { TriggerSpec } from "./routing/events.ts";
+import { defineState, registerState, type StateDefinition, type StateScope } from "./state.ts";
 
 type UnionToIntersection<U> = (U extends unknown ? (value: U) => void : never) extends (
 	value: infer I,

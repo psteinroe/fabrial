@@ -1,5 +1,5 @@
-import { connectChat } from "../../../src/chat/index.ts";
-import { metadataOf } from "../../../src/context.ts";
+import { connectChat } from "../../../src/chat/connection.ts";
+import { metadataOf } from "../../../src/workflows/metadata.ts";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Context as TranscriptContext } from "@earendil-works/pi-ai";
@@ -24,12 +24,13 @@ import {
 	type TaskEvent,
 	type WorkflowTask,
 } from "../../internals.ts";
-import { toolName } from "../../../src/agent.ts";
-import { callSession, connectAgents } from "../../../src/agents/pi.ts";
+import { toolName } from "../../../src/agents/definition.ts";
+import { callSession } from "../../../src/sessions/delivery.ts";
+import { connectAgents } from "../../../src/sessions/host.ts";
 import type { ExternalIdentity } from "../../../src/identity.ts";
-import { FakeChat } from "../../../src/testing.ts";
+import { FakeChat } from "../../../src/testing/chat.ts";
 import { until } from "../../conductor/helper.ts";
-import { PostgresStorage } from "../../../src/agents/storage.ts";
+import { PostgresStorage } from "../../../src/sessions/storage.ts";
 import { useAgents } from "./setup.ts";
 
 const definitions = createFabrial({ plugins: [] });

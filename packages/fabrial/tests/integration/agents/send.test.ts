@@ -1,4 +1,4 @@
-import type { FakeChat } from "../../../src/testing.ts";
+import type { FakeChat } from "../../../src/testing/chat.ts";
 import { randomUUID } from "node:crypto";
 import { createModels } from "@earendil-works/pi-ai/models";
 import type { Message } from "@earendil-works/pi-ai";
@@ -26,9 +26,10 @@ import {
 	type Json,
 	type JsonObject,
 } from "../../internals.ts";
-import { PostgresStorage } from "../../../src/agents/storage.ts";
-import { Conversations, Invocation, Obligations } from "../../../src/agents/documents.ts";
-import { WAITING_STATUS } from "../../../src/agents/errors.ts";
+import { PostgresStorage } from "../../../src/sessions/storage.ts";
+import { Conversations } from "../../../src/sessions/host.ts";
+import { Invocation, Obligations } from "../../../src/sessions/obligations.ts";
+import { WAITING_STATUS } from "../../../src/chat/status.ts";
 import type { Logger } from "../../../src/app.ts";
 import { until } from "../../conductor/helper.ts";
 import { useAgents } from "./setup.ts";

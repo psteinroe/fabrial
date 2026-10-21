@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ChatMessage, ExternalIdentity, JsonObject } from "../internals.ts";
-import { deliveryFor, escapeXml, renderInput } from "../../src/send.ts";
+import { deliveryFor, escapeXml, renderInput } from "../../src/sessions/delivery.ts";
 
 const message = (id: string, threadId: string, text = id): ChatMessage => ({
 	provider: "chat",

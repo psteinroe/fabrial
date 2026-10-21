@@ -1,7 +1,7 @@
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { expect, expectTypeOf, it, vi } from "vitest";
 import { createFabrial, definePlugin, defineUser } from "../internals.ts";
-import { testApp } from "../../src/testing-internal.ts";
+import { testApp } from "../../src/testing/app.ts";
 import postgres from "postgres";
 
 const database = definePlugin((value: string) => ({

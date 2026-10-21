@@ -2,13 +2,10 @@
 import { createMockAdapter, createTestMessage } from "@chat-adapter/tests";
 import type { ChatInstance } from "chat";
 import { afterEach, expect, it, vi } from "vitest";
-import {
-	chatCapability,
-	chatEvents,
-	connectChat,
-	routingState,
-	updateRoutingState,
-} from "../../../src/chat/index.ts";
+import { chatCapability } from "../../../src/plugin.ts";
+import { chatEvents } from "../../../src/routing/events.ts";
+import { connectChat } from "../../../src/chat/connection.ts";
+import { routingState, updateRoutingState } from "../../../src/routing/follows.ts";
 import { routingFixture, setup } from "../../chat/helper.ts";
 
 const ref = { kind: "thread" as const, provider: "slack", threadId: "slack:C1:root" };

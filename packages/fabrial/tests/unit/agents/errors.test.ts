@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { newErrorId, sentErrorReply } from "../../../src/agents/errors.ts";
+import { newErrorId, sentErrorReply } from "../../../src/sessions/obligations.ts";
 
 describe("sentErrorReply", () => {
 	it("tells the requester to retry later when a transient error exhausted the retries", () => {

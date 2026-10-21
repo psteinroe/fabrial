@@ -11,20 +11,10 @@ import { createFabrial, type FabrialHost, type InvocationMetadata } from "../../
 import { TaskContext } from "pgconductor-js";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
-import {
-	BridgeKey,
-	cancelChildren,
-	fields,
-	registerChild,
-	type BridgeFrame,
-} from "../../../src/agents/context.ts";
-import {
-	Binding,
-	ChildIntents,
-	ChildResults,
-	Invocation,
-	Obligations,
-} from "../../../src/agents/documents.ts";
+import { BridgeKey, fields, type BridgeFrame } from "../../../src/agents/tool-context.ts";
+import { cancelChildren, registerChild } from "../../../src/sessions/workflows.ts";
+import { Binding, Invocation, Obligations } from "../../../src/sessions/obligations.ts";
+import { ChildIntents, ChildResults } from "../../../src/sessions/workflows.ts";
 const { defineWorkflow } = createFabrial({ plugins: [] });
 
 async function fixture(workflows: FabrialHost["workflows"] = []) {

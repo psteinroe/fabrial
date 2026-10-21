@@ -1,43 +1,19 @@
-import type { Context } from "@earendil-works/chord";
+// Fabrial tools, workflow tools and instructions as Pi tools and prompt sections.
 import {
-	defineTool as piTool,
 	section as piSection,
+	defineTool as piTool,
 	type PromptSection,
 	type ToolExecutionResult,
 	type ToolRegistration,
 } from "@earendil-works/pi-durable";
 import type { TSchema } from "@earendil-works/pi-ai";
-import type { Instructions, ToolDefinition, ToolResult } from "../agent.ts";
-import type { JsonObject } from "../json.ts";
-import type { Schema } from "../schema.ts";
-import { ToolReceipt } from "./documents.ts";
-import { bindMetadata, metadataOf } from "../context.ts";
-import { cloneJson, commitStaged, fields, type StagedState } from "./context.ts";
-
-/**
- * JSON Schema for the model, from the Standard JSON Schema interface (`~standard.jsonSchema`).
- * Schema libraries without it (or schemas it cannot express) are rejected when the app starts.
- */
-export function toJsonSchema(schema: Schema, label: string): Record<string, unknown> {
-	const json = jsonSchemaOf(schema, `${label}: the input schema`);
-	if (json.type !== "object") throw new Error(`${label}: the input schema must describe an object`);
-	return json;
-}
-
-/** The JSON Schema of the values `schema` accepts; it must implement Standard JSON Schema. */
-export function jsonSchemaOf(schema: Schema, label: string): Record<string, unknown> {
-	const converter = (
-		schema["~standard"] as {
-			jsonSchema?: { input(options: { target: string }): Record<string, unknown> };
-		}
-	).jsonSchema;
-	if (!converter)
-		throw new Error(
-			`${label} must implement Standard JSON Schema (~standard.jsonSchema), e.g. zod >= 4.2`,
-		);
-	const { $schema: _dialect, ...json } = converter.input({ target: "draft-07" });
-	return json;
-}
+import type { Context } from "@earendil-works/chord";
+import { type Instructions, type ToolDefinition, toolName, type ToolResult } from "./definition.ts";
+import { cloneJson, type JsonObject, toJsonSchema } from "../schema.ts";
+import { commitStaged, type StagedState, ToolReceipt } from "../state.ts";
+import { fields } from "./tool-context.ts";
+import { bindMetadata, metadataOf } from "../workflows/metadata.ts";
+import type { AnyWorkflow } from "../workflows/definition.ts";
 
 /** Strings go to the model as is; other JSON values are serialized. */
 export function toolContent(result: ToolResult): string {
@@ -120,4 +96,48 @@ export function instructionsSection(
 		},
 		{ tag: false },
 	);
+}
+
+/**
+ * The built-in `no_reply` tool of runs that answer input with a reply thread: ends the run without posting its
+ * final answer. The reason stays in the transcript as the tool call's argument.
+ */
+export function noReplyTool(): ToolRegistration {
+	return piTool({
+		name: "no_reply",
+		description:
+			"End your turn without posting a reply, e.g. for chatter that is not for you or a notification that needs no answer. Call it alone, as the only tool call of your response.",
+		parameters: {
+			type: "object",
+			properties: {
+				reason: { type: "string", description: "Why no reply is needed; not shown to anyone" },
+			},
+			additionalProperties: false,
+		} as unknown as TSchema,
+		execute: async () => ({
+			content: [{ type: "text" as const, text: "No reply posted." }],
+			control: { terminate: true },
+		}),
+	});
+}
+
+export function workflowTool(workflow: AnyWorkflow, owner: string): ToolRegistration {
+	const { input, description } = workflow.definition;
+	const native = piTool({
+		name: toolName(workflow.name),
+		description: description ?? workflow.name,
+		// Core validates the input again when the workflow starts.
+		parameters: (input
+			? toJsonSchema(input, `Workflow ${workflow.name} (a tool of ${owner})`)
+			: { type: "object", properties: {}, additionalProperties: true }) as unknown as TSchema,
+		replay: "safe",
+		// Started behind a reporter like any waited child. A failed or cancelled workflow throws its outcome: Pi gives
+		// the model the error.
+		execute: async (input, api, context) => {
+			const ctx = await fields(context, api.conversationId, api);
+			const output = await ctx.invoke("workflow", workflow, input as never);
+			return { content: [{ type: "text", text: JSON.stringify(output) }] };
+		},
+	});
+	return native;
 }

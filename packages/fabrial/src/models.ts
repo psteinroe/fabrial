@@ -6,7 +6,13 @@ import type {
 	MutableModels,
 } from "@earendil-works/pi-ai";
 import { builtinModels, builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import { parseModel } from "./agent.ts";
+
+export function parseModel(model: string): { provider: string; modelId: string } {
+	const index = model.indexOf("/");
+	if (index <= 0 || index === model.length - 1)
+		throw new Error(`Model must be "provider/model", got "${model}"`);
+	return { provider: model.slice(0, index), modelId: model.slice(index + 1) };
+}
 
 /** Credentials per model provider, e.g. `{ anthropic: { apiKey } }`. */
 export type ModelCredentials = Record<string, { apiKey: string | undefined }>;

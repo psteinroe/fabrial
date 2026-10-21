@@ -1,22 +1,18 @@
-/**
- * Fabrial's executions on PG Conductor: core creates one client per app, a task per workflow on the app's queue, and
- * the Orchestrator that runs them (README, "Boundary").
- */
 import type postgres from "postgres";
 import {
-	Conductor,
-	Orchestrator,
-	TaskSchemas,
 	type AnyTask,
+	Conductor,
 	type Logger,
 	type Middleware,
+	Orchestrator,
 	type TaskContext,
 	type TaskDefinition,
+	TaskSchemas,
 	type WorkerConfig,
 } from "pgconductor-js";
-import type { EventFilter } from "./events.ts";
-import type { Json, JsonObject } from "./json.ts";
-import type { Surface } from "./thread.ts";
+import type { EventFilter } from "./routing/events.ts";
+import type { Surface } from "./chat/messages.ts";
+import type { Json, JsonObject } from "./schema.ts";
 
 export interface ConductorConfig {
 	/** Conductor's tables live in this database; the pool stays the caller's. */

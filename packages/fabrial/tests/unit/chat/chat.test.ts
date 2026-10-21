@@ -2,20 +2,18 @@
 import { createTestMessage } from "@chat-adapter/tests";
 import { Chat, type Author } from "chat";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { actionDedupeId } from "../../../src/chat/ingress.ts";
+import { chatEvents, chatTrigger } from "../../../src/routing/events.ts";
+import { connectChat } from "../../../src/chat/connection.ts";
 import {
-	actionDedupeId,
-	chatEvents,
-	connectChat,
 	editMessage,
 	fetchHistory,
 	postMessage,
 	postTo,
-	routingState,
-	updateRoutingState,
-	chatTrigger,
-	REJECT_MODAL,
 	renderMessage,
-} from "../../../src/chat/index.ts";
+} from "../../../src/chat/messages.ts";
+import { routingState, updateRoutingState } from "../../../src/routing/follows.ts";
+import { REJECT_MODAL } from "../../../src/approvals/authorization.ts";
 import { routingFixture, setup } from "../../chat/helper.ts";
 
 const ref = { kind: "thread" as const, provider: "slack", threadId: "slack:C1:root-1" };

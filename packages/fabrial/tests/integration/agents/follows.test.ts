@@ -19,7 +19,7 @@ import {
 	type JsonObject,
 	type ThreadRoutingState,
 } from "../../internals.ts";
-import { FakeChat } from "../../../src/testing.ts";
+import { FakeChat } from "../../../src/testing/chat.ts";
 import { github } from "../../../../github/src/index.ts";
 import { deliver, outsider, webhooks } from "../../../../github/tests/webhooks.ts";
 import { until } from "../../conductor/helper.ts";

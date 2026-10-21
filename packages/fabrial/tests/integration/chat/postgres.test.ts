@@ -4,7 +4,7 @@ import { createPostgresState } from "@chat-adapter/state-pg";
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { expect, it } from "vitest";
 import { routingFixture as fixture, setup } from "../../chat/helper.ts";
-import { routingState, updateRoutingState } from "../../../src/chat/index.ts";
+import { routingState, updateRoutingState } from "../../../src/routing/follows.ts";
 
 it("persists thread routing state and subscription through a Postgres-backed restart", async () => {
 	const container = await new PostgreSqlContainer("postgres:17-alpine").start();

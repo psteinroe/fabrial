@@ -1,8 +1,9 @@
 import postgres, { type Sql } from "postgres";
 import { afterAll, afterEach, beforeAll } from "vitest";
 import type { HostedApp } from "../../../src/app.ts";
-import { PostgresStorage } from "../../../src/agents/storage.ts";
-import { FakeChat, testApp } from "../../../src/testing-internal.ts";
+import { PostgresStorage } from "../../../src/sessions/storage.ts";
+import { FakeChat } from "../../../src/testing/chat.ts";
+import { testApp } from "../../../src/testing/app.ts";
 import { testClient, until, useConductor } from "../../conductor/helper.ts";
 
 type Config = Parameters<typeof testApp>[1];

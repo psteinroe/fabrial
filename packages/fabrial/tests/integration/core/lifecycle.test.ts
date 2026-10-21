@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AnyTask, Conductor, TaskContext } from "pgconductor-js";
-import { metadataOf } from "../../../src/context.ts";
+import { metadataOf } from "../../../src/workflows/metadata.ts";
 import { ExecutionError, startAndWait } from "../../../src/execution.ts";
 import { trigger, type Json, type JsonObject } from "../../internals.ts";
 import { until } from "../../conductor/helper.ts";

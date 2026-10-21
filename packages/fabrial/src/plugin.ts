@@ -1,11 +1,12 @@
-import type { EmitOptions, EventDefinition, InferEventPayload, Origin } from "./events.ts";
+// `fabrial/plugin`: what plugin authors add to the root API (events, routes, chat adapters, hooks).
+import type { Adapter, Message, Thread } from "chat";
+import type { EmitOptions, EventDefinition, InferEventPayload, Origin } from "./routing/events.ts";
 import type { ExternalIdentity } from "./identity.ts";
-import type { Adapter } from "chat";
-import type { AgentObservers, Instructions, ToolDefinition } from "./agent.ts";
-import type { WorkflowMiddleware } from "./workflow.ts";
-import type { Json, JsonObject } from "./json.ts";
-import type { InputPriority } from "./send.ts";
-import type { ThreadRef } from "./thread.ts";
+import type { WorkflowMiddleware } from "./workflows/definition.ts";
+import type { AgentObservers, Instructions, ToolDefinition } from "./agents/definition.ts";
+import type { Json, JsonObject } from "./schema.ts";
+import type { InputPriority } from "./sessions/delivery.ts";
+import type { ThreadRef } from "./chat/messages.ts";
 
 /** Context passed to a plugin's HTTP route handlers. */
 export interface RouteContext<TEvents extends Record<string, EventDefinition<any>>, TClients> {
@@ -209,3 +210,23 @@ export type ResourceRefJson = {
 	type: string;
 	ref: Json;
 };
+export { defineEvent, type EventDefinition, type InferEventPayload } from "./routing/events.ts";
+export { trigger } from "./routing/events.ts";
+export { chatEvents, chatTrigger } from "./routing/events.ts";
+export { chatIdentity } from "./identity.ts";
+export { literalCard } from "./chat/messages.ts";
+export type { AgentObservers, ModelResponse, ToolCall } from "./agents/definition.ts";
+export type { ExecutionInfo, WorkflowMiddleware } from "./workflows/definition.ts";
+
+export interface ChatPluginCapability extends ChatCapability {
+	/** Override root detection for adapters whose thread ids do not end in the root message id. */
+	isNewThread?: (thread: Thread, message: Message) => boolean;
+	/** Use an edited status post when the platform has no meaningful typing/status API. */
+	status?: "typing" | "message";
+	/** A link to a thread, shown on approval cards as their source. */
+	permalink?: (thread: ThreadRef) => Promise<string | null>;
+}
+
+export function chatCapability(options: ChatPluginCapability): ChatPluginCapability {
+	return options;
+}

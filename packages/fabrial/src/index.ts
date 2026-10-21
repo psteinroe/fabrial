@@ -25,17 +25,22 @@ export type {
 	ToolkitDefinition,
 	ToolResult,
 	ToolThread,
-} from "./agent.ts";
+} from "./agents/definition.ts";
 export type { ModelCredentials } from "./models.ts";
 export type {
 	ApprovalDecision,
 	ApprovalHandle,
 	ApprovalOptions,
 	DecisionStatus,
-} from "./approval.ts";
+} from "./approvals/request.ts";
 export type { EvaluateRequest } from "./models.ts";
-export type { EmitOptions, EventFilter, FilterAlternative, Origin } from "./events.ts";
-export type { ConversationRef, FollowOptions, FollowReceipt, UnfollowReceipt } from "./follows.ts";
+export type { EmitOptions, EventFilter, FilterAlternative, Origin } from "./routing/events.ts";
+export type {
+	ConversationRef,
+	FollowOptions,
+	FollowReceipt,
+	UnfollowReceipt,
+} from "./routing/follows.ts";
 export {
 	defineGroup,
 	defineUser,
@@ -46,9 +51,9 @@ export {
 	type Principal,
 	type UserDefinition,
 } from "./identity.ts";
-export type { Json, JsonObject } from "./json.ts";
+export type { Json, JsonObject } from "./schema.ts";
 export type { ResourceRef } from "./plugin.ts";
-export type { AgentRef, AgentResult, AgentRunOptions } from "./agent.ts";
+export type { AgentRef, AgentResult, AgentRunOptions } from "./agents/definition.ts";
 export { ExecutionError, type ExecutionResult } from "./execution.ts";
 export { SchemaValidationError, type InferOutput, type Schema } from "./schema.ts";
 export type {
@@ -58,7 +63,7 @@ export type {
 	SendOptions,
 	SendReceipt,
 	SessionOption,
-} from "./send.ts";
+} from "./sessions/delivery.ts";
 export type { StateDefinition, StateScope, ToolStateHandle } from "./state.ts";
 export type {
 	Card,
@@ -69,9 +74,9 @@ export type {
 	Surface,
 	Thread,
 	ThreadRef,
-} from "./thread.ts";
-export type { TriggerPayload, TriggerSpec } from "./trigger.ts";
-export type { ChatEventName, ChatEventPayload } from "./chat/events.ts";
+} from "./chat/messages.ts";
+export type { TriggerPayload, TriggerSpec } from "./routing/events.ts";
+export type { ChatEventName, ChatEventPayload } from "./routing/events.ts";
 export type {
 	AnyWorkflow,
 	Workflow,
@@ -80,4 +85,4 @@ export type {
 	WorkflowDefinition,
 	WorkflowInput,
 	WorkflowOutput,
-} from "./workflow.ts";
+} from "./workflows/definition.ts";

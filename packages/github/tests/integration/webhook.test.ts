@@ -1,4 +1,4 @@
-import { metadataOf } from "../../../fabrial/src/context.ts";
+import { metadataOf } from "../../../fabrial/src/workflows/metadata.ts";
 import { createHmac } from "node:crypto";
 import { GitHubAdapter } from "@chat-adapter/github";
 import { createFabrial, type WorkflowContext } from "fabrial";
