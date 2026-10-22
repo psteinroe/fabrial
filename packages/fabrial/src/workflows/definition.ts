@@ -32,8 +32,11 @@ export function workflowTask(
 		concurrency: workflow.definition.concurrency,
 		retries: workflow.definition.retries,
 		attempt,
-		handler: async (input, ctx) => {
-			const output = await workflow.definition.run(input, ctx as unknown as WorkflowContext);
+		handler: async (input, raw, tick) => {
+			const ctx = raw as unknown as WorkflowContext;
+			// A static cron tick carries no metadata: it replies where its trigger says.
+			if (tick?.replyTo) await ctx.fabrial.replyTo(tick.replyTo);
+			const output = await workflow.definition.run(input, ctx);
 			// The output schema validates (and transforms) the result before the run records it.
 			const label = `workflow ${workflow.name} output`;
 			if (workflow.definition.output)
@@ -44,7 +47,7 @@ export function workflowTask(
 }
 
 /** Conductor's context methods Fabrial wraps (typed for Fabrial workflows below) or keeps to itself. */
-type WrappedNative = Exclude<keyof Native, "waitForAny">;
+type WrappedNative = keyof Native;
 
 /** Fabrial's override of a child's metadata: merged onto this execution's (routing-only fields cleared). */
 type ChildMetadata =
@@ -102,6 +105,8 @@ export interface WorkflowContext<TClients = Record<string, unknown>> extends Omi
 		executionId: string,
 		options?: { timeout?: string | number },
 	): Promise<ExecutionOutcome<JsonObject | null> | { status: "timeout" }>;
+	/** Conductor `waitForAny`: the first branch to win; execution and signal branches are kept under `key`. */
+	waitForAny: TaskContext["waitForAny"];
 	schedule<W extends AnyWorkflow>(
 		workflow: W,
 		name: string,
@@ -164,6 +169,8 @@ export interface WorkflowContext<TClients = Record<string, unknown>> extends Omi
 	readonly fabrial: {
 		readonly native: Native;
 		readonly metadata: InvocationMetadata;
+		/** Points `thread` (and `replyTo`) at `surface`: a static cron tick's destination. */
+		replyTo(surface: Surface): Promise<void>;
 	};
 }
 

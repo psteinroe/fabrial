@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { defineGroup, definePlugin, defineUser } from "../../internals.ts";
+import { defineGroup, definePlugin, defineUser, trigger } from "../../internals.ts";
 import type { Json, WorkflowContext } from "../../internals.ts";
 import { until } from "../../conductor/helper.ts";
+import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
+import { production } from "../../../src/app.ts";
+import { scriptedModels, scriptedPi } from "../../../src/testing/models.ts";
 import {
 	alice,
 	approvalWorkflow,
@@ -9,6 +12,7 @@ import {
 	event,
 	identity,
 	message,
+	once,
 	outsider,
 	plugin,
 	source,
@@ -65,6 +69,93 @@ const cardOf = (content: unknown) =>
 	(content as { card: { text?: string; actions: { id: string }[] } }).card;
 
 describe("approvals", () => {
+	it("an approval's wait never reads a user step whose key looks like one Fabrial or Conductor derives", async () => {
+		const test = setup([
+			workflow(async (_input, ctx) => {
+				await ctx.step("approval:decision", () => ({ unrelated: true }));
+				await ctx.step("race:decision", () => ({ unrelated: true }));
+				const decision = await ctx.waitForApproval("approval", {
+					title: "Run SQL?",
+					details: "select 1",
+					approvers: team,
+				});
+				const approval = await ctx.requestApproval("race", {
+					title: "Run SQL?",
+					details: "select 1",
+					approvers: team,
+				});
+				const winner = await ctx.waitForAny("race", { decision: approval.branch });
+				if (winner.key !== "decision" || !("outcome" in winner)) return "lost";
+				return [decision.status, winner.outcome.status];
+			}),
+		]);
+		const owner = await enter(test);
+		const first = await card(test);
+		await test.chat.click(first.post.ref, first.approve, alice.identities[0]!, {
+			dedupeId: "click-1",
+		});
+		const dm = await test.chat.openDM(alice.identities[0]!);
+		const second = await until("the second approval card", async () => dm.posts[1]);
+		await test.chat.click(second.ref, cardOf(second.content).actions[0]!.id, alice.identities[0]!, {
+			dedupeId: "click-2",
+		});
+		expect(await owner.output()).toEqual(["approved", "completed"]);
+	});
+
+	it("under production's worker defaults, a Session in a long model call doesn't hold up an approval", async () => {
+		// What the Orchestrator runs with in production: Conductor's defaults under production()'s settings.
+		const conductorDefaults = {
+			concurrency: 1,
+			flushBatchSize: 2,
+			fetchBatchSize: 2,
+			pollIntervalMs: 1000,
+			flushIntervalMs: 2000,
+		};
+		const worker = {
+			...conductorDefaults,
+			...production({ database: undefined, models: {} }).conductor.worker,
+		};
+		const models = scriptedModels();
+		const slow = fauxProvider({ provider: "slow", models: [{ id: "model" }] });
+		scriptedPi.get(models)!.setProvider(slow.provider);
+		const held = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		slow.setResponses([
+			async () => {
+				held.resolve();
+				await release.promise;
+				return fauxAssistantMessage("done");
+			},
+		]);
+		const test = setup(
+			(f) => {
+				const agent = f.defineAgent({ name: "slow", description: "Thinks.", model: "slow/model" });
+				return [
+					approvalWorkflow(),
+					f.defineWorkflow({
+						name: "thinking",
+						triggers: [trigger({ event: "source.ping" })],
+						retries: once,
+						run: async (_input, ctx) => ({
+							answer: await ctx.agent("think", agent, { input: "?" }),
+						}),
+					}),
+				];
+			},
+			{ models, worker },
+		);
+		await test.app.start();
+		await test.app.emit("source.ping", {});
+		await held.promise;
+		await test.chat.receive(message("initial"));
+		const owner = await test.execution();
+		const c = await card(test);
+		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!, { dedupeId: "click" });
+		expect(await owner.output()).toBe("approved");
+		release.resolve();
+		expect(await (await test.execution("thinking")).output()).toEqual({ answer: "done" });
+	});
+
 	it.each(["approved", "rejected"])("handles %s and duplicate clicks", async (status) => {
 		const test = setup([approvalWorkflow()]);
 		const owner = await enter(test);

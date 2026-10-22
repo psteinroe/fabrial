@@ -26,6 +26,7 @@ import {
 	type Logger,
 	production,
 	type ProductionOverrides,
+	type WorkerOptions,
 } from "./app.ts";
 import type { JsonObject, Schema } from "./schema.ts";
 import type { TriggerSpec } from "./routing/events.ts";
@@ -57,6 +58,12 @@ export interface FabrialConfig<P extends readonly AnyPlugin[] = readonly AnyPlug
 	plugins: P;
 	/** Known users; groups are referenced where they're used. */
 	identity?: readonly UserDefinition[];
+	/**
+	 * Executions one process runs at once and how fast it polls and settles them. Defaults: concurrency 16, poll
+	 * 200 ms, flush 100 ms, fetch batch 16, flush batch 32. Every running execution (a Session's model call, a
+	 * routed message or click, a card post) holds a slot; add processes for more.
+	 */
+	worker?: WorkerOptions;
 }
 
 export interface AppConfig {
@@ -127,7 +134,7 @@ export function createFabrial<const P extends readonly AnyPlugin[]>(
 			sql && agents
 				? { conductor: { ...conductor, sql }, chat, agents }
 				: production(
-						{ database: config.database, models: config.models ?? {} },
+						{ database: config.database, models: config.models ?? {}, worker: config.worker },
 						{ ...settings, conductor },
 					);
 		return buildApp({

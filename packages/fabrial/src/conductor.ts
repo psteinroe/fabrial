@@ -36,8 +36,8 @@ export interface WorkflowTask {
 	name: string;
 	/** Event triggers: each matching event starts one execution, with the event's payload and metadata. */
 	triggers: { event: string; filter?: EventFilter }[];
-	/** Cron triggers; an execution's input is `{ name }`. */
-	cron?: { schedule: string; name: string; replyTo?: Surface }[];
+	/** Cron triggers; an execution's input is `{ name }`, and the handler gets the trigger as `tick`. */
+	cron?: CronTrigger[];
 	concurrency?: number;
 	retries?: { maxAttempts?: number };
 	/**
@@ -51,8 +51,17 @@ export interface WorkflowTask {
 	 * The object passed to `next` is merged onto Conductor's context (`ctx`), which reaches `handler`.
 	 */
 	attempt?: (ctx: TaskContext, next: (additions: object) => Promise<void>) => Promise<void>;
-	/** Its return value is the execution's native result (`getExecution`, result waits). */
-	handler: (input: Json, ctx: TaskContext) => Promise<Json | void>;
+	/**
+	 * Its return value is the execution's native result (`getExecution`, result waits). `tick` is the cron
+	 * trigger that started a static cron tick (which has no metadata).
+	 */
+	handler: (input: Json, ctx: TaskContext, tick?: CronTrigger) => Promise<Json | void>;
+}
+
+export interface CronTrigger {
+	schedule: string;
+	name: string;
+	replyTo?: Surface;
 }
 
 /** An event the app's tasks emit, trigger on or wait for. */
@@ -148,9 +157,15 @@ export function createConductor(
 				...(workflow.cron ?? []).map((cron) => ({ cron: cron.schedule, name: cron.name })),
 			],
 			// Input and output are what Conductor sees: the invoke or event payload, the native result.
+			// A static cron tick has no payload: its event is the trigger's name.
 			async (event, ctx) =>
-				((await workflow.handler(event.payload ?? { name: event.name }, ctx)) ??
-					null) as JsonObject,
+				((await workflow.handler(
+					event.payload ?? { name: event.name },
+					ctx,
+					event.payload === undefined
+						? workflow.cron?.find((cron) => cron.name === event.name)
+						: undefined,
+				)) ?? null) as JsonObject,
 		),
 	);
 	const orchestrator = Orchestrator.create({

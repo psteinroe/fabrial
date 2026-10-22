@@ -143,9 +143,14 @@ export function useCoreApp() {
 			models?: ScriptedModels;
 			/** Another app's queue, to run as its next deploy. */
 			queue?: string;
+			/** Replaces the test worker settings (fast polling, concurrency 8). */
+			worker?: CoreConfig["conductor"]["worker"];
 		} = {},
 	) {
-		const conductor = db.conductor(extra.queue ? { queue: extra.queue } : {});
+		const conductor = {
+			...db.conductor(extra.queue ? { queue: extra.queue } : {}),
+			...(extra.worker && { worker: extra.worker }),
+		};
 		const chat = new FakeChat();
 		const attempts: (ExecutionInfo & { metadata: InvocationMetadata })[] = [];
 		const recorder = definePlugin({
@@ -165,6 +170,7 @@ export function useCoreApp() {
 			logger,
 			models,
 			queue: _,
+			worker: __,
 			...config
 		} = extra;
 		const f = createFabrial({ plugins: [...plugins, recorder], identity: identities });

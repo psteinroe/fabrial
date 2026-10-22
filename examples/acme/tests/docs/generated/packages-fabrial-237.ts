@@ -1,4 +1,4 @@
-// Generated from packages/fabrial/README.md:235 by ../snippets.ts. Do not edit.
+// Generated from packages/fabrial/README.md:238 by ../snippets.ts. Do not edit.
 /* oxlint-disable */
 import { f, github, z } from "../prelude.ts";
 const watch = f.defineTool({

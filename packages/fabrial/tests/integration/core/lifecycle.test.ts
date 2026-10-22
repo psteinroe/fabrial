@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import type { AnyTask, Conductor, TaskContext } from "pgconductor-js";
 import { metadataOf } from "../../../src/workflows/metadata.ts";
 import { ExecutionError, startAndWait } from "../../../src/execution.ts";
@@ -10,6 +11,7 @@ import {
 	defineWorkflow,
 	metadata,
 	once,
+	surface,
 	useCoreApp,
 	workflow,
 } from "./setup.ts";
@@ -64,6 +66,64 @@ describe("registration", () => {
 		await db.execution(tick!.id).output();
 		expect(seen?.input).toEqual({ name: "tick" });
 		expect(seen?.metadata).toMatchObject({ origin: null, requestedBy: null });
+	});
+
+	it("a cron schedule's replyTo is the tick's thread", async () => {
+		const reports = { kind: "channel", provider: "chat", channelId: "reports" } as const;
+		let seen: unknown;
+		const scheduled = defineWorkflow({
+			name: "scheduled",
+			cron: [{ schedule: "* * * * *", name: "report", replyTo: reports }],
+			retries: once,
+			run: async (_input, ctx) => {
+				seen = metadataOf(ctx as never).replyTo;
+				await ctx.thread!.post("post", "Daily report");
+			},
+		});
+		const test = setup([scheduled]);
+		await test.app.start();
+		const [tick] = await db.sql<{ id: string }[]>`
+			select id from pgconductor._private_executions
+			where queue = ${test.client.queue} and task_key = 'scheduled' and cron_expression is not null`;
+		await db.sql`update pgconductor._private_executions set run_at = pgconductor._private_current_time()
+			where id = ${tick!.id}::uuid`;
+		await db.execution(tick!.id).output();
+		const posts = [...test.chat.threads.values()].flatMap((thread) =>
+			thread.posts.map((post) => [thread.channelId, post.content]),
+		);
+		expect(posts).toEqual([["reports", "Daily report"]]);
+		expect(seen).toEqual(reports);
+	});
+
+	it("a dynamic schedule's occurrence runs with its payload and replies where its scheduler does", async () => {
+		let seen: { input: Json; replyTo: unknown } | undefined;
+		const report = defineWorkflow({
+			name: "report",
+			input: z.object({ team: z.string() }),
+			retries: once,
+			run: async (input, ctx) => {
+				seen = { input, replyTo: metadataOf(ctx as never).replyTo };
+				await ctx.thread!.post("post", "Weekly report");
+			},
+		});
+		const test = setup([
+			workflow(async (_input, ctx) => {
+				await ctx.schedule(report, "weekly", { cron: "0 9 * * 1" }, { team: "core" });
+			}),
+			report,
+		]);
+		await (await enter(test)).output();
+		const [tick] = await db.sql<{ id: string }[]>`
+			select id from pgconductor._private_executions
+			where queue = ${test.client.queue} and task_key = 'report' and dedupe_key like 'dynamic::%'`;
+		await db.sql`update pgconductor._private_executions set run_at = pgconductor._private_current_time()
+			where id = ${tick!.id}::uuid`;
+		await db.execution(tick!.id).output();
+		expect(seen).toEqual({ input: { team: "core" }, replyTo: surface });
+		const posts = [...test.chat.threads.values()].flatMap((thread) =>
+			thread.posts.map((post) => [thread.ref.threadId, post.content]),
+		);
+		expect(posts).toEqual([[surface.threadId, "Weekly report"]]);
 	});
 });
 

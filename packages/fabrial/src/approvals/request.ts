@@ -142,7 +142,7 @@ export async function createApproval(
 	id: string,
 	options: ApprovalOptions,
 	ctx: ApprovalContext,
-): Promise<ApprovalHandle> {
+): Promise<ApprovalHandle & { waitAt(stepKey: string): Promise<ApprovalDecision> }> {
 	const { host, raw, native, metadata, now } = ctx;
 	if (!host.chat()) throw new Error("Approvals require a chat integration");
 	const originatingProvider = metadata.origin?.provider ?? metadata.replyTo?.provider;
@@ -258,27 +258,29 @@ export async function createApproval(
 
 	// A wait that loses `waitForAny` leaves the decision running: the approval can be awaited again.
 	const branch = { execution: decisionId };
+	const waitAt = async (stepKey: string): Promise<ApprovalDecision> => {
+		const winner = await ctx.native.waitForAny(stepKey, { decision: branch });
+		if (!("outcome" in winner)) throw new Error("Invalid approval decision");
+		const outcome = winner.outcome;
+		if (outcome.status === "completed") {
+			const output = outcome.result as unknown as DecisionResult;
+			if ("error" in output) throw new Error(`Approval failed: ${output.error}`);
+			return output.decision;
+		}
+		if (outcome.status === "failed") throw new Error(`Approval failed: ${outcome.error}`);
+		return {
+			status: "cancelled",
+			approved: false,
+			decidedBy: null,
+			decidedAt: new Date(now()).toISOString(),
+		};
+	};
 	return {
 		approvalId,
 		approvers,
 		branch,
-		wait: async (waitId) => {
-			const winner = await ctx.native.waitForAny(ctx.op(waitId), { decision: branch });
-			if (!("outcome" in winner)) throw new Error("Invalid approval decision");
-			const outcome = winner.outcome;
-			if (outcome.status === "completed") {
-				const output = outcome.result as unknown as DecisionResult;
-				if ("error" in output) throw new Error(`Approval failed: ${output.error}`);
-				return output.decision;
-			}
-			if (outcome.status === "failed") throw new Error(`Approval failed: ${outcome.error}`);
-			return {
-				status: "cancelled",
-				approved: false,
-				decidedBy: null,
-				decidedAt: new Date(now()).toISOString(),
-			};
-		},
+		wait: (waitId) => waitAt(ctx.op(waitId)),
+		waitAt,
 		// Decides the approval unless a decision came first. A signal, not an event: it is kept for the
 		// decision execution even when that has not subscribed yet.
 		cancel: async (cancelId, reason) => {

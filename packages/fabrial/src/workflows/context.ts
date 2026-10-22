@@ -82,13 +82,17 @@ export interface ContextOptions {
 	now: () => number;
 }
 
-/** Operation keys beginning with `fabrial:` are Fabrial's; Conductor derives its own keys from a key and a suffix. */
+/**
+ * A user operation key, as stored. Fabrial and Conductor derive keys by appending `:<suffix>` (an approval's
+ * wait, race branches, a child's input), and Fabrial's own keys begin with `fabrial:`. A stored user key
+ * contains no `:` (`%` and `:` are escaped), so no derived or internal key equals one.
+ */
 function userKey(key: string): string {
 	if (!key || typeof key !== "string")
 		throw new Error("Durable operations require a non-empty explicit key");
 	if (key.startsWith("fabrial:"))
 		throw new Error("Operation keys beginning with fabrial: are reserved");
-	return key;
+	return key.replaceAll("%", "%25").replaceAll(":", "%3A");
 }
 
 /** Signals Fabrial's internal executions listen for: user code cannot send them. */
@@ -132,8 +136,7 @@ async function createContext(options: ContextOptions) {
 		}
 	};
 
-	const surface = metadata.replyTo as Surface | null;
-	const thread: Thread | undefined =
+	const threadOf = (surface: Surface | null): Thread | undefined =>
 		surface && chat
 			? {
 					get ref() {
@@ -164,6 +167,12 @@ async function createContext(options: ContextOptions) {
 						native.step(op(id), async () => (bound ? fetchHistory(chat, bound, opts) : [])),
 				}
 			: undefined;
+	// Where a static cron tick replies: its trigger's destination, bound before the workflow runs.
+	const replyTo = async (surface: Surface) => {
+		metadata.replyTo = surface as InvocationMetadata["replyTo"];
+		bound = surface.kind === "thread" && chat ? await chat.thread(surface) : undefined;
+		Object.assign(raw, { thread: threadOf(surface) });
+	};
 	/** An app workflow: internal tasks (routing, approvals, sessions, …) are not destinations for user code. */
 	const target = (workflow: AnyWorkflow | { name: string } | string) => {
 		const name = typeof workflow === "string" ? workflow : workflow.name;
@@ -209,7 +218,7 @@ async function createContext(options: ContextOptions) {
 		},
 	});
 	const additions = {
-		thread,
+		thread: threadOf(metadata.replyTo as Surface | null),
 		clients: host.clients(),
 		actor: metadata.requestedBy,
 		step: (key: string, fn: () => Promise<Json | void> | Json | void) => native.step(op(key), fn),
@@ -220,22 +229,17 @@ async function createContext(options: ContextOptions) {
 			key: string,
 			options: { event: string | { name: string }; filter?: object; timeout?: number | string },
 		) => native.waitForEvent(op(key), eventOf(options) as never),
-		// Not native.waitForResult: Conductor's calls ctx.waitForAny, which plugin middleware may wrap.
-		waitForResult: async (key: string, executionId: string, opts?: object) => {
-			const winner = await native.waitForAny(
-				op(key),
-				{ result: { execution: executionId } },
-				opts as never,
-			);
-			return winner.key === "timeout" ? { status: "timeout" } : winner.outcome;
-		},
+		waitForResult: (key: string, executionId: string, opts?: { timeout?: number | string }) =>
+			native.waitForResult(op(key), executionId, opts as never),
+		waitForAny: (key: string, branches: object, opts?: object) =>
+			native.waitForAny(op(key), branches as never, opts as never),
 		invoke: async (
 			key: string,
 			workflow: AnyWorkflow,
 			value?: Json,
 			opts?: { metadata?: unknown },
 		) =>
-			native.invoke(op(key), target(workflow).task, await input(key, workflow, value), {
+			native.invoke(op(key), target(workflow).task, await input(op(key), workflow, value), {
 				...opts,
 				metadata: childMetadata(opts?.metadata),
 			} as never),
@@ -245,7 +249,7 @@ async function createContext(options: ContextOptions) {
 			value?: Json,
 			opts?: { metadata?: unknown },
 		) =>
-			native.invokeAndWait(op(key), target(workflow).task, await input(key, workflow, value), {
+			native.invokeAndWait(op(key), target(workflow).task, await input(op(key), workflow, value), {
 				...opts,
 				metadata: childMetadata(opts?.metadata),
 			} as never),
@@ -321,16 +325,24 @@ async function createContext(options: ContextOptions) {
 				op(id),
 				async () => (await evaluate(agents.models, request, raw.signal)) as unknown as Json,
 			),
-		requestApproval: async (id: string, opts: ApprovalOptions) =>
-			createApproval(op(id), opts, { ...options, native, op }),
+		requestApproval: async (id: string, opts: ApprovalOptions) => {
+			const approval = await createApproval(op(id), opts, { ...options, native, op });
+			return {
+				approvalId: approval.approvalId,
+				approvers: approval.approvers,
+				branch: approval.branch,
+				wait: (waitId: string) => approval.wait(waitId),
+				cancel: (cancelId: string, reason: string) => approval.cancel(cancelId, reason),
+			};
+		},
 		waitForApproval: async (id: string, opts: ApprovalOptions) => {
 			const key = op(id);
 			const approval = await createApproval(key, opts, { ...options, native, op });
-			return approval.wait(`${key}:decision`);
+			return approval.waitAt(`fabrial:${key}:wait`);
 		},
 		isMember: (principal: Principal, group: GroupDefinition) =>
 			host.directory.isMember(principal, group),
-		fabrial: { native, metadata },
+		fabrial: { native, metadata, replyTo },
 	};
 	bindMetadata(raw, metadata);
 	return additions;

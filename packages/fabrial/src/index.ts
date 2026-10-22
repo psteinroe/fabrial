@@ -7,7 +7,7 @@ export {
 	type FabrialConfig,
 	type ToolkitIdsOf,
 } from "./instance.ts";
-export type { App, Logger } from "./app.ts";
+export type { App, Logger, WorkerOptions } from "./app.ts";
 export type {
 	Agent,
 	AgentDefinition,

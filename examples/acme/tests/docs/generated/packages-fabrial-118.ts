@@ -1,4 +1,4 @@
-// Generated from packages/fabrial/README.md:116 by ../snippets.ts. Do not edit.
+// Generated from packages/fabrial/README.md:119 by ../snippets.ts. Do not edit.
 /* oxlint-disable */
 import { f, support, z } from "../prelude.ts";
 const triage = f.defineWorkflow({

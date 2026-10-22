@@ -86,12 +86,15 @@ When the agent calls `refund`, each billing member gets a card in their DMs with
 
 ## 1. The instance
 
-`createFabrial({ database, models, plugins, identity })`:
+`createFabrial({ database, models, plugins, identity, worker })`:
 
 - `database`: one Postgres connection string. Conductor, Pi, and Chat SDK keep their state there, each in its own schema. **One Fabrial app per database**: ingress events and their dedupe are database-wide, so two different apps on one database route each other's events. Instances of the same app (and versions during a rollout) may share it.
 - `models`: credentials per provider (`{ anthropic: { apiKey } }`). Agents and `ctx.evaluate` name models `"provider/model"`.
 - `plugins`: `slack(…)`, `github(…)`, `linear(…)`, or your own. **One installation per provider** in this preview: one Slack workspace, one GitHub installation, one Linear organization.
 - `identity`: users (`defineUser({ id, name, identities })`), which map chat identities to people. Groups are not listed here: define them with `f.defineGroup({ id, members })` or `f.defineGroup({ id, resolve })` and reference them where they are used.
+- `worker`: how much one process runs at once. `concurrency` (default 16) executions run at a time; an idle worker polls for work every `pollIntervalMs` (200), claims up to `fetchBatchSize` (16) per poll, and writes settled attempts back every `flushIntervalMs` (100), `flushBatchSize` (32) at a time. A settled result unblocks its waiters only when it is flushed.
+
+**Capacity per process.** Every running execution holds one of the worker's `concurrency` slots: a workflow while it runs (not while it sleeps or waits), a Session for each model call and tool round, the routing of each inbound message, click and stop, each approval card post. At the default 16, a Session streaming a long model call or backing off holds only its own slot, so approvals and routing keep moving; sustained load beyond 16 queues, and more processes add capacity. Conductor and Pi share one Postgres pool of `concurrency + 8` connections (24 by default): one per running execution plus headroom for polls, flushes, signal acks, emits and webhooks. Chat SDK's state opens its own pool (node-postgres' default, 10). Plan Postgres's `max_connections` for `processes × (concurrency + 18)`.
 
 Keep the instance in a module that imports plugins and users only, never workflows, so every definition file can import `f` without cycles. Plugin factories are side-effect free: nothing connects or validates credentials until `app.start()`, so importing the app with unset environment is safe.
 
@@ -153,7 +156,7 @@ A completed step is not an exactly-once effect: a crash during an external call 
 
 ## 4. Triggers
 
-Triggers are plugin helpers on workflows and agents: `slack.mentioned({ channel? })`, `slack.message({ channel })`, `github.pullRequestOpened({ repo })`, `linear.issueCreated({ team })`, …. `cron: [{ schedule, replyTo? }]` schedules a workflow.
+Triggers are plugin helpers on workflows and agents: `slack.mentioned({ channel? })`, `slack.message({ channel })`, `github.pullRequestOpened({ repo })`, `linear.issueCreated({ team })`, …. `cron: [{ schedule, name?, replyTo? }]` schedules a workflow: a tick receives `{ name }` and `ctx.thread` points at `replyTo`. `ctx.schedule(workflow, name, { cron }, input)` schedules one at runtime: each occurrence runs with `input` and the scheduling execution's metadata, so it replies where the scheduler does.
 
 - **One owner.** When several triggers match an event, the most specific one receives it, an agent's or a workflow's. Specificity is the trigger's `specificity`, by default the number of filtered fields. Two owners with equal specificity whose filters may overlap make `app.start()` fail; ties startup cannot see (a message in two chat event categories) fail that event's routing instead.
 - **Observers.** `observe: true` on a workflow trigger runs it as well, independently and without `ctx.thread`.

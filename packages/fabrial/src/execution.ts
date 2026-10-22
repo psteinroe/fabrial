@@ -75,7 +75,19 @@ export type Native = Pick<TaskContext, (typeof NATIVE)[number]>;
 /** Conductor's own methods of a context, from its prototype: unaffected by wrappers merged onto it. */
 export function nativeMethods(ctx: TaskContext): Native {
 	const proto = Object.getPrototypeOf(ctx) as Record<string, (...args: unknown[]) => unknown>;
-	return Object.fromEntries(NATIVE.map((name) => [name, proto[name]!.bind(ctx)])) as Native;
+	const native = Object.fromEntries(
+		NATIVE.map((name) => [name, proto[name]!.bind(ctx)]),
+	) as unknown as Native;
+	// Conductor's waitForResult calls `this.waitForAny`, which Fabrial's context wraps: this one stays native.
+	native.waitForResult = (async (key: string, executionId: string, options?: object) => {
+		const winner = await native.waitForAny(
+			key,
+			{ result: { execution: executionId } },
+			options as never,
+		);
+		return winner.key === "timeout" ? { status: "timeout" } : winner.outcome;
+	}) as Native["waitForResult"];
+	return native;
 }
 
 /**

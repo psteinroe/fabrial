@@ -393,8 +393,44 @@ const MODEL_RETRY: ConversationRetryPolicy = {
 	maxAgentDelayMs: 60_000,
 };
 
+/**
+ * How many executions one process runs at once, and how fast it picks up and settles work. Every running execution
+ * holds a slot: a workflow while it runs (not while it sleeps or waits), a Session for each model call and tool
+ * round, the routing of each inbound message, click and stop, each approval card post.
+ */
+export interface WorkerOptions {
+	/** Executions running at once in this process. */
+	concurrency?: number;
+	/** How often an idle worker polls for new work, in ms. */
+	pollIntervalMs?: number;
+	/** How often finished attempts are written back, in ms: a settled result unblocks its waiters only then. */
+	flushIntervalMs?: number;
+	/** Executions claimed per poll (at most the free slots). */
+	fetchBatchSize?: number;
+	/** Settled attempts written back per flush. */
+	flushBatchSize?: number;
+}
+
+/**
+ * Production's worker: 16 executions at once (a Session streaming or backing off holds only its own slot), new
+ * work within 200 ms, results within 100 ms.
+ */
+export const PRODUCTION_WORKER = {
+	concurrency: 16,
+	pollIntervalMs: 200,
+	flushIntervalMs: 100,
+	fetchBatchSize: 16,
+	flushBatchSize: 32,
+} as const satisfies Required<WorkerOptions>;
+
+/**
+ * Connections a process's pool opens beyond one per running execution: the worker's polls, flushes and
+ * signal acks, emits and webhooks, and Pi's writes outside an execution's own.
+ */
+const POOL_HEADROOM = 8;
+
 /** One lazily opened pool. Its identity is stable, so Conductor can hold it before app.start(). */
-function lazyPool(url: string | undefined) {
+function lazyPool(url: string | undefined, max: number) {
 	let pool: Sql | undefined;
 	const current = (): Sql => {
 		if (!pool) throw new Error("The Fabrial database is not open; call app.start() first");
@@ -409,7 +445,7 @@ function lazyPool(url: string | undefined) {
 		url,
 		open() {
 			if (!url) throw new Error("createFabrial requires a database connection string");
-			pool ??= postgres(url, { max: 20, onnotice: () => {} });
+			pool ??= postgres(url, { max, onnotice: () => {} });
 		},
 		async close() {
 			const open = pool;
@@ -419,16 +455,26 @@ function lazyPool(url: string | undefined) {
 	};
 }
 
+const defined = <T extends object>(value: T | undefined): Partial<T> =>
+	Object.fromEntries(Object.entries(value ?? {}).filter(([, v]) => v !== undefined)) as Partial<T>;
+
 /** Conductor, Pi, and Chat SDK on the instance's database. Side-effect free until app.start(). */
 export function production(
-	config: { database: string | undefined; models: ModelCredentials },
+	config: { database: string | undefined; models: ModelCredentials; worker?: WorkerOptions },
 	overrides: ProductionOverrides = {},
 ): Pick<CoreConfig, "conductor" | "chat" | "agents" | "resources"> {
-	const pool = lazyPool(config.database);
+	const worker = {
+		...PRODUCTION_WORKER,
+		...defined(config.worker),
+		...overrides.conductor?.worker,
+	};
+	// Conductor and Pi share one pool: a connection per running execution, plus headroom. Chat SDK's
+	// state opens its own (node-postgres' default, 10).
+	const pool = lazyPool(config.database, worker.concurrency + POOL_HEADROOM);
 	const credentials = createModels(config.models);
 	let state: ReturnType<typeof createPostgresState> | undefined;
 	return {
-		conductor: { ...overrides.conductor, sql: pool.sql },
+		conductor: { ...overrides.conductor, sql: pool.sql, worker },
 		// Opened when the app starts.
 		chat: { state: () => (state = createPostgresState({ url: pool.url! })) },
 		agents: {
