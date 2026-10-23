@@ -1,0 +1,11 @@
+{
+	"rules": {
+		"typescript/no-floating-promises": "off",
+		"typescript/restrict-template-expressions": "off"
+	},
+	"env": {
+		"browser": false,
+		"node": true
+	},
+	"ignorePatterns": ["node_modules", "dist", "coverage", "**/*.d.ts", "vendor/**"]
+}

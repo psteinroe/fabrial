@@ -1,0 +1,25 @@
+{
+	"name": "@fabrial/example-acme",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@fabrial/github": "workspace:*",
+		"@fabrial/linear": "workspace:*",
+		"@fabrial/slack": "workspace:*",
+		"fabrial": "workspace:*",
+		"postgres": "catalog:",
+		"zod": "catalog:"
+	},
+	"devDependencies": {
+		"@chat-adapter/tests": "catalog:",
+		"@slack/web-api": "catalog:",
+		"@testcontainers/postgresql": "catalog:",
+		"@types/node": "catalog:",
+		"chat": "catalog:",
+		"typescript": "catalog:",
+		"vitest": "catalog:"
+	}
+}

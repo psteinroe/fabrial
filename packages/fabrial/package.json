@@ -1,0 +1,61 @@
+{
+	"name": "fabrial",
+	"version": "0.0.0",
+	"description": "Durable workflows, AI agents, and human approvals in TypeScript.",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/psteinroe/fabrial.git",
+		"directory": "packages/fabrial"
+	},
+	"files": [
+		"dist"
+	],
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts",
+		"./plugin": "./src/plugin.ts",
+		"./testing": "./src/testing.ts",
+		"./internal/testing": "./src/testing/internal.ts"
+	},
+	"publishConfig": {
+		"exports": {
+			".": {
+				"types": "./dist/index.d.ts",
+				"default": "./dist/index.js"
+			},
+			"./plugin": {
+				"types": "./dist/plugin.d.ts",
+				"default": "./dist/plugin.js"
+			},
+			"./testing": {
+				"types": "./dist/testing.d.ts",
+				"default": "./dist/testing.js"
+			}
+		},
+		"access": "public"
+	},
+	"scripts": {
+		"build": "rm -rf dist && tsc -p tsconfig.build.json",
+		"prepack": "pnpm run build",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@chat-adapter/state-memory": "catalog:",
+		"@chat-adapter/state-pg": "catalog:",
+		"@earendil-works/chord": "catalog:",
+		"@earendil-works/pi-ai": "catalog:",
+		"@earendil-works/pi-durable": "catalog:",
+		"@standard-schema/spec": "catalog:",
+		"chat": "catalog:",
+		"pgconductor-js": "workspace:*",
+		"postgres": "catalog:",
+		"typebox": "catalog:"
+	},
+	"devDependencies": {
+		"@chat-adapter/slack": "catalog:",
+		"@chat-adapter/tests": "catalog:",
+		"@testcontainers/postgresql": "catalog:",
+		"zod": "catalog:"
+	}
+}
