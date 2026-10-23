@@ -188,6 +188,71 @@ describe("approvals", () => {
 		await eventually("the card update", () => c.post.updates.length > 0);
 		expect(c.post.updates).toHaveLength(1);
 	});
+	it.each([false, true])(
+		"a click held past the deadline, or decided past it on a router clock running behind, expires the approval (late: %s)",
+		async (late) => {
+			const decision = paused("cards");
+			const test = setup(
+				[approvalWorkflow("1h")],
+				late ? { plugins: [plugin, source, decision.hold] } : {},
+			);
+			const owner = await enter(test);
+			if (!late) decision.release();
+			const dm = await test.chat.openDM(alice.identities[0]!);
+			const post = await until("alice's approval card", async () => dm.posts[0]);
+			const conductor = test.app.host.conductor;
+			const emit = conductor.emit.bind(conductor);
+			const held = Promise.withResolvers<void>();
+			const reached = Promise.withResolvers<void>();
+			let emitted = false;
+			// The router passed its deadline check; its emit is held until after the deadline.
+			conductor.emit = (async (...args: Parameters<typeof emit>) => {
+				if (args[0] === "fabrial.approval.decided" && !late) {
+					reached.resolve();
+					await held.promise;
+					return emit(...args).finally(() => (emitted = true));
+				}
+				return emit(...args);
+			}) as typeof emit;
+			// Late, the router's clock also runs behind the database: its check passes on the host clock.
+			const host = test.app.host as { now(): number };
+			const now = host.now.bind(host);
+			if (late) host.now = () => now() - 3 * 60 * 60_000;
+			const click = test.chat.click(
+				post.ref,
+				cardOf(post.content).actions[0]!.id,
+				alice.identities[0]!,
+			);
+			if (late) await db.clock.advance("2h");
+			else await reached.promise;
+			if (!late) await db.clock.advance("2h");
+			held.resolve();
+			await click;
+			if (!late) await until("the late decided event", async () => emitted || undefined);
+			// Its decision execution registers its wait only now: the deadline still holds.
+			decision.release();
+			expect(await owner.output()).toBe("expired");
+		},
+	);
+	it("holds the deadline in database time, whatever the app's clock says", async () => {
+		const test = setup([approvalWorkflow("1h")]);
+		const host = test.app.host as { now(): number };
+		const now = host.now.bind(host);
+		// The requester's clock runs two hours behind the database.
+		host.now = () => now() - 2 * 60 * 60_000;
+		const owner = await enter(test);
+		const c = await card(test);
+		const [row] = await db.sql<{ deadline: number }[]>`
+			select (payload->>'deadline')::bigint as deadline from pgconductor._private_executions
+			where queue = ${test.client.queue} and task_key = 'fabrial.approval.decision'`;
+		expect(Math.abs(row!.deadline - (db.clock.now().getTime() + 60 * 60_000))).toBeLessThan(60_000);
+		// The router's clock runs two hours ahead: the approval has not expired in the database's time.
+		host.now = () => now() + 2 * 60 * 60_000;
+		await db.clock.advance("30m");
+		await test.chat.click(c.post.ref, c.approve, alice.identities[0]!);
+		expect(await owner.output()).toBe("approved");
+		expect(test.chat.ephemeral).toEqual([]);
+	});
 	it("rejects non-approvers ephemerally and continues waiting", async () => {
 		const test = setup([approvalWorkflow()]);
 		const owner = await enter(test);

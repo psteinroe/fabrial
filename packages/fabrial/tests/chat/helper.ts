@@ -46,6 +46,7 @@ export function setup(state: StateAdapter = createMemoryState()) {
 		orchestrator: {} as never,
 		queue: "default",
 		now: () => Date.now(),
+		databaseNow: async () => Date.now(),
 		directory: {
 			resolveIdentity: vi.fn(),
 			identitiesFor: vi.fn(),

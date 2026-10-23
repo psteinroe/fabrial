@@ -956,7 +956,8 @@ it.each([
 	},
 );
 
-it("a stop after the lead answered cancels a background child's approval workflow: its card no longer approves", async () => {
+/** A stop after the lead answered cancels a background child's approval workflow: its card no longer approves. */
+async function stopAfterAnswer(failing: boolean) {
 	const alice = defineUser({
 		id: `alice-${short()}`,
 		name: "Alice",
@@ -1019,11 +1020,14 @@ it("a stop after the lead answered cancels a background child's approval workflo
 		}),
 	);
 	const chat = new FakeChat({ installationId: "w" });
-	const { client } = await launch(g, {
+	const { client, app } = await launch(g, {
 		workflows: [runSql, ask],
 		chat,
 		agents: { models, sql: sql(), settings: { retry: { enabled: false } } },
 	});
+	// The stop's first cancel fails after its requests were marked stopped: the retried attempt must still cancel.
+	const cancel = vi.spyOn(app.host.conductor, "cancel");
+	if (failing) cancel.mockRejectedValueOnce(new Error("Conductor unavailable"));
 	const send = (text: string) =>
 		client.invoke(
 			ask.name,
@@ -1048,15 +1052,27 @@ it("a stop after the lead answered cancels a background child's approval workflo
 	await send("Fix the row");
 	await expect.poll(posts, { timeout: 30_000 }).toEqual(["On it."]);
 	const { approve } = await approvalCard(chat, alice.identities[0]!);
-	const db = sql();
 	const approvalWorkflow = async () => {
-		const rows = await db<{ cancelled: boolean; done: boolean }[]>`
+		const rows = await sql()<{ cancelled: boolean; done: boolean }[]>`
 			select cancelled, completed_at is not null as done
 			from pgconductor._private_executions where task_key = ${runSql.name}`;
 		return rows[0];
 	};
 	// The lead's reply is posted (its obligation fulfilled) while the worker's approval workflow still waits.
 	await chat.cancel(thread, alice.identities[0]!);
+	if (failing) {
+		await expect
+			.poll(() => cancel.mock.settledResults[0]?.type, { timeout: 30_000 })
+			.toBe("rejected");
+		// The Session's attempt failed; its retry waits out a backoff.
+		await until("the Session's retry to be scheduled", async () => {
+			const [row] = await sql()<{ waiting: boolean }[]>`
+				select locked_at is null and attempts > 0 as waiting from pgconductor._private_executions
+				where task_key = 'fabrial.session' and queue = ${client.queue}`;
+			return row?.waiting || undefined;
+		});
+		await db.clock.advance("1m");
+	}
 	await expect
 		.poll(approvalWorkflow, { timeout: 30_000 })
 		.toMatchObject({ cancelled: true, done: false });
@@ -1064,7 +1080,13 @@ it("a stop after the lead answered cancels a background child's approval workflo
 	await idle(client.queue);
 	expect(await approvalWorkflow()).toMatchObject({ cancelled: true, done: false });
 	expect(await posts()).toEqual(["On it."]);
-});
+}
+
+it("a stop after the lead answered cancels a background child's approval workflow: its card no longer approves", () =>
+	stopAfterAnswer(false));
+
+it("a stop whose first cancel fails still cancels a background child's approval workflow when redelivered", () =>
+	stopAfterAnswer(true));
 
 it("a background child waiting for approval suspends the Session: a new message is answered meanwhile, and the click resumes the child", async () => {
 	const alice = defineUser({

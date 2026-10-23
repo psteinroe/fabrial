@@ -60,6 +60,8 @@ export interface FabrialHost<TClients = Record<string, unknown>> {
 	readonly queue: string;
 	/** Conductor's clock (epoch ms): the test clock in tests. */
 	now(): number;
+	/** The database's time (epoch ms), the clock Conductor's deadlines and event times use. */
+	databaseNow(): Promise<number>;
 	readonly directory: IdentityDirectory;
 	readonly logger: Logger;
 	/** Live clients of all plugins (built once per app; plugin `clients()` must be cheap and stateless). */
@@ -163,6 +165,12 @@ const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 export function buildApp(config: CoreConfig): HostedApp {
 	const queue = config.conductor.queue ?? "default";
 	const now = () => config.conductor.clock?.now().getTime() ?? Date.now();
+	// Conductor's own time function: database time, or the test clock's fake time on its connection.
+	const databaseNow = async () => {
+		const [row] = await config.conductor.sql<{ now: Date }[]>`
+			select pgconductor._private_current_time() as now`;
+		return row!.now.getTime();
+	};
 	/** The app's Conductor client and Orchestrator, once `start` registered its tasks. */
 	let tasks: { conductor: Conductor; orchestrator: Orchestrator } | undefined;
 	let running = false;
@@ -193,6 +201,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 		},
 		queue,
 		now,
+		databaseNow,
 		directory,
 		logger: config.logger ?? silentLogger,
 		clients,
@@ -284,7 +293,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 		registered = true;
 		const extraWorkflows = new Map(agents.workflows.map((w) => [w.name, w]));
 		extraWorkflows.set(APPROVAL_REQUEST_WORKFLOW, approvalRequestWorkflow());
-		extraWorkflows.set(APPROVAL_DECISION_WORKFLOW, approvalDecisionWorkflow(now));
+		extraWorkflows.set(APPROVAL_DECISION_WORKFLOW, approvalDecisionWorkflow(databaseNow));
 		extraWorkflows.set(APPROVAL_DELIVERY_WORKFLOW, approvalDeliveryWorkflow());
 		extraWorkflows.set(CARD_WORKFLOW, cardWorkflow(host));
 		for (const workflow of extraWorkflows.values()) workflows.push({ ...workflow, attempt });

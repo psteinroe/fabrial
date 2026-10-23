@@ -48,10 +48,11 @@ export async function decideAction(
 		});
 		return { authorized: false };
 	}
-	// The persisted deadline holds here too: the decision may not have registered its timeout yet,
-	// and a retry reuses the authorization above.
+	// Checked in database time, as the decision checks it: a click past the deadline gets its notice here, and the
+	// decision rejects one decided past it whatever reaches it. A retry reuses the authorization above.
 	const decided = await native.step("decide", async () => {
-		if (host.now() >= request!.deadline) return false;
+		const decidedAt = await host.databaseNow();
+		if (decidedAt >= request!.deadline) return false;
 		await host.conductor.emit(
 			APPROVAL_DECIDED_EVENT as never,
 			{
@@ -59,6 +60,7 @@ export async function decideAction(
 				status: verb === "approve" ? "approved" : verb === "reject" ? "rejected" : "cancelled",
 				actor: actor as unknown as Json,
 				messageId: action.messageId,
+				decidedAt,
 				// A rejection's reason, from the reject modal; approve and cancel buttons carry none.
 				...(verb === "reject" && action.value?.trim()
 					? { comment: action.value.trim().slice(0, MAX_REASON) }

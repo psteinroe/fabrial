@@ -181,7 +181,8 @@ describe("expiry and timers", () => {
 				await ctx.sleep("sleep", 10);
 				await ctx.thread!.update("update", first, "updated");
 				await ctx.thread!.post("second", "second");
-				return { child: await ctx.invoke("child", child, {}) };
+				// invokeAndWait: the child posts before the owner settles.
+				return { child: await ctx.invokeAndWait("child", child, {}) };
 			},
 		});
 		const test = setup([owner, child]);

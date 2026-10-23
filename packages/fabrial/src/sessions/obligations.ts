@@ -140,7 +140,7 @@ export function sessionObligations(scope: SessionScope) {
 	 * started are cancelled: a background child's tools act for the lead's request, so its workflows go too, also
 	 * after the lead's answer posted. The abort reaches past the background boundary: the conversation's background
 	 * children and their reports stop too. Nothing more is owed for its requests, nor for reports on them. Calls have their own Session and
-	 * belong to their workflow.
+	 * belong to their workflow. A redelivered stop cancels what an earlier delivery marked stopped but did not cancel.
 	 */
 	async function stop(agentName: string, reason: string) {
 		const lead = (await harness.snapshot(Conversations, context))?.ids[agentName];
@@ -154,22 +154,19 @@ export function sessionObligations(scope: SessionScope) {
 			),
 		);
 		// Stopped first, so a tool starting a workflow for them now either is refused or left an intent to cancel.
-		const stopping = await harness.commit(async (tx) => {
-			const stopped: string[] = [];
+		const stopped = await harness.commit(async (tx) => {
+			const ids: string[] = [];
 			for (const [requestId, obligation] of Object.entries((await tx.doc(Obligations)).requests))
-				if (
-					!obligation.stopped &&
-					(requests.has(requestId) || requests.has(obligation.origin ?? ""))
-				) {
+				if (requests.has(requestId) || requests.has(obligation.origin ?? "")) {
 					obligation.stopped = true;
-					stopped.push(requestId);
+					ids.push(requestId);
 				}
-			return stopped;
+			return ids;
 		}, context);
 		await cancelChildren(
 			frame,
 			(executionId, why) => host.conductor.cancel(executionId, { reason: why }),
-			stopping,
+			stopped,
 			reason,
 			context,
 		);

@@ -27,7 +27,7 @@ export interface DecisionInput {
 	/** The request execution. */
 	approvalId: string;
 	callerId: string;
-	/** Epoch ms, persisted with the request: resumes never extend it. */
+	/** Epoch ms in database time, persisted with the request: resumes never extend it. */
 	deadline: number;
 	proposal: Proposal;
 	cards: ApprovalCard[];
@@ -58,7 +58,7 @@ export const UNREACHABLE = "No approver could be reached";
  * just posted is never missed. The first decision wins; the caller settling first cancels the approval,
  * and every approver card failing for good fails it.
  */
-export function approvalDecisionWorkflow(now: () => number): WorkflowTask {
+export function approvalDecisionWorkflow(now: () => Promise<number>): WorkflowTask {
 	return {
 		name: APPROVAL_DECISION_WORKFLOW,
 		triggers: [],
@@ -85,7 +85,7 @@ export function approvalDecisionWorkflow(now: () => number): WorkflowTask {
 async function decide(
 	data: DecisionInput,
 	ctx: TaskContext,
-	now: () => number,
+	now: () => Promise<number>,
 	cancelled: Promise<string>,
 ): Promise<JsonObject> {
 	const native = nativeMethods(ctx);
@@ -124,8 +124,10 @@ async function decide(
 			caller: { execution: data.callerId },
 			delivery: { execution: delivery },
 		},
-		// At least 1ms: a deadline passed before the wait registered (a resume after a crash) still expires it.
-		{ timeout: Math.max(1, data.deadline - now()) },
+		// What remains of the deadline in database time, the clock Conductor times the wait on. At least 1ms: a
+		// deadline passed before the wait registered (a resume after a crash) still expires it, and a click decided
+		// before it still counts.
+		{ timeout: Math.max(1, data.deadline - (await now())) },
 	);
 	if ("outcome" in winner && winner.key === "delivery") {
 		const error =
@@ -135,10 +137,10 @@ async function decide(
 		return {
 			error,
 			label: error,
-			at: new Date(now()).toISOString(),
+			at: new Date(await now()).toISOString(),
 		} satisfies DecisionResult;
 	}
-	const decidedAt = new Date(now()).toISOString();
+	const decidedAt = new Date(await now()).toISOString();
 	let result: DecisionResult;
 	if ("signal" in winner) {
 		const reason = await native.step("cancelled", () => cancelled);
@@ -152,7 +154,11 @@ async function decide(
 			},
 			label: reason === "superseded" ? "Superseded" : "Cancelled",
 		};
-	} else if ("event" in winner) {
+	} else if (
+		"event" in winner &&
+		// Decided before the deadline in database time, when the router checked it: a click decided later expires.
+		Number((winner.event.payload as JsonObject).decidedAt) < data.deadline
+	) {
 		const event = winner.event.payload as JsonObject;
 		const status = event.status as ApprovalDecision["status"];
 		const actor = event.actor as unknown as Principal | null;
@@ -175,12 +181,12 @@ async function decide(
 	} else
 		result = {
 			decision: {
-				status: winner.key === "timeout" ? "expired" : "cancelled",
+				status: winner.key === "timeout" || "event" in winner ? "expired" : "cancelled",
 				approved: false,
 				decidedBy: null,
 				decidedAt,
 			},
-			label: winner.key === "timeout" ? "Expired" : "Cancelled",
+			label: winner.key === "timeout" || "event" in winner ? "Expired" : "Cancelled",
 		};
 	return result as unknown as JsonObject;
 }

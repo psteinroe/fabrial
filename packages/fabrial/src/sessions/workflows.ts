@@ -42,6 +42,8 @@ interface ChildIntent extends JsonObject {
 	dedupeKey: string;
 	detached: boolean;
 	executionId: string | null;
+	/** Conductor confirmed a stop's cancel: a redelivered stop skips it. */
+	cancelled: boolean;
 }
 export const ChildIntents = defineDocFamily({
 	family: true,
@@ -104,6 +106,7 @@ export async function startChild(
 			dedupeKey,
 			detached,
 			executionId: null,
+			cancelled: false,
 		});
 		if (obligation) {
 			obligation.intents ??= [];
@@ -143,7 +146,8 @@ async function launch(
 /**
  * Cancels the workflows and effects the tools of `requests` started or wait on, except detached ones. Call it once the
  * requests are `stopped`: an intent still starting (no execution id yet) is started or found by its start key, then
- * cancelled, and no later start joins them.
+ * cancelled, and no later start joins them. Each intent is marked cancelled once Conductor confirmed it, so a stop
+ * that failed or crashed partway is completed by its redelivery.
  */
 export async function cancelChildren(
 	bridge: Pick<BridgeFrame, "harness" | "ctx">,
@@ -159,8 +163,11 @@ export async function cancelChildren(
 		if (!obligation) continue;
 		for (const key of obligation.intents ?? []) {
 			const intent = await harness.snapshot(ChildIntents, key, context);
-			if (!intent || intent.detached) continue;
+			if (!intent || intent.detached || intent.cancelled) continue;
 			await cancel(intent.executionId ?? (await launch(bridge, key, intent, context)), reason);
+			await harness.commit(async (tx) => {
+				(await tx.doc(ChildIntents, key, intent)).cancelled = true;
+			}, context);
 		}
 	}
 }

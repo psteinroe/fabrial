@@ -184,7 +184,8 @@ export async function createApproval(
 			requester: metadata.requestedBy,
 			...(await provenance(host, metadata.origin, (metadata.replyTo as Surface | null) ?? null)),
 			destination: options.destination ?? null,
-			deadline: now() + boundedTimeout(options.timeout),
+			// Database time: the decision, and the router checking clicks, hold it on that clock.
+			deadline: (await host.databaseNow()) + boundedTimeout(options.timeout),
 			title: options.title,
 			details: options.details,
 			requesterControls: options.requesterControls ?? true,
@@ -318,7 +319,7 @@ export interface ApprovalRequest {
 	thread: string | null;
 	/** Where the approver card goes instead of the approvers' DMs; grants no authority. */
 	destination: Surface | null;
-	/** Epoch ms. */
+	/** Epoch ms, in database time. */
 	deadline: number;
 	title: string;
 	details: Json;

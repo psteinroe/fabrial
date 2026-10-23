@@ -279,3 +279,30 @@ it("stopping a request cancels the attached workflows its tools started or waite
 		await f.harness.close(BACKGROUND_CONTEXT);
 	}
 });
+
+it("a stop whose cancel failed partway cancels the rest when redelivered, and never cancels a child twice", async () => {
+	const workflow = defineWorkflow({ name: "child", run: async () => null });
+	const f = await fixture([workflow]);
+	try {
+		const ctx = await fields(f.context, f.conversation.id, f.api);
+		await ctx.start("first", workflow, null as never);
+		await ctx.start("second", workflow, null as never);
+		const [first, second] = f.start.mock.calls.map(([key]) => `child:${key}`);
+		const cancel = vi.fn(async (executionId: string) => {
+			if (executionId === second && cancel.mock.calls.length === 2)
+				throw new Error("Conductor unavailable");
+		});
+		await expect(
+			cancelChildren(f.bridge, cancel, ["request"], "Stopped", BACKGROUND_CONTEXT),
+		).rejects.toThrow("Conductor unavailable");
+		await cancelChildren(f.bridge, cancel, ["request"], "Stopped", BACKGROUND_CONTEXT);
+		await cancelChildren(f.bridge, cancel, ["request"], "Stopped", BACKGROUND_CONTEXT);
+		expect(cancel.mock.calls).toEqual([
+			[first, "Stopped"],
+			[second, "Stopped"],
+			[second, "Stopped"],
+		]);
+	} finally {
+		await f.harness.close(BACKGROUND_CONTEXT);
+	}
+});
