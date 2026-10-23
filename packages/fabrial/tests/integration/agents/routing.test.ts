@@ -6,7 +6,7 @@ import {
 	fauxProvider,
 	fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
-import { expect, it } from "vitest";
+import { expect, it, onTestFinished, vi } from "vitest";
 import { z } from "zod";
 import {
 	chatEvents,
@@ -22,6 +22,7 @@ import {
 	type JsonObject,
 } from "../../internals.ts";
 import { FakeChat } from "../../../src/testing/chat.ts";
+import { until } from "../../conductor/helper.ts";
 import { useAgents } from "./setup.ts";
 
 const { sql, launch, idle, routed } = useAgents();
@@ -158,6 +159,89 @@ it("use case 1: a mention in #help starts a conversation that follows its thread
 	await t.settle();
 	expect(t.faux.state.callCount).toBe(2);
 	expect(await t.posts("t2")).toEqual([]);
+});
+
+it("a reply routed while the thread's first mention is still routing follows it and reaches the conversation after it", async () => {
+	const seen: string[] = [];
+	const t = await setup(({ channel, model }) => ({
+		agents: [
+			f.defineAgent({
+				name: `support-${channel}`,
+				description: "Answers questions in #help.",
+				model,
+				triggers: [chatTrigger("chat", "mentioned", { channel })],
+			}),
+		],
+	}));
+	t.respond([asked(seen), asked(seen)]);
+	// The mention's routing holds once it decided, before it records the follow.
+	const acquire = t.chat.state.acquireLock.bind(t.chat.state);
+	const held = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	onTestFinished(() => release.resolve());
+	let gated = false;
+	vi.spyOn(t.chat.state, "acquireLock").mockImplementation(async (key, ttl) => {
+		if (key.startsWith("fabrial:routing:") && !gated) {
+			gated = true;
+			held.resolve();
+			await release.promise;
+		}
+		return acquire(key, ttl);
+	});
+	await t.chat.receive(t.message("m1", "t1", "@bot how do refunds work?", { mention: true }));
+	await held.promise;
+	await t.chat.receive(t.message("m2", "t1", "and for annual plans?", { author: "bob" }));
+	// The reply's routing ran too: it decided, or it waits for the thread.
+	await until("the reply's routing to run", async () => {
+		const [row] = await sql()`
+			select 1 from pgconductor._private_steps s
+			join pgconductor._private_executions e on e.id = s.execution_id
+			where e.queue = ${t.client.queue} and e.task_key = 'fabrial.route'
+				and e.payload->'payload'->'origin'->>'messageId' = 'm2' and s.key in ('route', 'thread')`;
+		return row;
+	});
+	release.resolve();
+	expect(await routed(t.client.queue, "m1")).toBe("new");
+	expect(await routed(t.client.queue, "m2")).toBe("follow");
+	await t.settle();
+	const last = seen.at(-1)!;
+	expect(last).toContain("how do refunds work?");
+	expect(last.indexOf("how do refunds work?")).toBeLessThan(last.indexOf("and for annual plans?"));
+});
+
+it("a routing workflow woken by its thread's routing execution settling still gets its decision, dispatched later", async () => {
+	const t = await setup(({ channel, model }) => ({
+		agents: [
+			f.defineAgent({
+				name: `support-${channel}`,
+				description: "Answers questions in #help.",
+				model,
+				triggers: [chatTrigger("chat", "mentioned", { channel })],
+			}),
+		],
+	}));
+	t.respond([fauxAssistantMessage("Answer 1")]);
+	// The decision's event is dispatched only once the routing workflow saw the thread's routing settle.
+	const { db } = t.app.host.conductor;
+	const dispatch = db.dispatchCustomEvents.bind(db);
+	vi.spyOn(db, "dispatchCustomEvents").mockImplementation(async (args, opts) => {
+		const routed = await sql()`select 1 from pgconductor._private_executions
+			where id = any(${args.eventIds}) and payload->>'eventKey' = 'fabrial.routed'`;
+		if (routed.length)
+			await until("the routing workflow to see its thread's routing settle", async () => {
+				const [row] = await sql()`
+					select 1 from pgconductor._private_steps s
+					join pgconductor._private_executions e on e.id = s.execution_id
+					where e.queue = ${t.client.queue} and e.task_key = 'fabrial.route' and s.key = 'decided'`;
+				return row;
+			});
+		return dispatch(args, opts);
+	});
+	expect(
+		await t.receive(t.message("m1", "t1", "@bot how do refunds work?", { mention: true })),
+	).toBe("new");
+	await t.settle();
+	expect(await t.posts("t1")).toEqual(["Answer 1"]);
 });
 
 it("use case 2: every message in a channel reaches the agent in its thread; irrelevant ones end in no_reply", async () => {

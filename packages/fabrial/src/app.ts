@@ -21,7 +21,13 @@ import type { ChatMessage, Surface, ThreadRef } from "./chat/messages.ts";
 import type { Agent } from "./agents/definition.ts";
 import { type ConductorConfig, createConductor, type WorkflowTask } from "./conductor.ts";
 import { connectAgents, type PiOptions } from "./sessions/host.ts";
-import { accept, createRouter, INGRESS_EVENT, type IngressEvent } from "./routing/route.ts";
+import {
+	accept,
+	createRouter,
+	INGRESS_EVENT,
+	type IngressEvent,
+	ROUTED_EVENT,
+} from "./routing/route.ts";
 import { threadOf } from "./sessions/delivery.ts";
 import { attemptHook, pluginMiddleware } from "./workflows/context.ts";
 import { APPROVAL_REQUEST_WORKFLOW, approvalRequestWorkflow } from "./approvals/request.ts";
@@ -297,7 +303,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 		extraWorkflows.set(APPROVAL_DELIVERY_WORKFLOW, approvalDeliveryWorkflow());
 		extraWorkflows.set(CARD_WORKFLOW, cardWorkflow(host));
 		for (const workflow of extraWorkflows.values()) workflows.push({ ...workflow, attempt });
-		workflows.push(router.workflow);
+		workflows.push(...router.workflows);
 		tasks = createConductor(config.conductor, {
 			workflows,
 			middleware,
@@ -309,6 +315,7 @@ export function buildApp(config: CoreConfig): HostedApp {
 					})),
 				),
 				{ name: INGRESS_EVENT, filterable: [] },
+				{ name: ROUTED_EVENT, filterable: ["ingress"] },
 				{ name: APPROVAL_DECIDED_EVENT, filterable: ["approvalId"] },
 			],
 		});

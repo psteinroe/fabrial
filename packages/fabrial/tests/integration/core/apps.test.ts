@@ -212,11 +212,11 @@ describe("follow records", () => {
 		await chat.receive(message("m1", ref.threadId));
 		await chat.receive(message("m1", ref.threadId));
 		await until("the failed delivery", async () => attempts[1]);
-		// Conductor retries the router after its backoff, scheduled once the failed attempt is released.
+		// Conductor retries the thread's routing after its backoff, scheduled once the failed attempt is released.
 		await until("the router's retry to be scheduled", async () => {
 			const [row] = await db.sql<{ id: string }[]>`
 				select id from pgconductor._private_executions
-				where task_key = 'fabrial.route' and last_error is not null and locked_at is null`;
+				where task_key = 'fabrial.thread' and last_error is not null and locked_at is null`;
 			return row?.id;
 		});
 		await db.clock.advance("1m");

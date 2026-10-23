@@ -611,10 +611,11 @@ describe("multi-category chat ingress", () => {
 		const test = setup([a, b]);
 		await test.app.start();
 		expect(await test.chat.receive(mention("tie"))).toBe("accepted");
-		const route = await until("the route", async () => (await test.routes())[0]);
+		// The thread's routing execution decides the message, and retries it.
 		await until("the tie", async () => {
 			const [row] = await db.sql<{ last_error: string | null }[]>`
-				select last_error from pgconductor._private_executions where id = ${route}::uuid`;
+				select last_error from pgconductor._private_executions
+				where queue = ${test.client.queue} and task_key = 'fabrial.thread'`;
 			return row?.last_error?.includes("Ambiguous owner") ? true : undefined;
 		});
 		expect([...test.ids("owner"), ...test.ids("other")]).toEqual([]);

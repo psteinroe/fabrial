@@ -50,7 +50,15 @@ export function childMetadata(
 	ctx: TaskContext,
 	override?: Partial<InvocationMetadata>,
 ): InvocationMetadata {
-	const result: InvocationMetadata = { ...metadataOf(ctx) };
+	return inheritMetadata(metadataOf(ctx), override);
+}
+
+/** `base` with the fields `override` defines replaced. */
+export function inheritMetadata(
+	base: InvocationMetadata,
+	override?: Partial<InvocationMetadata>,
+): InvocationMetadata {
+	const result: InvocationMetadata = { ...base };
 	for (const [key, value] of Object.entries(override ?? {}))
 		if (value !== undefined) result[key] = value;
 	return result;

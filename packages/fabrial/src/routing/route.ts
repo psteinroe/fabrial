@@ -15,7 +15,7 @@ import {
 	routingState,
 	updateRoutingState,
 } from "./follows.ts";
-import { childMetadata, type InvocationMetadata, metadataOf } from "../workflows/metadata.ts";
+import { inheritMetadata, type InvocationMetadata, metadataOf } from "../workflows/metadata.ts";
 import {
 	conversationSession,
 	isChatMessage,
@@ -127,18 +127,23 @@ export function createRouter(config: CoreConfig, host: FabrialHost, agents: Agen
 		return request;
 	};
 	/**
-	 * The routing workflow, run once per ingress event and retried by Conductor. Each effect is a durable
-	 * operation: a retry after a partial delivery resumes after the deliveries that completed, and a
-	 * delivery that completed without its receipt is deduped by its request id.
+	 * Route one input, with its ingress's `ingressMetadata`, in the execution routing it, which retries it. Each
+	 * effect is a durable operation named by `key`: a retry after a partial delivery resumes after the
+	 * deliveries that completed, and a delivery that completed without its receipt is deduped by its request id.
 	 */
-	const route = async (ingress: IngressEvent, ctx: TaskContext): Promise<Json> => {
+	const routeInput = async (
+		ingress: IngressEvent,
+		ctx: TaskContext,
+		ingressMetadata: InvocationMetadata,
+		key: (name: string) => string,
+	): Promise<Json> => {
 		const native = nativeMethods(ctx);
-		const { requestId } = metadataOf(ctx);
+		const { requestId } = ingressMetadata;
 		const chat = host.chat();
 		const actor = (
 			ingress.actor
 				? await native.step(
-						"actor",
+						key("actor"),
 						async () => (await host.directory.resolveIdentity(ingress.actor!)) as unknown as Json,
 					)
 				: null
@@ -147,12 +152,12 @@ export function createRouter(config: CoreConfig, host: FabrialHost, agents: Agen
 		if (ingress.kind === "stop") {
 			const sdk = await chat?.thread(ingress.replyTo as ThreadRef);
 			const follows = (await native.step(
-				"follows",
+				key("follows"),
 				async () => ((sdk && (await routingState(sdk)))?.follows ?? []) as Json,
 			)) as Follow[];
 			// A stop cancels the current run of each conversation following the thread; anyone there may stop.
 			for (const [index, conversation] of follows.entries())
-				await native.step(`stop:${index}`, async () => {
+				await native.step(key(`stop:${index}`), async () => {
 					await agents.stopConversation(conversation, ingress.id, `Stopped by ${actor!.id}`);
 				});
 			return null;
@@ -161,7 +166,7 @@ export function createRouter(config: CoreConfig, host: FabrialHost, agents: Agen
 			ingress.kind === "message" ? (ingress.payload as unknown as ChatMessage) : undefined;
 		const thread = message && threadOf(message);
 		const sdk = thread && (await chat?.thread(thread));
-		const decision = await native.step("route", async (): Promise<RouteDecision> => {
+		const decision = await native.step(key("route"), async (): Promise<RouteDecision> => {
 			const { selected, tied, observers } = select(ingress.events, ingress.payload);
 			const conversation = (agent: Agent, replyTo: InvocationMetadata["replyTo"]): Follow => ({
 				session: conversationSession(
@@ -211,7 +216,7 @@ export function createRouter(config: CoreConfig, host: FabrialHost, agents: Agen
 		});
 		// A handled thread stays subscribed; every conversation receiving its messages follows it.
 		if (chat && sdk && decision.route !== "ignored")
-			await native.step("follow", async () => {
+			await native.step(key("follow"), async () => {
 				if (decision.conversations.length)
 					await updateRoutingState(chat!, sdk, (state) =>
 						decision.conversations.reduce(addFollow, state),
@@ -232,7 +237,7 @@ export function createRouter(config: CoreConfig, host: FabrialHost, agents: Agen
 		};
 		const named = knownAgents();
 		for (const [index, conversation] of decision.conversations.entries())
-			await native.step(`deliver:${index}`, async () => {
+			await native.step(key(`deliver:${index}`), async () => {
 				const request = await deliver(
 					named.get(conversation.agent) ?? { kind: "fabrial.agent", name: conversation.agent },
 					conversation,
@@ -242,13 +247,13 @@ export function createRouter(config: CoreConfig, host: FabrialHost, agents: Agen
 				// An event's conversation follows the thread its replies go to.
 				if (!message) await follow(host, request.follow, conversation);
 			});
-		const start = (key: string, workflow: string, metadata: Partial<InvocationMetadata>) =>
+		const start = (name: string, workflow: string, metadata: Partial<InvocationMetadata>) =>
 			native.invoke(
-				key,
+				key(name),
 				{ name: workflow, queue: ctx.queue },
 				ingress.payload as never,
 				{
-					metadata: childMetadata(ctx, metadata),
+					metadata: inheritMetadata(ingressMetadata, metadata),
 				} as never,
 			);
 		if (decision.owner) await start("owner", decision.owner.workflow, metadata);
@@ -267,18 +272,74 @@ export function createRouter(config: CoreConfig, host: FabrialHost, agents: Agen
 					ingress.payload as never,
 					{
 						dedupe_key: ingress.id,
-						metadata: childMetadata(ctx, metadata),
+						metadata: inheritMetadata(ingressMetadata, metadata),
 					} as never,
 				);
 		// Conversations following the event's resource threads get a notification; triggers still run.
 		if (ingress.kind === "event")
-			await native.step("notify", async () => {
+			await native.step(key("notify"), async () => {
 				await notifyFollowers(host, agents, ingress.events[0]!, ingress.payload, {
 					...metadata,
 					replyTo: null,
 				});
 			});
 		return decision;
+	};
+	/**
+	 * The routing workflow, run once per ingress event and retried by Conductor. The messages and stops of a thread
+	 * route one at a time, in the order their routing workflows reach the thread's routing execution, which decides
+	 * each and records its follow before the next: a reply routed while the thread's first mention still routes
+	 * follows it. The workflow waits for its input's decision, its result.
+	 */
+	const route = async (ingress: IngressEvent, ctx: TaskContext): Promise<Json> => {
+		const thread = routingKey(ingress);
+		if (!thread) return routeInput(ingress, ctx, metadataOf(ctx), (name) => name);
+		const native = nativeMethods(ctx);
+		// Unique per routing workflow: a redelivery routing again after its ingress dedupe expired is not deduped.
+		const id = ctx.executionId;
+		const subscribe = (key: string) =>
+			native.subscribe(key, { event: { name: ROUTED_EVENT }, filter: { ingress: [id] } } as never);
+		// The decision wakes the wait below, which closes its subscription when it settles. Its event is dispatched
+		// after the thread's routing emitted it, possibly after that execution settled and won the wait, so the
+		// decision is read from a second subscription, which stays open.
+		const routed = await subscribe("routed");
+		const decision = await subscribe("decision");
+		const execution = await native.signalWithStart("thread", {
+			task: THREAD_WORKFLOW,
+			queue: ctx.queue,
+			key: thread,
+			signal: {
+				name: INGRESS_SIGNAL,
+				id,
+				payload: { ingress, metadata: metadataOf(ctx) } satisfies ThreadInput,
+			},
+			input: {},
+		} as never);
+		const winner = (await native.waitForAny("decided", {
+			routed,
+			thread: { execution },
+		} as never)) as { key: string; outcome?: { status: string } };
+		// A completed routing execution handled every input it received, so the decision was emitted.
+		if (winner.outcome && winner.outcome.status !== "completed")
+			throw new Error(`The routing of ${thread} ${winner.outcome.status} before routing ${id}`);
+		const decided = (await decision.wait()) as { payload: { decision: Json } };
+		return decided.payload.decision;
+	};
+	/**
+	 * A thread's routing execution: routes its inputs one at a time, in the order they arrived, and ends once it has
+	 * none left. Short: it starts or signals what an input routes to and waits for none of them.
+	 */
+	const routeThread = async (ctx: TaskContext): Promise<null> => {
+		ctx.onSignal(INGRESS_SIGNAL, async (payload, { id }) => {
+			const { ingress, metadata } = payload as unknown as ThreadInput;
+			const decision = await routeInput(ingress, ctx, metadata, (name) => `${id}:${name}`);
+			await nativeMethods(ctx).emit(
+				ROUTED_EVENT as never,
+				{ ingress: id, decision } as never,
+				{ dedupe_key: id, metadata } as never,
+			);
+		});
+		return null;
 	};
 	/** Two owners of equal specificity whose filters may overlap make an event's owner ambiguous. */
 	const check = () => {
@@ -297,19 +358,52 @@ export function createRouter(config: CoreConfig, host: FabrialHost, agents: Agen
 			}
 	};
 	// Routing is plumbing: no workflow context or plugin middleware.
-	const workflow: WorkflowTask = {
-		name: ROUTE_WORKFLOW,
-		triggers: [{ event: INGRESS_EVENT }],
-		retries: { maxAttempts: 5 },
-		handler: (input, ctx) => route(input as IngressEvent, ctx),
-	};
-	return { check, workflow };
+	const workflows: WorkflowTask[] = [
+		{
+			name: ROUTE_WORKFLOW,
+			triggers: [{ event: INGRESS_EVENT }],
+			retries: { maxAttempts: 5 },
+			handler: (input, ctx) => route(input as IngressEvent, ctx),
+		},
+		{
+			name: THREAD_WORKFLOW,
+			triggers: [],
+			retries: { maxAttempts: 5 },
+			handler: (_input, ctx) => routeThread(ctx),
+		},
+	];
+	return { check, workflows };
 }
 
 /** The one event ingress emits; `fabrial.route` triggers on it. */
 export const INGRESS_EVENT = "fabrial.ingress";
 /** The internal workflow that routes every ingress event. */
 const ROUTE_WORKFLOW = "fabrial.route";
+/** The internal workflow routing the messages and stops of one thread, keyed by the thread. */
+const THREAD_WORKFLOW = "fabrial.thread";
+/** The signal carrying one input to its thread's routing execution. */
+const INGRESS_SIGNAL = "ingress";
+/** A thread's routing execution decided an input: `{ ingress, decision }`, `ingress` its signal id. */
+export const ROUTED_EVENT = "fabrial.routed";
+
+/** An input of a thread's routing execution, with its ingress's metadata. */
+interface ThreadInput extends JsonObject {
+	ingress: IngressEvent;
+	metadata: InvocationMetadata;
+}
+
+/** The key the messages and stops of a thread route under: the thread (or channel) replies go to. */
+const routingKey = (ingress: IngressEvent): string | null => {
+	if (ingress.kind !== "message" && ingress.kind !== "stop") return null;
+	const surface =
+		ingress.kind === "message"
+			? threadOf(ingress.payload as unknown as ChatMessage)
+			: (ingress.replyTo as Surface | null);
+	if (!surface) return null;
+	return surface.kind === "thread"
+		? threadSession(surface.provider, surface.threadId)
+		: `${surface.provider}:channel:${surface.channelId}`;
+};
 
 /**
  * Verified, normalized input from a webhook or chat, as `fabrial.ingress` carries it. Ingress emits it once
