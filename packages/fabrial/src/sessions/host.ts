@@ -89,7 +89,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 	 * The Session execution: hosts the Pi Session while it has work. Once every live task waits on a workflow, or only
 	 * the posts of its replies are pending, it closes Pi (freeing the lease) and suspends until input arrives or
 	 * one of those workflows or posts settles; the next attempt reopens Pi, and the waiting tools run again with their
-	 * workflows' outcomes. Signals arriving while it opens or closes wait for the next opening (and win the wait); a
+	 * workflows' outcomes. Only idempotent tools run again: while a non-idempotent tool runs, Pi stays open. Signals arriving while it opens or closes wait for the next opening (and win the wait); a
 	 * signal delivered after the handler returned is sent again, which re-queues the execution.
 	 *
 	 * A `ctx.agent` call's Session execution is a child of its caller and returns the call's outcome. Cancelled while
@@ -198,6 +198,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 			harness: undefined as unknown as Harness,
 			session: key,
 			children: new Map(),
+			unsafe: new Set(),
 			waiting: new Set(),
 			waitChild: (taskId, executionId, context) =>
 				awaitWithContext(
@@ -417,7 +418,10 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		const apply = (input: SessionInput) =>
 			input.kind === "stop" ? stop(input.agent, input.reason) : admit(input);
 
-		/** No work, or every running task waits on a workflow (or on a subagent that does) or on a reply's post. */
+		/**
+		 * No work, or every running task waits on a workflow (or on a subagent that does) or on a reply's post. A running
+		 * non-idempotent tool keeps Pi open even while it waits: its workflow's outcome reaches it in process.
+		 */
 		async function idleState(): Promise<Idle["kind"] | undefined> {
 			if (inflight) return undefined;
 			const inspection = await harness.inspect(context);
@@ -427,6 +431,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				return (await deliveriesPending()).length ? "parked" : "done";
 			}
 			const runners = live.filter((task) => task.state.kind === "running");
+			if (runners.some((task) => frame.unsafe.has(task.record.id))) return undefined;
 			const workflow = (id: number) => frame.children.has(id);
 			const parked = (id: number) => workflow(id) || frame.waiting.has(id);
 			return runners.some((task) => workflow(task.record.id)) &&

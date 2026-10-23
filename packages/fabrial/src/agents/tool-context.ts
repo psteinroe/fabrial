@@ -49,19 +49,24 @@ export interface BridgeFrame {
 	 * waits, the Session's execution closes Pi and suspends until one of them settles or input arrives.
 	 */
 	children: Map<number, { executionId: string; detached: boolean }>;
+	/**
+	 * Tasks of non-idempotent tools running now. The Session never closes Pi while one runs, also not while it waits on
+	 * a workflow or effect: Pi reports an unsafe tool it reopens to as interrupted, so it waits in process instead.
+	 */
+	unsafe: Set<number>;
 	/** Subagent calls waiting for their child's answer; they do not keep the Session open. */
 	waiting: Set<number>;
 	/**
 	 * Resolves with a waited child's committed result, memoized per child: once its reporter settled, or as the
 	 * reporter's `child` signal arrives. Without one (the reporter was cancelled, or signalled an earlier Session
-	 * execution) it waits until the Session closes, and the tool runs again when the Session's execution resumes on the
-	 * reporter's settlement. Frees the task's slot in `children`.
+	 * execution) it waits until the Session closes, and an idempotent tool runs again when the Session's execution
+	 * resumes on the reporter's settlement. Frees the task's slot in `children`.
 	 */
 	waitChild(taskId: number, executionId: string, context: Context): Promise<JsonObject>;
 }
 export const BridgeKey = createContextKey<BridgeFrame>("fabrial.pi.bridge");
-/** Tool context without the per-call signal. */
-type FabrialFields = Omit<ToolContext, "signal">;
+/** Tool context without the per-call signal and idempotency key. */
+type FabrialFields = Omit<ToolContext, "signal" | "idempotencyKey">;
 
 export function frame(context: Context): BridgeFrame {
 	const value = context.value(BridgeKey);

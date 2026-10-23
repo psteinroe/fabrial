@@ -11,7 +11,8 @@ import type { Context } from "@earendil-works/chord";
 import { type Instructions, type ToolDefinition, toolName, type ToolResult } from "./definition.ts";
 import { cloneJson, type JsonObject, toJsonSchema } from "../schema.ts";
 import { commitStaged, type StagedState, ToolReceipt } from "../state.ts";
-import { fields } from "./tool-context.ts";
+import { createHash } from "node:crypto";
+import { fields, frame } from "./tool-context.ts";
 import { bindMetadata, metadataOf } from "../workflows/metadata.ts";
 import type { AnyWorkflow } from "../workflows/definition.ts";
 
@@ -44,14 +45,29 @@ export function piToolOf(tool: ToolDefinition): ToolRegistration {
 				};
 			const staged = new Map<string, StagedState>();
 			const ctx = await fields(context, api.conversationId, api, staged);
-			// Spreading drops the context's metadata binding, so bind the tool context again.
-			const returned = await tool.run(
-				validated.value,
-				bindMetadata(
-					{ ...ctx, signal: context.abortSignal ?? new AbortController().signal },
-					metadataOf(ctx),
-				),
-			);
+			const bridge = frame(context);
+			// The call's identity in its Session: Pi keeps the task id across a replay.
+			const idempotencyKey = createHash("sha256")
+				.update(JSON.stringify([bridge.session, api.conversationId, api.taskId]))
+				.digest("hex");
+			if (!tool.idempotent) bridge.unsafe.add(api.taskId);
+			let returned: ToolResult;
+			try {
+				// Spreading drops the context's metadata binding, so bind the tool context again.
+				returned = await tool.run(
+					validated.value,
+					bindMetadata(
+						{
+							...ctx,
+							idempotencyKey,
+							signal: context.abortSignal ?? new AbortController().signal,
+						},
+						metadataOf(ctx),
+					),
+				);
+			} finally {
+				bridge.unsafe.delete(api.taskId);
+			}
 			const result: ToolExecutionResult = {
 				content: [{ type: "text", text: toolContent(returned) }],
 			};

@@ -14,5 +14,6 @@ it("exposes Fabrial's tool context, not Pi's tool API", () => {
 		| "follow"
 		| "unfollow"
 		| "signal"
+		| "idempotencyKey"
 	>();
 });

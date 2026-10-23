@@ -468,6 +468,7 @@ it("a crashed owner's lease delays the Session until it expires; Conductor retri
 
 it("a run resumes on a fresh instance after its host stops mid-run; each model request is sent once", async () => {
 	let lookups = 0;
+	const keys: string[] = [];
 	let slows = 0;
 	const slow = gate();
 	const lookup = f.defineTool({
@@ -482,6 +483,7 @@ it("a run resumes on a fresh instance after its host stops mid-run; each model r
 		input: z.object({}),
 		idempotent: true,
 		run: async (_input, ctx) => {
+			keys.push(ctx.idempotencyKey);
 			// The first call is interrupted by the stop; the replay on the fresh instance completes.
 			if (++slows === 1) await slow.pass(ctx.signal);
 			return "waited";
@@ -521,6 +523,9 @@ it("a run resumes on a fresh instance after its host stops mid-run; each model r
 	]);
 	expect(lookups).toBe(1);
 	expect(slows).toBe(2);
+	// The replay is the same call: its idempotency key is the first run's.
+	expect(keys).toHaveLength(2);
+	expect(keys[1]).toBe(keys[0]);
 	await released(metadata.requestId);
 });
 
@@ -940,4 +945,55 @@ it("a workflow tool's result sent while its Session restarts on another instance
 		1,
 	);
 	await released(await only());
+});
+
+it("a non-idempotent tool waiting on a workflow keeps its Session open and gets the workflow's output, never interrupted", async () => {
+	let runs = 0;
+	let calls = 0;
+	const slow = gate();
+	const child = f.defineWorkflow({
+		name: `child-${short()}`,
+		input: z.object({}),
+		run: async () => {
+			runs++;
+			await slow.pass();
+			return { value: 42 };
+		},
+	});
+	const charge = f.defineTool({
+		name: "charge",
+		description: "Charges once.",
+		input: z.object({}),
+		run: async (_input, ctx) => {
+			calls++;
+			return ctx.invoke("child", child, {});
+		},
+	});
+	const lead = f.defineAgent({
+		name: `lead-${short()}`,
+		description: "Answers.",
+		model,
+		tools: [charge],
+	});
+	const ask = f.defineWorkflow({
+		name: `ask-${short()}`,
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => ({ answer: await ctx.agent("answer", lead, { input }) }),
+	});
+	script = ({ context }) =>
+		lastText(context) === "Go" ? use("charge", {}) : say(`Got ${lastText(context)}`);
+	const a = await launch("a", [child, ask]);
+	const caller = await a.client.invoke(ask.name, { text: "Go" }, { metadata: metadataOf() });
+	await slow.entered;
+	// The Session stays open while the tool waits: its execution runs and holds the lease.
+	const key = await only();
+	await new Promise((resolve) => setTimeout(resolve, 500));
+	expect((await sessionExecutions()).filter((row) => !row.done)).toMatchObject([{ running: true }]);
+	expect(await lease(key)).not.toBeNull();
+	slow.open();
+	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
+	expect(await output(caller)).toBe('Got {"value":42}');
+	expect({ runs, calls }).toEqual({ runs: 1, calls: 1 });
+	expect(requests).toHaveLength(2);
+	await released(key);
 });

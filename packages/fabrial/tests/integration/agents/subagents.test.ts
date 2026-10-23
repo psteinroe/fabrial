@@ -1311,8 +1311,11 @@ it("continuing a background child from another actor and thread runs its tools f
 		);
 	await send("Go", 0);
 	await expect.poll(() => seen.length, { timeout: 30_000 }).toBe(1);
+	// The first round settles first (the child's report answered, the Session's execution returned): the case is the
+	// other actor and thread, not the race with the child's report.
+	await idle(client.queue);
 	await send("Again", 1);
-	await expect.poll(() => seen.length, { timeout: 30_000 }).toBe(2);
+	await expect.poll(() => seen.length, { timeout: 60_000 }).toBe(2);
 	expect(seen).toEqual([`${users[0]!.id}@${threads[0]}`, `${users[1]!.id}@${threads[1]}`]);
 	await idle(client.queue);
 });

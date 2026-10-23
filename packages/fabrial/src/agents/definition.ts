@@ -64,6 +64,11 @@ export interface ToolContext<
 	): Promise<UnfollowReceipt>;
 	/** Aborted when the agent run is cancelled or the call is interrupted. */
 	readonly signal: AbortSignal;
+	/**
+	 * Stable for this tool call, also when it runs again (see `idempotent`): pass it as the idempotency key of external
+	 * API calls (append a suffix per call when there are several), so a re-run does not repeat their effects.
+	 */
+	readonly idempotencyKey: string;
 }
 
 /** Strings are passed to the model as is; other JSON values are serialized. */
@@ -75,7 +80,14 @@ export interface ToolDefinition<TInput = any, TClients = Record<string, unknown>
 	description: string;
 	/** Standard Schema with Standard JSON Schema support (e.g. zod ≥ 4.2). Validated before `run`. */
 	input: Schema<TInput>;
-	/** A call interrupted by a crash runs again. Otherwise the model sees an interrupted result. */
+	/**
+	 * Whether a call may run again. An idempotent call runs again after a crash or restart, and when its Session closed
+	 * Pi while it waited on a managed operation (`invoke`, `thread.post`, `send`, `follow`, …), which frees the Session's
+	 * execution and lease during long waits; its managed operations resume by id, and external calls should use
+	 * `ctx.idempotencyKey`. A non-idempotent call (the default) runs at most once: its Session stays open while it runs,
+	 * waits included, and only a crash or restart meanwhile makes the model see it as interrupted (it may have partially
+	 * run).
+	 */
 	idempotent?: boolean;
 	run(input: TInput, ctx: ToolContext<TClients>): Promise<ToolResult> | ToolResult;
 }
