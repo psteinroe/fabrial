@@ -38,14 +38,14 @@ const alice = defineUser({
 	identities: [{ provider: "slack-test", installationId: "w", subjectId: "alice" }],
 });
 /** Runs after each workflow attempt's handler returned, before Conductor settles it; a throw fails the attempt. */
-let afterAttempt: (workflow: string) => void = () => {};
+let afterAttempt: (workflow: string) => void | Promise<void> = () => {};
 const interrupter = definePlugin({
 	id: "interrupter",
 	hooks: {
 		workflow: [
 			async (info, ctx, next) => {
 				await next();
-				afterAttempt(info.workflow);
+				await afterAttempt(info.workflow);
 			},
 		],
 	},
@@ -426,7 +426,7 @@ for (const from of ["the same", "another"] as const)
 		expect(await output(next)).toBe("fresh");
 	});
 
-it("a crashed owner's lease delays the Session until it expires; Conductor retries the opening", async () => {
+it("a crashed owner's lease delays the Session until it expires; the opening waits for it without spending an attempt", async () => {
 	let waits = 0;
 	const slow = gate();
 	const wait = f.defineTool({
@@ -457,16 +457,24 @@ it("a crashed owner's lease delays the Session until it expires; Conductor retri
 	await a.stop();
 	// A crashed owner: it holds the lease and never renews or releases it.
 	const key = callSession(caller, "answer");
-	const crashed = await PostgresStorage.open(sql, key, { leaseMs: 1_000 });
+	const crashed = await PostgresStorage.open(sql, key, { leaseMs: 3_000 });
 	clearInterval((crashed as unknown as { timer: ReturnType<typeof setInterval> }).timer);
+	const attempts = async () => {
+		const [session] = await sql<{ attempts: number; last_error: string | null }[]>`
+			select attempts, last_error from pgconductor._private_executions
+			where task_key = ${SESSION} and payload ->> 'session' = ${key}`;
+		return session!;
+	};
+	const before = await attempts();
+	const started = performance.now();
 	await launch("b", [ask]);
 	await expect.poll(() => execution(caller), poll).toMatchObject({ done: true });
 	expect(await output(caller)).toBe("all done");
-	// The opening failed while the lease was held, and Conductor's retry took the expired lease.
-	const [session] = await sql<{ attempts: number; last_error: string | null }[]>`
-		select attempts, last_error from pgconductor._private_executions
-		where task_key = ${SESSION} and payload ->> 'session' = ${key}`;
-	expect(session!.last_error).toContain("already has an owner");
+	// The opening waited for the expired lease in the same attempt: no failed attempt, no retry backoff.
+	expect(performance.now() - started).toBeLessThan(15_000);
+	const after = await attempts();
+	expect(after.last_error ?? "").not.toContain("already has an owner");
+	expect(after.attempts).toBe(before.attempts + 1);
 	await expect(crashed.commit([], BACKGROUND_CONTEXT)).rejects.toThrow();
 	expect(await lease(key)).toBeNull();
 });
@@ -632,6 +640,90 @@ it("input redelivered after its settled obligation was pruned is not processed a
 	}
 	expect(await submitted(session)).toEqual(["r1", "r2"]);
 	expect(requests.map((request) => lastText(request.context))).toEqual(["r1", "r2"]);
+});
+
+// Skipped: while an attempt's return is held (here by middleware), Conductor's signal inbox is still open, so the
+// handler's `:requeued` re-signal is delivered back to the same returned attempt, which re-signals it again: a hot loop
+// until the return settles (then the last copy re-queues the execution). Fix: requeue only once the inbox closed
+// (Conductor: deliver signals stored after the handler returned to the next attempt, not this one).
+it.skip("input arriving while the Session execution returns is answered promptly", async () => {
+	const lead = f.defineAgent({ name: `lead-${short()}`, description: "Answers.", model });
+	const session = `ops-${short()}`;
+	const replyTo = thread();
+	const deliver = f.defineWorkflow({
+		name: `deliver-${short()}`,
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => {
+			await ctx.send("send", lead, { session, input, home: replyTo });
+		},
+	});
+	script = ({ context }) => say(lastText(context).includes("second") ? "two" : "one");
+	const returning = gate();
+	let held = true;
+	// The Session suspends while its reply posts and returns once it posted: only the return is held.
+	afterAttempt = async (workflow) => {
+		if (workflow === SESSION && held && (await posts()).length) await returning.pass();
+	};
+	const a = await launch("a", [deliver]);
+	const posts = async () =>
+		(await a.chat.thread(replyTo)).posts.map((post) => JSON.stringify(post.content));
+	await a.client.invoke(deliver.name, { text: "first" }, { metadata: metadataOf() });
+	// The handler returned after answering; its attempt has not settled.
+	await returning.entered;
+	expect(await posts()).toEqual(['"one"']);
+	await a.client.invoke(deliver.name, { text: "second" }, { metadata: metadataOf() });
+	await expect
+		.poll(
+			async () =>
+				(
+					await sql`select 1 from pgconductor._private_execution_signals s
+						join pgconductor._private_executions e on e.id = s.execution_id
+						where e.task_key = ${SESSION} and s.name = 'input'`
+				).length,
+			poll,
+		)
+		.toBe(2);
+	held = false;
+	const opened = performance.now();
+	returning.open();
+	await expect.poll(posts, poll).toEqual(['"one"', '"two"']);
+	expect(performance.now() - opened).toBeLessThan(5_000);
+	await released(await only());
+});
+
+it("a Session execution failing its last attempt posts one error reply for each outstanding request, then fails", async () => {
+	const lead = f.defineAgent({ name: `lead-${short()}`, description: "Answers.", model });
+	const session = `ops-${short()}`;
+	const replyTo = thread();
+	const deliver = f.defineWorkflow({
+		name: `deliver-${short()}`,
+		input: z.object({ text: z.string() }),
+		run: async ({ text: input }, ctx) => {
+			await ctx.send("send", lead, { session, input, home: replyTo });
+		},
+	});
+	const held = gate();
+	script = async ({ signal }) => {
+		await held.pass(signal);
+		return say("too late");
+	};
+	const a = await launch("a", [deliver]);
+	await a.client.invoke(deliver.name, { text: "Go" }, { metadata: metadataOf() });
+	await held.entered;
+	const key = await only();
+	// The running attempt is the Session execution's last; then it loses its lease, which fails the attempt.
+	await sql`update pgconductor._private_executions set attempts = 10 where task_key = ${SESSION}`;
+	await sql`UPDATE fabrial_pi.sessions SET lease_until = clock_timestamp() - interval '1 second' WHERE key = ${key}`;
+	const thief = await PostgresStorage.open(sql, key);
+	await thief.close(BACKGROUND_CONTEXT);
+	await released(key);
+	const [failed] = await sessionExecutions();
+	expect(await execution(failed!.id)).toMatchObject({ failed: true, cancelled: false });
+	const posts = async () =>
+		(await a.chat.thread(replyTo)).posts.map((post) => JSON.stringify(post.content));
+	await expect.poll(posts, poll).toEqual([expect.stringContaining("I hit an error")]);
+	await quiet(1);
+	expect(await posts()).toHaveLength(1);
 });
 
 it("a host that loses its Session lease during a model call closes its harness and sends nothing more", async () => {

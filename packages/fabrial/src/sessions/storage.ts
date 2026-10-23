@@ -5,7 +5,16 @@ import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Context } from "@earendil-works/chord";
 
-export class SessionBusy extends Error {}
+/** Another owner holds the Session's lease: `owner`, until it expires in `expiresInMs` (database time). */
+export class SessionBusy extends Error {
+	constructor(
+		message: string,
+		readonly owner: string | null,
+		readonly expiresInMs: number,
+	) {
+		super(message);
+	}
+}
 export class LeaseLost extends Error {}
 
 /** Commits replayed per query on open. */
@@ -63,7 +72,16 @@ export class PostgresStorage extends MemoryStorage {
 			lease_until = clock_timestamp() + ${leaseMs} * interval '1 millisecond',
 			execution_id = coalesce(${options.executionId ?? null}::uuid, execution_id)
 			WHERE key = ${key} AND (owner IS NULL OR lease_until <= clock_timestamp()) RETURNING epoch`;
-		if (!rows[0]) throw new SessionBusy(`Pi Session ${key} already has an owner`);
+		if (!rows[0]) {
+			const [held] = await sql<{ owner: string | null; ms: number | null }[]>`SELECT owner,
+				extract(epoch FROM lease_until - clock_timestamp()) * 1000 AS ms
+				FROM fabrial_pi.sessions WHERE key = ${key}`;
+			throw new SessionBusy(
+				`Pi Session ${key} already has an owner`,
+				held?.owner ?? null,
+				Math.max(0, Number(held?.ms ?? 0)),
+			);
+		}
 		const storage = new PostgresStorage(sql, key, Number(rows[0].epoch), leaseMs, owner);
 		// Renewed from the moment it is taken: a replay may outlast the lease.
 		storage.timer = setInterval(

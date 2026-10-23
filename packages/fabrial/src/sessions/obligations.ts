@@ -535,6 +535,11 @@ const FAILED =
 /** Id of one failed sent request, shown in its error reply and logged with the provider's error text. */
 export const newErrorId = () => randomBytes(6).toString("hex");
 
+const errorReply = (text: string, errorId: string) => `${text}\n\n_Error id: \`${errorId}\`_`;
+
+/** The error reply for sent input whose Session execution failed for good. */
+export const failedReply = (errorId: string) => errorReply(FAILED, errorId);
+
 /**
  * The error reply for sent input Pi settled `unanswered`, or undefined for none. A model error whose text
  * is transient exhausted the durable retry budget; any other model error, or no model, is not retried.
@@ -549,5 +554,5 @@ export function sentErrorReply(
 	const transient =
 		reason === "model_error" &&
 		isRetryableAssistantError({ stopReason: "error", errorMessage: detail } as AssistantMessage);
-	return `${transient ? UNREACHABLE : FAILED}\n\n_Error id: \`${errorId}\`_`;
+	return errorReply(transient ? UNREACHABLE : FAILED, errorId);
 }

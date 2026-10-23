@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-durable";
 import type { Models } from "@earendil-works/pi-ai";
 import type { Sql } from "postgres";
+import { setTimeout as sleep } from "node:timers/promises";
 import type { TaskContext } from "pgconductor-js";
 import {
 	awaitWithContext,
@@ -21,22 +22,25 @@ import { agentRegistry } from "../agents/registry.ts";
 import { type BridgeFrame, BridgeKey } from "../agents/tool-context.ts";
 import { cloneJson, type Json, type JsonObject } from "../schema.ts";
 import { SESSION_WORKFLOW, sessionDelivery, type SessionInput, signalSession } from "./delivery.ts";
-import { type InvocationMetadata, metadataOf } from "../workflows/metadata.ts";
+import { childMetadata, type InvocationMetadata, metadataOf } from "../workflows/metadata.ts";
 import {
 	CHILD_SIGNAL,
 	childOutcome,
 	ChildResults,
 	type ChildSignal,
+	EFFECT_WORKFLOW,
 	effectWorkflow,
 	reportWorkflow,
 } from "./workflows.ts";
 import { isCancelled, nativeMethods, settlement } from "../execution.ts";
-import { LeaseLost, PostgresStorage } from "./storage.ts";
+import { LeaseLost, PostgresStorage, SessionBusy } from "./storage.ts";
 import { type Progress, progressOf } from "../chat/status.ts";
 import {
 	Binding,
 	type CallOutcome,
+	failedReply,
 	Invocation,
+	newErrorId,
 	Obligations,
 	outstanding,
 	prune,
@@ -52,6 +56,10 @@ export const Conversations = defineDoc({
 	version: 1,
 	initial: (): { ids: Record<string, number> } => ({ ids: {} }),
 });
+/** Attempts of a Session execution, for its whole lifetime: suspending gives its attempt back. */
+const SESSION_ATTEMPTS = 10;
+/** Lease periods an opening waits for an owner that keeps renewing, before its attempt fails. */
+const LIVE_OWNER_WAITS = 3;
 /** How often the Session's execution suspended on its tools and inputs: names each wait. */
 const Suspensions = defineDoc({
 	kind: "fabrial.suspensions",
@@ -169,10 +177,137 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 				return outcome as unknown as Json;
 			}
 		} catch (error) {
-			for (const each of late.splice(0)) each.done(error);
+			// A cancellation or a lost claim is not a failure of the Session.
+			const answered =
+				!ctx.signal.aborted && (await lastAttempt(ctx))
+					? await answerFailure(
+							key,
+							ctx,
+							late.map((each) => each.payload),
+							error,
+						)
+					: new Set<SessionInput>();
+			for (const each of late.splice(0))
+				if (answered.has(each.payload)) each.done();
+				else each.done(error);
 			throw error;
 		} finally {
 			phase = "returned";
+		}
+	}
+
+	async function lastAttempt(ctx: TaskContext) {
+		const info = await host.conductor.getExecution(ctx.executionId).catch(() => null);
+		return !!info && info.attempts >= SESSION_ATTEMPTS;
+	}
+
+	/**
+	 * The Session execution's last attempt failed: nothing hosts the Session until new input starts another execution.
+	 * Each outstanding sent request, and sent input that arrived meanwhile, gets one error reply, posted by an effect
+	 * that is not cancelled with the failing execution. Its obligation is fulfilled first, so a later execution
+	 * resuming the Session posts no answer after it. Calls fail with the execution. Best effort: a Session that cannot
+	 * be read answers only the input that arrived meanwhile. Returns the inputs answered.
+	 */
+	async function answerFailure(
+		key: string,
+		ctx: TaskContext,
+		late: SessionInput[],
+		error: unknown,
+	): Promise<Set<SessionInput>> {
+		const owed = new Map<string, { metadata: InvocationMetadata; errorId: string }>();
+		try {
+			const storage = await openStorage(key, ctx);
+			try {
+				const harness = await Harness.open(
+					storage,
+					{
+						models: options.models,
+						registry,
+						settings: { ...options.settings, extensions: [internal] },
+						onReport: (report) => host.logger.warn("Pi report", { error: report }),
+					},
+					BACKGROUND_CONTEXT,
+				);
+				try {
+					const invocations = new Map<string, InvocationMetadata | undefined>();
+					const requests =
+						(await harness.snapshot(Obligations, BACKGROUND_CONTEXT))?.requests ?? {};
+					for (const [requestId, obligation] of Object.entries(requests))
+						if (obligation.owes === "reply" && !obligation.fulfilled) {
+							// A background child's report answers into its origin's thread: one reply there.
+							const origin = obligation.origin ?? requestId;
+							const invocation = await harness.snapshot(Invocation, origin, BACKGROUND_CONTEXT);
+							invocations.set(requestId, invocation as InvocationMetadata | undefined);
+						}
+					await harness.commit(async (tx) => {
+						const requests = (await tx.doc(Obligations)).requests;
+						for (const [requestId, metadata] of invocations) {
+							const obligation = requests[requestId]!;
+							const origin = obligation.origin ?? requestId;
+							obligation.fulfilled = true;
+							if (!metadata?.send || !metadata.replyTo || owed.has(origin)) continue;
+							obligation.errorId ??= newErrorId();
+							owed.set(origin, { metadata: cloneJson(metadata), errorId: obligation.errorId });
+						}
+					}, BACKGROUND_CONTEXT);
+				} finally {
+					await harness.close(BACKGROUND_CONTEXT);
+				}
+			} finally {
+				await storage.close(BACKGROUND_CONTEXT);
+			}
+		} catch (cause) {
+			host.logger.error("Could not read the obligations of a failed Session", {
+				session: key,
+				error: cause,
+			});
+		}
+		const answered = new Set<SessionInput>();
+		for (const input of late)
+			if (input.kind === "input" && input.metadata.send && input.metadata.replyTo) {
+				if (!owed.has(input.requestId))
+					owed.set(input.requestId, { metadata: input.metadata, errorId: newErrorId() });
+				answered.add(input);
+			}
+		for (const [requestId, { metadata, errorId }] of owed)
+			try {
+				// Not a child: the failing execution's children are cancelled with it. The dedupe key posts it once.
+				await host.conductor.invoke(
+					{ name: EFFECT_WORKFLOW, queue: ctx.queue } as never,
+					{ method: "post", args: [failedReply(errorId)] } as never,
+					{
+						metadata: childMetadata(ctx, { ...metadata, triggerEvent: null, ownerWorkflow: null }),
+						dedupe_key: JSON.stringify(["fabrial.pi.failed", key, requestId]),
+					} as never,
+				);
+				host.logger.error("Sent input failed with its Session", { requestId, errorId, error });
+			} catch (cause) {
+				host.logger.error("Could not post the error reply of a failed Session", {
+					requestId,
+					error: cause,
+				});
+			}
+		return answered;
+	}
+
+	/**
+	 * A crashed owner's lease lasts until it expires: the opening waits for it, in database time, within the attempt
+	 * instead of spending one. An owner that still renews its lease after a few waits is alive: SessionBusy fails the
+	 * attempt, and Conductor retries it with backoff.
+	 */
+	async function openStorage(key: string, ctx: TaskContext): Promise<PostgresStorage> {
+		let last: string | null = null;
+		for (let renewed = 0; ;) {
+			try {
+				return await PostgresStorage.open(options.sql, key, { executionId: ctx.executionId });
+			} catch (error) {
+				if (!(error instanceof SessionBusy)) throw error;
+				// Seen again after its lease's expiry: the owner renewed it.
+				if (error.owner && error.owner === last && ++renewed >= LIVE_OWNER_WAITS) throw error;
+				last = error.owner;
+				host.logger.debug("Waiting for a Pi Session lease", { key, ms: error.expiresInMs });
+				await sleep(error.expiresInMs + 25, undefined, { signal: ctx.signal });
+			}
 		}
 	}
 
@@ -181,11 +316,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 		ctx: TaskContext,
 		reportOf: (executionId: string) => PromiseWithResolvers<JsonObject>,
 	): Promise<SessionHost> {
-		// A crashed owner's lease lasts until it expires: SessionBusy
-		// fails the attempt, and Conductor retries it with backoff (the Session workflow's attempts cover a lease).
-		const storage = await PostgresStorage.open(options.sql, key, {
-			executionId: ctx.executionId,
-		});
+		const storage = await openStorage(key, ctx);
 		const signal = AbortSignal.any([ctx.signal, storage.lost.signal]);
 		/** The agents' conversations this opening configured, by agent name. */
 		const conversations = new Map<string, Hosted>();
@@ -556,8 +687,8 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 	const session: WorkflowTask = {
 		name: SESSION_WORKFLOW,
 		triggers: [],
-		// Retries back off 15s, 30s, 1m, …: the first attempts outlast a crashed owner's 30s lease.
-		retries: { maxAttempts: 10 },
+		// Retries back off 15s, 30s, 1m, …; an opening waits for a crashed owner's lease without failing its attempt.
+		retries: { maxAttempts: SESSION_ATTEMPTS },
 		// No retentionDays, so kept forever: callers wait on a call's result and replay from it, and reclaim reads when
 		// it settled. A finite retention must outlast both, and retainCallSessionsDays.
 		handler: (input, ctx) => hostSession(input, ctx),
