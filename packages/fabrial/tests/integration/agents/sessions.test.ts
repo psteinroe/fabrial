@@ -22,6 +22,7 @@ import {
 } from "../../internals.ts";
 import { toolName } from "../../../src/agents/definition.ts";
 import { callSession } from "../../../src/sessions/delivery.ts";
+import { retention } from "../../../src/sessions/obligations.ts";
 import { PostgresStorage } from "../../../src/sessions/storage.ts";
 import { testClient } from "../../conductor/helper.ts";
 import { FakeChat } from "../../../src/testing/chat.ts";
@@ -134,14 +135,18 @@ function gate() {
 }
 
 /** One app instance on the test database: its own pool, orchestrator, chat, and model provider. */
-async function launch(name: string, workflows: Parameters<typeof testApp>[1]["workflows"]) {
+async function launch(
+	name: string,
+	workflows: Parameters<typeof testApp>[1]["workflows"],
+	streaming: Parameters<typeof fauxProvider>[0] = {},
+) {
 	const pool = postgres(url, { max: 10, onnotice: () => {} });
 	const conductor = {
 		sql: pool,
 		logger,
 		worker: { pollIntervalMs: 20, flushIntervalMs: 20, concurrency: 8, fetchBatchSize: 10 },
 	};
-	const faux = fauxProvider();
+	const faux = fauxProvider(streaming);
 	const models = createModels();
 	models.setProvider(faux.provider);
 	faux.setResponses(
@@ -583,6 +588,52 @@ it("input redelivered with the same request id, also through another instance, i
 	);
 });
 
+it("input redelivered after its settled obligation was pruned is not processed again", async () => {
+	const lead = f.defineAgent({ name: `lead-${short()}`, description: "Answers.", model });
+	const session = `pruned-${short()}`;
+	script = ({ context }) => say(`answered ${lastText(context)}`);
+	const a = await launch("a", []);
+	const metadata = { ...metadataOf(), piSession: session } as InvocationMetadata;
+	const input = (requestId: string, id: string) => ({
+		workflow: SESSION,
+		key: session,
+		signal: {
+			name: "input",
+			id,
+			payload: {
+				kind: "input",
+				agent: lead.name,
+				requestId,
+				content: requestId,
+				delivery: "followUp",
+				metadata,
+			} as unknown as Json,
+		},
+		input: { session },
+		metadata,
+	});
+	const kept = retention.settled;
+	retention.settled = 0;
+	try {
+		await a.client.signalWithStart(input("r1", "r1"));
+		await expect.poll(() => requests.length, poll).toBe(1);
+		await released(session);
+		// Each opening prunes every settled obligation: the redeliveries find only Pi's record of r1.
+		for (const id of ["r1:again", "r1:once-more"]) {
+			await a.client.signalWithStart(input("r1", id));
+			await released(session);
+		}
+		await a.client.signalWithStart(input("r2", "r2"));
+		await expect.poll(() => requests.length, poll).toBe(2);
+		await released(session);
+		expect(await sessionExecutions()).toHaveLength(4);
+	} finally {
+		retention.settled = kept;
+	}
+	expect(await submitted(session)).toEqual(["r1", "r2"]);
+	expect(requests.map((request) => lastText(request.context))).toEqual(["r1", "r2"]);
+});
+
 it("a host that loses its Session lease during a model call closes its harness and sends nothing more", async () => {
 	let lookups = 0;
 	const lookup = f.defineTool({
@@ -996,4 +1047,45 @@ it("a non-idempotent tool waiting on a workflow keeps its Session open and gets 
 	expect({ runs, calls }).toEqual({ runs: 1, calls: 1 });
 	expect(requests).toHaveLength(2);
 	await released(key);
+});
+
+// What one streamed turn costs the Session's log, and what replaying it costs: FABRIAL_BENCH=1 logs it.
+it.runIf(process.env.FABRIAL_BENCH)("measures the commits of a streamed turn", async () => {
+	const lead = f.defineAgent({ name: `lead-${short()}`, description: "Answers.", model });
+	const session = `bench-${short()}`;
+	script = () => say("word ".repeat(1_500));
+	// About 3s of streaming.
+	const a = await launch("a", [], { tokensPerSecond: 500, tokenSize: { min: 3, max: 3 } });
+	const metadata = { ...metadataOf(), piSession: session } as InvocationMetadata;
+	const requestId = randomUUID();
+	await a.client.signalWithStart({
+		workflow: SESSION,
+		key: session,
+		signal: {
+			name: "input",
+			id: requestId,
+			payload: {
+				kind: "input",
+				agent: lead.name,
+				requestId,
+				content: "go",
+				delivery: "followUp",
+				metadata,
+			} as unknown as Json,
+		},
+		input: { session },
+		metadata,
+	});
+	await expect.poll(async () => (await submitted(session)).length, poll).toBe(1);
+	await released(session);
+	const [log] = await sql<{ commits: number; bytes: number }[]>`
+		SELECT count(*)::int AS commits, sum(length(writes))::int AS bytes
+		FROM fabrial_pi.commits WHERE session_key = ${session}`;
+	const started = performance.now();
+	const storage = await PostgresStorage.open(sql, session);
+	const ms = performance.now() - started;
+	await storage.close(BACKGROUND_CONTEXT);
+	process.stderr.write(
+		`streamed turn: ${log!.commits} commits, ${log!.bytes} bytes; replay ${ms.toFixed(0)}ms\n`,
+	);
 });

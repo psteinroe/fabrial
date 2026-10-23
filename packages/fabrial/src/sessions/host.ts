@@ -39,6 +39,7 @@ import {
 	Invocation,
 	Obligations,
 	outstanding,
+	prune,
 	sessionObligations,
 } from "./obligations.ts";
 import { backgroundPending } from "../agents/subagents.ts";
@@ -475,6 +476,7 @@ export function connectAgents(host: FabrialHost, options: PiOptions) {
 			if (publication.changes.length) schedule();
 		});
 		try {
+			await prune(harness, context);
 			for (const [requestId, obligation] of Object.entries(await obligations())) {
 				if (obligation.outcome) outcomes.set(requestId, obligation.outcome);
 				for (const [key, delivery] of Object.entries(obligation.deliveries ?? {}))

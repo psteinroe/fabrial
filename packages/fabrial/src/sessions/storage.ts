@@ -8,6 +8,9 @@ import type { Context } from "@earendil-works/chord";
 export class SessionBusy extends Error {}
 export class LeaseLost extends Error {}
 
+/** Commits replayed per query on open. */
+const REPLAY_PAGE = 5000;
+
 /** Pi owns record validation and materialization; Postgres owns admission and atomic persistence. */
 export class PostgresStorage extends MemoryStorage {
 	readonly owner: string;
@@ -62,23 +65,35 @@ export class PostgresStorage extends MemoryStorage {
 			WHERE key = ${key} AND (owner IS NULL OR lease_until <= clock_timestamp()) RETURNING epoch`;
 		if (!rows[0]) throw new SessionBusy(`Pi Session ${key} already has an owner`);
 		const storage = new PostgresStorage(sql, key, Number(rows[0].epoch), leaseMs, owner);
+		// Renewed from the moment it is taken: a replay may outlast the lease.
+		storage.timer = setInterval(
+			() => {
+				void storage.renew().catch((error: unknown) => storage.lost.abort(error));
+			},
+			Math.floor(leaseMs / 3),
+		);
+		storage.timer.unref();
 		try {
-			const commits =
-				await sql`SELECT seq, writes FROM fabrial_pi.commits WHERE session_key = ${key} ORDER BY seq`;
-			for (const commit of commits)
-				storage
-					.prepareCommit(
-						JSON.parse(String(commit.writes)) as StorageWrite[],
-						Number(commit.seq) as Seq,
-					)
-					.apply();
-			storage.timer = setInterval(
-				() => {
-					void storage.renew().catch((error: unknown) => storage.lost.abort(error));
-				},
-				Math.floor(leaseMs / 3),
-			);
-			storage.timer.unref();
+			// Replay blocks the timer while it applies commits, so it renews in between once a third of the lease passed.
+			let renewed = performance.now();
+			for (let after = 0; ;) {
+				storage.lost.signal.throwIfAborted();
+				const commits = await sql`SELECT seq, writes FROM fabrial_pi.commits
+					WHERE session_key = ${key} AND seq > ${after} ORDER BY seq LIMIT ${REPLAY_PAGE}`;
+				for (const commit of commits) {
+					storage
+						.prepareCommit(
+							JSON.parse(String(commit.writes)) as StorageWrite[],
+							Number(commit.seq) as Seq,
+						)
+						.apply();
+					if (performance.now() - renewed < leaseMs / 3) continue;
+					await storage.renew();
+					renewed = performance.now();
+				}
+				if (commits.length < REPLAY_PAGE) break;
+				after = Number(commits.at(-1)!.seq);
+			}
 			return storage;
 		} catch (error) {
 			await storage.close(BACKGROUND_CONTEXT);

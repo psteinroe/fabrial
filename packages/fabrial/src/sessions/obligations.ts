@@ -22,7 +22,9 @@ import type { Progress } from "../chat/status.ts";
 import { Conversations, type Hosted } from "./host.ts";
 import {
 	cancelChildren,
+	ChildIntents,
 	childOutcome,
+	ChildResults,
 	type ChildSignal,
 	EFFECT_WORKFLOW,
 	startChild,
@@ -55,7 +57,7 @@ export type CallOutcome =
  * so a crash in between leaves the obligation for its redelivery. Pi owns the submission and its lifecycle (looked up
  * by request id); this holds only what Pi cannot know.
  */
-type Obligation = {
+export type Obligation = {
 	/** The conversation the request is submitted to. */
 	conversationId: number;
 	/**
@@ -96,6 +98,47 @@ export const outstanding = (obligation: Obligation, conversationId?: number) =>
 	!obligation.fulfilled &&
 	obligation.owes !== "task" &&
 	(conversationId === undefined || obligation.conversationId === conversationId);
+
+/** How many settled obligations a Session keeps for a redelivered request's dedupe: older ones are pruned on open. */
+export const retention = { settled: 100 };
+
+/**
+ * Obligations beyond the newest `keep` settled ones, in admission order: fulfilled, no post pending, not a call (its
+ * outcome is its execution's result), and none acting for them. A redelivered request pruned meanwhile is not
+ * submitted again (Pi dedupes by request id), and its posts reuse their effects (their intents stay).
+ */
+export function prunable(requests: Record<string, Obligation>, keep: number): string[] {
+	const origins = new Set(Object.values(requests).map((each) => each.origin));
+	const settled = Object.keys(requests).filter((requestId) => {
+		const each = requests[requestId]!;
+		return (
+			each.fulfilled &&
+			each.owes !== "call" &&
+			!origins.has(requestId) &&
+			!Object.values(each.deliveries ?? {}).some((delivery) => delivery.status === "pending")
+		);
+	});
+	return settled.slice(0, Math.max(0, settled.length - keep));
+}
+
+/** Prunes settled obligations past the retention, with the results their tools' workflows left. */
+export async function prune(harness: Harness, context: Context): Promise<void> {
+	const requests = (await harness.snapshot(Obligations, context))?.requests ?? {};
+	const pruned = prunable(requests, retention.settled);
+	if (!pruned.length) return;
+	const executions = new Set<string>();
+	for (const requestId of pruned)
+		for (const key of requests[requestId]!.intents ?? []) {
+			const intent = await harness.snapshot(ChildIntents, key, context);
+			if (intent?.executionId) executions.add(intent.executionId);
+		}
+	await harness.commit(async (tx) => {
+		const owed = (await tx.doc(Obligations)).requests;
+		for (const requestId of pruned) delete owed[requestId];
+		const results = (await tx.doc(ChildResults)).results;
+		for (const executionId of executions) delete results[executionId];
+	}, context);
+}
 
 /** What an opened Session's obligation handling works with: its host loop's state, read and changed in place. */
 interface SessionScope {
